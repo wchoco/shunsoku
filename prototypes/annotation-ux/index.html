@@ -1,0 +1,470 @@
+<!doctype html>
+<!--
+  PROTOTYPE（捨てコード）: 書き込み編集モードの UX（#7）
+  3 つの案を ?variant=A|B|C で切り替える。下中央のバーか ←/→ キー（編集モード外）で切り替え。
+  - A: スクラップに付くツールバー。書き込みはベクタで保持し、後から選び直して編集できる。トリムも同じモードに統合。
+  - B: ツールバーなし、キー操作のみ。描いたら画像に焼き込む（元に戻すだけ可）。
+  - C: 画面端の共有パレット。モードはスクラップ単位ではなく画面全体。ベクタ保持＋要素一覧。
+  実機の Win32 とは無関係。見た目と操作感を比べるためだけのもの。
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PROTOTYPE 書き込み編集モード</title>
+<style>
+  body { margin: 0; font: 13px system-ui, "Yu Gothic UI", "Meiryo", sans-serif; overflow: hidden; user-select: none; }
+  #desk { position: fixed; inset: 0; background: linear-gradient(135deg, #1d3557, #457b9d); }
+  .scrap { position: absolute; line-height: 0; box-shadow: 0 4px 14px rgba(0,0,0,.45); outline: 1px solid rgba(255,255,255,.35); }
+  .scrap.focused { outline: 2px solid #90caf9; }
+  .scrap.editing { outline: 3px solid #ff9800; }
+  body.v-C .scrap.editing { outline: 3px dashed #ff9800; }
+  .scrap canvas { display: block; }
+  .scrap.editing canvas { cursor: crosshair; }
+  body.space .scrap canvas { cursor: move !important; }
+  input.txt { position: absolute; z-index: 30; background: rgba(255,255,255,.6); border: 1px dashed #333; font-weight: bold; outline: none; padding: 0 2px; min-width: 80px; }
+
+  #state { position: fixed; right: 10px; top: 10px; width: 310px; max-height: 82vh; overflow: auto; z-index: 90;
+           background: rgba(0,0,0,.82); color: #d6f5e3; font: 12px ui-monospace, Consolas, monospace; padding: 10px; border-radius: 6px; white-space: pre-wrap; }
+  #state b { color: #ffcc80; }
+  #state button { font: inherit; margin-top: 6px; }
+
+  #switcher { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 100; display: flex; gap: 12px; align-items: center;
+              background: #111; color: #fff; border: 2px solid #ff4081; border-radius: 999px; padding: 6px 14px; box-shadow: 0 4px 16px rgba(0,0,0,.5); }
+  #switcher button { background: none; border: 0; color: #fff; font-size: 18px; cursor: pointer; }
+
+  /* A: スクラップに付くツールバー */
+  #tb { position: absolute; z-index: 40; display: none; gap: 4px; align-items: center; flex-wrap: wrap; max-width: 560px;
+        background: #fff; border-radius: 8px; padding: 5px; box-shadow: 0 3px 12px rgba(0,0,0,.4); }
+  .btn { border: 1px solid #ccc; background: #fafafa; border-radius: 5px; padding: 3px 7px; cursor: pointer; font: inherit; }
+  .btn.on { background: #ff9800; color: #fff; border-color: #ff9800; }
+  .btn:disabled { opacity: .4; cursor: default; }
+  .sw { width: 18px; height: 18px; border-radius: 50%; border: 2px solid #ccc; cursor: pointer; display: inline-block; vertical-align: middle; }
+  .sw.on { border-color: #000; box-shadow: 0 0 0 2px #ff9800; }
+  .sep { width: 1px; height: 20px; background: #ddd; margin: 0 3px; }
+
+  /* B: 状態チップとカーソル横の表示 */
+  #chip { position: absolute; z-index: 40; display: none; background: rgba(0,0,0,.78); color: #fff; padding: 4px 8px; border-radius: 4px; font-size: 12px; white-space: nowrap; }
+  #ctag { position: fixed; z-index: 45; display: none; pointer-events: none; background: #ff9800; color: #fff; font-size: 11px; padding: 1px 5px; border-radius: 3px; }
+
+  /* C: 共有パレット */
+  #palette { position: fixed; left: 10px; top: 60px; width: 160px; z-index: 40; display: none; background: #fff; border-radius: 8px; padding: 8px; box-shadow: 0 3px 12px rgba(0,0,0,.4); }
+  #palette .btn { display: block; width: 100%; text-align: left; margin: 2px 0; }
+  #palette .off .btn.tool { opacity: .5; }
+  #palette h4 { margin: 8px 0 3px; font-size: 11px; color: #777; }
+  #palette .layer { display: flex; justify-content: space-between; padding: 2px 4px; border-radius: 3px; cursor: pointer; font-size: 12px; }
+  #palette .layer.sel { background: #ffe0b2; }
+
+  #menu { position: fixed; z-index: 80; display: none; background: #fff; border-radius: 6px; box-shadow: 0 3px 12px rgba(0,0,0,.4); padding: 4px 0; min-width: 210px; }
+  #menu div { padding: 5px 14px; cursor: pointer; display: flex; justify-content: space-between; gap: 20px; }
+  #menu div:hover { background: #e3f2fd; }
+  #menu span { color: #888; }
+
+  #modal { position: fixed; inset: 0; z-index: 120; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; }
+  #modal .box { background: #fff; padding: 14px; border-radius: 8px; max-width: 90vw; }
+  #modal canvas { display: block; margin: 8px 0; outline: 1px solid #ccc; max-width: 80vw; }
+</style>
+</head>
+<body>
+<div id="desk"></div>
+<div id="tb"></div>
+<div id="chip"></div>
+<div id="ctag"></div>
+<div id="palette"></div>
+<div id="menu"></div>
+<div id="modal"><div class="box"></div></div>
+<div id="state"></div>
+<div id="switcher"></div>
+<script>
+const VARS = ['A', 'B', 'C'];
+const NAMES = { A: 'A: スクラップに付くツールバー', B: 'B: キー操作のみ・焼き込み', C: 'C: 共有パレット（画面全体のモード）' };
+const RULES = {
+  A: `入る: E / 右クリック「書き込み」
+抜ける: Esc / 「完了」/ 他のスクラップや背景をクリック
+保持: ベクタ（選択ツール V で選び直し、移動・色変更・削除、文字はダブルクリックで再編集）
+トリム: 同じツールバーのツールとして統合
+保存・コピー: 書き込みを含めるか出力時に選べる`,
+  B: `入る: E / 右クリック「書き込み」
+抜ける: Esc / もう一度 E
+ツール: 1〜8、色: C、太さ: [ ]
+保持: 描いた瞬間に画像へ焼き込み（後から選び直せない。Ctrl+Z のみ）
+トリム: 別操作のまま
+保存・コピー: 常に書き込み込み（分離できない）`,
+  C: `入る: E / パレットの ON / ツールを押す（全スクラップが対象）
+抜ける: Esc / パレットの OFF
+編集中のスクラップ移動: Space を押しながらドラッグ
+保持: ベクタ＋パレットの要素一覧（クリックで選択、✕で削除）
+トリム: 別操作のまま
+保存・コピー: 書き込みを含めるか出力時に選べる`,
+};
+const qv = new URLSearchParams(location.search).get('variant');
+const V = VARS.includes(qv) ? qv : 'A';
+const VECTOR = V !== 'B';
+document.body.classList.add('v-' + V);
+
+let TOOLS = [['select', '選択', 'V'], ['rect', '矩形', '1'], ['ellipse', '楕円', '2'], ['arrow', '矢印', '3'], ['line', '線', '4'],
+             ['pen', 'フリーハンド', '5'], ['text', '文字', '6'], ['mosaic', 'モザイク', '7'], ['highlight', 'ハイライト', '8']];
+if (V === 'B') TOOLS = TOOLS.filter(t => t[0] !== 'select');
+if (V === 'A') TOOLS.push(['trim', 'トリム', 'T']);
+const TNAME = Object.fromEntries(TOOLS.map(t => [t[0], t[1]]));
+const COLORS = ['#e53935', '#1e88e5', '#43a047', '#fdd835', '#212121', '#ffffff'];
+const WIDTHS = [2, 4, 8];
+
+const st = { tool: 'rect', color: COLORS[0], width: 4, focused: null, editing: null, global: false, selId: null, drag: null, space: false };
+const desk = document.getElementById('desk');
+let scraps = [];
+let nid = 1;
+const uid = () => nid++;
+
+// ---------- 偽のスクリーンショット ----------
+function paintFake(c, w, h, seed) {
+  c.fillStyle = seed ? '#263238' : '#f5f6f8'; c.fillRect(0, 0, w, h);
+  c.fillStyle = seed ? '#37474f' : '#3949ab'; c.fillRect(0, 0, w, 28);
+  c.fillStyle = '#fff'; c.font = '13px sans-serif'; c.textBaseline = 'alphabetic';
+  c.fillText(seed ? 'ターミナル — build.log' : '売上ダッシュボード - ブラウザ', 10, 19);
+  if (!seed) {
+    c.fillStyle = '#333'; c.fillText('月別の売上（万円）', 16, 52);
+    const hs = [60, 90, 75, 120, 100, 140, 80];
+    hs.forEach((v, i) => { c.fillStyle = i === 5 ? '#ef5350' : '#5c6bc0'; c.fillRect(24 + i * 44, h - 24 - v, 28, v); });
+    c.fillStyle = '#999'; c.fillRect(16, h - 24, w - 32, 1);
+    c.fillStyle = '#555'; c.font = '11px sans-serif';
+    ['1月', '2月', '3月', '4月', '5月', '6月', '7月'].forEach((m, i) => c.fillText(m, 28 + i * 44, h - 8));
+    c.fillText('担当: 山田 / 電話 090-1234-5678', w - 200, 52);
+  } else {
+    c.font = '12px monospace';
+    const L = ['$ cargo build --release', '   Compiling shunsoku v0.1.0', 'warning: unused variable `dpi`', '  --> src/capture.rs:42:9',
+               'error[E0308]: mismatched types', '  --> src/scrap.rs:118:20', '   |  expected `u32`, found `i32`', 'token=sk_live_XXXXXXXXXXXX'];
+    L.forEach((l, i) => { c.fillStyle = l.startsWith('error') ? '#ef9a9a' : l.startsWith('warning') ? '#ffe082' : '#cfd8dc'; c.fillText(l, 10, 50 + i * 20); });
+  }
+}
+
+function makeScrap(x, y, w, h, seed) {
+  const base = document.createElement('canvas'); base.width = w; base.height = h;
+  paintFake(base.getContext('2d'), w, h, seed);
+  const s = { id: uid(), x, y, w, h, base, elements: [], undo: [], redo: [], trim: null };
+  const d = document.createElement('div'); d.className = 'scrap';
+  const cv = document.createElement('canvas'); d.appendChild(cv); desk.appendChild(d);
+  s.el = d; s.cv = cv; bind(s); scraps.push(s); return s;
+}
+
+// ---------- 幾何 ----------
+const view = s => s.trim || { x: 0, y: 0, w: s.w, h: s.h };
+const isEditing = s => V === 'C' ? st.global : st.editing === s.id;
+const foc = () => scraps.find(s => s.id === st.focused);
+function norm(e) { return [Math.min(e.x1, e.x2), Math.min(e.y1, e.y2), Math.abs(e.x2 - e.x1), Math.abs(e.y2 - e.y1)]; }
+function bbox(e) {
+  if (e.type === 'pen') { const xs = e.pts.map(p => p[0]), ys = e.pts.map(p => p[1]); return [Math.min(...xs), Math.min(...ys), Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)]; }
+  if (e.type === 'text') return [e.x, e.y, e.tw, e.size * 1.25];
+  return norm(e);
+}
+function hit(s, p) {
+  for (let i = s.elements.length - 1; i >= 0; i--) {
+    const [x, y, w, h] = bbox(s.elements[i]);
+    if (p.x >= x - 6 && p.x <= x + w + 6 && p.y >= y - 6 && p.y <= y + h + 6) return s.elements[i];
+  }
+  return null;
+}
+function moveEl(e, dx, dy) {
+  if (e.type === 'pen') e.pts = e.pts.map(p => [p[0] + dx, p[1] + dy]);
+  else if (e.type === 'text') { e.x += dx; e.y += dy; }
+  else { e.x1 += dx; e.x2 += dx; e.y1 += dy; e.y2 += dy; }
+}
+function measure(text, size) { const c = document.createElement('canvas').getContext('2d'); c.font = `bold ${size}px sans-serif`; return c.measureText(text).width; }
+
+// ---------- 描画 ----------
+function mosaic(c, s, x, y, w, h) {
+  if (w < 2 || h < 2) return;
+  const k = 9, tw = Math.max(1, Math.round(w / k)), th = Math.max(1, Math.round(h / k));
+  const tmp = document.createElement('canvas'); tmp.width = tw; tmp.height = th;
+  tmp.getContext('2d').drawImage(s.base, x, y, w, h, 0, 0, tw, th);
+  c.save(); c.imageSmoothingEnabled = false; c.drawImage(tmp, 0, 0, tw, th, x, y, w, h); c.restore();
+}
+function drawEl(c, e, s) {
+  if (e.hidden) return;
+  c.save(); c.strokeStyle = e.color; c.fillStyle = e.color; c.lineWidth = e.width; c.lineCap = 'round'; c.lineJoin = 'round';
+  const [x, y, w, h] = e.x1 !== undefined ? norm(e) : [0, 0, 0, 0];
+  switch (e.type) {
+    case 'rect': c.strokeRect(x, y, w, h); break;
+    case 'ellipse': c.beginPath(); c.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2); c.stroke(); break;
+    case 'line': case 'arrow': {
+      c.beginPath(); c.moveTo(e.x1, e.y1); c.lineTo(e.x2, e.y2); c.stroke();
+      if (e.type === 'arrow') {
+        const a = Math.atan2(e.y2 - e.y1, e.x2 - e.x1), L = 10 + e.width * 2;
+        c.beginPath(); c.moveTo(e.x2, e.y2);
+        c.lineTo(e.x2 - L * Math.cos(a - 0.45), e.y2 - L * Math.sin(a - 0.45));
+        c.lineTo(e.x2 - L * Math.cos(a + 0.45), e.y2 - L * Math.sin(a + 0.45)); c.closePath(); c.fill();
+      }
+      break;
+    }
+    case 'pen': c.beginPath(); e.pts.forEach((p, i) => i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])); c.stroke(); break;
+    case 'text':
+      c.font = `bold ${e.size}px sans-serif`; c.textBaseline = 'top';
+      c.strokeStyle = e.color === '#ffffff' ? '#000' : '#fff'; c.lineWidth = 3; c.strokeText(e.text, e.x, e.y); c.fillText(e.text, e.x, e.y); break;
+    case 'mosaic': mosaic(c, s, x, y, w, h); break;
+    case 'highlight': c.globalAlpha = 0.35; c.fillRect(x, y, w, h); break;
+    case 'trimrect': c.setLineDash([6, 4]); c.strokeStyle = '#000'; c.lineWidth = 1; c.strokeRect(x, y, w, h); c.strokeStyle = '#fff'; c.lineDashOffset = 5; c.strokeRect(x, y, w, h); break;
+  }
+  c.restore();
+}
+function render(s) {
+  const t = view(s);
+  s.el.style.left = (s.x + t.x) + 'px'; s.el.style.top = (s.y + t.y) + 'px';
+  s.el.classList.toggle('focused', st.focused === s.id);
+  s.el.classList.toggle('editing', isEditing(s));
+  if (s.cv.width !== t.w || s.cv.height !== t.h) { s.cv.width = t.w; s.cv.height = t.h; }
+  const c = s.cv.getContext('2d');
+  c.setTransform(1, 0, 0, 1, -t.x, -t.y); c.clearRect(t.x, t.y, t.w, t.h);
+  c.drawImage(s.base, 0, 0);
+  s.elements.forEach(e => drawEl(c, e, s));
+  if (st.drag && st.drag.preview && st.drag.s === s) drawEl(c, st.drag.preview, s);
+  if (VECTOR && isEditing(s) && st.selId) {
+    const e = s.elements.find(e => e.id === st.selId);
+    if (e) { const [x, y, w, h] = bbox(e); c.save(); c.setLineDash([4, 3]); c.strokeStyle = '#2196f3'; c.lineWidth = 1.5; c.strokeRect(x - 5, y - 5, w + 10, h + 10); c.restore(); }
+  }
+}
+function renderAll() { scraps.forEach(render); ui(); }
+
+// ---------- 編集の履歴 ----------
+function snap(s) { return JSON.stringify({ elements: s.elements, trim: s.trim }); }
+function restore(s, j) { const o = JSON.parse(j); s.elements = o.elements; s.trim = o.trim; }
+function pushUndo(s) { s.undo.push(V === 'B' ? s.base.getContext('2d').getImageData(0, 0, s.w, s.h) : snap(s)); s.redo = []; }
+function undo(s) {
+  if (!s.undo.length) return;
+  if (V === 'B') { const c = s.base.getContext('2d'); s.redo.push(c.getImageData(0, 0, s.w, s.h)); c.putImageData(s.undo.pop(), 0, 0); }
+  else { s.redo.push(snap(s)); restore(s, s.undo.pop()); st.selId = null; }
+}
+function redo(s) {
+  if (!s.redo.length) return;
+  if (V === 'B') { const c = s.base.getContext('2d'); s.undo.push(c.getImageData(0, 0, s.w, s.h)); c.putImageData(s.redo.pop(), 0, 0); }
+  else { s.undo.push(snap(s)); restore(s, s.redo.pop()); st.selId = null; }
+}
+function commit(s, e) {
+  if (V === 'B') { pushUndo(s); drawEl(s.base.getContext('2d'), e, s); }
+  else { pushUndo(s); s.elements.push(e); st.selId = e.id; }
+}
+
+// ---------- 入力 ----------
+function local(s, ev) { const r = s.cv.getBoundingClientRect(), t = view(s); return { x: ev.clientX - r.left + t.x, y: ev.clientY - r.top + t.y }; }
+function focusScrap(s) {
+  if (V !== 'C' && st.editing && st.editing !== s.id) { st.editing = null; st.selId = null; }
+  st.focused = s.id;
+}
+function startText(s, p, existing) {
+  const size = existing ? existing.size : 12 + st.width * 3, color = existing ? existing.color : st.color;
+  const inp = document.createElement('input'); inp.className = 'txt';
+  inp.style.left = (s.x + p.x) + 'px'; inp.style.top = (s.y + p.y) + 'px'; inp.style.color = color; inp.style.fontSize = size + 'px';
+  if (existing) { inp.value = existing.text; existing.hidden = true; render(s); }
+  desk.appendChild(inp); setTimeout(() => inp.focus());
+  let done = false;
+  const fin = ok => {
+    if (done) return; done = true; const v = inp.value; inp.remove();
+    if (existing) { existing.hidden = false; if (ok && v && v !== existing.text) { pushUndo(s); existing.text = v; existing.tw = measure(v, size); } }
+    else if (ok && v) commit(s, { id: uid(), type: 'text', text: v, x: p.x, y: p.y, color, size, tw: measure(v, size) });
+    renderAll();
+  };
+  inp.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Enter') fin(true); if (e.key === 'Escape') fin(false); });
+  inp.addEventListener('blur', () => fin(true));
+}
+function bind(s) {
+  const cv = s.cv;
+  cv.addEventListener('pointerdown', ev => {
+    if (ev.button !== 0) return;
+    ev.preventDefault(); ev.stopPropagation(); hideMenu();
+    focusScrap(s);
+    const p = local(s, ev);
+    if (!isEditing(s) || (V === 'C' && st.space)) st.drag = { kind: 'move', s, sx: ev.clientX, sy: ev.clientY, ox: s.x, oy: s.y };
+    else if (st.tool === 'select') {
+      const e = hit(s, p); st.selId = e ? e.id : null;
+      if (e) { pushUndo(s); st.drag = { kind: 'moveEl', s, e, last: p, moved: false }; }
+    } else if (st.tool === 'text') { renderAll(); startText(s, p); return; }
+    else {
+      const type = st.tool === 'trim' ? 'trimrect' : st.tool;
+      const e = { id: uid(), type, color: type === 'highlight' && st.color === '#212121' ? '#fdd835' : st.color, width: st.width, x1: p.x, y1: p.y, x2: p.x, y2: p.y };
+      if (type === 'pen') e.pts = [[p.x, p.y]];
+      st.drag = { kind: 'draw', s, preview: e };
+    }
+    cv.setPointerCapture(ev.pointerId); renderAll();
+  });
+  cv.addEventListener('pointermove', ev => {
+    const d = st.drag; if (!d || d.s !== s) return;
+    if (d.kind === 'move') { s.x = d.ox + ev.clientX - d.sx; s.y = d.oy + ev.clientY - d.sy; }
+    else if (d.kind === 'moveEl') { const p = local(s, ev); moveEl(d.e, p.x - d.last.x, p.y - d.last.y); d.last = p; d.moved = true; }
+    else { const p = local(s, ev); d.preview.x2 = p.x; d.preview.y2 = p.y; if (d.preview.pts) d.preview.pts.push([p.x, p.y]); }
+    renderAll();
+  });
+  cv.addEventListener('pointerup', () => {
+    const d = st.drag; if (!d || d.s !== s) return; st.drag = null;
+    if (d.kind === 'moveEl' && !d.moved) s.undo.pop();
+    if (d.kind === 'draw') {
+      const e = d.preview, [x, y, w, h] = norm(e);
+      if (e.type === 'trimrect') {
+        if (w > 8 && h > 8) {
+          pushUndo(s);
+          const nx = Math.max(0, x), ny = Math.max(0, y);
+          s.trim = { x: Math.round(nx), y: Math.round(ny), w: Math.round(Math.min(s.w, x + w) - nx), h: Math.round(Math.min(s.h, y + h) - ny) };
+        }
+      } else if (e.type === 'pen' ? e.pts.length > 2 : (w > 3 || h > 3)) commit(s, e);
+    }
+    renderAll();
+  });
+  cv.addEventListener('dblclick', ev => {
+    if (!VECTOR || !isEditing(s)) return;
+    const e = hit(s, local(s, ev));
+    if (e && e.type === 'text') startText(s, { x: e.x, y: e.y }, e);
+  });
+  cv.addEventListener('contextmenu', ev => { ev.preventDefault(); focusScrap(s); renderAll(); showMenu(ev.clientX, ev.clientY); });
+}
+desk.addEventListener('pointerdown', () => {
+  hideMenu();
+  if (V !== 'C' && st.editing) { st.editing = null; st.selId = null; renderAll(); }
+});
+
+function toggleEdit() {
+  const s = foc();
+  if (V === 'C') st.global = !st.global;
+  else if (s) st.editing = st.editing === s.id ? null : s.id;
+  st.selId = null; renderAll();
+}
+function exitEdit() { st.editing = null; st.global = false; st.selId = null; renderAll(); }
+const anyEditing = () => V === 'C' ? st.global : !!st.editing;
+function setTool(t) { st.tool = t; if (V === 'C' && !st.global) st.global = true; if (t !== 'select') st.selId = null; renderAll(); }
+function setColor(c) {
+  st.color = c; const s = foc();
+  if (VECTOR && s && st.selId) { const e = s.elements.find(e => e.id === st.selId); if (e && e.type !== 'mosaic') { pushUndo(s); e.color = c; } }
+  renderAll();
+}
+function delSel() { const s = foc(); if (!s || !st.selId) return; pushUndo(s); s.elements = s.elements.filter(e => e.id !== st.selId); st.selId = null; renderAll(); }
+
+addEventListener('keydown', ev => {
+  if (ev.target.tagName === 'INPUT') return;
+  const s = foc(), k = ev.key, ed = s && isEditing(s);
+  if (V === 'C' && k === ' ') { st.space = true; document.body.classList.add('space'); ev.preventDefault(); return; }
+  if (ev.ctrlKey && (k === 'z' || k === 'Z')) {
+    ev.preventDefault();
+    if (ev.shiftKey) { alert('Ctrl+Shift+Z は「最後に閉じたスクラップを復元」（グローバル、#6）と衝突するため、やり直しは Ctrl+Y にしている'); return; }
+    if (ed) { undo(s); renderAll(); } return;
+  }
+  if (ev.ctrlKey && k === 'y') { ev.preventDefault(); if (ed) { redo(s); renderAll(); } return; }
+  if (ev.ctrlKey && (k === 's' || k === 'c')) { ev.preventDefault(); if (s) preview(s, k === 's' ? '保存' : 'コピー'); return; }
+  if (ev.ctrlKey) return;
+  if (k === 'e' || k === 'E') { toggleEdit(); return; }
+  if (k === 'Escape') { if (anyEditing()) exitEdit(); return; }
+  if (ed) {
+    const t = TOOLS.find(t => t[2].toLowerCase() === k.toLowerCase()); if (t) { setTool(t[0]); return; }
+    if (V === 'B' && (k === 'c' || k === 'C')) { setColor(COLORS[(COLORS.indexOf(st.color) + 1) % COLORS.length]); return; }
+    if (k === '[' || k === ']') { const i = WIDTHS.indexOf(st.width) + (k === ']' ? 1 : -1); st.width = WIDTHS[Math.max(0, Math.min(2, i))]; renderAll(); return; }
+    if (VECTOR && (k === 'Delete' || k === 'Backspace')) { delSel(); return; }
+  }
+  if (!anyEditing() && (k === 'ArrowLeft' || k === 'ArrowRight')) go(k === 'ArrowRight' ? 1 : -1);
+});
+addEventListener('keyup', ev => { if (ev.key === ' ') { st.space = false; document.body.classList.remove('space'); } });
+addEventListener('pointermove', ev => {
+  const tag = document.getElementById('ctag');
+  if (V === 'B' && st.editing) { tag.style.display = 'block'; tag.style.left = (ev.clientX + 14) + 'px'; tag.style.top = (ev.clientY + 14) + 'px'; tag.textContent = TNAME[st.tool] + ' ' + st.width + 'px'; tag.style.background = st.color === '#ffffff' ? '#777' : st.color; }
+  else tag.style.display = 'none';
+});
+
+// ---------- 右クリックメニュー ----------
+function showMenu(x, y) {
+  const m = document.getElementById('menu'), s = foc();
+  const items = [[isEditing(s) ? '書き込みを終える' : '書き込み', 'E', toggleEdit], ['コピー', 'Ctrl+C', () => preview(s, 'コピー')], ['既定の保存先へ保存', 'Ctrl+S', () => preview(s, '保存')]];
+  if (V === 'A' && s.trim) items.push(['トリムを解除', '', () => { pushUndo(s); s.trim = null; renderAll(); }]);
+  m.innerHTML = ''; items.forEach(([l, k, f]) => { const d = document.createElement('div'); d.innerHTML = `${l}<span>${k}</span>`; d.onclick = () => { hideMenu(); f(); }; m.appendChild(d); });
+  m.style.left = x + 'px'; m.style.top = y + 'px'; m.style.display = 'block';
+}
+function hideMenu() { document.getElementById('menu').style.display = 'none'; }
+
+// ---------- 保存・コピーの出力 ----------
+function compose(s, include) {
+  const t = view(s), c = document.createElement('canvas'); c.width = t.w; c.height = t.h;
+  const x = c.getContext('2d'); x.translate(-t.x, -t.y); x.drawImage(s.base, 0, 0);
+  if (include && VECTOR) s.elements.forEach(e => drawEl(x, e, s));
+  return c;
+}
+function preview(s, what) {
+  const m = document.getElementById('modal'), box = m.querySelector('.box');
+  let include = true;
+  const draw = () => {
+    box.innerHTML = `<b>${what}される画像（保存画像 / クリップボード）</b><br>
+      <label><input type="checkbox" id="inc" ${include ? 'checked' : ''} ${VECTOR ? '' : 'disabled'}> 書き込みを含める</label>
+      ${VECTOR ? '' : '<span style="color:#c62828">（B は焼き込み済みのため分離できない）</span>'}`;
+    box.appendChild(compose(s, include));
+    const b = document.createElement('button'); b.className = 'btn'; b.textContent = '閉じる'; b.onclick = () => m.style.display = 'none'; box.appendChild(b);
+    box.querySelector('#inc').onchange = e => { include = e.target.checked; draw(); };
+  };
+  draw(); m.style.display = 'flex';
+}
+
+// ---------- 各案の UI ----------
+function toolButtons(cls = '') {
+  return TOOLS.map(([id, name, key]) => `<button class="btn tool ${cls} ${st.tool === id ? 'on' : ''}" data-tool="${id}" title="${key}">${name} <small>${key}</small></button>`).join('');
+}
+function colorSw() { return COLORS.map(c => `<span class="sw ${st.color === c ? 'on' : ''}" data-color="${c}" style="background:${c}"></span>`).join(''); }
+function widthBtns() { return WIDTHS.map(w => `<button class="btn ${st.width === w ? 'on' : ''}" data-width="${w}">${w}px</button>`).join(''); }
+function wire(root) {
+  root.querySelectorAll('[data-tool]').forEach(b => b.onclick = () => setTool(b.dataset.tool));
+  root.querySelectorAll('[data-color]').forEach(b => b.onclick = () => setColor(b.dataset.color));
+  root.querySelectorAll('[data-width]').forEach(b => b.onclick = () => { st.width = +b.dataset.width; renderAll(); });
+  root.querySelectorAll('[data-act]').forEach(b => b.onclick = () => {
+    const s = foc(), a = b.dataset.act;
+    if (a === 'undo' && s) undo(s); if (a === 'redo' && s) redo(s);
+    if (a === 'done') exitEdit(); if (a === 'toggle') toggleEdit(); if (a === 'del') delSel();
+    if (a === 'untrim' && s) { pushUndo(s); s.trim = null; }
+    renderAll();
+  });
+  root.querySelectorAll('[data-layer]').forEach(b => b.onclick = ev => {
+    const s = foc(); const id = +b.dataset.layer;
+    if (ev.target.dataset.x) { pushUndo(s); s.elements = s.elements.filter(e => e.id !== id); st.selId = null; }
+    else { st.global = true; st.tool = 'select'; st.selId = id; }
+    renderAll();
+  });
+}
+function ui() {
+  const s = foc(), tb = document.getElementById('tb'), chip = document.getElementById('chip'), pal = document.getElementById('palette');
+  tb.style.display = 'none'; chip.style.display = 'none';
+  if (V === 'A' && s && st.editing === s.id) {
+    const t = view(s);
+    tb.innerHTML = toolButtons() + '<span class="sep"></span>' + colorSw() + '<span class="sep"></span>' + widthBtns() + '<span class="sep"></span>' +
+      `<button class="btn" data-act="undo" ${s.undo.length ? '' : 'disabled'}>↶</button><button class="btn" data-act="redo" ${s.redo.length ? '' : 'disabled'}>↷</button>` +
+      `<button class="btn" data-act="del" ${st.selId ? '' : 'disabled'}>削除</button>` +
+      (s.trim ? '<button class="btn" data-act="untrim">トリム解除</button>' : '') + '<button class="btn on" data-act="done">完了</button>';
+    tb.style.left = (s.x + t.x) + 'px'; tb.style.top = (s.y + t.y + t.h + 8) + 'px'; tb.style.display = 'flex'; wire(tb);
+  }
+  if (V === 'B' && s && st.editing === s.id) {
+    const t = view(s);
+    chip.innerHTML = `✎ ${TNAME[st.tool]} · <span style="color:${st.color}">●</span> · ${st.width}px　1-8 ツール / C 色 / [ ] 太さ / Ctrl+Z・Y / Esc 終了`;
+    chip.style.left = (s.x + t.x) + 'px'; chip.style.top = (s.y + t.y - 28) + 'px'; chip.style.display = 'block';
+  }
+  if (V === 'C') {
+    const layers = s ? s.elements.map((e, i) => `<div class="layer ${st.selId === e.id ? 'sel' : ''}" data-layer="${e.id}"><span>${i + 1}. ${TNAME[e.type] || e.type}${e.type === 'text' ? '「' + e.text + '」' : ''}</span><span data-x="1">✕</span></div>`).join('') : '';
+    pal.innerHTML = `<button class="btn ${st.global ? 'on' : ''}" data-act="toggle">書き込みモード ${st.global ? 'ON' : 'OFF'} (E)</button>
+      <div class="${st.global ? '' : 'off'}">${toolButtons()}</div><h4>色</h4>${colorSw()}<h4>太さ</h4>${widthBtns()}
+      <h4>元に戻す（フォーカス中のスクラップ）</h4><button class="btn" data-act="undo">↶ 元に戻す Ctrl+Z</button><button class="btn" data-act="redo">↷ やり直す Ctrl+Y</button>
+      <h4>要素一覧（フォーカス中）</h4>${layers || '<small>なし</small>'}<h4>ヒント</h4><small>Space+ドラッグでスクラップを移動</small>`;
+    pal.style.display = 'block'; wire(pal);
+  }
+  const sel = s && s.elements.find(e => e.id === st.selId);
+  document.getElementById('state').innerHTML =
+`<b>${NAMES[V]}</b>
+${RULES[V]}
+
+<b>状態</b>
+モード: ${anyEditing() ? (V === 'C' ? '書き込み（全スクラップ）' : '書き込み（スクラップ ' + st.editing + '）') : '通常'}
+フォーカス: スクラップ ${st.focused ?? '-'}
+ツール: ${TNAME[st.tool]} / 色 ${st.color} / 太さ ${st.width}px
+選択中の要素: ${sel ? sel.type + ' #' + sel.id : '-'}
+${scraps.map(x => `スクラップ ${x.id}: 要素 ${VECTOR ? x.elements.length : '(焼き込み済み)'} / undo ${x.undo.length} / redo ${x.redo.length} / トリム ${x.trim ? x.trim.w + 'x' + x.trim.h : 'なし'}`).join('\n')}
+<button class="btn" onclick="foc() && preview(foc(), '保存')">保存画像を確認（Ctrl+S）</button>`;
+}
+
+// ---------- 切り替えバー ----------
+function go(d) { const i = (VARS.indexOf(V) + d + VARS.length) % VARS.length; location.search = '?variant=' + VARS[i]; }
+document.getElementById('switcher').innerHTML = `<button onclick="go(-1)">‹</button><span>${NAMES[V]}</span><button onclick="go(1)">›</button>`;
+
+makeScrap(200, 90, 360, 240, 0);
+makeScrap(620, 300, 380, 220, 1);
+st.focused = 1;
+renderAll();
+</script>
+</body>
+</html>
