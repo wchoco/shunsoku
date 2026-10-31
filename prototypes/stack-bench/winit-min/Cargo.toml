@@ -1,0 +1,15 @@
+[package]
+name = "winit-min"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+winit = "0.30"
+softbuffer = "0.4"
+global-hotkey = "0.7"
+tray-icon = "0.21"
+
+[dependencies.windows]
+workspace = true
+features = ["Win32_Graphics_Dwm", "Win32_System_Performance", "Win32_System_Threading"]

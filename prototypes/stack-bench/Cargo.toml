@@ -1,0 +1,14 @@
+# PROTOTYPE — 捨てるコード。shunsoku #5「技術スタックの計測プロトタイプと採用決定」用。main にはマージしない。
+[workspace]
+resolver = "2"
+members = ["raw", "winit-min", "harness"]
+
+[workspace.dependencies]
+windows = "0.61"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
