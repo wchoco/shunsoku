@@ -250,6 +250,29 @@ impl Scrap {
         }
     }
 
+    /// `before` から変えた `model` を表示に移して（`sync_shown`）出し直す（`redraw`）。描けなければ（大きすぎるときなど）
+    /// ウィンドウは前のままなので、状態も `before` に戻して false。`what` はログに出す、何をしていたか。
+    fn redraw_or_revert(
+        &mut self,
+        before: &ScrapModel,
+        appearance: &Appearance,
+        renderer: &mut Option<render::Renderer>,
+        repaint: bool,
+        what: &str,
+    ) -> bool {
+        self.sync_shown(before);
+        match self.redraw(before, appearance, renderer, repaint) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("could not redraw a scrap ({what}): {e}");
+                let failed = std::mem::replace(&mut self.model, before.clone());
+                // 戻した状態と比べて、表示する画像も前のものに切り出し直す
+                self.sync_shown(&failed);
+                false
+            }
+        }
+    }
+
     /// 中身を描いて、`model` のとおりの位置と大きさに出す。
     fn paint(
         &self,
@@ -760,20 +783,16 @@ fn on_tray(owner: HWND, event: tray::Event) {
             let mut trash_entries: Vec<menu::Entry> = trashed
                 .iter()
                 .enumerate()
-                .map(|(i, (_, label))| menu::Entry::Item {
-                    id: CMD_TRASH_FIRST + i as u32,
-                    label: label.as_str().into(),
-                    enabled: true,
-                    checked: false,
+                .map(|(i, (_, label))| {
+                    menu::Entry::item(CMD_TRASH_FIRST + i as u32, label.as_str(), true)
                 })
                 .collect();
             if trash_entries.is_empty() {
-                trash_entries.push(menu::Entry::Item {
-                    id: CMD_TRASH_FIRST,
-                    label: text("tray.menu.trash_empty").into(),
-                    enabled: false,
-                    checked: false,
-                });
+                trash_entries.push(menu::Entry::item(
+                    CMD_TRASH_FIRST,
+                    text("tray.menu.trash_empty"),
+                    false,
+                ));
             }
             // 1 枚でも隠れていれば「すべて表示」、なければ「すべて隠す」
             let (any_scrap, any_hidden) = with_app(|app| {
@@ -784,45 +803,20 @@ fn on_tray(owner: HWND, event: tray::Event) {
             })
             .unwrap_or_default();
             let hide_or_show = if any_hidden {
-                menu::Entry::Item {
-                    id: CMD_SHOW_ALL,
-                    label: text("tray.menu.show_all").into(),
-                    enabled: true,
-                    checked: false,
-                }
+                menu::Entry::item(CMD_SHOW_ALL, text("tray.menu.show_all"), true)
             } else {
-                menu::Entry::Item {
-                    id: CMD_HIDE_ALL,
-                    label: text("tray.menu.hide_all").into(),
-                    enabled: any_scrap,
-                    checked: false,
-                }
+                menu::Entry::item(CMD_HIDE_ALL, text("tray.menu.hide_all"), any_scrap)
             };
             let items = [
-                menu::Entry::Item {
-                    id: CMD_SELECT_CAPTURE,
-                    label: text("tray.menu.select_capture").into(),
-                    enabled: true,
-                    checked: false,
-                },
+                menu::Entry::item(CMD_SELECT_CAPTURE, text("tray.menu.select_capture"), true),
                 menu::Entry::Submenu {
                     label: text("tray.menu.trash").into(),
                     enabled: true,
                     items: trash_entries,
                 },
-                menu::Entry::Item {
-                    id: CMD_CLOSE_ALL,
-                    label: text("tray.menu.close_all").into(),
-                    enabled: any_scrap,
-                    checked: false,
-                },
+                menu::Entry::item(CMD_CLOSE_ALL, text("tray.menu.close_all"), any_scrap),
                 hide_or_show,
-                menu::Entry::Item {
-                    id: CMD_EXIT,
-                    label: text("tray.menu.exit").into(),
-                    enabled: true,
-                    checked: false,
-                },
+                menu::Entry::item(CMD_EXIT, text("tray.menu.exit"), true),
             ];
             // モーダルなので App を借りずに呼ぶ
             let Some(command) = menu::show(owner, &items, x, y) else {
@@ -1038,6 +1032,19 @@ impl App {
     fn scrap_mut(&mut self, hwnd: HWND) -> Option<&mut Scrap> {
         self.scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)
     }
+
+    /// `hwnd` のスクラップと、描くのに要る設定の見た目と描画器を、まとめて借りる。
+    fn scrap_to_draw(
+        &mut self,
+        hwnd: HWND,
+    ) -> Option<(&mut Scrap, Appearance, &mut Option<render::Renderer>)> {
+        let appearance = Appearance::from(self.settings.scrap);
+        let App {
+            scraps, renderer, ..
+        } = self;
+        let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
+        Some((scrap, appearance, renderer))
+    }
 }
 
 /// `WM_MOUSEMOVE` の `wparam` と、`hwnd` がマウスを捕まえているかから作る、左ボタンの様子。
@@ -1106,24 +1113,14 @@ fn on_trim_move(hwnd: HWND, wparam: WPARAM, at: Point) {
 /// トリムの範囲の選択に入力を渡し、変わったら描き直す。トリムの最中でなければ何もせず false。
 fn on_trim_input(hwnd: HWND, input: TrimInput) -> bool {
     with_app(|app| {
-        let appearance = Appearance::from(app.settings.scrap);
-        let App {
-            scraps, renderer, ..
-        } = app;
-        let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
+        let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
         if !scrap.model.is_trimming() {
             return Some(false);
         }
         let before = scrap.model.clone();
         if scrap.model.trim_input(input) {
-            scrap.sync_shown(&before);
             // 動かす・描き直すときに届くメッセージでは App を借りないので、借りたまま描く
-            if let Err(e) = scrap.redraw(&before, &appearance, renderer, true) {
-                // 大きすぎて描けないときなど。ウィンドウは前のままなので、状態も前に戻す
-                log::warn!("could not redraw a trimming scrap: {e}");
-                scrap.model = before.clone();
-                scrap.sync_shown(&before);
-            }
+            scrap.redraw_or_revert(&before, &appearance, renderer, true, "trimming");
             if scrap.model.mode == Mode::Normal {
                 log::info!("trim finished (trimmed: {})", scrap.model.is_trimmed());
             }
@@ -1176,12 +1173,8 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
 fn on_scrap_dpi_changed(hwnd: HWND, dpi: u32) {
     let at = message_screen_point();
     with_app(|app| {
-        let appearance = Appearance::from(app.settings.scrap);
         let scaling = app.settings.general.dpi_scaling;
-        let App {
-            scraps, renderer, ..
-        } = app;
-        let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
+        let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
         let anchor = scrap.drag.zoom_anchor(at);
         let before = scrap.model.clone();
         if scrap.model.set_dpi(dpi, scaling, anchor) {
@@ -1191,10 +1184,7 @@ fn on_scrap_dpi_changed(hwnd: HWND, dpi: u32) {
                 scrap.model.zoom()
             );
             // 描くだけで App を借りるメッセージは届かないので、借りたまま描く
-            if let Err(e) = scrap.redraw(&before, &appearance, renderer, false) {
-                log::warn!("could not resize a scrap for the new dpi: {e}");
-                scrap.model = before;
-            }
+            scrap.redraw_or_revert(&before, &appearance, renderer, false, "new dpi");
         }
         Some(())
     });
@@ -1207,11 +1197,7 @@ fn hide_zoom_label(hwnd: HWND) {
         let _ = KillTimer(Some(hwnd), TIMER_ZOOM_LABEL);
     }
     with_app(|app| {
-        let appearance = Appearance::from(app.settings.scrap);
-        let App {
-            scraps, renderer, ..
-        } = app;
-        let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
+        let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
         if !scrap.zoom_label {
             return None;
         }
@@ -1388,11 +1374,7 @@ fn render_for(image: &Image, job: fn(Image) -> Deferred, failed_key: &'static st
 /// スクラップ操作を実行し、返った `Effect` を実行する。スクラップのキー・マウス・メニューはすべてここを通る。
 fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
     let deferred = with_app(|app| {
-        let appearance = Appearance::from(app.settings.scrap);
-        let App {
-            scraps, renderer, ..
-        } = app;
-        let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
+        let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
         let before = scrap.model.clone();
         let mut deferred = Vec::new();
         let context = OpContext {
@@ -1415,13 +1397,7 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                 // ウィンドウを動かす・描き直すときに届くメッセージ（WM_WINDOWPOSCHANGED、WM_DPICHANGED など）では
                 // App を借りないので、借りたままでよい
                 Effect::Redraw => {
-                    scrap.sync_shown(&before);
-                    if let Err(e) = scrap.redraw(&before, &appearance, renderer, show_zoom) {
-                        // 大きすぎて描けないときなど。ウィンドウは前のままなので、状態も前に戻す
-                        log::warn!("could not redraw a scrap: {e}");
-                        scrap.model = before.clone();
-                        scrap.sync_shown(&before);
-                    }
+                    scrap.redraw_or_revert(&before, &appearance, renderer, show_zoom, op.id);
                 }
                 Effect::EnterTrimMode => {
                     log::info!("trim started");
