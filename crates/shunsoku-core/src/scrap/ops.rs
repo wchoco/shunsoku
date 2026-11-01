@@ -69,6 +69,8 @@ pub enum MouseGesture {
 /// メニューの区切りのまとまり。宣言の順にメニューに並ぶ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
+    /// コピーと保存。メニューのいちばん上。
+    Output,
     Move,
     /// 閉じる。メニューのいちばん下。
     Close,
@@ -97,6 +99,10 @@ pub enum Effect {
     Redraw,
     /// スクラップを閉じる。M1 は破棄する（M2 でごみ箱への移動に置き換える）。
     Close,
+    /// 画像をクリップボードに置く。
+    CopyToClipboard,
+    /// 画像を全体設定の保存先に、全体のファイル名テンプレートの名前で保存する（ダイアログなし）。
+    SaveDefault,
 }
 
 const ESC: Chord = Chord::plain(Key::known(0x1B));
@@ -104,6 +110,8 @@ const LEFT: Chord = Chord::plain(Key::known(0x25));
 const UP: Chord = Chord::plain(Key::known(0x26));
 const RIGHT: Chord = Chord::plain(Key::known(0x27));
 const DOWN: Chord = Chord::plain(Key::known(0x28));
+const CTRL_C: Chord = Chord::plain(Key::known(0x43)).ctrl();
+const CTRL_S: Chord = Chord::plain(Key::known(0x53)).ctrl();
 
 const fn always(_: &ScrapModel) -> bool {
     true
@@ -136,6 +144,14 @@ fn close(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     vec![Effect::Close]
 }
 
+fn copy(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
+    vec![Effect::CopyToClipboard]
+}
+
+fn save_default(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
+    vec![Effect::SaveDefault]
+}
+
 /// キーで動かす操作の行。
 const fn keyboard_move(
     id: OperationId,
@@ -160,6 +176,30 @@ const fn keyboard_move(
 
 /// スクラップ操作の表。
 pub static OPERATIONS: &[OperationDescriptor] = &[
+    OperationDescriptor {
+        id: "copy",
+        label_key: "scrap.op.copy",
+        default_shortcut: &[CTRL_C],
+        default_mouse: None,
+        group: Group::Output,
+        order: 10,
+        drag_only: false,
+        can_execute: always,
+        choices: None,
+        run: copy,
+    },
+    OperationDescriptor {
+        id: "save_default",
+        label_key: "scrap.op.save_default",
+        default_shortcut: &[CTRL_S],
+        default_mouse: None,
+        group: Group::Output,
+        order: 20,
+        drag_only: false,
+        can_execute: always,
+        choices: None,
+        run: save_default,
+    },
     keyboard_move(
         "move_left",
         "scrap.op.move_left",
@@ -444,8 +484,28 @@ mod tests {
     }
 
     #[test]
+    fn copy_and_save_hand_the_image_to_the_win32_layer_without_changing_the_scrap() {
+        for (id, effect) in [
+            ("copy", Effect::CopyToClipboard),
+            ("save_default", Effect::SaveDefault),
+        ] {
+            let mut model = scrap();
+            let effects = execute(op(id), &mut model, &OpContext::default());
+            assert_eq!(effects, vec![effect], "{id}");
+            assert_eq!(model, scrap(), "{id}");
+        }
+    }
+
+    #[test]
     fn move_and_close_can_always_run_on_a_normal_scrap() {
-        for id in ["move", "move_left", "move_down_10", "close"] {
+        for id in [
+            "move",
+            "move_left",
+            "move_down_10",
+            "copy",
+            "save_default",
+            "close",
+        ] {
             assert!((op(id).can_execute)(&scrap()), "{id}");
         }
     }
@@ -470,6 +530,8 @@ mod tests {
         assert_eq!(bound(&shortcuts, "Shift+Up"), Some("move_up_10"));
         assert_eq!(bound(&shortcuts, "Shift+Down"), Some("move_down_10"));
         assert_eq!(bound(&shortcuts, "Esc"), Some("close"));
+        assert_eq!(bound(&shortcuts, "Ctrl+C"), Some("copy"));
+        assert_eq!(bound(&shortcuts, "Ctrl+S"), Some("save_default"));
         assert_eq!(bound(&shortcuts, "Ctrl+Left"), None);
         assert_eq!(shortcuts.chords("close"), vec![chord("Esc")]);
         assert_eq!(shortcuts.chords("move"), vec![]);
@@ -540,6 +602,9 @@ mod tests {
         assert_eq!(
             menu(OPERATIONS, &scrap(), &shortcuts),
             vec![
+                item("copy", true, Some("Ctrl+C")),
+                item("save_default", true, Some("Ctrl+S")),
+                MenuEntry::Separator,
                 item("move_left", true, Some("Left")),
                 item("move_right", true, Some("Right")),
                 item("move_up", true, Some("Up")),
@@ -562,7 +627,7 @@ mod tests {
         ]);
         let shortcuts = Shortcuts::new(OPERATIONS, &overrides);
         let entries = menu(OPERATIONS, &scrap(), &shortcuts);
-        assert_eq!(entries.first(), Some(&item("move_left", true, None)));
+        assert!(entries.contains(&item("move_left", true, None)));
         assert_eq!(entries.last(), Some(&item("close", true, Some("Ctrl+W"))));
     }
 

@@ -68,6 +68,13 @@ impl Chord {
         }
     }
 
+    /// `Ctrl` を足した組み合わせ（定数の表用）。
+    pub(crate) const fn ctrl(self) -> Chord {
+        let mut chord = self;
+        chord.modifiers.ctrl = true;
+        chord
+    }
+
     /// `Shift` を足した組み合わせ（定数の表用）。
     pub(crate) const fn shift(self) -> Chord {
         let mut chord = self;

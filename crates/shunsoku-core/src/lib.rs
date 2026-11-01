@@ -10,6 +10,7 @@ pub mod perf;
 pub mod scrap;
 pub mod selection;
 pub mod settings;
+pub mod template;
 
 /// アプリの名前。
 pub const APP_NAME: &str = "shunsoku";

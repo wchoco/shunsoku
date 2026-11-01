@@ -26,12 +26,17 @@
 //!   行を足し、新しい `Effect` があればそこに足す。
 //! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に 1 回読む。ファイルは作らず、書き換えない。
 //!   問題（読めない・不正な項目・登録できないホットキー・未設定のホットキー）は、まとめて 1 回だけ通知する。
-//! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。
+//! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。通知のクリックは
+//!   中身を持たないので、クリックで開くフォルダ（`App::notice_folder`）を覚えておき、新しい通知を出したら忘れる。
+//! - コピーと保存の画像は `render::render_image` で表示と同じ描き方で作る。保存先とファイル名は UI スレッドで
+//!   決め（`save::destination`）、PNG の書き出しと書き込みは裏のスレッドで行い、結果は `WM_APP_SAVED` で受ける。
+//!   保存先とファイル名テンプレートは設定（`[general]`）のものを使う。
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
@@ -49,6 +54,9 @@ use shunsoku_core::scrap::{Appearance, ScrapModel};
 use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsIssue};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Com::{
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -69,14 +77,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, Result, w};
 
 use crate::{
-    grab, hotkey, logger, menu, notify, overlay, panic_hook, perf, render, scrap_window,
-    single_instance, tray,
+    clipboard, grab, hotkey, logger, menu, notify, overlay, panic_hook, perf, render, save,
+    scrap_window, single_instance, tray,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
 const WM_APP_TRAY: u32 = WM_APP + 1;
 /// 環境変数 `SHUNSOKU_TEST_PANIC=ui` のとき、UI スレッドでパニックを起こす（手で確かめる用）。
 const WM_APP_TEST_PANIC: u32 = WM_APP + 2;
+/// 保存の裏のスレッドが書き終えた（結果は `App::saves` の受け口に入っている）。
+const WM_APP_SAVED: u32 = WM_APP + 3;
 
 /// 2 つのウィンドウのクラス名。2 つ目のプロセスはこの名前でメッセージ専用ウィンドウを探す。
 const CLASS_NAME: PCWSTR = w!("shunsoku.app");
@@ -113,6 +123,10 @@ struct App {
     shortcuts: Shortcuts,
     capture: Capture,
     scraps: Vec<Scrap>,
+    /// 保存の裏のスレッドが結果を入れる口と、UI スレッドが受ける口。
+    saves: (mpsc::Sender<Saved>, mpsc::Receiver<Saved>),
+    /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
+    notice_folder: Option<PathBuf>,
     gpu: grab::Gpu,
     hotkeys: hotkey::Registered,
     windows: Windows,
@@ -133,6 +147,13 @@ enum Capture {
         overlay: overlay::Overlay,
         selection: Selection,
     },
+}
+
+/// 保存の裏のスレッドの結果。
+struct Saved {
+    path: PathBuf,
+    /// 失敗の理由（裏のスレッドのパニックも失敗にする）。
+    result: std::result::Result<(), String>,
 }
 
 /// 浮かべているスクラップ 1 枚。
@@ -245,6 +266,13 @@ pub fn run() -> i32 {
         }
     };
 
+    // 通知のクリックでフォルダを開く ShellExecuteW のため
+    // SAFETY: UI スレッドで 1 回呼び、終わるときに CoUninitialize で対にする
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    if com.is_err() {
+        log::warn!("could not initialize COM: {com:?}");
+    }
+
     let settings_path = app_dir.map(|dir| dir.join("settings.toml"));
     let (settings, issues) = read_settings(settings_path.as_deref());
     log::set_max_level(level_filter(settings.log_level));
@@ -256,13 +284,12 @@ pub fn run() -> i32 {
             return 1;
         }
     };
-    if let Some((level, body)) =
-        startup_notice(&issues, &failed, &app.settings, settings_path.as_deref())
-    {
-        notify_user(&app, level, &body);
-    }
+    let notice = startup_notice(&issues, &failed, &app.settings, settings_path.as_deref());
     let message_window = app.windows.message;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
+    if let Some((level, body)) = notice {
+        notify_user(level, &body);
+    }
     log::info!("started");
 
     match std::env::var("SHUNSOKU_TEST_PANIC").as_deref() {
@@ -290,6 +317,10 @@ pub fn run() -> i32 {
     // 壊すときに呼ばれるウィンドウ プロシージャは App を見ない
     let app = APP.with(|cell| cell.borrow_mut().take());
     drop(app);
+    if com.is_ok() {
+        // SAFETY: 成功した CoInitializeEx と対にする
+        unsafe { CoUninitialize() };
+    }
     log::info!("exiting (code {code})");
     code
 }
@@ -404,6 +435,8 @@ fn start(
         shortcuts,
         capture: Capture::Idle,
         scraps: Vec::new(),
+        saves: mpsc::channel(),
+        notice_folder: None,
         gpu: grab::Gpu::default(),
         hotkeys,
         windows,
@@ -505,6 +538,10 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             Some(LRESULT(0))
         }
         WM_APP_TEST_PANIC => panic!("test panic on the UI thread (SHUNSOKU_TEST_PANIC)"),
+        WM_APP_SAVED => {
+            on_saved();
+            Some(LRESULT(0))
+        }
         WM_HOTKEY => {
             on_hotkey(wparam);
             Some(LRESULT(0))
@@ -565,6 +602,15 @@ fn on_tray(owner: HWND, event: tray::Event) {
             }
         }
         tray::Event::Select => request_capture(Source::TrayClick),
+        tray::Event::NotificationClick => {
+            let folder = with_app(|app| app.notice_folder.clone()).flatten();
+            // ShellExecuteW はメッセージを回すことがあるので、App を借りずに呼ぶ
+            if let Some(folder) = folder
+                && !save::open_folder(&folder)
+            {
+                log::warn!("could not open the folder {}", folder.display());
+            }
+        }
         tray::Event::Other => {}
     }
 }
@@ -828,27 +874,176 @@ fn show_scrap_menu(hwnd: HWND, lparam: LPARAM) {
     }
 }
 
+/// `App` を返したあとに行う `Effect`。
+enum Deferred {
+    Copy(Image),
+    Save(Image),
+    /// コピーや保存の画像を作れなかった。
+    RenderFailed(Effect, String),
+    Close,
+}
+
 /// スクラップ操作を実行し、返った `Effect` を実行する。スクラップのキー・マウス・メニューはすべてここを通る。
 fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
-    let close = with_app(|app| {
+    let deferred = with_app(|app| {
         let appearance = Appearance::from(app.settings.scrap);
         let scrap = app.scrap_mut(hwnd)?;
         let before = scrap.model.clone();
-        let mut close = false;
+        let mut deferred = Vec::new();
         for effect in ops::execute(op, &mut scrap.model, &context) {
             match effect {
                 // ウィンドウを動かす・描き直すときに届くメッセージ（WM_WINDOWPOSCHANGED、WM_DPICHANGED など）では
                 // App を借りないので、借りたままでよい
                 Effect::Redraw => scrap.redraw(&before, &appearance),
-                Effect::Close => close = true,
+                Effect::Close => deferred.push(Deferred::Close),
+                // 描くだけでメッセージは届かないので、借りたまま描く
+                Effect::CopyToClipboard | Effect::SaveDefault => {
+                    deferred.push(match render::render_image(&scrap.image) {
+                        Ok(image) if effect == Effect::CopyToClipboard => Deferred::Copy(image),
+                        Ok(image) => Deferred::Save(image),
+                        Err(e) => Deferred::RenderFailed(effect, e.to_string()),
+                    });
+                }
             }
         }
-        Some(close)
+        Some(deferred)
     })
-    .flatten();
-    if close == Some(true) {
-        close_scrap(hwnd);
+    .flatten()
+    .unwrap_or_default();
+    // クリップボード・通知・ウィンドウを壊すのはメッセージが届くことがあるので、App を借りずに行う
+    for action in deferred {
+        match action {
+            Deferred::Copy(image) => copy_to_clipboard(&image),
+            Deferred::Save(image) => save_default(image),
+            Deferred::RenderFailed(effect, e) => {
+                log::error!("could not render the scrap image for {effect:?}: {e}");
+                let key = if effect == Effect::CopyToClipboard {
+                    "copy.failed"
+                } else {
+                    "save.failed"
+                };
+                notify_user(notify::Level::Error, &format!("{}\n{e}", text(key)));
+            }
+            Deferred::Close => close_scrap(hwnd),
+        }
     }
+}
+
+/// `Effect::CopyToClipboard`: 画像をクリップボードに置く。失敗したらエラーの通知を出す。
+fn copy_to_clipboard(image: &Image) {
+    let Some(owner) = with_app(|app| app.windows.message) else {
+        return;
+    };
+    match clipboard::copy(owner, image) {
+        Ok(()) => log::info!(
+            "copied {}x{} to the clipboard",
+            image.width(),
+            image.height()
+        ),
+        Err(e) => {
+            log::error!("could not copy to the clipboard: {e}");
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{e}", text("copy.failed")),
+            );
+        }
+    }
+}
+
+/// `Effect::SaveDefault`: 全体設定の保存先に、全体のファイル名テンプレートの名前で保存する。
+/// 保存先とファイル名はここ（UI スレッド）で決め、PNG の書き出しと書き込みは裏のスレッドで行う。
+/// 失敗してもスクラップはそのまま残る。
+fn save_default(image: Image) {
+    let Some((save_dir, template, sender, message_window)) = with_app(|app| {
+        let general = &app.settings.general;
+        (
+            general.save_dir.clone(),
+            general.file_name_template.clone(),
+            app.saves.0.clone(),
+            app.windows.message,
+        )
+    }) else {
+        return;
+    };
+    let dir = match save_dir {
+        Some(dir) => dir,
+        None => match save::default_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                log::error!("could not find the Pictures folder: {e}");
+                save_failed(None, &e.to_string());
+                return;
+            }
+        },
+    };
+    let path = match save::destination(&dir, &template, save::now()) {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("could not prepare the save folder {}: {e}", dir.display());
+            save_failed(Some(&dir), &e.to_string());
+            return;
+        }
+    };
+    // HWND は Send でないので、番号にして渡す
+    let window = message_window.0 as isize;
+    let job_path = path.clone();
+    let spawned = std::thread::Builder::new()
+        .name("save".into())
+        .spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| save::write_png(&job_path, &image)))
+                .map_err(|_| "panic".to_owned())
+                .and_then(|written| written.map_err(|e| e.to_string()));
+            let _ = sender.send(Saved {
+                path: job_path,
+                result,
+            });
+            // SAFETY: UI スレッドのメッセージ専用ウィンドウに送るだけ。もう壊れていれば失敗するだけ
+            let _ = unsafe {
+                PostMessageW(
+                    Some(HWND(window as *mut _)),
+                    WM_APP_SAVED,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+        });
+    if let Err(e) = spawned {
+        log::error!("could not start the save thread: {e}");
+        save_failed(Some(&path), &e.to_string());
+    }
+}
+
+/// `WM_APP_SAVED`: 保存の結果を通知する。成功なら、通知のクリックで保存先のフォルダを開けるようにする。
+fn on_saved() {
+    let Some(results) = with_app(|app| app.saves.1.try_iter().collect::<Vec<_>>()) else {
+        return;
+    };
+    for saved in results {
+        match saved.result {
+            Ok(()) => {
+                log::info!("saved {}", saved.path.display());
+                let body = format!("{}\n{}", text("save.saved"), saved.path.display());
+                if notify_user(notify::Level::Success, &body) {
+                    let folder = saved.path.parent().map(Path::to_path_buf);
+                    with_app(|app| app.notice_folder = folder);
+                }
+            }
+            Err(e) => {
+                log::error!("could not save {}: {e}", saved.path.display());
+                save_failed(Some(&saved.path), &e);
+            }
+        }
+    }
+}
+
+/// 保存の失敗の通知。スクラップは残っているので、別の方法で残せる。
+fn save_failed(path: Option<&Path>, reason: &str) {
+    let mut body = format!("{}\n{reason}", text("save.failed"));
+    if let Some(path) = path {
+        body.push('\n');
+        body.push_str(&path.display().to_string());
+    }
+    notify_user(notify::Level::Error, &body);
 }
 
 /// スクラップを閉じる（M1 は破棄。M2 でごみ箱に移す）。
@@ -1244,18 +1439,24 @@ fn startup_notice(
     Some((level, lines.join("\n")))
 }
 
-/// トレイの通知を出す。設定で通知をオフにしたときは、成功の通知だけを止める（エラーと警告は出す）。
-fn notify_user(app: &App, level: notify::Level, body: &str) {
-    if matches!(level, notify::Level::Success) && !app.settings.general.notifications {
-        return;
+/// トレイの通知を出す。出したら true。設定で通知をオフにしたときは、成功の通知だけを止める（エラーと警告は出す）。
+/// 新しい通知は前の通知を置き換えるので、クリックで開くフォルダを忘れる（保存の通知なら呼び出し側で覚え直す）。
+fn notify_user(level: notify::Level, body: &str) -> bool {
+    let target = with_app(|app| {
+        app.notice_folder = None;
+        (app.windows.tray_owner, app.settings.general.notifications)
+    });
+    let Some((owner, enabled)) = target else {
+        log::warn!("notification dropped: {body}");
+        return false;
+    };
+    if matches!(level, notify::Level::Success) && !enabled {
+        return false;
     }
-    if !notify::show(
-        app.windows.tray_owner,
-        tray::ICON_ID,
-        level,
-        text("notify.title"),
-        body,
-    ) {
+    // Explorer とやりとりするので、App を借りずに出す
+    let shown = notify::show(owner, tray::ICON_ID, level, text("notify.title"), body);
+    if !shown {
         log::warn!("could not show a notification: {body}");
     }
+    shown
 }

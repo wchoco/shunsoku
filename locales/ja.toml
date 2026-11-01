@@ -26,6 +26,8 @@ unset = "範囲選択キャプチャのホットキーが未設定です。設�
 
 # スクラップ操作（右クリックメニュー）。キーは scrap::ops の表の label_key
 [scrap.op]
+copy = "コピー"
+save_default = "既定の保存先へ保存"
 move = "移動"
 move_left = "左へ移動（1px）"
 move_right = "右へ移動（1px）"
@@ -36,3 +38,10 @@ move_right_10 = "右へ移動（10px）"
 move_up_10 = "上へ移動（10px）"
 move_down_10 = "下へ移動（10px）"
 close = "閉じる"
+
+[copy]
+failed = "クリップボードにコピーできませんでした。"
+
+[save]
+saved = "保存しました（クリックでフォルダを開きます）:"
+failed = "保存できませんでした。スクラップは残っています。"

@@ -2,6 +2,7 @@
 //!
 //! キャプチャでは、モニタごとに切り抜いた断片（`Fragment`）を `Image::compose` で 1 枚にする。
 //! どのモニタにも当たらない部分は透明（アルファ 0）になる。
+//! 保存画像は `write_png` で PNG に書き出す。
 
 use crate::geometry::{Point, Rect, Size};
 
@@ -89,6 +90,47 @@ impl Image {
             }
         }
         out
+    }
+
+    /// premultiplied の BGRA（`render` で描いた DIB）から作る。色をアルファで割り戻す。長さが合わなければ None。
+    pub fn from_premultiplied(size: Size, mut pixels: Vec<u8>) -> Option<Image> {
+        if pixels.len() != size.width as usize * size.height as usize * BPP {
+            return None;
+        }
+        for px in pixels.chunks_exact_mut(BPP) {
+            let a = u16::from(px[3]);
+            if a == 255 {
+                continue;
+            }
+            for c in &mut px[..3] {
+                // 透明（a == 0）の画素の色は 0 にする
+                *c = (u16::from(*c) * 255 + a / 2)
+                    .checked_div(a)
+                    .map_or(0, |v| v.min(255) as u8);
+            }
+        }
+        Some(Image { size, pixels })
+    }
+
+    /// PNG（8 bit の RGBA）に書き出す。
+    pub fn write_png(&self, out: impl std::io::Write) -> Result<(), png::EncodingError> {
+        let mut encoder = png::Encoder::new(out, self.size.width, self.size.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        let mut rgba = self.pixels.clone();
+        for px in rgba.chunks_exact_mut(BPP) {
+            px.swap(0, 2);
+        }
+        writer.write_image_data(&rgba)?;
+        writer.finish()
+    }
+
+    /// PNG のバイト列。
+    pub fn to_png(&self) -> Result<Vec<u8>, png::EncodingError> {
+        let mut out = Vec::new();
+        self.write_png(&mut out)?;
+        Ok(out)
     }
 
     /// 1 行 `stride` バイトで並んだ BGRX（画面から書き戻した画像）から作る。アルファはすべて 255 にする。
@@ -277,5 +319,51 @@ mod tests {
     fn rows_shorter_than_the_size_are_rejected() {
         assert_eq!(Image::from_opaque_rows(Size::new(2, 2), 8, &[0; 15]), None);
         assert_eq!(Image::from_opaque_rows(Size::new(2, 2), 4, &[0; 16]), None);
+    }
+    /// PNG を読み戻して BGRA の画像にする。
+    fn decode_png(bytes: &[u8]) -> Image {
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        buf.truncate(info.buffer_size());
+        for px in buf.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        Image::from_bgra(Size::new(info.width, info.height), buf).unwrap()
+    }
+
+    #[test]
+    fn a_written_png_reads_back_with_the_same_pixels_including_transparent_ones() {
+        let image = Image::from_bgra(
+            Size::new(3, 2),
+            vec![
+                1, 2, 3, 255, 0, 0, 0, 0, 40, 50, 60, 128, //
+                255, 0, 0, 255, 0, 255, 0, 255, 7, 8, 9, 0,
+            ],
+        )
+        .unwrap();
+        let png = image.to_png().unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let back = decode_png(&png);
+        assert_eq!(back.size(), Size::new(3, 2));
+        assert_eq!(rows(&back), rows(&image));
+    }
+
+    #[test]
+    fn premultiplied_pixels_are_turned_back_into_straight_alpha() {
+        // 描いた DIB（premultiplied）から戻す。不透明と透明はそのまま、半透明は色を割り戻す
+        let image = Image::from_premultiplied(
+            Size::new(3, 1),
+            vec![1, 2, 3, 255, 50, 100, 25, 128, 9, 9, 9, 0],
+        )
+        .unwrap();
+        assert_eq!(
+            rows(&image),
+            vec![vec![[1, 2, 3, 255], [100, 199, 50, 128], [0, 0, 0, 0]]]
+        );
+        assert_eq!(Image::from_premultiplied(Size::new(2, 1), vec![0; 4]), None);
     }
 }
