@@ -24,7 +24,20 @@ pub const ZOOM_MAX: u16 = 800;
 /// 画素等倍の倍率（%）。
 pub const ZOOM_ACTUAL: u16 = 100;
 
+/// コンパクト表示の正方形の一辺（物理ピクセル）。
+pub const COMPACT_SIDE: u32 = 64;
+
+/// コンパクト表示に畳んだときの位置。広げるときに、畳んだあとの移動の分だけずらすために覚えておく。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Folded {
+    /// 畳む直前の画像の左上。
+    unfolded: Point,
+    /// 畳んだ直後の正方形の左上。
+    folded: Point,
+}
+
 /// 拡大縮小の基準点。この点の下にある画像の画素が、倍率を変えても同じ画面上の位置に残る。
+/// コンパクト表示に畳むときは、この点が正方形の中心になる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoomAnchor {
     /// 画像の中心（キーとメニューから）。
@@ -49,6 +62,8 @@ pub struct ScrapModel {
     /// 掛けるたびに丸めると、モニタを行き来するうちに倍率がずれていくので、ここから毎回計算する。
     /// 拡大縮小で倍率を変えたら捨てる。
     dpi_origin: Option<(u16, u32)>,
+    /// コンパクト表示に畳んでいれば Some。畳んでいる間、`position` は正方形の左上。
+    folded: Option<Folded>,
 }
 
 impl ScrapModel {
@@ -60,7 +75,53 @@ impl ScrapModel {
             zoom: ZOOM_ACTUAL,
             dpi: None,
             dpi_origin: None,
+            folded: None,
         }
+    }
+
+    /// コンパクト表示に畳んでいるか。
+    pub fn is_compact(&self) -> bool {
+        self.folded.is_some()
+    }
+
+    /// コンパクト表示（一辺 `COMPACT_SIDE` の正方形）に畳む。`anchor` が正方形の中心になる（`Center` なら
+    /// 画像の中心）。倍率はそのまま残る。もう畳んでいれば false。
+    pub fn fold(&mut self, anchor: ZoomAnchor) -> bool {
+        if self.is_compact() {
+            return false;
+        }
+        let center = match anchor {
+            ZoomAnchor::Center => {
+                let size = self.display_size();
+                let half = |from: i32, length: u32| from.saturating_add((length / 2) as i32);
+                Point::new(
+                    half(self.position.x, size.width),
+                    half(self.position.y, size.height),
+                )
+            }
+            ZoomAnchor::At(at) => at,
+        };
+        let half = (COMPACT_SIDE / 2) as i32;
+        let folded = Point::new(center.x.saturating_sub(half), center.y.saturating_sub(half));
+        self.folded = Some(Folded {
+            unfolded: self.position,
+            folded,
+        });
+        self.position = folded;
+        true
+    }
+
+    /// コンパクト表示から広げる。畳む前の位置に、畳んだあとに動かした分だけずらして戻す。畳んでいなければ false。
+    pub fn unfold(&mut self) -> bool {
+        let Some(Folded { unfolded, folded }) = self.folded.take() else {
+            return false;
+        };
+        let p = self.position;
+        self.position = Point::new(
+            unfolded.x.saturating_add(p.x.saturating_sub(folded.x)),
+            unfolded.y.saturating_add(p.y.saturating_sub(folded.y)),
+        );
+        true
     }
 
     /// 倍率（%）。
@@ -157,9 +218,14 @@ impl ScrapModel {
         Size::new(scale(self.image_size.width), scale(self.image_size.height))
     }
 
-    /// 画像を出す矩形（スクリーン座標）。大きさは倍率を掛けた表示の大きさ。
+    /// 画像を出す矩形（スクリーン座標）。大きさは倍率を掛けた表示の大きさ。畳んでいる間は正方形。
     pub fn image_rect(&self) -> Rect {
-        Rect::from_origin_size(self.position, self.display_size())
+        let size = if self.is_compact() {
+            Size::new(COMPACT_SIDE, COMPACT_SIDE)
+        } else {
+            self.display_size()
+        };
+        Rect::from_origin_size(self.position, size)
     }
 
     /// ウィンドウの矩形（スクリーン座標）。画像の外側に枠と影の分を足す。
@@ -548,6 +614,62 @@ mod tests {
         assert_eq!(wheel.turn(100), 0);
         assert_eq!(wheel.turn(-100), 0);
         assert_eq!(wheel.turn(-20), -1);
+    }
+
+    #[test]
+    fn folding_from_keys_makes_a_64px_square_on_the_center_of_the_scrap() {
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        // 中心は (50, 150)
+        assert!(scrap.fold(ZoomAnchor::Center));
+        assert!(scrap.is_compact());
+        assert_eq!(scrap.image_rect(), Rect::new(18, 118, 82, 182));
+        assert_eq!(
+            scrap.window_rect(&Appearance::default()),
+            Rect::new(9, 109, 91, 191)
+        );
+        // 畳んだまま畳んでも変わらない
+        assert!(!scrap.fold(ZoomAnchor::Center));
+        assert_eq!(scrap.image_rect(), Rect::new(18, 118, 82, 182));
+    }
+
+    #[test]
+    fn folding_with_the_mouse_centers_the_square_on_the_cursor() {
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        assert!(scrap.fold(ZoomAnchor::At(Point::new(-90, 60))));
+        assert_eq!(scrap.image_rect(), Rect::new(-122, 28, -58, 92));
+    }
+
+    #[test]
+    fn unfolding_without_moving_returns_to_where_it_was_before_folding() {
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        assert!(!scrap.unfold());
+        scrap.fold(ZoomAnchor::At(Point::new(-90, 60)));
+        assert!(scrap.unfold());
+        assert!(!scrap.is_compact());
+        assert_eq!(scrap.image_rect(), Rect::new(-100, 50, 200, 250));
+        assert!(!scrap.unfold());
+    }
+
+    #[test]
+    fn unfolding_shifts_the_scrap_by_how_far_the_square_was_moved() {
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        scrap.fold(ZoomAnchor::Center);
+        scrap.position = Point::new(scrap.position.x + 30, scrap.position.y - 500);
+        scrap.unfold();
+        assert_eq!(scrap.image_rect(), Rect::new(-70, -450, 230, -250));
+    }
+
+    #[test]
+    fn a_zoomed_scrap_keeps_its_zoom_through_folding_and_unfolding() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_zoom(200, ZoomAnchor::At(Point::new(0, 0)));
+        // 中心は表示の大きさ（600x400）の中心
+        scrap.fold(ZoomAnchor::Center);
+        assert_eq!(scrap.image_rect(), Rect::new(268, 168, 332, 232));
+        assert_eq!(scrap.zoom(), 200);
+        scrap.unfold();
+        assert_eq!(scrap.zoom(), 200);
+        assert_eq!(scrap.image_rect(), Rect::new(0, 0, 600, 400));
     }
 
     #[test]

@@ -49,7 +49,7 @@ use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
 use shunsoku_core::capture::request::{CaptureRequest, Source};
-use shunsoku_core::geometry::Point;
+use shunsoku_core::geometry::{Point, Size};
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
@@ -80,8 +80,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, RegisterWindowMessageW, SetCursorPos, SetTimer, TranslateMessage,
     WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -223,7 +223,8 @@ impl Scrap {
     ) -> Result<()> {
         let same_content = self.model.image_size == before.image_size
             && self.model.display_size() == before.display_size()
-            && self.model.mode == before.mode;
+            && self.model.mode == before.mode
+            && self.model.is_compact() == before.is_compact();
         if same_content && !repaint {
             self.window.move_to(self.model.window_rect(appearance))
         } else {
@@ -253,6 +254,7 @@ impl Scrap {
 }
 
 /// スクラップの中身を描いて、ウィンドウを `model` の矩形（`ScrapModel::window_rect`）に出す。
+/// コンパクト表示のときは、画像の代わりに `COMPACT_FACE` の色で正方形を塗る（中身は隠す）。
 ///
 /// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
 /// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
@@ -270,10 +272,29 @@ fn paint_scrap(
         Some(painter) => painter,
         None => render::Renderer::new()?,
     };
-    painter.paint_scrap(&canvas, image, model.display_size(), appearance, label)?;
+    let face;
+    let image = if model.is_compact() {
+        face = compact_face();
+        &face
+    } else {
+        image
+    };
+    let display = model.image_rect().size();
+    painter.paint_scrap(&canvas, image, display, appearance, label)?;
     *renderer = Some(painter);
     // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
     window.present(canvas.dc(), rect, appearance.opacity)
+}
+
+/// コンパクト表示の正方形の色（BGRA）。
+const COMPACT_FACE: [u8; 4] = [0x50, 0x50, 0x50, 0xFF];
+
+/// コンパクト表示の正方形に引き伸ばして描く 1 画素の画像。
+fn compact_face() -> Image {
+    Image::from_bgra(Size::new(1, 1), COMPACT_FACE.to_vec()).unwrap_or_else(|| {
+        // 長さは合っているので起こらない
+        Image::transparent(Size::new(1, 1))
+    })
 }
 
 struct Windows {
@@ -911,6 +932,15 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
                     scrap.drag.end();
                 }
             });
+            Some(LRESULT(0))
+        }
+        // 2 回目の押下は WM_LBUTTONDOWN の代わりにこれで来る（CS_DBLCLKS）
+        WM_LBUTTONDBLCLK => {
+            let context = OpContext {
+                cursor: Some(message_screen_point()),
+                ..OpContext::default()
+            };
+            run_mouse_operation(hwnd, MouseGesture::DoubleClick, context);
             Some(LRESULT(0))
         }
         WM_MBUTTONUP => {
