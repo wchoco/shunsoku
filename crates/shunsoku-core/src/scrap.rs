@@ -180,6 +180,11 @@ impl ScrapModel {
         if zoom == self.zoom {
             return false;
         }
+        if self.is_compact() {
+            // 畳んだ正方形の大きさと位置は倍率によらない。広げたときに新しい倍率で出る
+            self.zoom = zoom;
+            return false;
+        }
         let before = self.display_size();
         self.zoom = zoom;
         let after = self.display_size();
@@ -657,6 +662,22 @@ mod tests {
         scrap.position = Point::new(scrap.position.x + 30, scrap.position.y - 500);
         scrap.unfold();
         assert_eq!(scrap.image_rect(), Rect::new(-70, -450, 230, -250));
+    }
+
+    #[test]
+    fn a_folded_scrap_stays_put_when_it_moves_to_another_dpi() {
+        let keep = DpiScaling::KeepApparentSize;
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_dpi(144, keep, ZoomAnchor::Center);
+        scrap.fold(ZoomAnchor::Center);
+        let square = scrap.image_rect();
+        // 畳んだ正方形の大きさは変わらないので、描き直さず、位置も動かさない
+        assert!(!scrap.set_dpi(96, keep, ZoomAnchor::Center));
+        assert_eq!(scrap.image_rect(), square);
+        // 倍率は計算し直してあり、広げると移動先の DPI での見かけの大きさで出る
+        assert_eq!(scrap.zoom(), 67);
+        scrap.unfold();
+        assert_eq!(scrap.image_rect().size(), Size::new(201, 134));
     }
 
     #[test]
