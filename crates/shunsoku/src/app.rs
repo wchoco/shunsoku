@@ -35,6 +35,7 @@ use shunsoku_core::capture::request::{CaptureRequest, Source};
 use shunsoku_core::geometry::Point;
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
+use shunsoku_core::perf::Mark;
 use shunsoku_core::scrap::{Appearance, ScrapModel};
 use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsIssue};
@@ -58,7 +59,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, Result, w};
 
 use crate::{
-    grab, hotkey, logger, notify, overlay, panic_hook, render, scrap_window, single_instance, tray,
+    grab, hotkey, logger, notify, overlay, panic_hook, perf, render, scrap_window, single_instance,
+    tray,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
@@ -154,10 +156,14 @@ fn text(key: &'static str) -> &'static str {
 
 /// 常駐本体を動かし、終了コードを返す。
 pub fn run() -> i32 {
+    let perf_started = perf::start();
     // 設定ファイルとログを置くフォルダ
     let app_dir = std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join(APP_NAME));
     let log_path = app_dir.as_deref().and_then(|dir| logger::init(dir).ok());
     log::info!("starting {APP_NAME} v{}", env!("CARGO_PKG_VERSION"));
+    if let Err(e) = perf_started {
+        log::warn!("could not open the perf log: {e}");
+    }
 
     let catalog = Catalog::parse(include_str!("../../../locales/ja.toml")).unwrap_or_else(|e| {
         log::error!("bundled locale is not valid TOML: {e}");
@@ -324,6 +330,7 @@ fn start(
         text("tray.tooltip").to_owned(),
     );
     if tray.register() {
+        perf::mark(Mark::TrayRegistered);
         log::info!("tray icon registered");
     } else {
         log::warn!("could not register the tray icon; waiting for TaskbarCreated");
@@ -729,6 +736,7 @@ fn finish_selection() {
         if rejected.is_none() {
             log::warn!("could not keep the scrap");
         }
+        perf::mark(Mark::ScrapShown);
     }
     log::info!("overlay closed");
 }
@@ -815,7 +823,11 @@ fn open_overlay() {
 
     // ウィンドウを作るとメッセージが届くので、App を借りずに開く
     let overlay = match overlay::Overlay::open(shots, module) {
-        Ok(overlay) => overlay,
+        Ok(overlay) => {
+            // open は全モニタで DwmFlush が返ってから戻る
+            perf::mark(Mark::OverlayFlushed);
+            overlay
+        }
         Err(e) => {
             log::error!("could not open the overlay: {e}");
             end_capture();
@@ -879,6 +891,7 @@ fn end_capture() {
 
 /// `WM_HOTKEY`。範囲選択の画面を開いている間に押されたものは `request_capture` が無視する。
 fn on_hotkey(wparam: WPARAM) {
+    perf::mark(Mark::HotkeyReceived);
     let action = with_app(|app| app.hotkeys.action(wparam)).flatten();
     match action {
         Some(settings::HotkeyAction::SelectCapture) => request_capture(Source::Hotkey),

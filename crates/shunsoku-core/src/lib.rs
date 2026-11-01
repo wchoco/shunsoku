@@ -6,6 +6,7 @@ pub mod i18n;
 pub mod image;
 pub mod keys;
 pub mod log_file;
+pub mod perf;
 pub mod scrap;
 pub mod selection;
 pub mod settings;
