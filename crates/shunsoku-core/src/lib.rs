@@ -4,6 +4,7 @@ pub mod capture;
 pub mod i18n;
 pub mod keys;
 pub mod log_file;
+pub mod perf;
 pub mod settings;
 
 /// アプリの名前。
