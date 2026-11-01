@@ -1,0 +1,3 @@
+# CRT を静的にリンクし、VC++ ランタイムなしで exe 1 つで動かす（ADR-0001）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

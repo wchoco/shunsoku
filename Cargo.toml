@@ -11,3 +11,9 @@ members = [
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+# panic = "abort" にはしない。裏のスレッドのパニックをその仕事の失敗として扱い、常駐を続けるため（spec #32）。
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

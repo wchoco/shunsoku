@@ -1,0 +1,13 @@
+# UI の文言（日本語）。exe に include_str! で埋め込む。
+# キーはテーブルを `.` でつないだもの（[tray.menu] の exit は tray.menu.exit）。
+# 用語は GLOSSARY.md に従う。
+
+[tray]
+tooltip = "shunsoku"
+
+[tray.menu]
+exit = "終了"
+
+[panic]
+title = "shunsoku"
+body = "予期しないエラーが起きたため、shunsoku を終了します。詳しくはログを見てください。"
