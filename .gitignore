@@ -1,2 +1,4 @@
 CLAUDE-SECURITY-*/
 /target/
+.claude/settings.local.json
+.claude/worktrees/

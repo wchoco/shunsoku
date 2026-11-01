@@ -21,6 +21,14 @@ cargo build --release
 
 ツールチェーンは `rust-toolchain.toml` で固定している。
 
+WSL では、push の前に次を通す。Win32 層は Linux のホストではコンパイルされないので、clippy は Windows の target で回す。実機の exe の組み方と Win32 の落とし穴は `docs/agents/windows-dev.md`。
+
+```sh
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+```
+
 ### セキュリティゲート（必須ステータス `claude-security`）
 
 main の Ruleset が PR の HEAD に `claude-security` ステータスの success を要求する。HEAD が変われば付け直しが必要。
@@ -28,7 +36,7 @@ main の Ruleset が PR の HEAD に `claude-security` ステータスの succes
 1. **スキャン要否の判定**: `git diff --name-only main...HEAD` の全ファイルが `*.md` / `docs/**` / `LICENSE` のいずれかならスキャン不要。それ以外（`.github/`、`.claude/`、依存定義・lockfile・設定ファイル含む）は必須。
 2. **スキャン種別**: 基本は claude-security の差分スキャン（ブランチの変更）。コードを含む最初の PR、および依存関係・認証まわりの大きな変更ではフルスキャン。
 3. **指摘の扱い**: 重大度にかかわらず全件を「修正」か「受け入れ（PR 本文に理由を記載）」にする。未対応が残る間は failure、0 件になったら success。
-4. **修正後の再スキャン**: 指摘の修正で追加した commit のみを差分（commit）スキャンする。
+4. **修正後の再スキャン**: 指摘の修正で追加した commit のみを差分（commit）スキャンする。スキャン済みの HEAD から足した commit がすべて docs 系（`*.md` / `docs/**` / `LICENSE`）なら再スキャンせず、description に `docs-only since <sha>` と書いて付け直す。
 5. **ステータスの付与**:
 
    ```sh
