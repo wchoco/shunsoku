@@ -31,6 +31,18 @@ pub enum Entry<'a> {
     Separator,
 }
 
+impl<'a> Entry<'a> {
+    /// チェックを付けない項目。
+    pub fn item(id: u32, label: impl Into<Cow<'a, str>>, enabled: bool) -> Entry<'a> {
+        Entry::Item {
+            id,
+            label: label.into(),
+            enabled,
+            checked: false,
+        }
+    }
+}
+
 /// メニューを出して、選ばれた項目の `id` を返す。モーダルなので、呼ぶ間はアプリの状態を借りないこと。
 pub fn show(owner: HWND, entries: &[Entry], x: i32, y: i32) -> Option<u32> {
     // SAFETY: メニューはこの関数の中で作って壊す（子メニューは親を壊すと一緒に壊れる）

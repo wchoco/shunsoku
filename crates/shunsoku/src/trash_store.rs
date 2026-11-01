@@ -6,8 +6,7 @@
 //! - 画素（非圧縮の BGRA）は `%TEMP%\shunsoku\<プロセス ID>\` に裏のスレッドで書き、書き終えたらメモリから
 //!   捨てる（常駐時のメモリを増やさないため）。書き終えるまでと、書けなかったときはメモリに持つ。
 //!   書き終えたら `PostMessageW(window, message)` で UI スレッドを起こし、`app` が `on_written` を呼ぶ。
-//! - 退避する画素は `Stash` 1 つずつ。画素を足すとき（トリム前の画像など）は、`Entry` に `Stash` を足して
-//!   `Entry::stashes_mut` と `Entry::take` に加える。
+//! - 退避する画素は `Stash` 1 つずつ。いまは元の画像（`Entry::image`）だけ。
 //! - ごみ箱から消えたもの（上限で捨てた・戻した）の一時ファイルは消す。drop（終了時）でフォルダごと消す。
 //!   起動時（`new`）には前回の残り（`%TEMP%\shunsoku\` の下のほかのフォルダ）も消す。
 
@@ -52,11 +51,6 @@ struct Entry {
 }
 
 impl Entry {
-    /// 退避する画素のすべて。
-    fn stashes_mut(&mut self) -> impl Iterator<Item = &mut Stash> {
-        [&mut self.image].into_iter()
-    }
-
     /// 画素を読み戻して、閉じる直前のスクラップにする。一時ファイルは消す。
     fn take(self) -> std::io::Result<Trashed> {
         Ok(Trashed {
@@ -176,41 +170,40 @@ impl TrashStore {
         let Some(entry) = self.trash.get_mut(id) else {
             return;
         };
-        for stash in entry.stashes_mut() {
-            let path = self.dir.join(format!("{}.bgra", self.next_file));
-            self.next_file += 1;
-            let Some(image) = stash.memory.clone() else {
-                continue;
-            };
-            let sender = self.written.0.clone();
-            let window = self.window;
-            let message = self.message;
-            let job_path = path.clone();
-            let spawned = std::thread::Builder::new()
-                .name("trash".into())
-                .spawn(move || {
-                    let result = catch_unwind(AssertUnwindSafe(|| write_pixels(&job_path, &image)))
-                        .map_err(|_| "panicked".to_owned())
-                        .and_then(|written| written.map_err(|e| e.to_string()));
-                    drop(image);
-                    let _ = sender.send(Written {
-                        id,
-                        path: job_path,
-                        result,
-                    });
-                    // SAFETY: UI スレッドのメッセージ専用ウィンドウに送るだけ。もう壊れていれば失敗するだけ
-                    let _ = unsafe {
-                        PostMessageW(Some(HWND(window as *mut _)), message, WPARAM(0), LPARAM(0))
-                    };
+        let stash = &mut entry.image;
+        let path = self.dir.join(format!("{}.bgra", self.next_file));
+        self.next_file += 1;
+        let Some(image) = stash.memory.clone() else {
+            return;
+        };
+        let sender = self.written.0.clone();
+        let window = self.window;
+        let message = self.message;
+        let job_path = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("trash".into())
+            .spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| write_pixels(&job_path, &image)))
+                    .map_err(|_| "panicked".to_owned())
+                    .and_then(|written| written.map_err(|e| e.to_string()));
+                drop(image);
+                let _ = sender.send(Written {
+                    id,
+                    path: job_path,
+                    result,
                 });
-            match spawned {
-                Ok(_) => {
-                    stash.file = Some(path);
-                    self.in_flight += 1;
-                }
-                Err(e) => log::warn!(
-                    "could not start the trash thread; keeping the pixels in memory: {e}"
-                ),
+                // SAFETY: UI スレッドのメッセージ専用ウィンドウに送るだけ。もう壊れていれば失敗するだけ
+                let _ = unsafe {
+                    PostMessageW(Some(HWND(window as *mut _)), message, WPARAM(0), LPARAM(0))
+                };
+            });
+        match spawned {
+            Ok(_) => {
+                stash.file = Some(path);
+                self.in_flight += 1;
+            }
+            Err(e) => {
+                log::warn!("could not start the trash thread; keeping the pixels in memory: {e}")
             }
         }
     }
@@ -221,11 +214,11 @@ impl TrashStore {
         let results: Vec<Written> = self.written.1.try_iter().collect();
         for written in results {
             self.in_flight = self.in_flight.saturating_sub(1);
-            let stash = self.trash.get_mut(written.id).and_then(|entry| {
-                entry
-                    .stashes_mut()
-                    .find(|s| s.file.as_deref() == Some(written.path.as_path()))
-            });
+            let stash = self
+                .trash
+                .get_mut(written.id)
+                .map(|entry| &mut entry.image)
+                .filter(|s| s.file.as_deref() == Some(written.path.as_path()));
             match (stash, written.result) {
                 (Some(stash), Ok(())) => {
                     stash.memory = None;
@@ -297,9 +290,7 @@ impl Drop for TrashStore {
 
 /// 捨てたスクラップの一時ファイルを消す。
 fn discard(entry: &mut Entry) {
-    for stash in entry.stashes_mut() {
-        stash.discard();
-    }
+    entry.image.discard();
 }
 
 /// 画素を `path` に新しいファイルとして書く（裏のスレッドで呼ぶ）。失敗したら作りかけのファイルを消す。

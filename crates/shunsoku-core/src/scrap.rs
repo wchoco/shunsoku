@@ -50,6 +50,39 @@ pub enum TrimInput {
     Cancel,
 }
 
+impl TrimInput {
+    /// カーソルが `at` に動いたときの入力。押したまま（`Pointer::holding`）でなければ、離したことを取りこぼした
+    /// ものとして `Release` にする。
+    pub fn pointer_move(at: Point, pointer: Pointer) -> TrimInput {
+        if pointer.holding() {
+            TrimInput::Move(at)
+        } else {
+            TrimInput::Release
+        }
+    }
+}
+
+/// カーソルが動いたとき（`WM_MOUSEMOVE`）の左ボタンとマウスの捕まえ方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pointer {
+    /// 左ボタンを押している。
+    pub left_down: bool,
+    /// このウィンドウがマウスを捕まえている。
+    pub captured: bool,
+}
+
+impl Pointer {
+    /// 押したまま動かしている。ドラッグと範囲の選択は、このときだけ続ける。
+    pub fn holding(&self) -> bool {
+        self.left_down && self.captured
+    }
+
+    /// 左ボタンを離したのに、まだマウスを捕まえている（離したことを取りこぼした）。放す。
+    pub fn stray_capture(&self) -> bool {
+        self.captured && !self.left_down
+    }
+}
+
 /// 倍率の下限（%）。
 pub const ZOOM_MIN: u16 = 10;
 /// 倍率の上限（%）。
@@ -57,16 +90,20 @@ pub const ZOOM_MAX: u16 = 800;
 /// 画素等倍の倍率（%）。
 pub const ZOOM_ACTUAL: u16 = 100;
 
-/// コンパクト表示の正方形の一辺（物理ピクセル）。
+/// コンパクト表示の正方形の一辺（96 DPI での物理ピクセル）。実際の一辺はモニタの DPI で換算する
+/// （`ScrapModel::compact_side`）。
 pub const COMPACT_SIDE: u32 = 64;
+
+/// 拡大率 100% のモニタの DPI。
+const BASE_DPI: u32 = 96;
 
 /// コンパクト表示に畳んだときの位置。広げるときに、畳んだあとの移動の分だけずらすために覚えておく。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Folded {
+struct CompactOrigin {
     /// 畳む直前の画像の左上。
-    unfolded: Point,
+    expanded: Point,
     /// 畳んだ直後の正方形の左上。
-    folded: Point,
+    square: Point,
 }
 
 /// 拡大縮小の基準点。この点の下にある画像の画素が、倍率を変えても同じ画面上の位置に残る。
@@ -98,7 +135,7 @@ pub struct ScrapModel {
     /// 拡大縮小で倍率を変えたら捨てる。
     dpi_origin: Option<(u16, u32)>,
     /// コンパクト表示に畳んでいれば Some。畳んでいる間、`position` は正方形の左上。
-    folded: Option<Folded>,
+    compact: Option<CompactOrigin>,
     /// トリムしていれば、表示する範囲（元の画像の画素）。
     trimmed: Option<Rect>,
 }
@@ -113,19 +150,34 @@ impl ScrapModel {
             appearance_overrides: AppearanceOverrides::default(),
             dpi: None,
             dpi_origin: None,
-            folded: None,
+            compact: None,
             trimmed: None,
         }
     }
 
     /// コンパクト表示に畳んでいるか。
     pub fn is_compact(&self) -> bool {
-        self.folded.is_some()
+        self.compact.is_some()
     }
 
-    /// コンパクト表示（一辺 `COMPACT_SIDE` の正方形）に畳む。`anchor` が正方形の中心になる（`Center` なら
+    /// トリムの範囲を選んでいるか（`Mode::Trimming`）。
+    pub const fn is_trimming(&self) -> bool {
+        matches!(self.mode, Mode::Trimming(_))
+    }
+
+    /// `before` と描く中身が同じか（位置のほかは変わっていない）。同じならウィンドウを動かすだけでよい。
+    pub fn same_content(&self, before: &ScrapModel) -> bool {
+        self.image_size == before.image_size
+            && self.image_rect().size() == before.image_rect().size()
+            && self.display_size() == before.display_size()
+            && self.mode == before.mode
+            && self.is_compact() == before.is_compact()
+            && self.appearance_overrides == before.appearance_overrides
+    }
+
+    /// コンパクト表示（一辺 `compact_side` の正方形）に畳む。`anchor` が正方形の中心になる（`Center` なら
     /// 画像の中心）。倍率はそのまま残る。もう畳んでいれば false。
-    pub fn fold(&mut self, anchor: ZoomAnchor) -> bool {
+    pub fn enter_compact(&mut self, anchor: ZoomAnchor) -> bool {
         if self.is_compact() {
             return false;
         }
@@ -140,25 +192,25 @@ impl ScrapModel {
             }
             ZoomAnchor::At(at) => at,
         };
-        let half = (COMPACT_SIDE / 2) as i32;
-        let folded = Point::new(center.x.saturating_sub(half), center.y.saturating_sub(half));
-        self.folded = Some(Folded {
-            unfolded: self.position,
-            folded,
+        let half = (self.compact_side() / 2) as i32;
+        let square = Point::new(center.x.saturating_sub(half), center.y.saturating_sub(half));
+        self.compact = Some(CompactOrigin {
+            expanded: self.position,
+            square,
         });
-        self.position = folded;
+        self.position = square;
         true
     }
 
     /// コンパクト表示から広げる。畳む前の位置に、畳んだあとに動かした分だけずらして戻す。畳んでいなければ false。
-    pub fn unfold(&mut self) -> bool {
-        let Some(Folded { unfolded, folded }) = self.folded.take() else {
+    pub fn leave_compact(&mut self) -> bool {
+        let Some(CompactOrigin { expanded, square }) = self.compact.take() else {
             return false;
         };
         let p = self.position;
         self.position = Point::new(
-            unfolded.x.saturating_add(p.x.saturating_sub(folded.x)),
-            unfolded.y.saturating_add(p.y.saturating_sub(folded.y)),
+            expanded.x.saturating_add(p.x.saturating_sub(square.x)),
+            expanded.y.saturating_add(p.y.saturating_sub(square.y)),
         );
         true
     }
@@ -203,7 +255,7 @@ impl ScrapModel {
         if from == dpi {
             return false;
         }
-        match scaling {
+        let rescaled = match scaling {
             DpiScaling::KeepPixels => {
                 self.dpi_origin = None;
                 false
@@ -215,7 +267,48 @@ impl ScrapModel {
                 let scaled = u16::try_from(scaled).unwrap_or(u16::MAX);
                 self.scale_to(scaled, anchor)
             }
+        };
+        if self.is_compact() {
+            // 正方形はどちらの設定でも 64px 相当に保つ
+            return self.resize_compact(compact_side_at(from), anchor);
         }
+        rescaled
+    }
+
+    /// コンパクト表示の正方形の一辺（物理ピクセル）。`COMPACT_SIDE` をウィンドウのあるモニタの DPI で換算する
+    /// （DPI が分かるまでは 96 DPI とみなす）。
+    pub fn compact_side(&self) -> u32 {
+        compact_side_at(self.dpi.unwrap_or(BASE_DPI))
+    }
+
+    /// 畳んだ正方形の一辺が `before` から変わったら、`anchor` の下の点が動かないように位置を動かす。
+    /// 大きさを変えただけなので、広げるときの移動の量には数えない。変わったら true。
+    fn resize_compact(&mut self, before: u32, anchor: ZoomAnchor) -> bool {
+        let after = self.compact_side();
+        if after == before {
+            return false;
+        }
+        let p = self.position;
+        let (anchor_x, anchor_y) = match anchor {
+            ZoomAnchor::Center => (
+                f64::from(p.x) + f64::from(before) / 2.0,
+                f64::from(p.y) + f64::from(before) / 2.0,
+            ),
+            ZoomAnchor::At(at) => (f64::from(at.x), f64::from(at.y)),
+        };
+        self.position = Point::new(
+            scaled_origin(anchor_x, p.x, before, after),
+            scaled_origin(anchor_y, p.y, before, after),
+        );
+        if let Some(origin) = self.compact.as_mut() {
+            let (dx, dy) = (
+                self.position.x.saturating_sub(p.x),
+                self.position.y.saturating_sub(p.y),
+            );
+            let square = origin.square;
+            origin.square = Point::new(square.x.saturating_add(dx), square.y.saturating_add(dy));
+        }
+        true
     }
 
     /// 倍率を `zoom`（%、範囲に収める）にし、`anchor` の下の画素が動かないように位置を動かす。
@@ -240,15 +333,9 @@ impl ScrapModel {
             ),
             ZoomAnchor::At(at) => (f64::from(at.x), f64::from(at.y)),
         };
-        // 基準点から画像の左上までの距離を、表示の大きさの比で伸び縮みさせる
-        let scale = |anchor: f64, from: i32, before: u32, after: u32| {
-            let ratio = f64::from(after) / f64::from(before.max(1));
-            let to = anchor - (anchor - f64::from(from)) * ratio;
-            to.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
-        };
         self.position = Point::new(
-            scale(anchor_x, p.x, before.width, after.width),
-            scale(anchor_y, p.y, before.height, after.height),
+            scaled_origin(anchor_x, p.x, before.width, after.width),
+            scaled_origin(anchor_y, p.y, before.height, after.height),
         );
         true
     }
@@ -295,7 +382,7 @@ impl ScrapModel {
 
     /// トリムの範囲の選択を始める。すでに選んでいれば false。
     pub fn start_trim(&mut self) -> bool {
-        if matches!(self.mode, Mode::Trimming(_)) {
+        if self.is_trimming() {
             return false;
         }
         self.mode = Mode::Trimming(TrimState::default());
@@ -415,7 +502,8 @@ impl ScrapModel {
     /// 画像を出す矩形（スクリーン座標）。大きさは倍率を掛けた表示の大きさ。畳んでいる間は正方形。
     pub fn image_rect(&self) -> Rect {
         let size = if self.is_compact() {
-            Size::new(COMPACT_SIDE, COMPACT_SIDE)
+            let side = self.compact_side();
+            Size::new(side, side)
         } else {
             self.display_size()
         };
@@ -428,6 +516,21 @@ impl ScrapModel {
         self.image_rect()
             .inflate(self.appearance(defaults).margin())
     }
+}
+
+/// `dpi` のモニタでのコンパクト表示の正方形の一辺（物理ピクセル、四捨五入）。
+fn compact_side_at(dpi: u32) -> u32 {
+    let side = (u64::from(COMPACT_SIDE) * u64::from(dpi) * 2 + u64::from(BASE_DPI))
+        / (u64::from(BASE_DPI) * 2);
+    u32::try_from(side).unwrap_or(u32::MAX).max(1)
+}
+
+/// 大きさが `before` から `after` に変わるときの、新しい左上の座標（1 軸）。基準点 `anchor` から左上 `from` までの
+/// 距離を、大きさの比で伸び縮みさせる。
+fn scaled_origin(anchor: f64, from: i32, before: u32, after: u32) -> i32 {
+    let ratio = f64::from(after) / f64::from(before.max(1));
+    let to = anchor - (anchor - f64::from(from)) * ratio;
+    to.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
 /// 1 段上の倍率。100% までは 10% の、その上は 25% の倍数のうち、`zoom` より大きい最初のもの。
@@ -456,7 +559,10 @@ pub struct Border {
 pub struct Appearance {
     /// 透明度（%）。100 で不透明。
     pub opacity: u8,
-    pub border: Option<Border>,
+    /// 枠の太さと色。枠を出さないときも持っておき、スクラップごとに枠を付けたときに使う。
+    pub border: Border,
+    /// 枠を出すか。
+    pub show_border: bool,
     pub shadow: bool,
 }
 
@@ -465,29 +571,39 @@ pub struct Appearance {
 pub struct AppearanceOverrides {
     /// 透明度（%）。
     pub opacity: Option<u8>,
-    /// 枠。`Some(None)` で枠なし、`Some(Some(color))` でその色（`0xRRGGBB`）の枠。太さは既定値の太さ（既定値が
-    /// 枠なしなら設定の既定の太さ）。
-    pub border: Option<Option<u32>>,
+    /// 枠。
+    pub border: Option<BorderOverride>,
     /// 影の有無。
     pub shadow: Option<bool>,
+}
+
+/// 枠のスクラップごとの上書き。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderOverride {
+    /// 枠を出さない。
+    Hidden,
+    /// その色（`0xRRGGBB`）の枠を出す。太さは既定値の太さ（既定値で枠を出さなくても設定の太さ）。
+    Color(u32),
 }
 
 impl AppearanceOverrides {
     /// `defaults` に重ねた見た目。
     fn apply(&self, defaults: &Appearance) -> Appearance {
-        let border = match self.border {
-            None => defaults.border,
-            Some(None) => None,
-            Some(Some(color)) => Some(Border {
-                width: defaults
-                    .border
-                    .map_or(crate::settings::Border::default().width, |b| b.width),
-                color,
-            }),
+        let (border, show_border) = match self.border {
+            None => (defaults.border, defaults.show_border),
+            Some(BorderOverride::Hidden) => (defaults.border, false),
+            Some(BorderOverride::Color(color)) => (
+                Border {
+                    color,
+                    ..defaults.border
+                },
+                true,
+            ),
         };
         Appearance {
             opacity: self.opacity.unwrap_or(defaults.opacity),
             border,
+            show_border,
             shadow: self.shadow.unwrap_or(defaults.shadow),
         }
     }
@@ -501,35 +617,42 @@ impl Default for Appearance {
     fn default() -> Appearance {
         Appearance {
             opacity: 100,
-            border: Some(Border {
+            border: Border {
                 width: 1,
                 color: 0x80_80_80,
-            }),
+            },
+            show_border: true,
             shadow: true,
         }
     }
 }
 
 impl Appearance {
+    /// 出す枠。枠を出さないなら None。
+    pub fn shown_border(&self) -> Option<Border> {
+        self.show_border.then_some(self.border)
+    }
+
     /// 画像の外側に足す幅（枠 + 影）。
     pub fn margin(&self) -> i32 {
-        let border = self.border.map_or(0, |b| b.width);
+        let border = self.shown_border().map_or(0, |b| b.width);
         let shadow = if self.shadow { SHADOW_WIDTH } else { 0 };
         (border + shadow) as i32
     }
 }
 
 impl From<ScrapAppearance> for Appearance {
-    /// 設定ファイルの `[scrap]` から作る。枠を出さない設定なら枠なし。
+    /// 設定ファイルの `[scrap]` から作る。枠を出さない設定でも、枠の太さと色は持っておく。
     fn from(settings: ScrapAppearance) -> Appearance {
         let border = settings.border;
         let (r, g, b) = (border.color.0, border.color.1, border.color.2);
         Appearance {
             opacity: settings.opacity,
-            border: border.visible.then_some(Border {
+            border: Border {
                 width: border.width,
                 color: u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
-            }),
+            },
+            show_border: border.visible,
             shadow: settings.shadow,
         }
     }
@@ -557,8 +680,24 @@ impl Drag {
         self.from.is_some()
     }
 
+    /// 大きさを変えるとき（DPI が変わったときなど）の基準点。ドラッグ中ならつかんだところが離れないようにカーソルの
+    /// 位置 `cursor`、そうでなければ中心。
+    pub fn zoom_anchor(&self, cursor: Point) -> ZoomAnchor {
+        if self.is_active() {
+            ZoomAnchor::At(cursor)
+        } else {
+            ZoomAnchor::Center
+        }
+    }
+
     /// カーソルが `at` に動いた。ドラッグの間なら前回からの移動量。ドラッグしていなければ None。
-    pub fn move_to(&mut self, at: Point) -> Option<Point> {
+    /// 押したまま（`Pointer::holding`）でなければ、離したことを取りこぼしたものとしてドラッグを終える
+    /// （ホバーだけでスクラップが動かないように）。
+    pub fn move_to(&mut self, at: Point, pointer: Pointer) -> Option<Point> {
+        if !pointer.holding() {
+            self.end();
+            return None;
+        }
         // 押していないときに位置を覚えると、次の移動がドラッグになってしまう
         let from = self.from.as_mut()?;
         let delta = Point::new(at.x - from.x, at.y - from.y);
@@ -611,9 +750,9 @@ mod tests {
             Rect::new(-109, 41, 209, 259)
         );
         let plain = Appearance {
-            opacity: 100,
-            border: None,
+            show_border: false,
             shadow: false,
+            ..Appearance::default()
         };
         assert_eq!(scrap.window_rect(&plain), Rect::new(-100, 50, 200, 250));
     }
@@ -638,10 +777,11 @@ mod tests {
             Appearance::from(custom),
             Appearance {
                 opacity: 80,
-                border: Some(Border {
+                border: Border {
                     width: 3,
                     color: 0x12_34_56,
-                }),
+                },
+                show_border: true,
                 shadow: false,
             }
         );
@@ -652,7 +792,7 @@ mod tests {
             },
             ..ScrapAppearance::default()
         };
-        assert_eq!(Appearance::from(hidden).border, None);
+        assert_eq!(Appearance::from(hidden).shown_border(), None);
     }
 
     #[test]
@@ -660,10 +800,11 @@ mod tests {
         let scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
         let defaults = Appearance {
             opacity: 80,
-            border: Some(Border {
+            border: Border {
                 width: 3,
                 color: 0x12_34_56,
-            }),
+            },
+            show_border: true,
             shadow: false,
         };
         assert_eq!(scrap.appearance(&defaults), defaults);
@@ -683,15 +824,15 @@ mod tests {
         );
         // 枠の色だけを変えても、太さは既定値のまま
         let thick = Appearance {
-            border: Some(Border {
+            border: Border {
                 width: 4,
                 color: 0x80_80_80,
-            }),
+            },
             ..defaults
         };
-        scrap.appearance_overrides.border = Some(Some(0xFF_00_00));
+        scrap.appearance_overrides.border = Some(BorderOverride::Color(0xFF_00_00));
         assert_eq!(
-            scrap.appearance(&thick).border,
+            scrap.appearance(&thick).shown_border(),
             Some(Border {
                 width: 4,
                 color: 0xFF_00_00,
@@ -704,29 +845,37 @@ mod tests {
         let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
         scrap.appearance_overrides = AppearanceOverrides {
             opacity: Some(30),
-            border: Some(Some(0x00_00_FF)),
+            border: Some(BorderOverride::Color(0x00_00_FF)),
             shadow: Some(true),
         };
         let plain = Appearance {
             opacity: 100,
-            border: None,
+            border: Border {
+                width: 3,
+                color: 0x80_80_80,
+            },
+            show_border: false,
             shadow: false,
         };
-        // 既定値で枠がなければ、枠を付けたときの太さは設定の既定の太さ
+        // 既定値で枠を出さなくても、枠を付けたときの太さは設定の太さ
         assert_eq!(
             scrap.appearance(&plain),
             Appearance {
                 opacity: 30,
-                border: Some(Border {
-                    width: 1,
+                border: Border {
+                    width: 3,
                     color: 0x00_00_FF,
-                }),
+                },
+                show_border: true,
                 shadow: true,
             }
         );
-        scrap.appearance_overrides.border = Some(None);
+        scrap.appearance_overrides.border = Some(BorderOverride::Hidden);
         scrap.appearance_overrides.shadow = Some(false);
-        assert_eq!(scrap.appearance(&Appearance::default()).border, None);
+        assert_eq!(
+            scrap.appearance(&Appearance::default()).shown_border(),
+            None
+        );
         assert!(!scrap.appearance(&Appearance::default()).shadow);
     }
 
@@ -737,7 +886,7 @@ mod tests {
         assert_eq!(scrap.window_rect(&defaults), Rect::new(-109, 41, 209, 259));
         scrap.appearance_overrides.shadow = Some(false);
         assert_eq!(scrap.window_rect(&defaults), Rect::new(-101, 49, 201, 251));
-        scrap.appearance_overrides.border = Some(None);
+        scrap.appearance_overrides.border = Some(BorderOverride::Hidden);
         assert_eq!(scrap.window_rect(&defaults), Rect::new(-100, 50, 200, 250));
         // 透明度は大きさに関係しない
         scrap.appearance_overrides.opacity = Some(10);
@@ -947,7 +1096,7 @@ mod tests {
     }
 
     fn trimming(scrap: &ScrapModel) -> bool {
-        matches!(scrap.mode, Mode::Trimming(_))
+        scrap.is_trimming()
     }
 
     #[test]
@@ -1101,7 +1250,7 @@ mod tests {
     fn folding_from_keys_makes_a_64px_square_on_the_center_of_the_scrap() {
         let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
         // 中心は (50, 150)
-        assert!(scrap.fold(ZoomAnchor::Center));
+        assert!(scrap.enter_compact(ZoomAnchor::Center));
         assert!(scrap.is_compact());
         assert_eq!(scrap.image_rect(), Rect::new(18, 118, 82, 182));
         assert_eq!(
@@ -1109,51 +1258,98 @@ mod tests {
             Rect::new(9, 109, 91, 191)
         );
         // 畳んだまま畳んでも変わらない
-        assert!(!scrap.fold(ZoomAnchor::Center));
+        assert!(!scrap.enter_compact(ZoomAnchor::Center));
         assert_eq!(scrap.image_rect(), Rect::new(18, 118, 82, 182));
     }
 
     #[test]
     fn folding_with_the_mouse_centers_the_square_on_the_cursor() {
         let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
-        assert!(scrap.fold(ZoomAnchor::At(Point::new(-90, 60))));
+        assert!(scrap.enter_compact(ZoomAnchor::At(Point::new(-90, 60))));
         assert_eq!(scrap.image_rect(), Rect::new(-122, 28, -58, 92));
     }
 
     #[test]
     fn unfolding_without_moving_returns_to_where_it_was_before_folding() {
         let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
-        assert!(!scrap.unfold());
-        scrap.fold(ZoomAnchor::At(Point::new(-90, 60)));
-        assert!(scrap.unfold());
+        assert!(!scrap.leave_compact());
+        scrap.enter_compact(ZoomAnchor::At(Point::new(-90, 60)));
+        assert!(scrap.leave_compact());
         assert!(!scrap.is_compact());
         assert_eq!(scrap.image_rect(), Rect::new(-100, 50, 200, 250));
-        assert!(!scrap.unfold());
+        assert!(!scrap.leave_compact());
     }
 
     #[test]
     fn unfolding_shifts_the_scrap_by_how_far_the_square_was_moved() {
         let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
-        scrap.fold(ZoomAnchor::Center);
+        scrap.enter_compact(ZoomAnchor::Center);
         scrap.position = Point::new(scrap.position.x + 30, scrap.position.y - 500);
-        scrap.unfold();
+        scrap.leave_compact();
         assert_eq!(scrap.image_rect(), Rect::new(-70, -450, 230, -250));
     }
 
     #[test]
-    fn a_folded_scrap_stays_put_when_it_moves_to_another_dpi() {
+    fn a_folded_scrap_rescales_its_zoom_for_when_it_unfolds_on_another_dpi() {
         let keep = DpiScaling::KeepApparentSize;
         let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
         scrap.set_dpi(144, keep, ZoomAnchor::Center);
-        scrap.fold(ZoomAnchor::Center);
-        let square = scrap.image_rect();
-        // 畳んだ正方形の大きさは変わらないので、描き直さず、位置も動かさない
-        assert!(!scrap.set_dpi(96, keep, ZoomAnchor::Center));
-        assert_eq!(scrap.image_rect(), square);
+        scrap.enter_compact(ZoomAnchor::Center);
+        scrap.set_dpi(96, keep, ZoomAnchor::Center);
         // 倍率は計算し直してあり、広げると移動先の DPI での見かけの大きさで出る
         assert_eq!(scrap.zoom(), 67);
-        scrap.unfold();
+        scrap.leave_compact();
         assert_eq!(scrap.image_rect().size(), Size::new(201, 134));
+    }
+
+    #[test]
+    fn resizing_the_square_for_a_dpi_does_not_count_as_moving_it() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_dpi(96, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        scrap.enter_compact(ZoomAnchor::Center);
+        scrap.set_dpi(144, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        scrap.leave_compact();
+        assert_eq!(scrap.image_rect(), Rect::new(0, 0, 300, 200));
+    }
+
+    #[test]
+    fn the_compact_square_is_64px_at_96_dpi_and_scales_with_the_dpi() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_dpi(144, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        // 中心は (150, 100)。144 DPI では 64px 相当は 96px
+        scrap.enter_compact(ZoomAnchor::Center);
+        assert_eq!(scrap.image_rect(), Rect::new(102, 52, 198, 148));
+        let mut at_96 = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        at_96.set_dpi(96, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        at_96.enter_compact(ZoomAnchor::Center);
+        assert_eq!(at_96.image_rect(), Rect::new(118, 68, 182, 132));
+    }
+
+    #[test]
+    fn a_folded_scrap_resizes_its_square_around_the_anchor_on_another_dpi() {
+        for scaling in [DpiScaling::KeepPixels, DpiScaling::KeepApparentSize] {
+            let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+            scrap.set_dpi(96, scaling, ZoomAnchor::Center);
+            scrap.enter_compact(ZoomAnchor::Center);
+            assert_eq!(scrap.image_rect(), Rect::new(118, 68, 182, 132));
+            // 正方形の中心 (150, 100) を残して 96px にする
+            assert!(
+                scrap.set_dpi(144, scaling, ZoomAnchor::Center),
+                "{scaling:?}"
+            );
+            assert_eq!(
+                scrap.image_rect(),
+                Rect::new(102, 52, 198, 148),
+                "{scaling:?}"
+            );
+            // ドラッグ中はカーソルの下が動かない
+            assert!(scrap.set_dpi(96, scaling, ZoomAnchor::At(Point::new(102, 52))));
+            assert_eq!(
+                scrap.image_rect(),
+                Rect::new(102, 52, 166, 116),
+                "{scaling:?}"
+            );
+        }
     }
 
     #[test]
@@ -1161,19 +1357,25 @@ mod tests {
         let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
         scrap.set_zoom(200, ZoomAnchor::At(Point::new(0, 0)));
         // 中心は表示の大きさ（600x400）の中心
-        scrap.fold(ZoomAnchor::Center);
+        scrap.enter_compact(ZoomAnchor::Center);
         assert_eq!(scrap.image_rect(), Rect::new(268, 168, 332, 232));
         assert_eq!(scrap.zoom(), 200);
-        scrap.unfold();
+        scrap.leave_compact();
         assert_eq!(scrap.zoom(), 200);
         assert_eq!(scrap.image_rect(), Rect::new(0, 0, 600, 400));
     }
 
+    /// 左ボタンを押していて、ウィンドウがマウスを捕まえている。
+    const HOLDING: Pointer = Pointer {
+        left_down: true,
+        captured: true,
+    };
+
     #[test]
     fn hovering_without_pressing_never_moves_the_scrap() {
         let mut drag = Drag::default();
-        assert_eq!(drag.move_to(Point::new(10, 10)), None);
-        assert_eq!(drag.move_to(Point::new(15, 12)), None);
+        assert_eq!(drag.move_to(Point::new(10, 10), HOLDING), None);
+        assert_eq!(drag.move_to(Point::new(15, 12), HOLDING), None);
         assert!(!drag.is_active());
     }
 
@@ -1181,10 +1383,126 @@ mod tests {
     fn a_drag_reports_each_move_from_the_previous_position_until_it_ends() {
         let mut drag = Drag::default();
         drag.start(Point::new(10, 10));
-        assert_eq!(drag.move_to(Point::new(15, 8)), Some(Point::new(5, -2)));
-        assert_eq!(drag.move_to(Point::new(14, 8)), Some(Point::new(-1, 0)));
+        assert_eq!(
+            drag.move_to(Point::new(15, 8), HOLDING),
+            Some(Point::new(5, -2))
+        );
+        assert_eq!(
+            drag.move_to(Point::new(14, 8), HOLDING),
+            Some(Point::new(-1, 0))
+        );
         drag.end();
-        assert_eq!(drag.move_to(Point::new(20, 20)), None);
-        assert_eq!(drag.move_to(Point::new(25, 20)), None);
+        assert_eq!(drag.move_to(Point::new(20, 20), HOLDING), None);
+        assert_eq!(drag.move_to(Point::new(25, 20), HOLDING), None);
+    }
+
+    #[test]
+    fn a_drag_ends_when_a_move_arrives_without_the_button_or_the_capture() {
+        for pointer in [
+            Pointer {
+                left_down: false,
+                captured: true,
+            },
+            Pointer {
+                left_down: true,
+                captured: false,
+            },
+        ] {
+            let mut drag = Drag::default();
+            drag.start(Point::new(10, 10));
+            // 離したことを取りこぼしても、ホバーでスクラップを動かさない
+            assert_eq!(drag.move_to(Point::new(15, 8), pointer), None);
+            assert!(!drag.is_active());
+            assert_eq!(drag.move_to(Point::new(20, 8), HOLDING), None);
+        }
+    }
+
+    #[test]
+    fn the_capture_is_stray_only_when_it_outlives_the_button() {
+        let stray = |left_down, captured| {
+            Pointer {
+                left_down,
+                captured,
+            }
+            .stray_capture()
+        };
+        assert!(stray(false, true));
+        assert!(!stray(true, true));
+        assert!(!stray(true, false));
+        assert!(!stray(false, false));
+    }
+
+    #[test]
+    fn a_trim_move_without_the_button_or_the_capture_releases_the_press() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(100, 100));
+        scrap.start_trim();
+        scrap.trim_input(TrimInput::Press(Point::new(10, 10)));
+        let lost = Pointer {
+            left_down: false,
+            captured: true,
+        };
+        assert_eq!(
+            TrimInput::pointer_move(Point::new(30, 30), lost),
+            TrimInput::Release
+        );
+        assert_eq!(
+            TrimInput::pointer_move(Point::new(30, 30), HOLDING),
+            TrimInput::Move(Point::new(30, 30))
+        );
+        scrap.trim_input(TrimInput::pointer_move(Point::new(30, 30), lost));
+        // 押していないことになったので、そのあとの移動では範囲を選ばない
+        assert!(!scrap.trim_input(TrimInput::Move(Point::new(40, 40))));
+        assert_eq!(scrap.trim_selection(), None);
+    }
+
+    #[test]
+    fn a_dpi_change_anchors_at_the_cursor_only_while_dragging() {
+        let mut drag = Drag::default();
+        let cursor = Point::new(30, 40);
+        assert_eq!(drag.zoom_anchor(cursor), ZoomAnchor::Center);
+        drag.start(Point::new(10, 10));
+        assert_eq!(drag.zoom_anchor(cursor), ZoomAnchor::At(cursor));
+        drag.end();
+        assert_eq!(drag.zoom_anchor(cursor), ZoomAnchor::Center);
+    }
+
+    #[test]
+    fn moving_a_scrap_keeps_its_content_but_zooming_or_folding_does_not() {
+        let before = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        let mut moved = before.clone();
+        moved.position = Point::new(50, 60);
+        assert!(moved.same_content(&before));
+        let mut zoomed = before.clone();
+        zoomed.zoom_in(ZoomAnchor::Center);
+        assert!(!zoomed.same_content(&before));
+        let mut folded = before.clone();
+        folded.enter_compact(ZoomAnchor::Center);
+        assert!(!folded.same_content(&before));
+        let mut restyled = before.clone();
+        restyled.appearance_overrides.shadow = Some(false);
+        assert!(!restyled.same_content(&before));
+        let mut trimming = before.clone();
+        trimming.start_trim();
+        assert!(!trimming.same_content(&before));
+    }
+
+    #[test]
+    fn a_folded_scrap_on_another_dpi_needs_a_repaint_for_its_new_square() {
+        let mut before = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        before.set_dpi(96, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        before.enter_compact(ZoomAnchor::Center);
+        let mut after = before.clone();
+        after.set_dpi(144, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        assert!(!after.same_content(&before));
+    }
+
+    #[test]
+    fn a_scrap_is_trimming_from_start_until_it_confirms_or_cancels() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(100, 100));
+        assert!(!scrap.is_trimming());
+        scrap.start_trim();
+        assert!(scrap.is_trimming());
+        scrap.trim_input(TrimInput::Cancel);
+        assert!(!scrap.is_trimming());
     }
 }

@@ -42,6 +42,11 @@ notifications = true
 # 超えたら古いものから消えます。0 なら閉じたらすぐに破棄します。終了するとごみ箱は空になります。
 trash_limit = 10
 
+# DPI（拡大率）の違うモニタへスクラップを動かしたときの見え方。次のどちらか。
+#   keep_pixels         画素を等倍に保つ。画面上の画素数は変わらず、見かけの大きさが変わる
+#   keep_apparent_size  見かけの大きさを保つ。移動先の DPI に合わせて倍率を変える
+dpi_scaling = "keep_pixels"
+
 [hotkeys]
 # 範囲選択キャプチャを呼び出すホットキー。既定は未設定（"" も未設定）なので、使うには下の行の # を外して
 # 好きなキーにしてください。
@@ -55,6 +60,10 @@ trash_limit = 10
 # OS やほかのアプリが使っている組み合わせは登録できず、通知で知らせます。
 # select_capture = "Ctrl+Shift+A"
 
+# 最後に閉じたスクラップをごみ箱から復元するホットキー。既定は未設定（"" も未設定）で、書かなくても
+# 通知は出ません。書き方は select_capture と同じです。範囲選択の画面を開いている間は効きません。
+# restore_last = "Ctrl+Shift+Z"
+
 [shortcuts]
 # スクラップにフォーカスがあるときのショートカットを、スクラップ操作の id ごとに上書きします。
 # 書き方は [hotkeys] と同じです。書いた 1 つが既定のショートカットを全部置き換えます。
@@ -66,6 +75,8 @@ trash_limit = 10
 # copy            コピー                            Ctrl+C
 # save_default    既定の保存先へ保存                Ctrl+S
 # save_as         保存先を確認して保存              Ctrl+Shift+S
+# trim            トリム                            Ctrl+T
+# untrim          トリムを解除                      （なし）
 # move_left       左へ移動（1px）                   Left
 # move_right      右へ移動（1px）                   Right
 # move_up         上へ移動（1px）                   Up
@@ -74,8 +85,17 @@ trash_limit = 10
 # move_right_10   右へ移動（10px）                  Shift+Right
 # move_up_10      上へ移動（10px）                  Shift+Up
 # move_down_10    下へ移動（10px）                  Shift+Down
+# zoom_in         拡大                              Ctrl+Plus、Ctrl+Shift+Plus、Ctrl+NumpadAdd
+#                                                   （マウスのホイールを上へでも拡大します）
+# zoom_out        縮小                              Ctrl+Minus、Ctrl+NumpadSubtract
+#                                                   （マウスのホイールを下へでも縮小します）
+# zoom_actual     元のサイズに戻す                  Ctrl+0
+# opacity_up      濃くする                          （なし。Ctrl+ホイールを上へで濃くします）
+# opacity_down    薄くする                          （なし。Ctrl+ホイールを下へで薄くします）
+# toggle_compact  コンパクト表示                    （なし。ダブルクリックで切り替えます）
 # close           閉じる                            Esc（マウスの中クリックでも閉じます）
-# （ドラッグでの移動はマウスだけの操作で、ショートカットは付けられません）
+# （ドラッグでの移動はマウスだけの操作で、ショートカットは付けられません。右クリックメニューの
+#   「拡大縮小」「見た目」の一覧から選ぶ操作にも付けられません）
 #
 # 例:
 # copy = "Ctrl+Shift+C"

@@ -66,6 +66,7 @@ close = "閉じる"
 # 枠の一覧（scrap::ops の border の選択肢）
 [scrap.border]
 none = "なし"
+default = "既定の色"
 gray = "灰"
 black = "黒"
 white = "白"

@@ -28,8 +28,8 @@
 use std::collections::BTreeMap;
 
 use crate::geometry::Point;
-use crate::keys::{Chord, Key};
-use crate::scrap::{Appearance, Mode, ScrapModel, ZoomAnchor};
+use crate::keys::{Chord, Key, Modifiers};
+use crate::scrap::{Appearance, BorderOverride, ScrapModel, ZoomAnchor};
 use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
@@ -96,6 +96,31 @@ pub enum MouseGesture {
 }
 
 impl MouseGesture {
+    /// ホイールの回転（`rotation`、上が正）と、そのとき押している修飾キーから決まるホイールの操作。修飾キーなしと
+    /// Ctrl だけなら上下の向きで決め、ほかの修飾キーつきと回っていない（0）なら None（対応がない）。
+    pub fn wheel(modifiers: Modifiers, rotation: i32) -> Option<MouseGesture> {
+        let Modifiers {
+            win: false,
+            ctrl,
+            alt: false,
+            shift: false,
+        } = modifiers
+        else {
+            return None;
+        };
+        let up = match rotation.signum() {
+            1 => true,
+            -1 => false,
+            _ => return None,
+        };
+        Some(match (ctrl, up) {
+            (false, true) => MouseGesture::WheelUp,
+            (false, false) => MouseGesture::WheelDown,
+            (true, true) => MouseGesture::CtrlWheelUp,
+            (true, false) => MouseGesture::CtrlWheelDown,
+        })
+    }
+
     /// 設定ファイル（`[mouse]`）での名前。
     const NAMES: [(MouseGesture, &'static str); 7] = [
         (MouseGesture::LeftDrag, "LeftDrag"),
@@ -221,19 +246,19 @@ const CTRL_SHIFT_S: Chord = CTRL_S.shift();
 const CTRL_T: Chord = Chord::plain(Key::known(0x54)).ctrl();
 
 /// トリムの範囲を選んでいる間（`Mode::Trimming`）のほかは、いつでも実行できる。
-const fn always(model: &ScrapModel) -> bool {
-    !matches!(model.mode, Mode::Trimming(_))
+const fn not_trimming(model: &ScrapModel) -> bool {
+    !model.is_trimming()
 }
 
 /// トリムしていて、畳んでいなければ実行できる（トリムの範囲を選んでいる間は除く）。
 fn trimmed(model: &ScrapModel) -> bool {
-    unfolded(model) && model.is_trimmed()
+    not_compact(model) && model.is_trimmed()
 }
 
 /// コンパクト表示に畳んでいないときだけ実行できる。畳んでいる間に実行できるのは移動・閉じる・コピーと、
 /// 広げる操作だけにする（spec #33）。
-fn unfolded(model: &ScrapModel) -> bool {
-    always(model) && !model.is_compact()
+fn not_compact(model: &ScrapModel) -> bool {
+    not_trimming(model) && !model.is_compact()
 }
 
 /// `(dx, dy)` だけ動かす操作の `run`。
@@ -385,7 +410,7 @@ fn opacity_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
 /// 枠の一覧の「枠なし」の値。色の値（`0xRRGGBB`）は 0 以上なので重ならない。
 const NO_BORDER: i32 = -1;
 
-/// 枠の一覧の色（文言のキー、`0xRRGGBB`）。先頭は設定の既定の色。
+/// 枠の一覧で設定の色に続けて並べる色（文言のキー、`0xRRGGBB`）。設定の色と同じものは並べない。
 const BORDER_COLORS: [(&str, u32); 5] = [
     ("scrap.border.gray", 0x80_80_80),
     ("scrap.border.black", 0x00_00_00),
@@ -394,18 +419,26 @@ const BORDER_COLORS: [(&str, u32); 5] = [
     ("scrap.border.blue", 0x00_00_FF),
 ];
 
+/// 枠の一覧: 「なし」、設定の色（設定で枠を出さなくても）、`BORDER_COLORS` の順。
 fn border_choices(model: &ScrapModel, defaults: &Appearance) -> Vec<Choice> {
-    let now = model.appearance(defaults).border.map(|b| b.color);
+    let now = model.appearance(defaults).shown_border().map(|b| b.color);
+    let configured = defaults.border.color;
     let none = Choice {
         label: ChoiceLabel::Key("scrap.border.none"),
         value: NO_BORDER,
         checked: now.is_none(),
     };
-    let colors = BORDER_COLORS.iter().map(|&(key, color)| Choice {
-        label: ChoiceLabel::Key(key),
-        value: color as i32,
-        checked: now == Some(color),
-    });
+    let others = BORDER_COLORS
+        .iter()
+        .copied()
+        .filter(|&(_, color)| color != configured);
+    let colors = std::iter::once(("scrap.border.default", configured))
+        .chain(others)
+        .map(|(key, color)| Choice {
+            label: ChoiceLabel::Key(key),
+            value: color as i32,
+            checked: now == Some(color),
+        });
     std::iter::once(none).chain(colors).collect()
 }
 
@@ -417,13 +450,14 @@ fn border_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     let color = u32::try_from(choice).ok().map(|c| c & 0xFF_FF_FF);
     if model
         .appearance(&context.appearance)
-        .border
+        .shown_border()
         .map(|b| b.color)
         == color
     {
         return Vec::new();
     }
-    model.appearance_overrides.border = Some(color);
+    let border = color.map_or(BorderOverride::Hidden, BorderOverride::Color);
+    model.appearance_overrides.border = Some(border);
     vec![Effect::Redraw]
 }
 
@@ -454,9 +488,9 @@ fn shadow_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
 /// コンパクト表示に畳む、または広げる。畳む基準点は拡大縮小と同じ（マウスならカーソル、ほかは中心）。
 fn toggle_compact(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     if model.is_compact() {
-        model.unfold();
+        model.leave_compact();
     } else {
-        model.fold(zoom_anchor(context));
+        model.enter_compact(zoom_anchor(context));
     }
     vec![Effect::Redraw]
 }
@@ -498,7 +532,7 @@ const fn keyboard_move(
         order,
         drag_only: false,
         in_menu: false,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run,
     }
@@ -515,7 +549,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run: copy,
     },
@@ -528,7 +562,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 20,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: save_default,
     },
@@ -541,7 +575,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 30,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: save_as,
     },
@@ -554,7 +588,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: trim,
     },
@@ -630,7 +664,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 0,
         drag_only: true,
         in_menu: false,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run: drag,
     },
@@ -643,7 +677,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: Some(zoom_choices),
         run: zoom_to,
     },
@@ -656,7 +690,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 11,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: zoom_in,
     },
@@ -669,7 +703,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 12,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: zoom_out,
     },
@@ -682,7 +716,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 13,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: zoom_actual,
     },
@@ -695,7 +729,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 20,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: Some(opacity_choices),
         run: opacity_to,
     },
@@ -708,7 +742,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 21,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: opacity_up,
     },
@@ -721,7 +755,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 22,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: opacity_down,
     },
@@ -734,7 +768,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 23,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: Some(border_choices),
         run: border_to,
     },
@@ -747,7 +781,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 24,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: Some(shadow_choices),
         run: shadow_to,
     },
@@ -760,7 +794,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 30,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run: toggle_compact,
     },
@@ -773,7 +807,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run: close,
     },
@@ -1211,7 +1245,7 @@ mod tests {
         let mut model = scrap();
         let effects = execute(op("trim"), &mut model, &OpContext::default());
         assert_eq!(effects, vec![Effect::EnterTrimMode]);
-        assert!(matches!(model.mode, Mode::Trimming(_)));
+        assert!(model.is_trimming());
         trim(&mut model);
         assert_eq!(model.mode, Mode::Normal);
         assert!(model.is_trimmed());
@@ -1377,7 +1411,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (ChoiceLabel::Key("scrap.border.none"), -1),
-                (ChoiceLabel::Key("scrap.border.gray"), 0x80_80_80),
+                (ChoiceLabel::Key("scrap.border.default"), 0x80_80_80),
                 (ChoiceLabel::Key("scrap.border.black"), 0x00_00_00),
                 (ChoiceLabel::Key("scrap.border.white"), 0xFF_FF_FF),
                 (ChoiceLabel::Key("scrap.border.red"), 0xFF_00_00),
@@ -1387,19 +1421,74 @@ mod tests {
         // 既定値は 1px の灰色
         assert_eq!(checked_values("border", &scrap(), &defaults), [0x80_80_80]);
         let no_border = Appearance {
-            border: None,
+            show_border: false,
             ..defaults
         };
         assert_eq!(checked_values("border", &scrap(), &no_border), [-1]);
-        // 一覧にない色なら、どれにもチェックを付けない
+    }
+
+    #[test]
+    fn the_border_list_puts_the_configured_color_first_without_repeating_it() {
+        let red = Appearance {
+            border: Border {
+                width: 2,
+                color: 0xFF_00_00,
+            },
+            ..Appearance::default()
+        };
+        let choices = (op("border").choices.unwrap())(&scrap(), &red);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|c| (c.label, c.value))
+                .collect::<Vec<_>>(),
+            [
+                (ChoiceLabel::Key("scrap.border.none"), -1),
+                (ChoiceLabel::Key("scrap.border.default"), 0xFF_00_00),
+                (ChoiceLabel::Key("scrap.border.gray"), 0x80_80_80),
+                (ChoiceLabel::Key("scrap.border.black"), 0x00_00_00),
+                (ChoiceLabel::Key("scrap.border.white"), 0xFF_FF_FF),
+                (ChoiceLabel::Key("scrap.border.blue"), 0x00_00_FF),
+            ]
+        );
+        assert_eq!(checked_values("border", &scrap(), &red), [0xFF_00_00]);
+        // 決まった色にない色でも、設定の色なら先頭に出してチェックを付ける
         let custom = Appearance {
-            border: Some(Border {
+            border: Border {
                 width: 2,
                 color: 0x12_34_56,
-            }),
-            ..defaults
+            },
+            ..Appearance::default()
         };
-        assert_eq!(checked_values("border", &scrap(), &custom), [] as [i32; 0]);
+        assert_eq!(checked_values("border", &scrap(), &custom), [0x12_34_56]);
+    }
+
+    #[test]
+    fn a_border_added_to_a_scrap_uses_the_configured_width_even_when_the_settings_hide_it() {
+        let defaults = Appearance {
+            border: Border {
+                width: 3,
+                color: 0x80_80_80,
+            },
+            show_border: false,
+            ..Appearance::default()
+        };
+        let mut model = scrap();
+        let choose = OpContext {
+            choice: Some(0x00_00_FF),
+            ..with_defaults(defaults)
+        };
+        assert_eq!(
+            execute(op("border"), &mut model, &choose),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(
+            model.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 3,
+                color: 0x00_00_FF,
+            })
+        );
     }
 
     #[test]
@@ -1414,14 +1503,14 @@ mod tests {
             execute(op("border"), &mut model, &choose(-1)),
             vec![Effect::Redraw]
         );
-        assert_eq!(model.appearance(&defaults).border, None);
+        assert_eq!(model.appearance(&defaults).shown_border(), None);
         assert_eq!(checked_values("border", &model, &defaults), [-1]);
         assert_eq!(
             execute(op("border"), &mut model, &choose(0xFF_00_00)),
             vec![Effect::Redraw]
         );
         assert_eq!(
-            model.appearance(&defaults).border,
+            model.appearance(&defaults).shown_border(),
             Some(Border {
                 width: 1,
                 color: 0xFF_00_00,
@@ -1509,7 +1598,7 @@ mod tests {
     #[test]
     fn only_moving_closing_copying_and_unfolding_run_while_compact() {
         let mut model = scrap();
-        model.fold(ZoomAnchor::Center);
+        model.enter_compact(ZoomAnchor::Center);
         let runnable: Vec<OperationId> = OPERATIONS
             .iter()
             .filter(|op| (op.can_execute)(&model))
@@ -1545,7 +1634,7 @@ mod tests {
     fn the_menu_greys_out_what_cannot_run_while_compact() {
         let shortcuts = Shortcuts::new(OPERATIONS, &ShortcutOverrides::new());
         let mut model = scrap();
-        model.fold(ZoomAnchor::Center);
+        model.enter_compact(ZoomAnchor::Center);
         let enabled: Vec<(OperationId, bool)> =
             menu(OPERATIONS, &model, &shortcuts, &Appearance::default())
                 .into_iter()
@@ -2059,9 +2148,40 @@ mod tests {
             order,
             drag_only: false,
             in_menu: true,
-            can_execute: always,
+            can_execute: not_trimming,
             choices: None,
             run: nothing,
+        }
+    }
+
+    #[test]
+    fn the_wheel_maps_to_a_gesture_only_without_modifiers_or_with_ctrl_alone() {
+        let none = Modifiers::default();
+        let ctrl = Modifiers { ctrl: true, ..none };
+        assert_eq!(MouseGesture::wheel(none, 120), Some(MouseGesture::WheelUp));
+        assert_eq!(MouseGesture::wheel(none, -1), Some(MouseGesture::WheelDown));
+        assert_eq!(
+            MouseGesture::wheel(ctrl, 1),
+            Some(MouseGesture::CtrlWheelUp)
+        );
+        assert_eq!(
+            MouseGesture::wheel(ctrl, -120),
+            Some(MouseGesture::CtrlWheelDown)
+        );
+        assert_eq!(MouseGesture::wheel(none, 0), None);
+        for other in [
+            Modifiers {
+                shift: true,
+                ..none
+            },
+            Modifiers { alt: true, ..none },
+            Modifiers { win: true, ..none },
+            Modifiers {
+                shift: true,
+                ..ctrl
+            },
+        ] {
+            assert_eq!(MouseGesture::wheel(other, 120), None, "{other:?}");
         }
     }
 }
