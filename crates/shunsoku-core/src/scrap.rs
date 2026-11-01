@@ -57,8 +57,12 @@ pub const ZOOM_MAX: u16 = 800;
 /// 画素等倍の倍率（%）。
 pub const ZOOM_ACTUAL: u16 = 100;
 
-/// コンパクト表示の正方形の一辺（物理ピクセル）。
+/// コンパクト表示の正方形の一辺（96 DPI での物理ピクセル）。実際の一辺はモニタの DPI で換算する
+/// （`ScrapModel::compact_side`）。
 pub const COMPACT_SIDE: u32 = 64;
+
+/// 拡大率 100% のモニタの DPI。
+const BASE_DPI: u32 = 96;
 
 /// コンパクト表示に畳んだときの位置。広げるときに、畳んだあとの移動の分だけずらすために覚えておく。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,7 +127,7 @@ impl ScrapModel {
         self.folded.is_some()
     }
 
-    /// コンパクト表示（一辺 `COMPACT_SIDE` の正方形）に畳む。`anchor` が正方形の中心になる（`Center` なら
+    /// コンパクト表示（一辺 `compact_side` の正方形）に畳む。`anchor` が正方形の中心になる（`Center` なら
     /// 画像の中心）。倍率はそのまま残る。もう畳んでいれば false。
     pub fn fold(&mut self, anchor: ZoomAnchor) -> bool {
         if self.is_compact() {
@@ -140,7 +144,7 @@ impl ScrapModel {
             }
             ZoomAnchor::At(at) => at,
         };
-        let half = (COMPACT_SIDE / 2) as i32;
+        let half = (self.compact_side() / 2) as i32;
         let folded = Point::new(center.x.saturating_sub(half), center.y.saturating_sub(half));
         self.folded = Some(Folded {
             unfolded: self.position,
@@ -203,7 +207,7 @@ impl ScrapModel {
         if from == dpi {
             return false;
         }
-        match scaling {
+        let rescaled = match scaling {
             DpiScaling::KeepPixels => {
                 self.dpi_origin = None;
                 false
@@ -215,7 +219,52 @@ impl ScrapModel {
                 let scaled = u16::try_from(scaled).unwrap_or(u16::MAX);
                 self.scale_to(scaled, anchor)
             }
+        };
+        if self.is_compact() {
+            // 正方形はどちらの設定でも 64px 相当に保つ
+            return self.resize_compact(compact_side_at(from), anchor);
         }
+        rescaled
+    }
+
+    /// コンパクト表示の正方形の一辺（物理ピクセル）。`COMPACT_SIDE` をウィンドウのあるモニタの DPI で換算する
+    /// （DPI が分かるまでは 96 DPI とみなす）。
+    pub fn compact_side(&self) -> u32 {
+        compact_side_at(self.dpi.unwrap_or(BASE_DPI))
+    }
+
+    /// 畳んだ正方形の一辺が `before` から変わったら、`anchor` の下の点が動かないように位置を動かす。
+    /// 大きさを変えただけなので、広げるときの移動の量には数えない。変わったら true。
+    fn resize_compact(&mut self, before: u32, anchor: ZoomAnchor) -> bool {
+        let after = self.compact_side();
+        if after == before {
+            return false;
+        }
+        let p = self.position;
+        let (anchor_x, anchor_y) = match anchor {
+            ZoomAnchor::Center => (
+                f64::from(p.x) + f64::from(before) / 2.0,
+                f64::from(p.y) + f64::from(before) / 2.0,
+            ),
+            ZoomAnchor::At(at) => (f64::from(at.x), f64::from(at.y)),
+        };
+        self.position = Point::new(
+            scaled_origin(anchor_x, p.x, before, after),
+            scaled_origin(anchor_y, p.y, before, after),
+        );
+        if let Some(folded) = self.folded.as_mut() {
+            folded.folded = Point::new(
+                folded
+                    .folded
+                    .x
+                    .saturating_add(self.position.x.saturating_sub(p.x)),
+                folded
+                    .folded
+                    .y
+                    .saturating_add(self.position.y.saturating_sub(p.y)),
+            );
+        }
+        true
     }
 
     /// 倍率を `zoom`（%、範囲に収める）にし、`anchor` の下の画素が動かないように位置を動かす。
@@ -240,15 +289,9 @@ impl ScrapModel {
             ),
             ZoomAnchor::At(at) => (f64::from(at.x), f64::from(at.y)),
         };
-        // 基準点から画像の左上までの距離を、表示の大きさの比で伸び縮みさせる
-        let scale = |anchor: f64, from: i32, before: u32, after: u32| {
-            let ratio = f64::from(after) / f64::from(before.max(1));
-            let to = anchor - (anchor - f64::from(from)) * ratio;
-            to.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
-        };
         self.position = Point::new(
-            scale(anchor_x, p.x, before.width, after.width),
-            scale(anchor_y, p.y, before.height, after.height),
+            scaled_origin(anchor_x, p.x, before.width, after.width),
+            scaled_origin(anchor_y, p.y, before.height, after.height),
         );
         true
     }
@@ -415,7 +458,8 @@ impl ScrapModel {
     /// 画像を出す矩形（スクリーン座標）。大きさは倍率を掛けた表示の大きさ。畳んでいる間は正方形。
     pub fn image_rect(&self) -> Rect {
         let size = if self.is_compact() {
-            Size::new(COMPACT_SIDE, COMPACT_SIDE)
+            let side = self.compact_side();
+            Size::new(side, side)
         } else {
             self.display_size()
         };
@@ -428,6 +472,21 @@ impl ScrapModel {
         self.image_rect()
             .inflate(self.appearance(defaults).margin())
     }
+}
+
+/// `dpi` のモニタでのコンパクト表示の正方形の一辺（物理ピクセル、四捨五入）。
+fn compact_side_at(dpi: u32) -> u32 {
+    let side = (u64::from(COMPACT_SIDE) * u64::from(dpi) * 2 + u64::from(BASE_DPI))
+        / (u64::from(BASE_DPI) * 2);
+    u32::try_from(side).unwrap_or(u32::MAX).max(1)
+}
+
+/// 大きさが `before` から `after` に変わるときの、新しい左上の座標（1 軸）。基準点 `anchor` から左上 `from` までの
+/// 距離を、大きさの比で伸び縮みさせる。
+fn scaled_origin(anchor: f64, from: i32, before: u32, after: u32) -> i32 {
+    let ratio = f64::from(after) / f64::from(before.max(1));
+    let to = anchor - (anchor - f64::from(from)) * ratio;
+    to.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
 /// 1 段上の倍率。100% までは 10% の、その上は 25% の倍数のうち、`zoom` より大きい最初のもの。
@@ -1141,19 +1200,66 @@ mod tests {
     }
 
     #[test]
-    fn a_folded_scrap_stays_put_when_it_moves_to_another_dpi() {
+    fn a_folded_scrap_rescales_its_zoom_for_when_it_unfolds_on_another_dpi() {
         let keep = DpiScaling::KeepApparentSize;
         let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
         scrap.set_dpi(144, keep, ZoomAnchor::Center);
         scrap.fold(ZoomAnchor::Center);
-        let square = scrap.image_rect();
-        // 畳んだ正方形の大きさは変わらないので、描き直さず、位置も動かさない
-        assert!(!scrap.set_dpi(96, keep, ZoomAnchor::Center));
-        assert_eq!(scrap.image_rect(), square);
+        scrap.set_dpi(96, keep, ZoomAnchor::Center);
         // 倍率は計算し直してあり、広げると移動先の DPI での見かけの大きさで出る
         assert_eq!(scrap.zoom(), 67);
         scrap.unfold();
         assert_eq!(scrap.image_rect().size(), Size::new(201, 134));
+    }
+
+    #[test]
+    fn resizing_the_square_for_a_dpi_does_not_count_as_moving_it() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_dpi(96, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        scrap.fold(ZoomAnchor::Center);
+        scrap.set_dpi(144, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        scrap.unfold();
+        assert_eq!(scrap.image_rect(), Rect::new(0, 0, 300, 200));
+    }
+
+    #[test]
+    fn the_compact_square_is_64px_at_96_dpi_and_scales_with_the_dpi() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_dpi(144, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        // 中心は (150, 100)。144 DPI では 64px 相当は 96px
+        scrap.fold(ZoomAnchor::Center);
+        assert_eq!(scrap.image_rect(), Rect::new(102, 52, 198, 148));
+        let mut at_96 = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        at_96.set_dpi(96, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        at_96.fold(ZoomAnchor::Center);
+        assert_eq!(at_96.image_rect(), Rect::new(118, 68, 182, 132));
+    }
+
+    #[test]
+    fn a_folded_scrap_resizes_its_square_around_the_anchor_on_another_dpi() {
+        for scaling in [DpiScaling::KeepPixels, DpiScaling::KeepApparentSize] {
+            let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+            scrap.set_dpi(96, scaling, ZoomAnchor::Center);
+            scrap.fold(ZoomAnchor::Center);
+            assert_eq!(scrap.image_rect(), Rect::new(118, 68, 182, 132));
+            // 正方形の中心 (150, 100) を残して 96px にする
+            assert!(
+                scrap.set_dpi(144, scaling, ZoomAnchor::Center),
+                "{scaling:?}"
+            );
+            assert_eq!(
+                scrap.image_rect(),
+                Rect::new(102, 52, 198, 148),
+                "{scaling:?}"
+            );
+            // ドラッグ中はカーソルの下が動かない
+            assert!(scrap.set_dpi(96, scaling, ZoomAnchor::At(Point::new(102, 52))));
+            assert_eq!(
+                scrap.image_rect(),
+                Rect::new(102, 52, 166, 116),
+                "{scaling:?}"
+            );
+        }
     }
 
     #[test]
