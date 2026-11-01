@@ -143,6 +143,8 @@ struct App {
     /// 名前を決めて裏のスレッドに渡し、まだ結果（`WM_APP_SAVED`）を受けていない保存先。次の名前を決めるとき、
     /// 使われている名前として数える（`save::destination`）。
     pending_saves: Vec<PathBuf>,
+    /// スクラップの中身を描く Direct2D の描き手。描き直しのたびに作らないよう使い回す（`paint_scrap`）。
+    renderer: Option<render::Renderer>,
     /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
     notice_folder: Option<PathBuf>,
     gpu: grab::Gpu,
@@ -187,13 +189,18 @@ struct Scrap {
 impl Scrap {
     /// `Effect::Redraw`: `model` のとおりに出し直す。大きさとモードが `before` と同じなら、中身は変わらないので
     /// ウィンドウを動かすだけにする（ドラッグのたびに描き直さない）。
-    fn redraw(&self, before: &ScrapModel, appearance: &Appearance) {
+    fn redraw(
+        &self,
+        before: &ScrapModel,
+        appearance: &Appearance,
+        renderer: &mut Option<render::Renderer>,
+    ) {
         let rect = self.model.window_rect(appearance);
         let result = if self.model.image_size == before.image_size && self.model.mode == before.mode
         {
             self.window.move_to(rect)
         } else {
-            paint_scrap(&self.window, &self.image, rect, appearance)
+            paint_scrap(renderer, &self.window, &self.image, rect, appearance)
         };
         if let Err(e) = result {
             log::warn!("could not redraw a scrap: {e}");
@@ -202,14 +209,23 @@ impl Scrap {
 }
 
 /// スクラップの中身を描いて、ウィンドウを `rect` に出す。
+///
+/// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
+/// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
 fn paint_scrap(
+    renderer: &mut Option<render::Renderer>,
     window: &scrap_window::ScrapWindow,
     image: &Image,
     rect: Rect,
     appearance: &Appearance,
 ) -> Result<()> {
     let canvas = render::Canvas::new(rect.size())?;
-    render::Renderer::new()?.paint_scrap(&canvas, image, appearance)?;
+    let painter = match renderer.take() {
+        Some(painter) => painter,
+        None => render::Renderer::new()?,
+    };
+    painter.paint_scrap(&canvas, image, appearance)?;
+    *renderer = Some(painter);
     // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
     window.present(canvas.dc(), rect, appearance.opacity)
 }
@@ -464,6 +480,7 @@ fn start(
         scraps: Vec::new(),
         saves: mpsc::channel(),
         pending_saves: Vec::new(),
+        renderer: None,
         notice_folder: None,
         gpu: grab::Gpu::default(),
         hotkeys,
@@ -934,14 +951,17 @@ fn render_for(image: &Image, job: fn(Image) -> Deferred, failed_key: &'static st
 fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
     let deferred = with_app(|app| {
         let appearance = Appearance::from(app.settings.scrap);
-        let scrap = app.scrap_mut(hwnd)?;
+        let App {
+            scraps, renderer, ..
+        } = app;
+        let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
         let before = scrap.model.clone();
         let mut deferred = Vec::new();
         for effect in ops::execute(op, &mut scrap.model, &context) {
             match effect {
                 // ウィンドウを動かす・描き直すときに届くメッセージ（WM_WINDOWPOSCHANGED、WM_DPICHANGED など）では
                 // App を借りないので、借りたままでよい
-                Effect::Redraw => scrap.redraw(&before, &appearance),
+                Effect::Redraw => scrap.redraw(&before, &appearance, renderer),
                 Effect::Close => deferred.push(Deferred::Close),
                 // 描くだけでメッセージは届かないので、借りたまま描く
                 Effect::CopyToClipboard => {
@@ -1271,7 +1291,11 @@ fn open_scrap(
     let model = ScrapModel::new(at, image.size());
     let rect = model.window_rect(appearance);
     let window = scrap_window::ScrapWindow::create(module, rect)?;
-    paint_scrap(&window, &image, rect, appearance)?;
+    // 描いて出すときに届くメッセージ（WM_WINDOWPOSCHANGED など）では App を借りないので、借りたまま描いてよい。
+    // 借りられなければ（起こらないはず）、その場かぎりの描き手で描く
+    let painted = with_app(|app| paint_scrap(&mut app.renderer, &window, &image, rect, appearance))
+        .unwrap_or_else(|| paint_scrap(&mut None, &window, &image, rect, appearance));
+    painted?;
     window.show(focus);
     Ok(Scrap {
         window,
@@ -1541,7 +1565,13 @@ fn apply_changes(app: &mut App, changes: &SettingsChanges) {
         let appearance = Appearance::from(app.settings.scrap);
         for scrap in &app.scraps {
             let rect = scrap.model.window_rect(&appearance);
-            if let Err(e) = paint_scrap(&scrap.window, &scrap.image, rect, &appearance) {
+            if let Err(e) = paint_scrap(
+                &mut app.renderer,
+                &scrap.window,
+                &scrap.image,
+                rect,
+                &appearance,
+            ) {
                 log::warn!("could not redraw a scrap with the new appearance: {e}");
             }
         }
