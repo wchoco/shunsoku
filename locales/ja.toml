@@ -51,7 +51,27 @@ zoom = "拡大縮小"
 zoom_in = "拡大"
 zoom_out = "縮小"
 zoom_actual = "元のサイズに戻す"
+appearance = "見た目"
+opacity = "透明度"
+opacity_up = "濃くする"
+opacity_down = "薄くする"
+border = "枠"
+shadow = "影"
 close = "閉じる"
+
+# 枠の一覧（scrap::ops の border の選択肢）
+[scrap.border]
+none = "なし"
+gray = "灰"
+black = "黒"
+white = "白"
+red = "赤"
+blue = "青"
+
+# 影の一覧（scrap::ops の shadow の選択肢）
+[scrap.shadow]
+on = "あり"
+off = "なし"
 
 # 裏のスレッドのパニック（その仕事の失敗の理由として出す）
 [job]

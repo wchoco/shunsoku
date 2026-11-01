@@ -747,6 +747,20 @@ shadow = 1
     }
 
     #[test]
+    fn an_opacity_outside_10_to_100_falls_back_to_the_default_and_is_named() {
+        for value in ["9", "101", "0", "-10"] {
+            let (settings, issues) = load(&format!("version = 1\n[scrap]\nopacity = {value}\n"));
+            assert_eq!(issues, vec![invalid("scrap.opacity")], "{value}");
+            assert_eq!(settings.scrap.opacity, 100, "{value}");
+        }
+        for (value, opacity) in [("10", 10), ("55", 55), ("100", 100)] {
+            let (settings, issues) = load(&format!("version = 1\n[scrap]\nopacity = {value}\n"));
+            assert_eq!(issues, vec![], "{value}");
+            assert_eq!(settings.scrap.opacity, opacity, "{value}");
+        }
+    }
+
+    #[test]
     fn the_trash_limit_defaults_to_10_and_out_of_range_values_fall_back_to_it() {
         assert_eq!(load("version = 1\n").0.general.trash_limit, 10);
         for (value, limit) in [("0", 0), ("2", 2), ("100", 100)] {
