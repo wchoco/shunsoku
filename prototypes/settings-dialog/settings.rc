@@ -1,0 +1,56 @@
+// Settings dialog prototype (#38). UTF-8; compiled by build.rs with rc.exe.
+// No #include: the few style constants are defined here so rc.exe needs no INCLUDE path.
+#pragma code_page(65001)
+
+#define WS_POPUP        0x80000000L
+#define WS_VISIBLE      0x10000000L
+#define WS_CAPTION      0x00C00000L
+#define WS_BORDER       0x00800000L
+#define WS_VSCROLL      0x00200000L
+#define WS_SYSMENU      0x00080000L
+#define WS_GROUP        0x00020000L
+#define WS_MINIMIZEBOX  0x00020000L
+#define WS_TABSTOP      0x00010000L
+#define WS_CHILD        0x40000000L
+#define DS_SETFONT      0x40L
+#define DS_CENTER       0x0800L
+#define CBS_DROPDOWNLIST 0x0003L
+#define LBS_NOINTEGRALHEIGHT 0x0100L
+#define LBS_NOSEL       0x4000L
+
+// Keep in sync with src/main.rs.
+#define IDD_SETTINGS  101
+#define IDC_HOTKEY    1001
+#define IDC_VALUE     1002
+#define IDC_DPI       1003
+#define IDC_STATUS    1004
+#define IDC_LOG       1005
+#define IDC_INTERCEPT 1006
+#define IDC_DARK      1007
+#define IDC_CLEAR     1008
+#define IDC_REOPEN    1009
+#define IDC_CLOSE     1010
+#define IDC_COMBO     1011
+
+IDD_SETTINGS DIALOGEX 0, 0, 270, 208
+STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "瞬速 設定（試作 #38）"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "日本語の表示確認：設定画面の試作（ADR-0004）。あいうえお／漢字／ｶﾀｶﾅ", -1, 7, 7, 256, 10
+    LTEXT           "ショートカット:", -1, 7, 25, 60, 8
+    CONTROL         "", IDC_HOTKEY, "msctls_hotkey32", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP, 70, 22, 120, 14
+    PUSHBUTTON      "クリア", IDC_CLEAR, 196, 22, 50, 14
+    LTEXT           "現在の値:", -1, 7, 42, 60, 8
+    LTEXT           "", IDC_VALUE, 70, 42, 193, 8
+    AUTOCHECKBOX    "WM_KEYDOWN / WM_SYSKEYDOWN もサブクラスで横取りする", IDC_INTERCEPT, 7, 54, 256, 10
+    LTEXT           "マウスの割り当て:", -1, 7, 71, 60, 8
+    COMBOBOX        IDC_COMBO, 70, 68, 120, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "キー履歴（新しい順）:", -1, 7, 86, 120, 8
+    LISTBOX         IDC_LOG, 7, 96, 256, 64, WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT | LBS_NOSEL
+    LTEXT           "", IDC_DPI, 7, 164, 256, 8
+    LTEXT           "", IDC_STATUS, 7, 175, 256, 8
+    PUSHBUTTON      "ダーク切替", IDC_DARK, 7, 188, 60, 14
+    PUSHBUTTON      "DPI モード切替（開き直す）", IDC_REOPEN, 72, 188, 110, 14
+    PUSHBUTTON      "閉じる", IDC_CLOSE, 213, 188, 50, 14
+END
