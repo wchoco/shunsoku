@@ -12,6 +12,8 @@ mod hotkey;
 #[cfg(windows)]
 mod logger;
 #[cfg(windows)]
+mod menu;
+#[cfg(windows)]
 mod notify;
 #[cfg(windows)]
 mod overlay;
