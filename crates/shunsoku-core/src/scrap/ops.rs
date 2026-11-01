@@ -88,6 +88,8 @@ pub enum MouseGesture {
     CtrlWheelUp,
     /// Ctrl を押しながらホイールを下（手前）へ 1 ノッチ。
     CtrlWheelDown,
+    /// 左ボタンのダブルクリック（`WM_LBUTTONDBLCLK`）。
+    DoubleClick,
 }
 
 /// メニューの区切りのまとまり。宣言の順にメニューに並ぶ（spec #33: コピー / 保存 ─ トリム / 書き込み ─
@@ -172,6 +174,12 @@ const CTRL_SHIFT_S: Chord = CTRL_S.shift();
 
 const fn always(_: &ScrapModel) -> bool {
     true
+}
+
+/// コンパクト表示に畳んでいないときだけ実行できる。畳んでいる間に実行できるのは移動・閉じる・コピーと、
+/// 広げる操作だけにする（spec #33）。
+fn unfolded(model: &ScrapModel) -> bool {
+    !model.is_compact()
 }
 
 /// `(dx, dy)` だけ動かす操作の `run`。
@@ -389,6 +397,16 @@ fn shadow_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     vec![Effect::Redraw]
 }
 
+/// コンパクト表示に畳む、または広げる。畳む基準点は拡大縮小と同じ（マウスならカーソル、ほかは中心）。
+fn toggle_compact(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    if model.is_compact() {
+        model.unfold();
+    } else {
+        model.fold(zoom_anchor(context));
+    }
+    vec![Effect::Redraw]
+}
+
 fn save_as(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     vec![Effect::ShowSaveDialog]
 }
@@ -440,7 +458,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 20,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: unfolded,
         choices: None,
         run: save_default,
     },
@@ -453,7 +471,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 30,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: unfolded,
         choices: None,
         run: save_as,
     },
@@ -529,7 +547,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: unfolded,
         choices: Some(zoom_choices),
         run: zoom_to,
     },
@@ -542,7 +560,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 11,
         drag_only: false,
         in_menu: false,
-        can_execute: always,
+        can_execute: unfolded,
         choices: None,
         run: zoom_in,
     },
@@ -555,7 +573,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 12,
         drag_only: false,
         in_menu: false,
-        can_execute: always,
+        can_execute: unfolded,
         choices: None,
         run: zoom_out,
     },
@@ -568,7 +586,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 13,
         drag_only: false,
         in_menu: false,
-        can_execute: always,
+        can_execute: unfolded,
         choices: None,
         run: zoom_actual,
     },
@@ -581,7 +599,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 20,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: unfolded,
         choices: Some(opacity_choices),
         run: opacity_to,
     },
@@ -594,7 +612,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 21,
         drag_only: false,
         in_menu: false,
-        can_execute: always,
+        can_execute: unfolded,
         choices: None,
         run: opacity_up,
     },
@@ -607,7 +625,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 22,
         drag_only: false,
         in_menu: false,
-        can_execute: always,
+        can_execute: unfolded,
         choices: None,
         run: opacity_down,
     },
@@ -620,7 +638,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 23,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: unfolded,
         choices: Some(border_choices),
         run: border_to,
     },
@@ -633,9 +651,22 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 24,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: unfolded,
         choices: Some(shadow_choices),
         run: shadow_to,
+    },
+    OperationDescriptor {
+        id: "toggle_compact",
+        label_key: "scrap.op.toggle_compact",
+        default_shortcut: &[],
+        default_mouse: Some(MouseGesture::DoubleClick),
+        group: Group::View,
+        order: 30,
+        drag_only: false,
+        in_menu: true,
+        can_execute: always,
+        choices: None,
+        run: toggle_compact,
     },
     OperationDescriptor {
         id: "close",
@@ -1191,6 +1222,100 @@ mod tests {
         assert_eq!(bound(&shortcuts, "Ctrl+Up"), Some("opacity_up"));
     }
 
+    #[test]
+    fn a_double_click_folds_around_the_cursor_and_toggles_back() {
+        let id = |g| mouse_operation(OPERATIONS, g).map(|op| op.id);
+        assert_eq!(id(MouseGesture::DoubleClick), Some("toggle_compact"));
+        let mut model = scrap();
+        let at_cursor = OpContext {
+            cursor: Some(Point::new(-90, 60)),
+            ..OpContext::default()
+        };
+        let effects = execute(op("toggle_compact"), &mut model, &at_cursor);
+        assert_eq!(effects, vec![Effect::Redraw]);
+        assert!(model.is_compact());
+        assert_eq!(model.image_rect(), Rect::new(-122, 28, -58, 92));
+        let effects = execute(op("toggle_compact"), &mut model, &at_cursor);
+        assert_eq!(effects, vec![Effect::Redraw]);
+        assert_eq!(model, scrap());
+    }
+
+    #[test]
+    fn the_menu_folds_around_the_center() {
+        let mut model = scrap();
+        execute(op("toggle_compact"), &mut model, &OpContext::default());
+        assert_eq!(model.image_rect(), Rect::new(18, 118, 82, 182));
+    }
+
+    #[test]
+    fn only_moving_closing_copying_and_unfolding_run_while_compact() {
+        let mut model = scrap();
+        model.fold(ZoomAnchor::Center);
+        let runnable: Vec<OperationId> = OPERATIONS
+            .iter()
+            .filter(|op| (op.can_execute)(&model))
+            .map(|op| op.id)
+            .collect();
+        assert_eq!(
+            runnable,
+            [
+                "copy",
+                "move_left",
+                "move_right",
+                "move_up",
+                "move_down",
+                "move_left_10",
+                "move_right_10",
+                "move_up_10",
+                "move_down_10",
+                "move",
+                "toggle_compact",
+                "close",
+            ]
+        );
+        // 実行できない操作は呼んでも何もしない
+        let before = model.clone();
+        assert_eq!(
+            execute(op("zoom_in"), &mut model, &OpContext::default()),
+            vec![]
+        );
+        assert_eq!(model, before);
+    }
+
+    #[test]
+    fn the_menu_greys_out_what_cannot_run_while_compact() {
+        let shortcuts = Shortcuts::new(OPERATIONS, &ShortcutOverrides::new());
+        let mut model = scrap();
+        model.fold(ZoomAnchor::Center);
+        let enabled: Vec<(OperationId, bool)> =
+            menu(OPERATIONS, &model, &shortcuts, &Appearance::default())
+                .into_iter()
+                .flat_map(|entry| match entry {
+                    MenuEntry::Folder(folder) => folder.entries,
+                    other => vec![other],
+                })
+                .filter_map(|entry| match entry {
+                    MenuEntry::Item(item) => Some((item.id, item.enabled)),
+                    MenuEntry::Submenu(submenu) => Some((submenu.id, submenu.enabled)),
+                    MenuEntry::Folder(_) | MenuEntry::Separator => None,
+                })
+                .collect();
+        assert_eq!(
+            enabled,
+            [
+                ("copy", true),
+                ("save_default", false),
+                ("save_as", false),
+                ("zoom", false),
+                ("opacity", false),
+                ("border", false),
+                ("shadow", false),
+                ("toggle_compact", true),
+                ("close", true),
+            ]
+        );
+    }
+
     fn chord(s: &str) -> Chord {
         s.parse().unwrap()
     }
@@ -1323,6 +1448,7 @@ mod tests {
                         }))
                         .to_vec(),
                 }),
+                item("toggle_compact", true, None),
                 MenuEntry::Separator,
                 item("close", true, Some("Esc")),
             ]

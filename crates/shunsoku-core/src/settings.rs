@@ -18,6 +18,8 @@
 //! file_name_template = "shunsoku_{date}-{time}"
 //! notifications = true                         # false で止まるのは成功の通知だけ
 //! trash_limit = 10                             # ごみ箱の上限（0〜100 件）。0 なら閉じたらすぐに破棄
+//! dpi_scaling = "keep_pixels"                  # DPI の違うモニタへ動かしたとき: keep_pixels（画素を等倍に保つ）
+//!                                              #   / keep_apparent_size（見かけの大きさを保つ）
 //!
 //! [hotkeys]
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
@@ -82,6 +84,8 @@ pub struct General {
     pub notifications: bool,
     /// ごみ箱の上限（件）。0 なら閉じたらすぐに破棄する。
     pub trash_limit: u8,
+    /// DPI の違うモニタへスクラップを動かしたときの見え方。
+    pub dpi_scaling: DpiScaling,
 }
 
 impl Default for General {
@@ -91,6 +95,7 @@ impl Default for General {
             file_name_template: DEFAULT_FILE_NAME_TEMPLATE.to_owned(),
             notifications: true,
             trash_limit: DEFAULT_TRASH_LIMIT,
+            dpi_scaling: DpiScaling::default(),
         }
     }
 }
@@ -198,6 +203,16 @@ impl Default for Border {
 /// 色。設定ファイルでは `#RRGGBB` で書く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
+
+/// DPI の違うモニタへスクラップを動かしたときの見え方（`[general] dpi_scaling`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DpiScaling {
+    /// 画素を等倍に保つ。表示の大きさ（物理ピクセル）は変えず、見かけの大きさが変わる。
+    #[default]
+    KeepPixels,
+    /// 見かけの大きさを保つ。移動先の DPI に合わせて表示の大きさを変え、倍率を画素基準で計算し直す。
+    KeepApparentSize,
+}
 
 /// ログのレベル。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -405,6 +420,9 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }) {
         s.general.trash_limit = limit;
     }
+    if let Some(scaling) = r.value(general, "general", "dpi_scaling", dpi_scaling) {
+        s.general.dpi_scaling = scaling;
+    }
 
     let hotkeys = r.table(root, "hotkeys");
     for action in HotkeyAction::ALL {
@@ -549,6 +567,14 @@ fn rgb(item: &Item) -> Option<Rgb> {
     Some(Rgb(channel(0)?, channel(2)?, channel(4)?))
 }
 
+fn dpi_scaling(item: &Item) -> Option<DpiScaling> {
+    match item.as_str()? {
+        "keep_pixels" => Some(DpiScaling::KeepPixels),
+        "keep_apparent_size" => Some(DpiScaling::KeepApparentSize),
+        _ => None,
+    }
+}
+
 fn log_level(item: &Item) -> Option<LogLevel> {
     let level = match item.as_str()?.to_ascii_lowercase().as_str() {
         "off" => LogLevel::Off,
@@ -609,6 +635,7 @@ save_dir = 'D:\shots'
 file_name_template = "cap_{datetime:yyyy}"
 notifications = false
 trash_limit = 3
+dpi_scaling = "keep_apparent_size"
 
 [hotkeys]
 select_capture = "Win+Shift+PrintScreen"
@@ -635,6 +662,7 @@ shadow = false
                     file_name_template: "cap_{datetime:yyyy}".to_owned(),
                     notifications: false,
                     trash_limit: 3,
+                    dpi_scaling: DpiScaling::KeepApparentSize,
                 },
                 hotkeys: Hotkeys {
                     select_capture: Some(chord("Win+Shift+PrintScreen")),
@@ -774,6 +802,34 @@ shadow = 1
                 load(&format!("version = 1\n[general]\ntrash_limit = {value}\n"));
             assert_eq!(issues, vec![invalid("general.trash_limit")], "{value}");
             assert_eq!(settings.general.trash_limit, 10, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_dpi_scaling_defaults_to_keeping_pixels_and_unknown_values_fall_back_to_it() {
+        assert_eq!(
+            load("version = 1\n").0.general.dpi_scaling,
+            DpiScaling::KeepPixels
+        );
+        for (value, scaling) in [
+            ("keep_pixels", DpiScaling::KeepPixels),
+            ("keep_apparent_size", DpiScaling::KeepApparentSize),
+        ] {
+            let (settings, issues) = load(&format!(
+                "version = 1\n[general]\ndpi_scaling = \"{value}\"\n"
+            ));
+            assert_eq!(issues, vec![], "{value}");
+            assert_eq!(settings.general.dpi_scaling, scaling, "{value}");
+        }
+        for value in ["\"keep_size\"", "\"\"", "true", "1"] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[general]\ndpi_scaling = {value}\n"));
+            assert_eq!(issues, vec![invalid("general.dpi_scaling")], "{value}");
+            assert_eq!(
+                settings.general.dpi_scaling,
+                DpiScaling::KeepPixels,
+                "{value}"
+            );
         }
     }
 

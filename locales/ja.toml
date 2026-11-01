@@ -57,6 +57,7 @@ opacity_up = "濃くする"
 opacity_down = "薄くする"
 border = "枠"
 shadow = "影"
+toggle_compact = "コンパクト表示"
 close = "閉じる"
 
 # 枠の一覧（scrap::ops の border の選択肢）
