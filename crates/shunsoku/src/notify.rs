@@ -14,6 +14,7 @@ use crate::wide::copy_truncated;
 
 /// 通知の種類。設定で通知をオフにしても、止めるのは `Success` だけ（spec #32）。
 pub enum Level {
+    #[expect(dead_code, reason = "保存の通知（#44）で使う")]
     Success,
     Warning,
     Error,

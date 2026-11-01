@@ -10,6 +10,8 @@ use std::time::Duration;
 /// 依頼の発生源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
+    /// 範囲選択キャプチャのホットキー。
+    Hotkey,
     /// トレイのアイコンの左クリック（またはキーボードで選んで Enter / Space）。
     TrayClick,
     /// トレイのメニューの「範囲選択キャプチャ」。
@@ -68,7 +70,7 @@ impl CaptureRequest {
     /// 発生源から依頼を作る。
     pub fn from_source(source: Source) -> CaptureRequest {
         match source {
-            Source::TrayClick | Source::TrayMenu => CaptureRequest::select(),
+            Source::Hotkey | Source::TrayClick | Source::TrayMenu => CaptureRequest::select(),
         }
     }
 
@@ -120,6 +122,12 @@ mod tests {
     #[test]
     fn tray_menu_requests_a_select_capture_shown_as_a_focused_scrap() {
         let request = CaptureRequest::from_source(Source::TrayMenu);
+        assert_eq!(request, select_capture());
+    }
+
+    #[test]
+    fn hotkey_requests_a_select_capture_shown_as_a_focused_scrap() {
+        let request = CaptureRequest::from_source(Source::Hotkey);
         assert_eq!(request, select_capture());
     }
 }

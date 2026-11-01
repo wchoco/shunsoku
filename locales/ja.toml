@@ -12,3 +12,14 @@ exit = "終了"
 [panic]
 title = "shunsoku"
 body = "予期しないエラーが起きたため、shunsoku を終了します。詳しくはログを見てください。"
+
+[notify]
+title = "shunsoku"
+
+[settings]
+unreadable = "設定ファイルを読めないため、既定値で起動しました。"
+invalid_items = "不正な項目を既定値にしました: "
+
+[hotkey]
+failed = "次のホットキーを登録できませんでした（他のアプリが使っている可能性があります）: "
+unset = "範囲選択キャプチャのホットキーが未設定です。設定ファイルの [hotkeys] の select_capture に書いてください（トレイからも撮れます）。"

@@ -17,16 +17,20 @@
 //!   ほかに、範囲選択の画面を開いている間だけ、モニタごとのウィンドウ（`overlay`）がある。
 //! - キャプチャは `capture::request` の依頼 1 本の流れで進める: 依頼 → 待機（`delay`）→ 取得（`grab`）→
 //!   範囲選択の画面（`overlay`）→ 切り抜き → 出力 → 結果。同時に進める依頼は 1 件だけ（`Capture`）。
+//! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に 1 回読む。ファイルは作らず、書き換えない。
+//!   問題（読めない・不正な項目・登録できないホットキー・未設定のホットキー）は、まとめて 1 回だけ通知する。
+//! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
 use shunsoku_core::capture::request::{CaptureRequest, Source};
 use shunsoku_core::i18n::Catalog;
+use shunsoku_core::settings::{self, LogLevel, Settings, SettingsIssue};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -37,12 +41,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
     IDI_APPLICATION, KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SetTimer, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP,
-    WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN, WM_TIMER,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
+    WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
-use crate::{grab, logger, overlay, panic_hook, single_instance, tray};
+use crate::{grab, hotkey, logger, notify, overlay, panic_hook, single_instance, tray};
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
 const WM_APP_TRAY: u32 = WM_APP + 1;
@@ -75,12 +79,14 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-/// アプリの状態。UI スレッドだけが持つ。drop の順（宣言の順）でトレイを消し、範囲選択の画面を閉じてから
-/// ウィンドウを壊す。
+/// アプリの状態。UI スレッドだけが持つ。drop の順（宣言の順）でトレイを消し、範囲選択の画面を閉じ、
+/// ホットキーの登録を外してからウィンドウを壊す。
 struct App {
     tray: tray::Tray,
+    settings: Settings,
     capture: Capture,
     gpu: grab::Gpu,
+    hotkeys: hotkey::Registered,
     windows: Windows,
     module: HINSTANCE,
     _instance: Option<single_instance::Guard>,
@@ -123,9 +129,9 @@ fn text(key: &'static str) -> &'static str {
 
 /// 常駐本体を動かし、終了コードを返す。
 pub fn run() -> i32 {
-    let log_path = std::env::var_os("APPDATA")
-        .map(|dir| PathBuf::from(dir).join(APP_NAME))
-        .and_then(|dir| logger::init(&dir).ok());
+    // 設定ファイルとログを置くフォルダ
+    let app_dir = std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join(APP_NAME));
+    let log_path = app_dir.as_deref().and_then(|dir| logger::init(dir).ok());
     log::info!("starting {APP_NAME} v{}", env!("CARGO_PKG_VERSION"));
 
     let catalog = Catalog::parse(include_str!("../../../locales/ja.toml")).unwrap_or_else(|e| {
@@ -167,13 +173,22 @@ pub fn run() -> i32 {
         }
     };
 
-    let app = match start(instance) {
-        Ok(app) => app,
+    let settings_path = app_dir.map(|dir| dir.join("settings.toml"));
+    let (settings, issues) = read_settings(settings_path.as_deref());
+    log::set_max_level(level_filter(settings.log_level));
+
+    let (app, failed) = match start(instance, settings) {
+        Ok(started) => started,
         Err(e) => {
             log::error!("failed to start: {e}");
             return 1;
         }
     };
+    if let Some((level, body)) =
+        startup_notice(&issues, &failed, &app.settings, settings_path.as_deref())
+    {
+        notify_user(&app, level, &body);
+    }
     let message_window = app.windows.message;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     log::info!("started");
@@ -207,7 +222,11 @@ pub fn run() -> i32 {
     code
 }
 
-fn start(instance: Option<single_instance::Guard>) -> Result<App> {
+/// 起動する。登録できなかったホットキーも返す。
+fn start(
+    instance: Option<single_instance::Guard>,
+    settings: Settings,
+) -> Result<(App, Vec<hotkey::Failed>)> {
     // SAFETY: 自分のモジュールのハンドル
     let module: HINSTANCE = unsafe { GetModuleHandleW(None)? }.into();
     let class = WNDCLASSEXW {
@@ -284,14 +303,27 @@ fn start(instance: Option<single_instance::Guard>) -> Result<App> {
         log::warn!("could not register the tray icon; waiting for TaskbarCreated");
     }
 
-    Ok(App {
+    let (hotkeys, failed) = hotkey::register(windows.message, &settings.hotkeys);
+    for f in &failed {
+        log::warn!(
+            "could not register the hotkey {} for {:?}: {}",
+            f.chord,
+            f.action,
+            f.error
+        );
+    }
+
+    let app = App {
         tray,
+        settings,
         capture: Capture::Idle,
         gpu: grab::Gpu::default(),
+        hotkeys,
         windows,
         module,
         _instance: instance,
-    })
+    };
+    Ok((app, failed))
 }
 
 fn message_loop() -> i32 {
@@ -375,6 +407,10 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             Some(LRESULT(0))
         }
         WM_APP_TEST_PANIC => panic!("test panic on the UI thread (SHUNSOKU_TEST_PANIC)"),
+        WM_HOTKEY => {
+            on_hotkey(wparam);
+            Some(LRESULT(0))
+        }
         WM_TIMER if wparam.0 == TIMER_CAPTURE_DELAY => {
             // SAFETY: 自分のタイマーを止める
             unsafe {
@@ -477,6 +513,11 @@ fn on_overlay_message(_hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPARAM) ->
 }
 
 /// 発生源からキャプチャの依頼を受ける。ほかの依頼を進めている間（範囲選択の画面を開いている間など）は無視する。
+///
+/// spec の「残りは順に待たせる」ための待ち行列は M1 では作らない。M1 の依頼は `delay` が 0 で、
+/// 待機と取得と範囲選択の画面を開くまでが 1 つのメッセージの処理の中で終わる（その間に次の依頼は届かない）。
+/// ほかの依頼が届きうるのは範囲選択の画面を開いている間だけで、spec はそのときのホットキーを無視すると決めている
+/// （トレイは画面に覆われて押せない）。待ち行列は、`delay` や CLI の依頼が入る M3 で `Capture` に足す。
 fn request_capture(source: Source) {
     let request = CaptureRequest::from_source(source);
     let delay = request.delay;
@@ -585,4 +626,110 @@ fn end_capture() {
         app.capture = Capture::Idle;
         app.gpu.trim();
     });
+}
+
+/// `WM_HOTKEY`。範囲選択の画面を開いている間に押されたものは `request_capture` が無視する。
+fn on_hotkey(wparam: WPARAM) {
+    let action = with_app(|app| app.hotkeys.action(wparam)).flatten();
+    match action {
+        Some(settings::HotkeyAction::SelectCapture) => request_capture(Source::Hotkey),
+        None => log::warn!("unknown hotkey id {}", wparam.0),
+    }
+}
+
+/// 設定ファイルを読む。ファイルがなければ既定値で、問題にしない。読めなければ既定値で、TOML として読めない
+/// ときと同じ問題にする。
+fn read_settings(path: Option<&Path>) -> (Settings, Vec<SettingsIssue>) {
+    let Some(path) = path else {
+        log::warn!("APPDATA is not set; using the default settings");
+        return (Settings::default(), Vec::new());
+    };
+    let (settings, issues) = match std::fs::read_to_string(path) {
+        Ok(src) => settings::load(&src),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::info!("no settings file at {}; using the defaults", path.display());
+            return (Settings::default(), Vec::new());
+        }
+        Err(e) => {
+            let issue = SettingsIssue::NotToml {
+                message: e.to_string(),
+            };
+            (Settings::default(), vec![issue])
+        }
+    };
+    log::info!("settings loaded from {}", path.display());
+    for issue in &issues {
+        log::warn!("settings issue: {issue:?}");
+    }
+    (settings, issues)
+}
+
+fn level_filter(level: LogLevel) -> log::LevelFilter {
+    match level {
+        LogLevel::Off => log::LevelFilter::Off,
+        LogLevel::Error => log::LevelFilter::Error,
+        LogLevel::Warn => log::LevelFilter::Warn,
+        LogLevel::Info => log::LevelFilter::Info,
+        LogLevel::Debug => log::LevelFilter::Debug,
+        LogLevel::Trace => log::LevelFilter::Trace,
+    }
+}
+
+/// 起動時の設定とホットキーの問題を、1 つの通知の本文にまとめる。問題がなければ None。
+/// 通知は前の通知を置き換えるので、別々に出すと最後の 1 つしか見えない。
+fn startup_notice(
+    issues: &[SettingsIssue],
+    failed: &[hotkey::Failed],
+    settings: &Settings,
+    path: Option<&Path>,
+) -> Option<(notify::Level, String)> {
+    let mut level = notify::Level::Warning;
+    let mut lines = Vec::new();
+    let mut invalid = Vec::new();
+    for issue in issues {
+        match issue {
+            SettingsIssue::NotToml { .. } => {
+                level = notify::Level::Error;
+                lines.push(text("settings.unreadable").to_owned());
+            }
+            SettingsIssue::Invalid { item } => invalid.push(item.as_str()),
+        }
+    }
+    if !invalid.is_empty() {
+        lines.push(format!(
+            "{}{}",
+            text("settings.invalid_items"),
+            invalid.join(", ")
+        ));
+    }
+    if !failed.is_empty() {
+        let chords: Vec<String> = failed.iter().map(|f| f.chord.to_string()).collect();
+        lines.push(format!("{}{}", text("hotkey.failed"), chords.join(", ")));
+    }
+    if settings.hotkeys.select_capture.is_none() {
+        lines.push(text("hotkey.unset").to_owned());
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    if let Some(path) = path {
+        lines.push(path.display().to_string());
+    }
+    Some((level, lines.join("\n")))
+}
+
+/// トレイの通知を出す。設定で通知をオフにしたときは、成功の通知だけを止める（エラーと警告は出す）。
+fn notify_user(app: &App, level: notify::Level, body: &str) {
+    if matches!(level, notify::Level::Success) && !app.settings.general.notifications {
+        return;
+    }
+    if !notify::show(
+        app.windows.tray_owner,
+        tray::ICON_ID,
+        level,
+        text("notify.title"),
+        body,
+    ) {
+        log::warn!("could not show a notification: {body}");
+    }
 }
