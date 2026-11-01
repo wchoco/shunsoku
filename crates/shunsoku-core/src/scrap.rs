@@ -1,6 +1,7 @@
 //! スクラップの状態（`ScrapModel`）と見た目（`Appearance`）。
 //!
-//! 位置はスクリーン座標（物理ピクセル）で持ち、画像の画素を等倍で出す。ウィンドウは画像の外側に
+//! 位置はスクリーン座標（物理ピクセル）で持ち、画像の画素に倍率（`ScrapModel::zoom`、100% が画素等倍）を
+//! 掛けた大きさで出す。ウィンドウは画像の外側に
 //! 枠と影の分だけ大きく作り、画像の位置（`ScrapModel::position`）がちょうど撮った範囲に重なるようにする。
 
 pub mod ops;
@@ -16,6 +17,22 @@ pub enum Mode {
     Normal,
 }
 
+/// 倍率の下限（%）。
+pub const ZOOM_MIN: u16 = 10;
+/// 倍率の上限（%）。
+pub const ZOOM_MAX: u16 = 800;
+/// 画素等倍の倍率（%）。
+pub const ZOOM_ACTUAL: u16 = 100;
+
+/// 拡大縮小の基準点。この点の下にある画像の画素が、倍率を変えても同じ画面上の位置に残る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomAnchor {
+    /// 画像の中心（キーとメニューから）。
+    Center,
+    /// スクリーン座標の点（ホイールのときのカーソルの位置）。
+    At(Point),
+}
+
 /// 1 枚のスクラップの状態。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrapModel {
@@ -24,6 +41,8 @@ pub struct ScrapModel {
     /// 画像の大きさ（画素）。
     pub image_size: Size,
     pub mode: Mode,
+    /// 倍率（%）。画像の画素が基準で、100 が画素等倍。`ZOOM_MIN..=ZOOM_MAX` に収める。
+    zoom: u16,
 }
 
 impl ScrapModel {
@@ -32,18 +51,90 @@ impl ScrapModel {
             position,
             image_size,
             mode: Mode::Normal,
+            zoom: ZOOM_ACTUAL,
         }
     }
 
-    /// 画像を出す矩形（スクリーン座標）。
+    /// 倍率（%）。
+    pub fn zoom(&self) -> u16 {
+        self.zoom
+    }
+
+    /// 1 段拡大する（100% までは 10%、その上は 25% 刻みの次の段）。上限で変わらなければ false。
+    pub fn zoom_in(&mut self, anchor: ZoomAnchor) -> bool {
+        self.set_zoom(step_up(self.zoom), anchor)
+    }
+
+    /// 1 段縮小する。下限で変わらなければ false。
+    pub fn zoom_out(&mut self, anchor: ZoomAnchor) -> bool {
+        self.set_zoom(step_down(self.zoom), anchor)
+    }
+
+    /// 倍率を `zoom`（%、範囲に収める）にする。変わらなければ false。
+    pub fn set_zoom(&mut self, zoom: u16, anchor: ZoomAnchor) -> bool {
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if zoom == self.zoom {
+            return false;
+        }
+        let before = self.display_size();
+        self.zoom = zoom;
+        let after = self.display_size();
+        let p = self.position;
+        let (anchor_x, anchor_y) = match anchor {
+            ZoomAnchor::Center => (
+                f64::from(p.x) + f64::from(before.width) / 2.0,
+                f64::from(p.y) + f64::from(before.height) / 2.0,
+            ),
+            ZoomAnchor::At(at) => (f64::from(at.x), f64::from(at.y)),
+        };
+        // 基準点から画像の左上までの距離を、表示の大きさの比で伸び縮みさせる
+        let scale = |anchor: f64, from: i32, before: u32, after: u32| {
+            let ratio = f64::from(after) / f64::from(before.max(1));
+            let to = anchor - (anchor - f64::from(from)) * ratio;
+            to.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+        };
+        self.position = Point::new(
+            scale(anchor_x, p.x, before.width, after.width),
+            scale(anchor_y, p.y, before.height, after.height),
+        );
+        true
+    }
+
+    /// 倍率を画素等倍に戻す（中心が基準）。等倍のままなら false。
+    pub fn reset_zoom(&mut self) -> bool {
+        self.set_zoom(ZOOM_ACTUAL, ZoomAnchor::Center)
+    }
+
+    /// 画像を出す大きさ（物理ピクセル）。画像の画素に倍率を掛けて四捨五入し、0 にはしない。
+    pub fn display_size(&self) -> Size {
+        let scale = |pixels: u32| {
+            let scaled = (u64::from(pixels) * u64::from(self.zoom) + 50) / 100;
+            u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
+        };
+        Size::new(scale(self.image_size.width), scale(self.image_size.height))
+    }
+
+    /// 画像を出す矩形（スクリーン座標）。大きさは倍率を掛けた表示の大きさ。
     pub fn image_rect(&self) -> Rect {
-        Rect::from_origin_size(self.position, self.image_size)
+        Rect::from_origin_size(self.position, self.display_size())
     }
 
     /// ウィンドウの矩形（スクリーン座標）。画像の外側に枠と影の分を足す。
     pub fn window_rect(&self, appearance: &Appearance) -> Rect {
         self.image_rect().inflate(appearance.margin())
     }
+}
+
+/// 1 段上の倍率。100% までは 10% の、その上は 25% の倍数のうち、`zoom` より大きい最初のもの。
+fn step_up(zoom: u16) -> u16 {
+    let step = if zoom < ZOOM_ACTUAL { 10 } else { 25 };
+    (zoom / step + 1) * step
+}
+
+/// 1 段下の倍率。100% までは 10% の、その上は 25% の倍数のうち、`zoom` より小さい最初のもの。
+fn step_down(zoom: u16) -> u16 {
+    let step = if zoom <= ZOOM_ACTUAL { 10 } else { 25 };
+    (zoom.saturating_sub(1) / step) * step
 }
 
 /// 枠。
@@ -138,6 +229,29 @@ impl Drag {
     }
 }
 
+/// 1 ノッチのホイールの量（Win32 の `WHEEL_DELTA`）。
+pub const WHEEL_NOTCH: i32 = 120;
+
+/// ホイールの回転。`WM_MOUSEWHEEL` の量をためて、1 ノッチ（`WHEEL_NOTCH`）ごとに 1 段として返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Wheel {
+    /// まだ 1 ノッチに満たない量（上が正）。
+    rest: i32,
+}
+
+impl Wheel {
+    /// ホイールが `delta`（上が正）だけ回った。ノッチの数（上が正）を返す。向きが変わったらためた分は捨てる。
+    pub fn turn(&mut self, delta: i32) -> i32 {
+        if (self.rest > 0 && delta < 0) || (self.rest < 0 && delta > 0) {
+            self.rest = 0;
+        }
+        self.rest = self.rest.saturating_add(delta);
+        let notches = self.rest / WHEEL_NOTCH;
+        self.rest -= notches * WHEEL_NOTCH;
+        notches
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +314,114 @@ mod tests {
             ..ScrapAppearance::default()
         };
         assert_eq!(Appearance::from(hidden).border, None);
+    }
+
+    #[test]
+    fn zooming_steps_by_10_up_to_100_and_by_25_above_and_stops_at_10_and_800() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(100, 100));
+        assert_eq!(scrap.zoom(), 100);
+        let mut seen = vec![scrap.zoom()];
+        while scrap.zoom_out(ZoomAnchor::Center) {
+            seen.push(scrap.zoom());
+        }
+        assert_eq!(seen, [100, 90, 80, 70, 60, 50, 40, 30, 20, 10]);
+        assert!(!scrap.zoom_out(ZoomAnchor::Center));
+        assert_eq!(scrap.zoom(), 10);
+
+        let mut seen = vec![scrap.zoom()];
+        while scrap.zoom_in(ZoomAnchor::Center) {
+            seen.push(scrap.zoom());
+        }
+        let mut expected: Vec<u16> = (1..=10).map(|n| n * 10).collect();
+        expected.extend((5..=32).map(|n| n * 25));
+        assert_eq!(seen, expected);
+        assert_eq!(scrap.zoom(), 800);
+        assert!(!scrap.zoom_in(ZoomAnchor::Center));
+        assert_eq!(scrap.zoom(), 800);
+        // 下げるときも 100% より上は 25% 刻み
+        scrap.zoom_out(ZoomAnchor::Center);
+        assert_eq!(scrap.zoom(), 775);
+    }
+
+    #[test]
+    fn the_window_is_sized_from_the_zoomed_image() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_zoom(50, ZoomAnchor::At(Point::new(0, 0)));
+        assert_eq!(scrap.display_size(), Size::new(150, 100));
+        assert_eq!(scrap.image_rect(), Rect::new(0, 0, 150, 100));
+        assert_eq!(
+            scrap.window_rect(&Appearance::default()),
+            Rect::new(-9, -9, 159, 109)
+        );
+        // 端数は四捨五入し、10% でも 1px は残す
+        let mut tiny = ScrapModel::new(Point::new(0, 0), Size::new(3, 15));
+        tiny.set_zoom(ZOOM_MIN, ZoomAnchor::At(Point::new(0, 0)));
+        assert_eq!(tiny.display_size(), Size::new(1, 2));
+    }
+
+    #[test]
+    fn keys_zoom_around_the_center_of_the_scrap() {
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        // 中心は (50, 150)
+        assert!(scrap.zoom_out(ZoomAnchor::Center));
+        assert_eq!(scrap.image_rect(), Rect::new(-85, 60, 185, 240));
+        assert!(scrap.zoom_in(ZoomAnchor::Center));
+        assert!(scrap.zoom_in(ZoomAnchor::Center));
+        assert_eq!(scrap.zoom(), 125);
+        assert_eq!(scrap.image_rect(), Rect::new(-138, 25, 237, 275));
+    }
+
+    #[test]
+    fn the_wheel_zooms_around_the_cursor_so_the_pixel_under_it_stays_put() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        let cursor = Point::new(40, 20);
+        assert!(scrap.zoom_in(ZoomAnchor::At(cursor)));
+        assert_eq!(scrap.image_rect(), Rect::new(-10, -5, 365, 245));
+        assert!(scrap.zoom_out(ZoomAnchor::At(cursor)));
+        assert_eq!(scrap.image_rect(), Rect::new(0, 0, 300, 200));
+        // 画像の右下の角で縮めると、右下の角が動かない
+        let corner = Point::new(300, 200);
+        for _ in 0..5 {
+            scrap.zoom_out(ZoomAnchor::At(corner));
+        }
+        assert_eq!(scrap.zoom(), 50);
+        assert_eq!(scrap.image_rect(), Rect::new(150, 100, 300, 200));
+    }
+
+    #[test]
+    fn resetting_the_zoom_returns_to_actual_pixels_around_the_center() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_zoom(200, ZoomAnchor::At(Point::new(0, 0)));
+        assert_eq!(scrap.image_rect(), Rect::new(0, 0, 600, 400));
+        assert!(scrap.reset_zoom());
+        assert_eq!(scrap.zoom(), ZOOM_ACTUAL);
+        assert_eq!(scrap.image_rect(), Rect::new(150, 100, 450, 300));
+        assert!(!scrap.reset_zoom());
+    }
+
+    #[test]
+    fn a_chosen_zoom_is_kept_within_the_range() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        assert!(scrap.set_zoom(5, ZoomAnchor::Center));
+        assert_eq!(scrap.zoom(), ZOOM_MIN);
+        assert!(scrap.set_zoom(1000, ZoomAnchor::Center));
+        assert_eq!(scrap.zoom(), ZOOM_MAX);
+        assert!(!scrap.set_zoom(ZOOM_MAX, ZoomAnchor::Center));
+    }
+
+    #[test]
+    fn the_wheel_counts_whole_notches_and_keeps_the_rest_of_fine_turns() {
+        let mut wheel = Wheel::default();
+        assert_eq!(wheel.turn(120), 1);
+        assert_eq!(wheel.turn(-240), -2);
+        // タッチパッドなどの細かい量はためて、1 ノッチになったら返す
+        assert_eq!(wheel.turn(60), 0);
+        assert_eq!(wheel.turn(30), 0);
+        assert_eq!(wheel.turn(40), 1);
+        // 向きが変わったらためた分を捨てる
+        assert_eq!(wheel.turn(100), 0);
+        assert_eq!(wheel.turn(-100), 0);
+        assert_eq!(wheel.turn(-20), -1);
     }
 
     #[test]

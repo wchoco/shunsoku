@@ -10,12 +10,18 @@
 //! ない操作にだけ付き、設定ファイルの上書きは操作の id ごとに 1 つなので、こうすると矢印と Shift+矢印を
 //! 1 つずつ割り当て直せる。左ドラッグの移動（`move`）はドラッグの量を `OpContext` で受け取るので、
 //! ショートカットを持たず、メニューにも出さない。
+//!
+//! 拡大縮小も同じ理由で、引数のない拡大（`zoom_in`）・縮小（`zoom_out`）・元のサイズに戻す（`zoom_actual`）と、
+//! 倍率の一覧を `choices` に持つ親（`zoom`）に分ける。`choices` を持つ操作はメニューで子メニューになり、選んだ
+//! 値が `OpContext::choice` で渡る。親はメニュー専用、ほかはキーとマウス専用（`in_menu: false`）にして、
+//! メニューを spec #33 の並び（`Group` の宣言の順）に保つ。ホイールから呼ぶときは `OpContext::cursor` に
+//! カーソルの位置が入り、そこが拡大縮小の基準点になる（キーとメニューからは中心）。
 
 use std::collections::BTreeMap;
 
 use crate::geometry::Point;
 use crate::keys::{Chord, Key};
-use crate::scrap::ScrapModel;
+use crate::scrap::{ScrapModel, ZoomAnchor};
 use crate::settings::{self, Conflict, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
@@ -36,9 +42,13 @@ pub struct OperationDescriptor {
     /// ドラッグの量（`OpContext::drag`）を引数に取る操作。ドラッグでしか呼べないので、メニューにも
     /// ショートカットの対応表にも出さない。
     pub drag_only: bool,
+    /// 右クリックメニューに出すか。キーやマウスで足りる操作（移動、拡大・縮小）は出さず、メニューを spec の
+    /// 並びに保つ。
+    pub in_menu: bool,
     /// いま実行できるか。できない操作はメニューでグレー表示にし、ショートカットでも実行しない。
     pub can_execute: fn(&ScrapModel) -> bool,
-    /// 引数の選択肢（M2 の透明度など）。Some の操作はショートカットを持たない。
+    /// 引数の選択肢（倍率の一覧など）。Some の操作はショートカットを持たず、メニューでは子メニューになる。
+    /// 選ばれた選択肢の `Choice::value` は `OpContext::choice` で `run` に渡る。
     pub choices: Option<fn(&ScrapModel) -> Vec<Choice>>,
     pub run: fn(&mut ScrapModel, &OpContext) -> Vec<Effect>,
 }
@@ -64,13 +74,23 @@ impl std::fmt::Debug for OperationDescriptor {
 pub enum MouseGesture {
     LeftDrag,
     MiddleClick,
+    /// ホイールを上（奥）へ 1 ノッチ。修飾キーなし。
+    WheelUp,
+    /// ホイールを下（手前）へ 1 ノッチ。修飾キーなし。
+    WheelDown,
 }
 
-/// メニューの区切りのまとまり。宣言の順にメニューに並ぶ。
+/// メニューの区切りのまとまり。宣言の順にメニューに並ぶ（spec #33: コピー / 保存 ─ トリム / 書き込み ─
+/// 拡大縮小 / 見た目 / コンパクト表示 ─ 閉じる）。操作のない `Group` は区切りも出ない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
     /// コピーと保存。メニューのいちばん上。
     Output,
+    /// トリム・トリムを解除（M2）と書き込み（M4）。
+    Edit,
+    /// 拡大縮小・見た目・コンパクト表示。
+    View,
+    /// キーとドラッグの移動（メニューには出さない）。
     Move,
     /// 閉じる。メニューのいちばん下。
     Close,
@@ -79,8 +99,19 @@ pub enum Group {
 /// 引数のある操作の選択肢 1 つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
-    pub label_key: &'static str,
+    pub label: ChoiceLabel,
     pub value: i32,
+    /// いまの状態がこの選択肢か（メニューでチェックを付ける）。
+    pub checked: bool,
+}
+
+/// 選択肢の文言。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChoiceLabel {
+    /// 文言のキー（`locales/ja.toml`）。
+    Key(&'static str),
+    /// 百分率（`50%` のように出す）。
+    Percent(i32),
 }
 
 /// 操作を呼び出したときの引数。
@@ -90,6 +121,9 @@ pub struct OpContext {
     pub drag: Point,
     /// 選ばれた選択肢の `Choice::value`。
     pub choice: Option<i32>,
+    /// マウスで呼んだときのカーソルの位置（スクリーン座標）。ホイールの拡大縮小の基準点になる。
+    /// キーやメニューから呼んだときは None（スクラップの中心が基準）。
+    pub cursor: Option<Point>,
 }
 
 /// 操作の結果、Win32 層がすること。
@@ -103,6 +137,8 @@ pub enum Effect {
     CopyToClipboard,
     /// 画像を全体設定の保存先に、全体のファイル名テンプレートの名前で保存する（ダイアログなし）。
     SaveDefault,
+    /// 倍率（`ScrapModel::zoom`）を少しの間だけスクラップの上に出す。
+    ShowZoom,
     /// 「名前を付けて保存」のダイアログを出し、選ばれた場所に保存する。初期フォルダとファイル名は `SaveDefault` と同じ。
     ShowSaveDialog,
 }
@@ -114,6 +150,12 @@ const RIGHT: Chord = Chord::plain(Key::known(0x27));
 const DOWN: Chord = Chord::plain(Key::known(0x28));
 const CTRL_C: Chord = Chord::plain(Key::known(0x43)).ctrl();
 const CTRL_S: Chord = Chord::plain(Key::known(0x53)).ctrl();
+/// `VK_OEM_PLUS`（US 配列の `=` / `+`、JIS 配列の `;` / `+`）。`+` は Shift と打つ配列があるので両方に付ける。
+const CTRL_PLUS: Chord = Chord::plain(Key::known(0xBB)).ctrl();
+const CTRL_MINUS: Chord = Chord::plain(Key::known(0xBD)).ctrl();
+const CTRL_NUMPAD_ADD: Chord = Chord::plain(Key::known(0x6B)).ctrl();
+const CTRL_NUMPAD_SUBTRACT: Chord = Chord::plain(Key::known(0x6D)).ctrl();
+const CTRL_0: Chord = Chord::plain(Key::known(0x30)).ctrl();
 const CTRL_SHIFT_S: Chord = CTRL_S.shift();
 
 const fn always(_: &ScrapModel) -> bool {
@@ -155,6 +197,59 @@ fn save_default(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     vec![Effect::SaveDefault]
 }
 
+/// 拡大縮小の基準点。マウスから呼んだらカーソルの位置、キーやメニューからならスクラップの中心。
+fn zoom_anchor(context: &OpContext) -> ZoomAnchor {
+    context.cursor.map_or(ZoomAnchor::Center, ZoomAnchor::At)
+}
+
+/// 倍率を変えたあとの `Effect`。変わらなくても（範囲の端）、いまの倍率は出す。
+fn zoomed(changed: bool) -> Vec<Effect> {
+    if changed {
+        vec![Effect::Redraw, Effect::ShowZoom]
+    } else {
+        vec![Effect::ShowZoom]
+    }
+}
+
+fn zoom_in(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    zoomed(model.zoom_in(zoom_anchor(context)))
+}
+
+fn zoom_out(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    zoomed(model.zoom_out(zoom_anchor(context)))
+}
+
+/// 右クリックメニューの倍率の一覧（%）。
+const ZOOM_LIST: [u16; 10] = [10, 25, 50, 75, 100, 150, 200, 300, 400, 800];
+
+fn zoom_choices(model: &ScrapModel) -> Vec<Choice> {
+    ZOOM_LIST
+        .iter()
+        .map(|&percent| Choice {
+            label: ChoiceLabel::Percent(i32::from(percent)),
+            value: i32::from(percent),
+            checked: model.zoom() == percent,
+        })
+        .collect()
+}
+
+/// 倍率の一覧から選んだ倍率にする（中心が基準）。
+fn zoom_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let Some(choice) = context.choice else {
+        return Vec::new();
+    };
+    let percent = u16::try_from(choice.max(0)).unwrap_or(u16::MAX);
+    zoomed(model.set_zoom(percent, zoom_anchor(context)))
+}
+
+fn zoom_actual(model: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
+    if model.reset_zoom() {
+        vec![Effect::Redraw]
+    } else {
+        Vec::new()
+    }
+}
+
 fn save_as(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     vec![Effect::ShowSaveDialog]
 }
@@ -175,6 +270,7 @@ const fn keyboard_move(
         group: Group::Move,
         order,
         drag_only: false,
+        in_menu: false,
         can_execute: always,
         choices: None,
         run,
@@ -191,6 +287,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 10,
         drag_only: false,
+        in_menu: true,
         can_execute: always,
         choices: None,
         run: copy,
@@ -203,6 +300,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 20,
         drag_only: false,
+        in_menu: true,
         can_execute: always,
         choices: None,
         run: save_default,
@@ -215,6 +313,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 30,
         drag_only: false,
+        in_menu: true,
         can_execute: always,
         choices: None,
         run: save_as,
@@ -277,9 +376,62 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Move,
         order: 0,
         drag_only: true,
+        in_menu: false,
         can_execute: always,
         choices: None,
         run: drag,
+    },
+    OperationDescriptor {
+        id: "zoom",
+        label_key: "scrap.op.zoom",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::View,
+        order: 10,
+        drag_only: false,
+        in_menu: true,
+        can_execute: always,
+        choices: Some(zoom_choices),
+        run: zoom_to,
+    },
+    OperationDescriptor {
+        id: "zoom_in",
+        label_key: "scrap.op.zoom_in",
+        default_shortcut: &[CTRL_PLUS, CTRL_PLUS.shift(), CTRL_NUMPAD_ADD],
+        default_mouse: Some(MouseGesture::WheelUp),
+        group: Group::View,
+        order: 11,
+        drag_only: false,
+        in_menu: false,
+        can_execute: always,
+        choices: None,
+        run: zoom_in,
+    },
+    OperationDescriptor {
+        id: "zoom_out",
+        label_key: "scrap.op.zoom_out",
+        default_shortcut: &[CTRL_MINUS, CTRL_NUMPAD_SUBTRACT],
+        default_mouse: Some(MouseGesture::WheelDown),
+        group: Group::View,
+        order: 12,
+        drag_only: false,
+        in_menu: false,
+        can_execute: always,
+        choices: None,
+        run: zoom_out,
+    },
+    OperationDescriptor {
+        id: "zoom_actual",
+        label_key: "scrap.op.zoom_actual",
+        default_shortcut: &[CTRL_0],
+        default_mouse: None,
+        group: Group::View,
+        order: 13,
+        drag_only: false,
+        in_menu: false,
+        can_execute: always,
+        choices: None,
+        run: zoom_actual,
     },
     OperationDescriptor {
         id: "close",
@@ -289,6 +441,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Close,
         order: 10,
         drag_only: false,
+        in_menu: true,
         can_execute: always,
         choices: None,
         run: close,
@@ -373,7 +526,7 @@ impl Shortcuts {
     }
 }
 
-/// マウスの操作に付いた操作（表の既定値。M1 では割り当て直せない）。
+/// マウスの操作に付いた操作（表の既定値。まだ割り当て直せない）。
 pub fn mouse_operation(
     ops: &'static [OperationDescriptor],
     gesture: MouseGesture,
@@ -399,7 +552,19 @@ pub fn execute(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuEntry {
     Item(MenuItem),
+    /// 引数のある操作（`choices` が Some）。選択肢を子メニューに並べる。
+    Submenu(Submenu),
     Separator,
+}
+
+/// 子メニューに展開する操作。選んだ選択肢の `value` を `OpContext::choice` に入れて実行する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submenu {
+    pub id: OperationId,
+    pub label_key: &'static str,
+    /// false なら親の項目をグレー表示にする。
+    pub enabled: bool,
+    pub choices: Vec<Choice>,
 }
 
 /// 右クリックメニューの項目。
@@ -414,15 +579,17 @@ pub struct MenuItem {
 }
 
 /// 右クリックメニューを `ops`（ふつうは `OPERATIONS`）から作る。`group` の宣言の順、その中は `order` の順に並べ、
-/// `group` の変わり目に区切りを入れる。ドラッグでしか呼べない操作は出さない。
-///
-/// 引数のある操作（`choices`）を子メニューにするのは、最初にそういう操作を足すチケット（M2）で行う。
+/// `group` の変わり目に区切りを入れる。ドラッグでしか呼べない操作と `in_menu` が false の操作は出さない。
+/// 引数のある操作（`choices`）は子メニュー（`MenuEntry::Submenu`）にする。
 pub fn menu(
     ops: &'static [OperationDescriptor],
     model: &ScrapModel,
     shortcuts: &Shortcuts,
 ) -> Vec<MenuEntry> {
-    let mut listed: Vec<&OperationDescriptor> = ops.iter().filter(|op| !op.drag_only).collect();
+    let mut listed: Vec<&OperationDescriptor> = ops
+        .iter()
+        .filter(|op| op.in_menu && !op.drag_only)
+        .collect();
     listed.sort_by_key(|op| (op.group, op.order));
     let mut entries = Vec::new();
     let mut group = None;
@@ -431,12 +598,21 @@ pub fn menu(
             entries.push(MenuEntry::Separator);
         }
         group = Some(op.group);
-        entries.push(MenuEntry::Item(MenuItem {
-            id: op.id,
-            label_key: op.label_key,
-            enabled: (op.can_execute)(model),
-            shortcut: shortcuts.chords(op.id).first().copied(),
-        }));
+        let enabled = (op.can_execute)(model);
+        entries.push(match op.choices {
+            Some(choices) => MenuEntry::Submenu(Submenu {
+                id: op.id,
+                label_key: op.label_key,
+                enabled,
+                choices: choices(model),
+            }),
+            None => MenuEntry::Item(MenuItem {
+                id: op.id,
+                label_key: op.label_key,
+                enabled,
+                shortcut: shortcuts.chords(op.id).first().copied(),
+            }),
+        });
     }
     entries
 }
@@ -444,8 +620,8 @@ pub fn menu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{Point, Size};
-    use crate::scrap::ScrapModel;
+    use crate::geometry::{Point, Rect, Size};
+    use crate::scrap::{ScrapModel, ZOOM_ACTUAL, ZOOM_MAX, ZOOM_MIN, ZoomAnchor};
     use crate::settings::Conflict;
 
     fn scrap() -> ScrapModel {
@@ -528,6 +704,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn keys_zoom_in_and_out_around_the_center_and_show_the_zoom() {
+        let mut model = ScrapModel::new(Point::new(0, 0), Size::new(400, 200));
+        let effects = execute(op("zoom_in"), &mut model, &OpContext::default());
+        assert_eq!(effects, vec![Effect::Redraw, Effect::ShowZoom]);
+        assert_eq!(model.zoom(), 125);
+        assert_eq!(model.image_rect(), Rect::new(-50, -25, 450, 225));
+        let effects = execute(op("zoom_out"), &mut model, &OpContext::default());
+        assert_eq!(effects, vec![Effect::Redraw, Effect::ShowZoom]);
+        assert_eq!(model.image_rect(), Rect::new(0, 0, 400, 200));
+    }
+
+    #[test]
+    fn the_wheel_zooms_around_the_cursor() {
+        let mut model = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        let at_cursor = OpContext {
+            cursor: Some(Point::new(40, 20)),
+            ..OpContext::default()
+        };
+        let id = |g| mouse_operation(OPERATIONS, g).map(|op| op.id);
+        assert_eq!(id(MouseGesture::WheelUp), Some("zoom_in"));
+        assert_eq!(id(MouseGesture::WheelDown), Some("zoom_out"));
+        execute(op("zoom_in"), &mut model, &at_cursor);
+        assert_eq!(model.image_rect(), Rect::new(-10, -5, 365, 245));
+    }
+
+    #[test]
+    fn zooming_past_the_limit_only_shows_the_zoom() {
+        let mut model = scrap();
+        model.set_zoom(ZOOM_MAX, ZoomAnchor::Center);
+        let before = model.clone();
+        let effects = execute(op("zoom_in"), &mut model, &OpContext::default());
+        assert_eq!(effects, vec![Effect::ShowZoom]);
+        assert_eq!(model, before);
+        model.set_zoom(ZOOM_MIN, ZoomAnchor::Center);
+        let effects = execute(op("zoom_out"), &mut model, &OpContext::default());
+        assert_eq!(effects, vec![Effect::ShowZoom]);
+    }
+
+    #[test]
+    fn zoom_actual_returns_to_actual_pixels_around_the_center() {
+        let mut model = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        model.set_zoom(200, ZoomAnchor::At(Point::new(0, 0)));
+        let effects = execute(op("zoom_actual"), &mut model, &OpContext::default());
+        assert_eq!(effects, vec![Effect::Redraw]);
+        assert_eq!(model.zoom(), ZOOM_ACTUAL);
+        assert_eq!(model.image_rect(), Rect::new(150, 100, 450, 300));
+        // 等倍のままなら何もしない
+        let effects = execute(op("zoom_actual"), &mut model, &OpContext::default());
+        assert_eq!(effects, vec![]);
+    }
+
     fn chord(s: &str) -> Chord {
         s.parse().unwrap()
     }
@@ -550,6 +778,12 @@ mod tests {
         assert_eq!(bound(&shortcuts, "Esc"), Some("close"));
         assert_eq!(bound(&shortcuts, "Ctrl+C"), Some("copy"));
         assert_eq!(bound(&shortcuts, "Ctrl+S"), Some("save_default"));
+        assert_eq!(bound(&shortcuts, "Ctrl+Plus"), Some("zoom_in"));
+        assert_eq!(bound(&shortcuts, "Ctrl+Shift+Plus"), Some("zoom_in"));
+        assert_eq!(bound(&shortcuts, "Ctrl+NumpadAdd"), Some("zoom_in"));
+        assert_eq!(bound(&shortcuts, "Ctrl+Minus"), Some("zoom_out"));
+        assert_eq!(bound(&shortcuts, "Ctrl+NumpadSubtract"), Some("zoom_out"));
+        assert_eq!(bound(&shortcuts, "Ctrl+0"), Some("zoom_actual"));
         assert_eq!(bound(&shortcuts, "Ctrl+Shift+S"), Some("save_as"));
         assert_eq!(bound(&shortcuts, "Ctrl+Left"), None);
         assert_eq!(shortcuts.chords("close"), vec![chord("Esc")]);
@@ -590,8 +824,9 @@ mod tests {
     fn an_operation_with_choices_gets_no_shortcut() {
         fn opacity_choices(_: &ScrapModel) -> Vec<Choice> {
             vec![Choice {
-                label_key: "opacity.50",
+                label: ChoiceLabel::Percent(50),
                 value: 50,
+                checked: false,
             }]
         }
         static TABLE: &[OperationDescriptor] = &[OperationDescriptor {
@@ -615,9 +850,20 @@ mod tests {
         })
     }
 
+    fn zoom_choice(percent: i32, checked: bool) -> Choice {
+        Choice {
+            label: ChoiceLabel::Percent(percent),
+            value: percent,
+            checked,
+        }
+    }
+
     #[test]
-    fn the_menu_lists_the_operations_by_group_and_order_with_their_shortcuts() {
+    fn the_menu_follows_the_spec_order_with_the_zoom_list_as_a_submenu() {
         let shortcuts = Shortcuts::new(OPERATIONS, &ShortcutOverrides::new());
+        let zoom_list = [10, 25, 50, 75, 100, 150, 200, 300, 400, 800]
+            .map(|p| zoom_choice(p, p == 100))
+            .to_vec();
         assert_eq!(
             menu(OPERATIONS, &scrap(), &shortcuts),
             vec![
@@ -625,16 +871,112 @@ mod tests {
                 item("save_default", true, Some("Ctrl+S")),
                 item("save_as", true, Some("Ctrl+Shift+S")),
                 MenuEntry::Separator,
-                item("move_left", true, Some("Left")),
-                item("move_right", true, Some("Right")),
-                item("move_up", true, Some("Up")),
-                item("move_down", true, Some("Down")),
-                item("move_left_10", true, Some("Shift+Left")),
-                item("move_right_10", true, Some("Shift+Right")),
-                item("move_up_10", true, Some("Shift+Up")),
-                item("move_down_10", true, Some("Shift+Down")),
+                MenuEntry::Submenu(Submenu {
+                    id: "zoom",
+                    label_key: "scrap.op.zoom",
+                    enabled: true,
+                    choices: zoom_list,
+                }),
                 MenuEntry::Separator,
                 item("close", true, Some("Esc")),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_zoom_list_checks_the_current_zoom_and_nothing_when_it_is_not_listed() {
+        let choices = op("zoom").choices.expect("zoom has choices");
+        let mut model = scrap();
+        model.set_zoom(200, ZoomAnchor::Center);
+        let checked: Vec<i32> = choices(&model)
+            .iter()
+            .filter(|c| c.checked)
+            .map(|c| c.value)
+            .collect();
+        assert_eq!(checked, [200]);
+        model.set_zoom(125, ZoomAnchor::Center);
+        assert!(choices(&model).iter().all(|c| !c.checked));
+    }
+
+    #[test]
+    fn choosing_from_the_zoom_list_sets_that_zoom_around_the_center() {
+        let mut model = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        let chosen = OpContext {
+            choice: Some(200),
+            ..OpContext::default()
+        };
+        let effects = execute(op("zoom"), &mut model, &chosen);
+        assert_eq!(effects, vec![Effect::Redraw, Effect::ShowZoom]);
+        assert_eq!(model.zoom(), 200);
+        assert_eq!(model.image_rect(), Rect::new(-150, -100, 450, 300));
+        // 選択肢なしで呼ばれたら何もしない
+        assert_eq!(
+            execute(op("zoom"), &mut model, &OpContext::default()),
+            vec![]
+        );
+        assert_eq!(model.zoom(), 200);
+    }
+
+    #[test]
+    fn the_zoom_list_takes_no_shortcut() {
+        let overrides = ShortcutOverrides::from([("zoom".to_owned(), Some(chord("Z")))]);
+        let shortcuts = Shortcuts::new(OPERATIONS, &overrides);
+        assert_eq!(bound(&shortcuts, "Z"), None);
+        assert_eq!(shortcuts.chords("zoom"), vec![]);
+        assert_eq!(shortcuts.ignored_overrides(), ["zoom"]);
+    }
+
+    #[test]
+    fn an_operation_with_choices_becomes_a_submenu_with_its_checks() {
+        fn never(_: &ScrapModel) -> bool {
+            false
+        }
+        fn levels(_: &ScrapModel) -> Vec<Choice> {
+            vec![
+                Choice {
+                    label: ChoiceLabel::Key("low"),
+                    value: 1,
+                    checked: false,
+                },
+                Choice {
+                    label: ChoiceLabel::Key("high"),
+                    value: 2,
+                    checked: true,
+                },
+            ]
+        }
+        static TABLE: &[OperationDescriptor] = &[
+            OperationDescriptor {
+                choices: Some(levels),
+                ..test_op("level", Group::View, 10, &[])
+            },
+            OperationDescriptor {
+                choices: Some(levels),
+                can_execute: never,
+                ..test_op("blocked", Group::View, 20, &[])
+            },
+            OperationDescriptor {
+                in_menu: false,
+                ..test_op("hidden", Group::View, 30, &[])
+            },
+            test_op("plain", Group::Close, 10, &[]),
+        ];
+        let shortcuts = Shortcuts::new(TABLE, &ShortcutOverrides::new());
+        let submenu = |id, enabled| {
+            MenuEntry::Submenu(Submenu {
+                id,
+                label_key: id,
+                enabled,
+                choices: levels(&scrap()),
+            })
+        };
+        assert_eq!(
+            menu(TABLE, &scrap(), &shortcuts),
+            vec![
+                submenu("level", true),
+                submenu("blocked", false),
+                MenuEntry::Separator,
+                item("plain", true, None),
             ]
         );
     }
@@ -643,11 +985,11 @@ mod tests {
     fn the_menu_shows_overridden_shortcuts() {
         let overrides = ShortcutOverrides::from([
             ("close".to_owned(), Some(chord("Ctrl+W"))),
-            ("move_left".to_owned(), None),
+            ("copy".to_owned(), None),
         ]);
         let shortcuts = Shortcuts::new(OPERATIONS, &overrides);
         let entries = menu(OPERATIONS, &scrap(), &shortcuts);
-        assert!(entries.contains(&item("move_left", true, None)));
+        assert_eq!(entries.first(), Some(&item("copy", true, None)));
         assert_eq!(entries.last(), Some(&item("close", true, Some("Ctrl+W"))));
     }
 
@@ -759,6 +1101,7 @@ mod tests {
             group,
             order,
             drag_only: false,
+            in_menu: true,
             can_execute: always,
             choices: None,
             run: nothing,

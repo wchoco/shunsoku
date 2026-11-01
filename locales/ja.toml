@@ -47,6 +47,10 @@ move_left_10 = "左へ移動（10px）"
 move_right_10 = "右へ移動（10px）"
 move_up_10 = "上へ移動（10px）"
 move_down_10 = "下へ移動（10px）"
+zoom = "拡大縮小"
+zoom_in = "拡大"
+zoom_out = "縮小"
+zoom_actual = "元のサイズに戻す"
 close = "閉じる"
 
 # 裏のスレッドのパニック（その仕事の失敗の理由として出す）
