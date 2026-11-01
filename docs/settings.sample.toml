@@ -61,6 +61,7 @@ notifications = true
 # id              操作（右クリックメニューの名前）  既定のショートカット
 # copy            コピー                            Ctrl+C
 # save_default    既定の保存先へ保存                Ctrl+S
+# save_as         保存先を確認して保存              Ctrl+Shift+S
 # move_left       左へ移動（1px）                   Left
 # move_right      右へ移動（1px）                   Right
 # move_up         上へ移動（1px）                   Up

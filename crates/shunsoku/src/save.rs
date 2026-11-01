@@ -3,7 +3,8 @@
 //! - 保存先とファイル名（`destination`）は UI スレッドで決める: フォルダがなければ作り、既存のファイル名の
 //!   一覧と書き込み中の保存先から core の `template` で重ならない名前を付ける。
 //! - PNG の書き出しと書き込み（`write_png`）は裏のスレッドで行う。書き込みは新しいファイルとしてだけ作り
-//!   （`create_new`）、名前を決めたあとに同じ名前のファイルができていても上書きしない。
+//!   （`create_new`）、名前を決めたあとに同じ名前のファイルができていても上書きしない。ただし「名前を付けて保存」
+//!   （`ask_path`）で選ばれた場所は、ダイアログで上書きを確かめてあるので上書きする（`Overwrite::Allow`）。
 
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
@@ -13,13 +14,17 @@ use std::path::{Path, PathBuf};
 use shunsoku_core::APP_NAME;
 use shunsoku_core::image::Image;
 use shunsoku_core::template::{self, LocalTime};
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Pictures, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellExecuteW,
+    FOLDERID_Pictures, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_STRICTFILETYPES,
+    FileSaveDialog, IFileSaveDialog, IShellItem, KF_FLAG_DEFAULT, SHCreateItemFromParsingName,
+    SHGetKnownFolderPath, SIGDN_FILESYSPATH, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{PCWSTR, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 /// 保存画像の拡張子。形式は PNG だけ。
 const EXTENSION: &str = "png";
@@ -76,9 +81,68 @@ pub fn destination(
     Ok(dir.join(name))
 }
 
-/// 画像を PNG にして `path` に新しいファイルとして書く（裏のスレッドで呼ぶ）。失敗したら作りかけのファイルを消す。
-pub fn write_png(path: &Path, image: &Image) -> std::io::Result<()> {
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+/// 「名前を付けて保存」のダイアログを出し、選ばれたパスを返す。キャンセルされたら None。
+///
+/// 初期フォルダは `path` のフォルダ、ファイル名は `path` のファイル名にする（どちらも既定の保存と同じものを渡す）。
+/// 形式は PNG だけ。既にあるファイルを選んだら、ダイアログが上書きを確かめる。モーダルなので `App` を借りずに
+/// 呼ぶ。UI スレッドで COM を初期化してから呼ぶ。
+pub fn ask_path(
+    owner: HWND,
+    path: &Path,
+    filter_name: &str,
+) -> windows::core::Result<Option<PathBuf>> {
+    let folder = path.parent().map(HSTRING::from);
+    let file_name = path.file_name().map(HSTRING::from).unwrap_or_default();
+    let filter_name = HSTRING::from(filter_name);
+    let filters = [COMDLG_FILTERSPEC {
+        pszName: PCWSTR(filter_name.as_ptr()),
+        pszSpec: w!("*.png"),
+    }];
+    // SAFETY: 渡す文字列はどれも呼び出しの間生きている。返った文字列は CoTaskMemFree で返す
+    unsafe {
+        let dialog: IFileSaveDialog =
+            CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
+        dialog.SetFileTypes(&filters)?;
+        dialog.SetDefaultExtension(w!("png"))?;
+        let options = dialog.GetOptions()?;
+        dialog.SetOptions(
+            options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_STRICTFILETYPES,
+        )?;
+        if let Some(folder) = &folder {
+            let item: IShellItem = SHCreateItemFromParsingName(folder, None)?;
+            dialog.SetFolder(&item)?;
+        }
+        dialog.SetFileName(&file_name)?;
+        match dialog.Show(Some(owner)) {
+            Ok(()) => {}
+            Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let chosen = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let text = chosen.to_string();
+        CoTaskMemFree(Some(chosen.0 as *const _));
+        Ok(Some(PathBuf::from(text?)))
+    }
+}
+
+/// 書き込む先に同じ名前のファイルがあったときどうするか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overwrite {
+    /// 新しいファイルとしてだけ作る（既定の保存）。
+    Deny,
+    /// 上書きする（「名前を付けて保存」で上書きを確かめたとき）。
+    Allow,
+}
+
+/// 画像を PNG にして `path` に書く（裏のスレッドで呼ぶ）。失敗したら作りかけのファイルを消す。
+pub fn write_png(path: &Path, image: &Image, overwrite: Overwrite) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    match overwrite {
+        Overwrite::Deny => options.create_new(true),
+        Overwrite::Allow => options.create(true).truncate(true),
+    };
+    let file = options.open(path)?;
     let mut out = BufWriter::new(file);
     let written = image
         .write_png(&mut out)
