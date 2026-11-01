@@ -1,0 +1,90 @@
+# shunsoku の設定ファイルのサンプル
+#
+# 置き場所: %APPDATA%\shunsoku\settings.toml
+#   （エクスプローラーのアドレス欄に %APPDATA%\shunsoku と入れると開けます）
+# このファイルをその名前でコピーし、変えたい項目だけを書き換えてください。
+# 保存すると、再起動しなくてもすぐに反映されます。
+#
+# - 書かなかった項目と、行頭に # を付けた（コメントにした）項目は既定値になります。
+#   このサンプルの値はすべて既定値です。
+# - 値が正しくない項目は、その項目だけ既定値になり、通知で項目名を知らせます。
+# - ファイル全体が TOML として読めないときは、直前の設定のまま動き続けます（起動時ならすべて既定値）。
+
+# 設定ファイルの形式の版。必須で、1 だけを書けます。消したり変えたりしないでください。
+version = 1
+
+# ログ（%APPDATA%\shunsoku\shunsoku.log）に書く細かさ。不具合を調べるとき用の隠し項目です。
+# off / error / warn / info / debug / trace のどれか。
+log_level = "info"
+
+[general]
+# 「既定の保存先へ保存」で画像を保存するフォルダ。絶対パスだけを書けます（C:\… か \\サーバー\共有\…）。
+# 既定はピクチャ フォルダの下の shunsoku。
+# バックスラッシュをそのまま書けるよう、' ' で囲んでください。
+# save_dir = 'D:\shots'
+
+# 保存する画像のファイル名（拡張子 .png は自動で付きます）。空にはできません。使える変数:
+#   {date}             日付 yyyyMMdd（例: 20261101）
+#   {time}             時刻 HHmmss（例: 153045）
+#   {datetime:<書式>}  書式の yyyy（年 4 桁）yy MM dd HH mm ss fff（ミリ秒）を置き換え、ほかの文字はそのまま
+#                      （例: {datetime:yyyy-MM-dd_HH.mm.ss}）
+#   {seq} / {seq:N}    連番（N 桁にゼロ埋め）。保存先フォルダの同じテンプレートの名前の最大の番号 + 1
+#   {name}             定型領域の名前（範囲選択キャプチャでは空）
+# 知らない変数はそのまま残ります。ファイル名に使えない文字（<>:"/\|?* など）は _ に置き換えます。
+# 同じ名前のファイルがあれば _2、_3 … を付けて上書きを避けます。
+file_name_template = "shunsoku_{date}-{time}"
+
+# 通知を出すかどうか（true / false）。false で止まるのは成功の通知（保存しました など）だけで、
+# エラーと警告は常に出します。
+notifications = true
+
+[hotkeys]
+# 範囲選択キャプチャを呼び出すホットキー。既定は未設定（"" も未設定）なので、使うには下の行の # を外して
+# 好きなキーにしてください。
+# キーの書き方:
+#   修飾キー（Win / Ctrl / Alt / Shift）とキー 1 つを + でつなぎます（例: "Ctrl+Shift+A"）。
+#   大文字と小文字は区別しません。修飾キーなしでも書けます（例: "PrintScreen"）。
+#   キー: A〜Z、0〜9、F1〜F24、Numpad0〜Numpad9、
+#         Backspace Tab Enter Pause Esc Space PageUp PageDown End Home Left Up Right Down
+#         PrintScreen Insert Delete NumpadMultiply NumpadAdd NumpadSubtract NumpadDecimal
+#         NumpadDivide Plus Comma Minus Period
+# OS やほかのアプリが使っている組み合わせは登録できず、通知で知らせます。
+# select_capture = "Ctrl+Shift+A"
+
+[shortcuts]
+# スクラップにフォーカスがあるときのショートカットを、スクラップ操作の id ごとに上書きします。
+# 書き方は [hotkeys] と同じです。書いた 1 つが既定のショートカットを全部置き換えます。
+# "" と書くと、その操作のショートカットを外します。書かなかった操作は既定のままです。
+# 同じキーを 2 つ以上の操作に書くと、どの操作にも付かず、通知で知らせます。
+# 表にない id は無視して通知で知らせます。
+#
+# id              操作（右クリックメニューの名前）  既定のショートカット
+# copy            コピー                            Ctrl+C
+# save_default    既定の保存先へ保存                Ctrl+S
+# move_left       左へ移動（1px）                   Left
+# move_right      右へ移動（1px）                   Right
+# move_up         上へ移動（1px）                   Up
+# move_down       下へ移動（1px）                   Down
+# move_left_10    左へ移動（10px）                  Shift+Left
+# move_right_10   右へ移動（10px）                  Shift+Right
+# move_up_10      上へ移動（10px）                  Shift+Up
+# move_down_10    下へ移動（10px）                  Shift+Down
+# close           閉じる                            Esc（マウスの中クリックでも閉じます）
+# （ドラッグでの移動はマウスだけの操作で、ショートカットは付けられません）
+#
+# 例:
+# copy = "Ctrl+Shift+C"
+# close = ""
+
+[scrap]
+# 新しく作るスクラップの見た目。
+# 透明度（%）。10〜100 の整数で、100 で不透明。
+opacity = 100
+# 枠を出すかどうか（true / false）。
+border = true
+# 枠の太さ（px）。1〜16 の整数。
+border_width = 1
+# 枠の色。"#RRGGBB" の形で書きます。
+border_color = "#808080"
+# 影を出すかどうか（true / false）。
+shadow = true

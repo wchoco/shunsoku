@@ -1,0 +1,22 @@
+[package]
+name = "perf-harness"
+description = "配布物の性能を測るハーネス（開発専用。zip には入れない）。測り方は docs/perf.md"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+shunsoku-core = { path = "../../crates/shunsoku-core" }
+
+# Linux では `cargo test --workspace` が通るように、Win32 の部分は Windows でだけ組む。
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Performance",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]

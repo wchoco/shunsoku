@@ -1,0 +1,58 @@
+# UI の文言（日本語）。exe に include_str! で埋め込む。
+# キーはテーブルを `.` でつないだもの（[tray.menu] の exit は tray.menu.exit）。
+# 用語は GLOSSARY.md に従う。
+
+[tray]
+tooltip = "shunsoku"
+
+[tray.menu]
+select_capture = "範囲選択キャプチャ"
+exit = "終了"
+
+[panic]
+title = "shunsoku"
+body = "予期しないエラーが起きたため、shunsoku を終了します。詳しくはログを見てください。"
+
+[notify]
+title = "shunsoku"
+
+[settings]
+unreadable = "設定ファイルを読めないため、既定値で起動しました。"
+invalid_items = "不正な項目を既定値にしました: "
+unreadable_kept = "設定ファイルを TOML として読めないため、直前の設定のまま動いています。"
+conflicts = "重なったキーを、重なった項目のすべてで無効にしました: "
+overlaps = "ホットキーとショートカットが重なっています（ホットキーが優先され、そのショートカットは効きません）: "
+watch_stopped = "設定ファイルの監視が止まりました。設定ファイルを直したら shunsoku を起動し直してください。"
+
+[hotkey]
+failed = "次のホットキーを登録できませんでした（他のアプリが使っている可能性があります）: "
+unset = "範囲選択キャプチャのホットキーが未設定です。設定ファイルの [hotkeys] の select_capture に書いてください（トレイからも撮れます）。"
+
+# スクラップ操作（右クリックメニュー）。キーは scrap::ops の表の label_key
+[scrap.op]
+copy = "コピー"
+save_default = "既定の保存先へ保存"
+move = "移動"
+move_left = "左へ移動（1px）"
+move_right = "右へ移動（1px）"
+move_up = "上へ移動（1px）"
+move_down = "下へ移動（1px）"
+move_left_10 = "左へ移動（10px）"
+move_right_10 = "右へ移動（10px）"
+move_up_10 = "上へ移動（10px）"
+move_down_10 = "下へ移動（10px）"
+close = "閉じる"
+
+# 裏のスレッドのパニック（その仕事の失敗の理由として出す）
+[job]
+panicked = "予期しないエラーが起きました。詳しくはログを見てください。"
+
+[capture]
+failed = "画面を撮れませんでした。"
+
+[copy]
+failed = "クリップボードにコピーできませんでした。"
+
+[save]
+saved = "保存しました（クリックでフォルダを開きます）:"
+failed = "保存できませんでした。スクラップは残っています。"
