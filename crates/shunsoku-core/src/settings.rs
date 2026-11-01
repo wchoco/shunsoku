@@ -1013,4 +1013,49 @@ a = 1
             "{issues:?}"
         );
     }
+
+    /// docs/settings.sample.toml（README から案内するサンプル）。
+    const SAMPLE: &str = include_str!("../../../docs/settings.sample.toml");
+
+    #[test]
+    fn the_sample_file_reads_without_issues_and_holds_the_defaults() {
+        let (settings, issues) = load(SAMPLE);
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn the_examples_commented_out_in_the_sample_file_are_valid() {
+        // `# key = value` の行の # を外す（説明のコメントは `key = value` の形でないので残る）
+        let uncommented: String = SAMPLE
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(rest)
+                    if rest.split_once(" = ").is_some_and(|(key, _)| {
+                        key.bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    }) =>
+                {
+                    rest
+                }
+                _ => line,
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let (settings, issues) = load(&uncommented);
+        assert_eq!(issues, vec![]);
+        assert_eq!(keymap(&settings, OPERATIONS).issues, vec![]);
+        assert_eq!(settings.general.save_dir, Some(PathBuf::from(r"D:\shots")));
+        assert_eq!(
+            settings.hotkeys.select_capture,
+            Some("Ctrl+Shift+A".parse().unwrap())
+        );
+        assert_eq!(
+            settings.shortcuts,
+            ShortcutOverrides::from([
+                ("copy".to_owned(), Some("Ctrl+Shift+C".parse().unwrap())),
+                ("close".to_owned(), None),
+            ])
+        );
+    }
 }
