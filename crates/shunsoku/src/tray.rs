@@ -1,18 +1,13 @@
-//! タスクトレイのアイコンとメニュー。`NOTIFYICON_VERSION_4` で登録する。
+//! タスクトレイのアイコン。`NOTIFYICON_VERSION_4` で登録する。メニューは `menu` で出す。
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIN_SELECT,
     NINF_KEY, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, HICON, MF_GRAYED, MF_STRING, PostMessageW,
-    SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    WM_CONTEXTMENU, WM_NULL,
-};
-use windows::core::PCWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{HICON, WM_CONTEXTMENU};
 
-use crate::wide::{copy_truncated, to_wide};
+use crate::wide::copy_truncated;
 
 /// トレイのアイコンの番号。通知（`notify`）も同じアイコンに出す。
 pub const ICON_ID: u32 = 1;
@@ -35,13 +30,6 @@ pub enum Event {
         y: i32,
     },
     Other,
-}
-
-/// メニューの項目。
-pub struct MenuItem<'a> {
-    pub id: u32,
-    pub label: &'a str,
-    pub enabled: bool,
 }
 
 impl Tray {
@@ -106,36 +94,5 @@ pub fn event(wparam: WPARAM, lparam: LPARAM) -> Event {
         }
     } else {
         Event::Other
-    }
-}
-
-/// メニューを出して、選ばれた項目の `id` を返す。モーダルなので、呼ぶ間はアプリの状態を借りないこと。
-pub fn show_menu(owner: HWND, items: &[MenuItem], x: i32, y: i32) -> Option<u32> {
-    // SAFETY: メニューはこの関数の中で作って壊す。文字列は AppendMenuW の間生きている
-    unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        for item in items {
-            let label = to_wide(item.label);
-            let flags = if item.enabled {
-                MF_STRING
-            } else {
-                MF_STRING | MF_GRAYED
-            };
-            let _ = AppendMenuW(menu, flags, item.id as usize, PCWSTR(label.as_ptr()));
-        }
-        // 前面にしないと、メニューの外をクリックしても閉じない
-        let _ = SetForegroundWindow(owner);
-        let chosen = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-            x,
-            y,
-            None,
-            owner,
-            None,
-        );
-        let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-        (chosen.0 != 0).then_some(chosen.0 as u32)
     }
 }

@@ -20,6 +20,10 @@
 //! - 範囲選択の入力（マウス・キー）は core の `selection::Input` にして `Selection::handle` に渡す。
 //!   入力を足すときは `Input` を足し、ここではメッセージから作るだけにする。
 //! - スクラップ（`Scrap`）は `App::scraps` に持つ。ウィンドウは `scrap_window`、中身の描画は `render`。
+//! - スクラップへのキーとマウスと右クリックメニューは、core の `scrap::ops` の表（ショートカットの対応表
+//!   `App::shortcuts`、`ops::mouse_operation`、`ops::menu`）でスクラップ操作に変え、`run_scrap_operation` で
+//!   実行する。操作が返す `Effect` を実行するのはここ（`run_scrap_operation`）。操作を足すときは core の表に
+//!   行を足し、新しい `Effect` があればそこに足す。
 //! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に 1 回読む。ファイルは作らず、書き換えない。
 //!   問題（読めない・不正な項目・登録できないホットキー・未設定のホットキー）は、まとめて 1 回だけ通知する。
 //! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。
@@ -33,8 +37,13 @@ use std::time::Instant;
 use shunsoku_core::APP_NAME;
 use shunsoku_core::capture::request::{CaptureRequest, Source};
 use shunsoku_core::geometry::Point;
+use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
+use shunsoku_core::keys::{Chord, Key, Modifiers};
+use shunsoku_core::scrap::ops::{
+    self, Effect, MenuEntry, MouseGesture, OpContext, OperationDescriptor, Shortcuts,
+};
 use shunsoku_core::scrap::{Appearance, ScrapModel};
 use shunsoku_core::selection::{Button, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsIssue};
@@ -43,19 +52,24 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN,
+    VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
-    IDI_APPLICATION, KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SetTimer, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP,
-    WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_TIMER, WNDCLASSEXW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessagePos, GetMessageW,
+    HWND_MESSAGE, IDI_APPLICATION, KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SetTimer, TranslateMessage, WINDOW_EX_STYLE,
+    WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
 use crate::{
-    grab, hotkey, logger, notify, overlay, panic_hook, render, scrap_window, single_instance, tray,
+    grab, hotkey, logger, menu, notify, overlay, panic_hook, render, scrap_window, single_instance,
+    tray,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
@@ -94,6 +108,8 @@ thread_local! {
 struct App {
     tray: tray::Tray,
     settings: Settings,
+    /// スクラップ操作のショートカットの対応表（表の既定値に `settings.shortcuts` を重ねたもの）。
+    shortcuts: Shortcuts,
     capture: Capture,
     scraps: Vec<Scrap>,
     gpu: grab::Gpu,
@@ -121,12 +137,41 @@ enum Capture {
 /// 浮かべているスクラップ 1 枚。
 struct Scrap {
     /// drop でウィンドウを壊す。
-    #[expect(dead_code, reason = "スクラップの操作のチケット（#42）で使う")]
     window: scrap_window::ScrapWindow,
-    #[expect(dead_code, reason = "スクラップの操作のチケット（#42）で使う")]
     model: ScrapModel,
-    #[expect(dead_code, reason = "コピーと保存のチケット（#44）で使う")]
     image: Image,
+    /// 左ドラッグの間、前回のカーソルの位置（スクリーン座標）。
+    drag_from: Option<Point>,
+}
+
+impl Scrap {
+    /// `Effect::Redraw`: `model` のとおりに出し直す。大きさとモードが `before` と同じなら、中身は変わらないので
+    /// ウィンドウを動かすだけにする（ドラッグのたびに描き直さない）。
+    fn redraw(&self, before: &ScrapModel, appearance: &Appearance) {
+        let rect = self.model.window_rect(appearance);
+        let result = if self.model.image_size == before.image_size && self.model.mode == before.mode
+        {
+            self.window.move_to(rect)
+        } else {
+            paint_scrap(&self.window, &self.image, rect, appearance)
+        };
+        if let Err(e) = result {
+            log::warn!("could not redraw a scrap: {e}");
+        }
+    }
+}
+
+/// スクラップの中身を描いて、ウィンドウを `rect` に出す。
+fn paint_scrap(
+    window: &scrap_window::ScrapWindow,
+    image: &Image,
+    rect: Rect,
+    appearance: &Appearance,
+) -> Result<()> {
+    let canvas = render::Canvas::new(rect.size())?;
+    render::Renderer::new()?.paint_scrap(&canvas, image, appearance)?;
+    // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
+    window.present(canvas.dc(), rect, appearance.opacity)
 }
 
 struct Windows {
@@ -336,9 +381,21 @@ fn start(
         );
     }
 
+    // 無視した上書きと重なったショートカットの通知は、設定の監視のチケット（#46）で足す
+    let shortcuts = Shortcuts::new(ops::OPERATIONS, &settings.shortcuts);
+    for id in shortcuts.ignored_overrides() {
+        log::warn!(
+            "shortcut override for an unknown or argument-taking scrap operation ignored: {id}"
+        );
+    }
+    for chord in shortcuts.conflicts() {
+        log::warn!("shortcut {chord} is assigned to several scrap operations; disabled");
+    }
+
     let app = App {
         tray,
         settings,
+        shortcuts,
         capture: Capture::Idle,
         scraps: Vec::new(),
         gpu: grab::Gpu::default(),
@@ -485,19 +542,19 @@ fn on_tray(owner: HWND, event: tray::Event) {
     match event {
         tray::Event::ContextMenu { x, y } => {
             let items = [
-                tray::MenuItem {
+                menu::Entry::Item {
                     id: CMD_SELECT_CAPTURE,
                     label: text("tray.menu.select_capture"),
                     enabled: true,
                 },
-                tray::MenuItem {
+                menu::Entry::Item {
                     id: CMD_EXIT,
                     label: text("tray.menu.exit"),
                     enabled: true,
                 },
             ];
             // モーダルなので App を借りずに呼ぶ
-            if let Some(command) = tray::show_menu(owner, &items, x, y) {
+            if let Some(command) = menu::show(owner, &items, x, y) {
                 on_command(command);
             }
         }
@@ -578,12 +635,225 @@ fn on_overlay_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> O
     }
 }
 
-/// スクラップのウィンドウへのメッセージ。
-fn on_scrap_message(_hwnd: HWND, msg: u32, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+/// スクラップのウィンドウへのメッセージ。キーとマウスは対応表でスクラップ操作に変えて実行する。
+/// キーはフォーカスのあるスクラップにだけ届くので、ショートカットはそのときだけ効く。
+fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     match msg {
+        WM_LBUTTONDOWN => {
+            // カーソルがウィンドウの外へ速く動いても追えるように、マウスを捕まえる
+            // SAFETY: 自分のウィンドウ
+            unsafe { SetCapture(hwnd) };
+            let at = message_screen_point();
+            with_app(|app| {
+                if let Some(scrap) = app.scrap_mut(hwnd) {
+                    scrap.drag_from = Some(at);
+                }
+            });
+            Some(LRESULT(0))
+        }
+        WM_MOUSEMOVE => {
+            on_scrap_drag(hwnd, message_screen_point());
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONUP => {
+            // ドラッグは WM_CAPTURECHANGED で終える。App を借りる前に放す（そのメッセージが届くため）
+            // SAFETY: UI スレッドで呼ぶ
+            let _ = unsafe { ReleaseCapture() };
+            Some(LRESULT(0))
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                if let Some(scrap) = app.scrap_mut(hwnd) {
+                    scrap.drag_from = None;
+                }
+            });
+            Some(LRESULT(0))
+        }
+        WM_MBUTTONUP => {
+            // 押したときに閉じると、離したときのメッセージが下のウィンドウに届くので、離したときに閉じる
+            run_mouse_operation(hwnd, MouseGesture::MiddleClick, OpContext::default());
+            Some(LRESULT(0))
+        }
+        // Alt との組み合わせは WM_SYSKEYDOWN で来る。対応表にないキーは DefWindowProcW に任せる
+        WM_KEYDOWN | WM_SYSKEYDOWN => on_scrap_key(hwnd, wparam).then_some(LRESULT(0)),
+        // 右クリック（DefWindowProcW が WM_RBUTTONUP から作る）と Shift+F10・アプリケーション キー
+        WM_CONTEXTMENU => {
+            show_scrap_menu(hwnd, lparam);
+            Some(LRESULT(0))
+        }
+        // Alt+F4 など。ウィンドウだけ壊されて App に残らないように、閉じるのと同じにする
+        WM_CLOSE => {
+            close_scrap(hwnd);
+            Some(LRESULT(0))
+        }
         // 画素を等倍のまま出すので、DPI の違うモニタに動いても大きさを変えない
         WM_DPICHANGED => Some(LRESULT(0)),
         _ => None,
+    }
+}
+
+/// いま処理しているメッセージが送られたときのカーソルの位置（スクリーン座標、物理ピクセル）。
+/// ドラッグ中はウィンドウが動くので、クライアント座標ではなくこれを使う。
+fn message_screen_point() -> Point {
+    // SAFETY: 引数なし
+    let pos = unsafe { GetMessagePos() };
+    // 左や上のモニタでは負になるので、符号付き 16 ビットとして読む
+    Point::new(
+        (pos & 0xFFFF) as u16 as i16 as i32,
+        (pos >> 16) as u16 as i16 as i32,
+    )
+}
+
+impl App {
+    fn scrap_mut(&mut self, hwnd: HWND) -> Option<&mut Scrap> {
+        self.scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)
+    }
+}
+
+/// 左ドラッグの間のカーソルの移動を、ドラッグの操作に渡す。
+fn on_scrap_drag(hwnd: HWND, at: Point) {
+    let delta = with_app(|app| {
+        let scrap = app.scrap_mut(hwnd)?;
+        let from = scrap.drag_from.replace(at)?;
+        Some(Point::new(at.x - from.x, at.y - from.y))
+    })
+    .flatten();
+    if let Some(drag) = delta {
+        let context = OpContext {
+            drag,
+            ..OpContext::default()
+        };
+        run_mouse_operation(hwnd, MouseGesture::LeftDrag, context);
+    }
+}
+
+fn run_mouse_operation(hwnd: HWND, gesture: MouseGesture, context: OpContext) {
+    if let Some(op) = ops::mouse_operation(ops::OPERATIONS, gesture) {
+        run_scrap_operation(hwnd, op, context);
+    }
+}
+
+/// キーをショートカットの対応表で引いて実行する。対応表になければ false。
+fn on_scrap_key(hwnd: HWND, wparam: WPARAM) -> bool {
+    // 修飾キーだけのときは名前の表になく、None になる
+    let Some(key) = Key::from_vk(wparam.0 as u16) else {
+        return false;
+    };
+    let chord = Chord {
+        modifiers: held_modifiers(),
+        key,
+    };
+    let Some(op) = with_app(|app| app.shortcuts.operation(chord)).flatten() else {
+        return false;
+    };
+    run_scrap_operation(hwnd, op, OpContext::default());
+    true
+}
+
+/// いま押されている修飾キー（キーのメッセージを処理している時点の状態）。
+fn held_modifiers() -> Modifiers {
+    // SAFETY: 引数は定数
+    let down = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
+    Modifiers {
+        win: down(VK_LWIN.0) || down(VK_RWIN.0),
+        ctrl: down(VK_CONTROL.0),
+        alt: down(VK_MENU.0),
+        shift: down(VK_SHIFT.0),
+    }
+}
+
+/// 右クリックメニューを表から作って出し、選ばれた操作を実行する。
+fn show_scrap_menu(hwnd: HWND, lparam: LPARAM) {
+    let built = with_app(|app| {
+        let scrap = app.scraps.iter().find(|s| s.window.hwnd() == hwnd)?;
+        let entries = ops::menu(ops::OPERATIONS, &scrap.model, &app.shortcuts);
+        Some((entries, scrap.model.position))
+    })
+    .flatten();
+    let Some((entries, image_origin)) = built else {
+        return;
+    };
+    let x = (lparam.0 & 0xFFFF) as u16 as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+    // キーボードから開いたときは (-1, -1)。画像の左上に出す
+    let at = if (x, y) == (-1, -1) {
+        image_origin
+    } else {
+        Point::new(x, y)
+    };
+    let labels: Vec<String> = entries
+        .iter()
+        .map(|entry| match entry {
+            MenuEntry::Item(item) => match item.shortcut {
+                Some(chord) => format!("{}\t{chord}", text(item.label_key)),
+                None => text(item.label_key).to_owned(),
+            },
+            MenuEntry::Separator => String::new(),
+        })
+        .collect();
+    // 項目の番号は entries の添字 + 1（0 は「選ばなかった」）
+    let items: Vec<menu::Entry> = entries
+        .iter()
+        .zip(&labels)
+        .enumerate()
+        .map(|(i, (entry, label))| match entry {
+            MenuEntry::Item(item) => menu::Entry::Item {
+                id: i as u32 + 1,
+                label,
+                enabled: item.enabled,
+            },
+            MenuEntry::Separator => menu::Entry::Separator,
+        })
+        .collect();
+    // モーダルなので App を借りずに呼ぶ
+    let Some(command) = menu::show(hwnd, &items, at.x, at.y) else {
+        return;
+    };
+    let chosen = entries
+        .get(command as usize - 1)
+        .and_then(|entry| match entry {
+            MenuEntry::Item(item) => ops::find(item.id),
+            MenuEntry::Separator => None,
+        });
+    if let Some(op) = chosen {
+        run_scrap_operation(hwnd, op, OpContext::default());
+    }
+}
+
+/// スクラップ操作を実行し、返った `Effect` を実行する。スクラップのキー・マウス・メニューはすべてここを通る。
+fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
+    let close = with_app(|app| {
+        let appearance = Appearance::from(app.settings.scrap);
+        let scrap = app.scrap_mut(hwnd)?;
+        let before = scrap.model.clone();
+        let mut close = false;
+        for effect in ops::execute(op, &mut scrap.model, &context) {
+            match effect {
+                // ウィンドウを動かす・描き直すときに届くメッセージ（WM_WINDOWPOSCHANGED、WM_DPICHANGED など）では
+                // App を借りないので、借りたままでよい
+                Effect::Redraw => scrap.redraw(&before, &appearance),
+                Effect::Close => close = true,
+            }
+        }
+        Some(close)
+    })
+    .flatten();
+    if close == Some(true) {
+        close_scrap(hwnd);
+    }
+}
+
+/// スクラップを閉じる（M1 は破棄。M2 でごみ箱に移す）。
+fn close_scrap(hwnd: HWND) {
+    let removed = with_app(|app| {
+        let index = app.scraps.iter().position(|s| s.window.hwnd() == hwnd)?;
+        Some(app.scraps.remove(index))
+    })
+    .flatten();
+    // ウィンドウを壊すとメッセージが届くので、App を借りずに壊す
+    if let Some(scrap) = removed {
+        drop(scrap);
+        log::info!("scrap closed");
     }
 }
 
@@ -702,16 +972,14 @@ fn open_scrap(
 ) -> Result<Scrap> {
     let model = ScrapModel::new(at, image.size());
     let rect = model.window_rect(appearance);
-    let canvas = render::Canvas::new(rect.size())?;
-    render::Renderer::new()?.paint_scrap(&canvas, &image, appearance)?;
     let window = scrap_window::ScrapWindow::create(module, rect)?;
-    // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
-    window.present(canvas.dc(), rect, appearance.opacity)?;
+    paint_scrap(&window, &image, rect, appearance)?;
     window.show(focus);
     Ok(Scrap {
         window,
         model,
         image,
+        drag_from: None,
     })
 }
 

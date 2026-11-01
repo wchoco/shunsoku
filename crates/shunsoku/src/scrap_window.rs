@@ -11,8 +11,9 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, IDC_ARROW, LoadCursorW, RegisterClassExW, SW_SHOW,
-    SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow, ULW_ALPHA, UpdateLayeredWindow,
-    WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+    ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -98,6 +99,26 @@ impl ScrapWindow {
                 COLORREF(0),
                 Some(&blend),
                 ULW_ALPHA,
+            )
+        }
+    }
+
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    /// 大きさを変えずに、左上を `rect` の左上に動かす（中身は描き直さない）。
+    pub fn move_to(&self, rect: Rect) -> Result<()> {
+        // SAFETY: 自分のウィンドウ
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                rect.left,
+                rect.top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             )
         }
     }

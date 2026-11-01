@@ -3,6 +3,8 @@
 //! 位置はスクリーン座標（物理ピクセル）で持ち、画像の画素を等倍で出す。ウィンドウは画像の外側に
 //! 枠と影の分だけ大きく作り、画像の位置（`ScrapModel::position`）がちょうど撮った範囲に重なるようにする。
 
+pub mod ops;
+
 use crate::geometry::{Point, Rect, Size};
 use crate::settings::ScrapAppearance;
 

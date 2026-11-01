@@ -28,6 +28,12 @@ impl Key {
         name_of(vk).map(|_| Key(vk))
     }
 
+    /// 定数の表（`scrap::ops` の既定のショートカット）に書くためのもの。名前の表にあるキーだけを渡す
+    /// （`scrap::ops` のテストで、表示の名前があることを確かめる）。
+    pub(crate) const fn known(vk: u16) -> Key {
+        Key(vk)
+    }
+
     /// 仮想キーコード。
     pub fn vk(self) -> u16 {
         self.0
@@ -46,6 +52,28 @@ impl fmt::Display for Key {
 pub struct Chord {
     pub modifiers: Modifiers,
     pub key: Key,
+}
+
+impl Chord {
+    /// 修飾キーなしの組み合わせ（定数の表用）。
+    pub(crate) const fn plain(key: Key) -> Chord {
+        Chord {
+            modifiers: Modifiers {
+                win: false,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            },
+            key,
+        }
+    }
+
+    /// `Shift` を足した組み合わせ（定数の表用）。
+    pub(crate) const fn shift(self) -> Chord {
+        let mut chord = self;
+        chord.modifiers.shift = true;
+        chord
+    }
 }
 
 impl fmt::Display for Chord {

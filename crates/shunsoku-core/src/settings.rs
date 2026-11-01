@@ -122,7 +122,8 @@ impl Hotkeys {
 
 /// スクラップ操作のショートカットの上書き。キーはスクラップ操作の id（`scrap::ops` の表）。
 /// 値が None なら、その操作にショートカットを割り当てない。書かなかった操作は表の既定値のまま。
-/// id が表にあるかどうかはここでは確かめない（表と重ねるときに見る）。
+/// id が表にあるかどうかはここでは確かめない。表と重ねる `scrap::ops::Shortcuts::new` が、表にない id と
+/// 引数のある操作の id を無視して `Shortcuts::ignored_overrides` に載せる。
 pub type ShortcutOverrides = BTreeMap<String, Option<Chord>>;
 
 /// スクラップの見た目の既定値。
