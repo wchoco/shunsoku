@@ -11,6 +11,7 @@ pub mod scrap;
 pub mod selection;
 pub mod settings;
 pub mod template;
+pub mod trash;
 
 /// アプリの名前。
 pub const APP_NAME: &str = "shunsoku";

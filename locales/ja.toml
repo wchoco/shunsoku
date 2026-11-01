@@ -7,6 +7,11 @@ tooltip = "shunsoku"
 
 [tray.menu]
 select_capture = "範囲選択キャプチャ"
+trash = "ごみ箱"
+trash_empty = "（空）"
+close_all = "すべてのスクラップを閉じる"
+hide_all = "すべて隠す"
+show_all = "すべて表示"
 exit = "終了"
 
 [panic]
@@ -21,6 +26,7 @@ unreadable = "設定ファイルを読めないため、既定値で起動しま
 invalid_items = "不正な項目を既定値にしました: "
 unreadable_kept = "設定ファイルを TOML として読めないため、直前の設定のまま動いています。"
 conflicts = "重なったキーを、重なった項目のすべてで無効にしました: "
+mouse_conflicts = "重なったマウス操作を、重なった項目のすべてで無効にしました: "
 overlaps = "ホットキーとショートカットが重なっています（ホットキーが優先され、そのショートカットは効きません）: "
 watch_stopped = "設定ファイルの監視が止まりました。設定ファイルを直したら shunsoku を起動し直してください。"
 
@@ -32,6 +38,9 @@ unset = "範囲選択キャプチャのホットキーが未設定です。設�
 [scrap.op]
 copy = "コピー"
 save_default = "既定の保存先へ保存"
+save_as = "保存先を確認して保存"
+trim = "トリム"
+untrim = "トリムを解除"
 move = "移動"
 move_left = "左へ移動（1px）"
 move_right = "右へ移動（1px）"
@@ -41,7 +50,33 @@ move_left_10 = "左へ移動（10px）"
 move_right_10 = "右へ移動（10px）"
 move_up_10 = "上へ移動（10px）"
 move_down_10 = "下へ移動（10px）"
+zoom = "拡大縮小"
+zoom_in = "拡大"
+zoom_out = "縮小"
+zoom_actual = "元のサイズに戻す"
+appearance = "見た目"
+opacity = "透明度"
+opacity_up = "濃くする"
+opacity_down = "薄くする"
+border = "枠"
+shadow = "影"
+toggle_compact = "コンパクト表示"
 close = "閉じる"
+
+# 枠の一覧（scrap::ops の border の選択肢）
+[scrap.border]
+none = "なし"
+default = "既定の色"
+gray = "灰"
+black = "黒"
+white = "白"
+red = "赤"
+blue = "青"
+
+# 影の一覧（scrap::ops の shadow の選択肢）
+[scrap.shadow]
+on = "あり"
+off = "なし"
 
 # 裏のスレッドのパニック（その仕事の失敗の理由として出す）
 [job]
@@ -53,6 +88,11 @@ failed = "画面を撮れませんでした。"
 [copy]
 failed = "クリップボードにコピーできませんでした。"
 
+[trash]
+restore_failed = "ごみ箱から戻せませんでした。"
+
 [save]
 saved = "保存しました（クリックでフォルダを開きます）:"
 failed = "保存できませんでした。スクラップは残っています。"
+# 「名前を付けて保存」のファイルの種類
+png_filter = "PNG 画像"
