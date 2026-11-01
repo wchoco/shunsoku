@@ -21,6 +21,7 @@
 //!
 //! [hotkeys]
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
+//! restore_last = "Ctrl+Shift+Z"                # 最後に閉じたものを復元。既定は空で、必須ではない
 //!
 //! [shortcuts]                                  # スクラップ操作の id ごとの上書き。"" は割り当てなし
 //! copy = "Ctrl+Shift+C"
@@ -99,16 +100,19 @@ impl Default for General {
 pub enum HotkeyAction {
     /// 範囲選択キャプチャ。必須（空なら未設定の通知を出す）。
     SelectCapture,
+    /// 最後に閉じたスクラップをごみ箱から復元する。任意（空でも通知しない）。
+    RestoreLast,
 }
 
 impl HotkeyAction {
     /// すべて。
-    pub const ALL: [HotkeyAction; 1] = [HotkeyAction::SelectCapture];
+    pub const ALL: [HotkeyAction; 2] = [HotkeyAction::SelectCapture, HotkeyAction::RestoreLast];
 
     /// `[hotkeys]` の中のキー。
     pub fn key(self) -> &'static str {
         match self {
             HotkeyAction::SelectCapture => "select_capture",
+            HotkeyAction::RestoreLast => "restore_last",
         }
     }
 }
@@ -117,6 +121,7 @@ impl HotkeyAction {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hotkeys {
     pub select_capture: Option<Chord>,
+    pub restore_last: Option<Chord>,
 }
 
 impl Hotkeys {
@@ -124,6 +129,7 @@ impl Hotkeys {
     pub fn get(&self, action: HotkeyAction) -> Option<Chord> {
         match action {
             HotkeyAction::SelectCapture => self.select_capture,
+            HotkeyAction::RestoreLast => self.restore_last,
         }
     }
 
@@ -139,6 +145,7 @@ impl Hotkeys {
     fn get_mut(&mut self, action: HotkeyAction) -> &mut Option<Chord> {
         match action {
             HotkeyAction::SelectCapture => &mut self.select_capture,
+            HotkeyAction::RestoreLast => &mut self.restore_last,
         }
     }
 }
@@ -605,6 +612,7 @@ trash_limit = 3
 
 [hotkeys]
 select_capture = "Win+Shift+PrintScreen"
+restore_last = "Ctrl+Alt+Z"
 
 [shortcuts]
 copy = "Ctrl+Shift+C"
@@ -630,6 +638,7 @@ shadow = false
                 },
                 hotkeys: Hotkeys {
                     select_capture: Some(chord("Win+Shift+PrintScreen")),
+                    restore_last: Some(chord("Ctrl+Alt+Z")),
                 },
                 shortcuts: BTreeMap::from([
                     ("close".to_owned(), None),
@@ -918,6 +927,7 @@ a = 1
         assert!(Hotkeys::default().assign().bound.is_empty());
         let hotkeys = Hotkeys {
             select_capture: Some(chord("Ctrl+Alt+S")),
+            restore_last: None,
         };
         let assigned = hotkeys.assign();
         assert_eq!(
@@ -925,6 +935,45 @@ a = 1
             BTreeMap::from([(chord("Ctrl+Alt+S"), HotkeyAction::SelectCapture)])
         );
         assert!(assigned.conflicts.is_empty());
+    }
+
+    #[test]
+    fn restore_last_hotkey_is_unset_by_default() {
+        let (settings, issues) = load("version = 1\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.hotkeys.get(HotkeyAction::RestoreLast), None);
+    }
+
+    #[test]
+    fn restore_last_hotkey_is_read_and_assigned() {
+        let (settings, issues) = load("version = 1\n[hotkeys]\nrestore_last = \"Ctrl+Alt+Z\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.hotkeys.get(HotkeyAction::RestoreLast),
+            Some(chord("Ctrl+Alt+Z"))
+        );
+        assert_eq!(
+            settings.hotkeys.assign().bound,
+            BTreeMap::from([(chord("Ctrl+Alt+Z"), HotkeyAction::RestoreLast)])
+        );
+    }
+
+    #[test]
+    fn restore_last_hotkey_overlapping_another_hotkey_disables_both() {
+        let keymap = keymap_of(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Alt+S\"\nrestore_last = \"Ctrl+Alt+S\"\n",
+        );
+        assert!(keymap.hotkeys.bound.is_empty());
+        assert_eq!(
+            keymap.issues,
+            vec![SettingsIssue::Conflict {
+                chord: chord("Ctrl+Alt+S"),
+                items: vec![
+                    "hotkeys.select_capture".to_owned(),
+                    "hotkeys.restore_last".to_owned()
+                ],
+            }]
+        );
     }
 
     fn keymap_of(src: &str) -> Keymap {

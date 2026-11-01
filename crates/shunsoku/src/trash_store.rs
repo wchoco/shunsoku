@@ -260,7 +260,6 @@ impl TrashStore {
     }
 
     /// 最後に閉じたスクラップを取り出す。空なら None。画素を読めなければ Some(Err)。
-    #[allow(dead_code)] // 復元のホットキー（#57）で使う
     pub fn restore_last(&mut self) -> Option<std::io::Result<Trashed>> {
         self.trash.restore_last().map(Entry::take)
     }

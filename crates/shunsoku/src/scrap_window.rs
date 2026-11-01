@@ -13,10 +13,10 @@ use shunsoku_core::geometry::Rect;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, IDC_ARROW, LoadCursorW, RegisterClassExW, RemovePropW, SW_SHOW,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetPropW,
-    SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DestroyWindow, IDC_ARROW, IsWindowVisible, LoadCursorW, RegisterClassExW,
+    RemovePropW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow,
+    WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -146,6 +146,18 @@ impl ScrapWindow {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
         }
+    }
+
+    /// 隠す（壊さない。`show` で出し直せる）。
+    pub fn hide(&self) {
+        // SAFETY: 自分のウィンドウ
+        let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+    }
+
+    /// 出ているか（`hide` で隠していないか）。
+    pub fn is_visible(&self) -> bool {
+        // SAFETY: 自分のウィンドウ
+        unsafe { IsWindowVisible(self.hwnd) }.as_bool()
     }
 }
 
