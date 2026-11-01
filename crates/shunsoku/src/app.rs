@@ -88,7 +88,8 @@ use crate::{
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
 const WM_APP_TRAY: u32 = WM_APP + 1;
-/// 環境変数 `SHUNSOKU_TEST_PANIC=ui` のとき、UI スレッドでパニックを起こす（手で確かめる用）。
+/// 環境変数 `SHUNSOKU_TEST_PANIC=ui` のとき、UI スレッドでパニックを起こす（手で確かめる用。デバッグ ビルドだけ）。
+#[cfg(debug_assertions)]
 const WM_APP_TEST_PANIC: u32 = WM_APP + 2;
 /// 保存の裏のスレッドが書き終えた（結果は `App::saves` の受け口に入っている）。
 const WM_APP_SAVED: u32 = WM_APP + 3;
@@ -310,13 +311,31 @@ pub fn run() -> i32 {
         unset,
         app.settings_path.as_deref(),
     );
-    let message_window = app.windows.message;
+    #[cfg(debug_assertions)]
+    start_test_panic(app.windows.message);
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     if let Some((level, body)) = notice {
         notify_user(level, &body);
     }
     log::info!("started");
 
+    let code = message_loop();
+    // トレイを消してからウィンドウを壊す。APP から出してから drop するので、
+    // 壊すときに呼ばれるウィンドウ プロシージャは App を見ない
+    let app = APP.with(|cell| cell.borrow_mut().take());
+    drop(app);
+    if com.is_ok() {
+        // SAFETY: 成功した CoInitializeEx と対にする
+        unsafe { CoUninitialize() };
+    }
+    log::info!("exiting (code {code})");
+    code
+}
+
+/// 手で確かめる用のパニック（デバッグ ビルドだけ）。環境変数 `SHUNSOKU_TEST_PANIC` が `ui` なら UI スレッドで、
+/// `worker` なら裏のスレッドでパニックを起こす。UI スレッドの分はメッセージ ループが回ってから起きる。
+#[cfg(debug_assertions)]
+fn start_test_panic(message_window: HWND) {
     match std::env::var("SHUNSOKU_TEST_PANIC").as_deref() {
         Ok("ui") => {
             // SAFETY: 自分のウィンドウに送る
@@ -336,18 +355,6 @@ pub fn run() -> i32 {
         }
         _ => {}
     }
-
-    let code = message_loop();
-    // トレイを消してからウィンドウを壊す。APP から出してから drop するので、
-    // 壊すときに呼ばれるウィンドウ プロシージャは App を見ない
-    let app = APP.with(|cell| cell.borrow_mut().take());
-    drop(app);
-    if com.is_ok() {
-        // SAFETY: 成功した CoInitializeEx と対にする
-        unsafe { CoUninitialize() };
-    }
-    log::info!("exiting (code {code})");
-    code
 }
 
 /// 起動する。キーの割り当ての問題（`settings::keymap`）と、登録できなかったホットキーも返す。
@@ -558,6 +565,7 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             on_tray(hwnd, tray::event(wparam, lparam));
             Some(LRESULT(0))
         }
+        #[cfg(debug_assertions)]
         WM_APP_TEST_PANIC => panic!("test panic on the UI thread (SHUNSOKU_TEST_PANIC)"),
         WM_APP_SAVED => {
             on_saved();
