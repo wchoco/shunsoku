@@ -8,6 +8,19 @@
 - main への直接 push は禁止。必ず PR を作り、**merge commit** で main に戻す（squash / rebase は無効化済み）。マージ後のブランチは自動削除される。
 - PR のマージはユーザーの指示があった場合のみ `gh pr merge <番号> --merge` で行う。自己判断でマージしない。
 
+### CI（必須ステータス `ci`）
+
+main の Ruleset が PR の HEAD に `ci` ステータスの success を要求する。`.github/workflows/ci.yml` の `ci` ジョブ（`windows-latest`）が、すべての PR と main への push で次の 4 つを回す（パスでは絞らない）。push 前に手元でも通しておく。
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --release
+```
+
+ツールチェーンは `rust-toolchain.toml` で固定している。
+
 ### セキュリティゲート（必須ステータス `claude-security`）
 
 main の Ruleset が PR の HEAD に `claude-security` ステータスの success を要求する。HEAD が変われば付け直しが必要。
