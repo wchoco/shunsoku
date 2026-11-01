@@ -4,6 +4,7 @@
 //! 枠と影の分だけ大きく作り、画像の位置（`ScrapModel::position`）がちょうど撮った範囲に重なるようにする。
 
 use crate::geometry::{Point, Rect, Size};
+use crate::settings::ScrapAppearance;
 
 /// スクラップの表示のモード。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,6 +88,22 @@ impl Appearance {
     }
 }
 
+impl From<ScrapAppearance> for Appearance {
+    /// 設定ファイルの `[scrap]` から作る。枠を出さない設定なら枠なし。
+    fn from(settings: ScrapAppearance) -> Appearance {
+        let border = settings.border;
+        let (r, g, b) = (border.color.0, border.color.1, border.color.2);
+        Appearance {
+            opacity: settings.opacity,
+            border: border.visible.then_some(Border {
+                width: border.width,
+                color: u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
+            }),
+            shadow: settings.shadow,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +129,42 @@ mod tests {
             shadow: false,
         };
         assert_eq!(scrap.window_rect(&plain), Rect::new(-100, 50, 200, 250));
+    }
+
+    #[test]
+    fn the_appearance_follows_the_settings() {
+        use crate::settings::{self, Rgb};
+        assert_eq!(
+            Appearance::from(ScrapAppearance::default()),
+            Appearance::default()
+        );
+        let custom = ScrapAppearance {
+            opacity: 80,
+            border: settings::Border {
+                visible: true,
+                width: 3,
+                color: Rgb(0x12, 0x34, 0x56),
+            },
+            shadow: false,
+        };
+        assert_eq!(
+            Appearance::from(custom),
+            Appearance {
+                opacity: 80,
+                border: Some(Border {
+                    width: 3,
+                    color: 0x12_34_56,
+                }),
+                shadow: false,
+            }
+        );
+        let hidden = ScrapAppearance {
+            border: settings::Border {
+                visible: false,
+                ..settings::Border::default()
+            },
+            ..ScrapAppearance::default()
+        };
+        assert_eq!(Appearance::from(hidden).border, None);
     }
 }
