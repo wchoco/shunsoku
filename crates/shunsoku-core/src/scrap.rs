@@ -7,7 +7,7 @@
 pub mod ops;
 
 use crate::geometry::{Point, Rect, Size};
-use crate::settings::ScrapAppearance;
+use crate::settings::{DpiScaling, ScrapAppearance};
 
 /// スクラップの表示のモード。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,6 +43,12 @@ pub struct ScrapModel {
     pub mode: Mode,
     /// 倍率（%）。画像の画素が基準で、100 が画素等倍。`ZOOM_MIN..=ZOOM_MAX` に収める。
     zoom: u16,
+    /// ウィンドウのあるモニタの DPI。最初の `set_dpi` までは分からない。
+    dpi: Option<u32>,
+    /// 「見かけの大きさを保つ」で倍率を計算し直す元: 最後に倍率を決めたときの倍率と DPI。倍率を DPI の比で
+    /// 掛けるたびに丸めると、モニタを行き来するうちに倍率がずれていくので、ここから毎回計算する。
+    /// 拡大縮小で倍率を変えたら捨てる。
+    dpi_origin: Option<(u16, u32)>,
 }
 
 impl ScrapModel {
@@ -52,6 +58,8 @@ impl ScrapModel {
             image_size,
             mode: Mode::Normal,
             zoom: ZOOM_ACTUAL,
+            dpi: None,
+            dpi_origin: None,
         }
     }
 
@@ -72,6 +80,41 @@ impl ScrapModel {
 
     /// 倍率を `zoom`（%、範囲に収める）にする。変わらなければ false。
     pub fn set_zoom(&mut self, zoom: u16, anchor: ZoomAnchor) -> bool {
+        let changed = self.scale_to(zoom, anchor);
+        if changed {
+            self.dpi_origin = None;
+        }
+        changed
+    }
+
+    /// ウィンドウのあるモニタの DPI が `dpi` になった（開いたときと `WM_DPICHANGED`）。最初の 1 回は覚えるだけ。
+    /// `scaling` が「見かけの大きさを保つ」なら、倍率を DPI の比で計算し直す（`anchor` が基準）。
+    /// 計算し直した倍率は四捨五入して範囲に収める。表示の大きさが変わったら true。
+    pub fn set_dpi(&mut self, dpi: u32, scaling: DpiScaling, anchor: ZoomAnchor) -> bool {
+        let dpi = dpi.max(1);
+        let Some(from) = self.dpi.replace(dpi) else {
+            return false;
+        };
+        if from == dpi {
+            return false;
+        }
+        match scaling {
+            DpiScaling::KeepPixels => {
+                self.dpi_origin = None;
+                false
+            }
+            DpiScaling::KeepApparentSize => {
+                let (zoom, origin) = *self.dpi_origin.get_or_insert((self.zoom, from));
+                let scaled = (u64::from(zoom) * u64::from(dpi) * 2 + u64::from(origin))
+                    / (u64::from(origin) * 2);
+                let scaled = u16::try_from(scaled).unwrap_or(u16::MAX);
+                self.scale_to(scaled, anchor)
+            }
+        }
+    }
+
+    /// 倍率を `zoom`（%、範囲に収める）にし、`anchor` の下の画素が動かないように位置を動かす。
+    fn scale_to(&mut self, zoom: u16, anchor: ZoomAnchor) -> bool {
         let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         if zoom == self.zoom {
             return false;
@@ -407,6 +450,89 @@ mod tests {
         assert!(scrap.set_zoom(1000, ZoomAnchor::Center));
         assert_eq!(scrap.zoom(), ZOOM_MAX);
         assert!(!scrap.set_zoom(ZOOM_MAX, ZoomAnchor::Center));
+    }
+
+    #[test]
+    fn keeping_the_apparent_size_rescales_the_zoom_from_150_to_100_percent_dpi() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        assert!(!scrap.set_dpi(144, DpiScaling::KeepApparentSize, ZoomAnchor::Center));
+        assert!(scrap.set_dpi(96, DpiScaling::KeepApparentSize, ZoomAnchor::Center));
+        // 300px を 144dpi で見た大きさは、96dpi では 200px。倍率は画素が基準なので 67%
+        assert_eq!(scrap.zoom(), 67);
+        assert_eq!(scrap.display_size(), Size::new(201, 134));
+        // 中心 (150, 100) は動かない
+        assert_eq!(scrap.image_rect(), Rect::new(50, 33, 251, 167));
+    }
+
+    #[test]
+    fn keeping_the_apparent_size_rescales_the_zoom_from_100_to_150_percent_dpi() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_dpi(96, DpiScaling::KeepApparentSize, ZoomAnchor::Center);
+        assert!(scrap.set_dpi(144, DpiScaling::KeepApparentSize, ZoomAnchor::Center));
+        assert_eq!(scrap.zoom(), 150);
+        assert_eq!(scrap.image_rect(), Rect::new(-75, -50, 375, 250));
+    }
+
+    #[test]
+    fn keeping_pixels_leaves_the_size_and_the_zoom_across_dpis() {
+        for (from, to) in [(144, 96), (96, 144)] {
+            let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+            scrap.set_dpi(from, DpiScaling::KeepPixels, ZoomAnchor::Center);
+            assert!(!scrap.set_dpi(to, DpiScaling::KeepPixels, ZoomAnchor::Center));
+            assert_eq!(scrap.zoom(), 100, "{from} -> {to}");
+            assert_eq!(
+                scrap.image_rect(),
+                Rect::new(0, 0, 300, 200),
+                "{from} -> {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn going_back_to_the_first_dpi_restores_the_zoom_even_when_it_was_rounded() {
+        let keep = DpiScaling::KeepApparentSize;
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_dpi(144, keep, ZoomAnchor::Center);
+        scrap.set_dpi(96, keep, ZoomAnchor::Center);
+        assert_eq!(scrap.zoom(), 67);
+        // 67% から計算し直すと 100.5% になるが、元の倍率から計算するので 100% に戻る
+        scrap.set_dpi(144, keep, ZoomAnchor::Center);
+        assert_eq!(scrap.zoom(), 100);
+        scrap.set_dpi(120, keep, ZoomAnchor::Center);
+        assert_eq!(scrap.zoom(), 83);
+        scrap.set_dpi(144, keep, ZoomAnchor::Center);
+        assert_eq!(scrap.zoom(), 100);
+
+        // 上限で止めた倍率も、戻れば元の倍率になる
+        scrap.set_zoom(800, ZoomAnchor::Center);
+        scrap.set_dpi(96, keep, ZoomAnchor::Center);
+        assert_eq!(scrap.zoom(), 533);
+        scrap.set_dpi(192, keep, ZoomAnchor::Center);
+        assert_eq!(scrap.zoom(), ZOOM_MAX);
+        scrap.set_dpi(144, keep, ZoomAnchor::Center);
+        assert_eq!(scrap.zoom(), 800);
+    }
+
+    #[test]
+    fn zooming_after_a_dpi_change_becomes_the_new_base() {
+        let keep = DpiScaling::KeepApparentSize;
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_dpi(144, keep, ZoomAnchor::Center);
+        scrap.set_dpi(96, keep, ZoomAnchor::Center);
+        assert!(scrap.zoom_in(ZoomAnchor::Center));
+        assert_eq!(scrap.zoom(), 70);
+        scrap.set_dpi(144, keep, ZoomAnchor::Center);
+        assert_eq!(scrap.zoom(), 105);
+    }
+
+    #[test]
+    fn a_dpi_change_while_dragging_scales_around_the_cursor() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_dpi(96, DpiScaling::KeepApparentSize, ZoomAnchor::Center);
+        let cursor = Point::new(30, 20);
+        scrap.set_dpi(192, DpiScaling::KeepApparentSize, ZoomAnchor::At(cursor));
+        // ドラッグ中はカーソルの下の画素がカーソルについてくる
+        assert_eq!(scrap.image_rect(), Rect::new(-30, -20, 570, 380));
     }
 
     #[test]

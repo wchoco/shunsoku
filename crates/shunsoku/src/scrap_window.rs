@@ -2,8 +2,8 @@
 //! premultiplied BGRA の DIB（`render::Canvas` の DC）から出す。
 //!
 //! - 位置と大きさはスクリーン座標の物理ピクセル。大きさは core の `ScrapModel::window_rect`（倍率を掛けた
-//!   表示の大きさ + 余白）で決まり、DPI が変わっても変えない（ウィンドウ プロシージャは `app` が持ち、
-//!   `WM_DPICHANGED` で 0 を返す）。
+//!   表示の大きさ + 余白）で決まる。`WM_DPICHANGED` で提案された矩形は当てない（ウィンドウ プロシージャは
+//!   `app` が持ち、新しい DPI を core の `ScrapModel::set_dpi` に渡すだけにする）。
 //! - 透明度は `SourceConstantAlpha` で掛ける。
 //! - シェルの全画面の判定から外す（`NonRudeHWND`）。モニタ全体を覆うスクラップを最前面に出すと、
 //!   シェルが全画面のウィンドウとみなしてタスクバーを後ろに回し、動かすたびにモニタを覆う・覆わないが
