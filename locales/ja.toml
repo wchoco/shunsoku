@@ -6,6 +6,7 @@
 tooltip = "shunsoku"
 
 [tray.menu]
+select_capture = "範囲選択キャプチャ"
 exit = "終了"
 
 [panic]

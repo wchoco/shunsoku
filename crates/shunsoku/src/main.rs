@@ -6,10 +6,14 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod grab;
+#[cfg(windows)]
 mod logger;
 #[cfg(windows)]
 #[expect(dead_code, reason = "通知を出す後続のチケット（#44 など）で使う")]
 mod notify;
+#[cfg(windows)]
+mod overlay;
 #[cfg(windows)]
 mod panic_hook;
 #[cfg(windows)]

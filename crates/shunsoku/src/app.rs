@@ -14,28 +14,35 @@
 //! - ウィンドウは 2 つ。ホットキーと登録メッセージを受けるメッセージ専用ウィンドウと、トレイの持ち主の
 //!   隠しウィンドウ。メッセージ専用ウィンドウにはブロードキャストの `TaskbarCreated` が届かないため、
 //!   Explorer の再起動のあとにトレイを登録し直せるように、トレイだけ通常の（見えない）ウィンドウに持たせる。
+//!   ほかに、範囲選択の画面を開いている間だけ、モニタごとのウィンドウ（`overlay`）がある。
+//! - キャプチャは `capture::request` の依頼 1 本の流れで進める: 依頼 → 待機（`delay`）→ 取得（`grab`）→
+//!   範囲選択の画面（`overlay`）→ 切り抜き → 出力 → 結果。同時に進める依頼は 1 件だけ（`Capture`）。
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
+use shunsoku_core::capture::request::{CaptureRequest, Source};
 use shunsoku_core::i18n::Catalog;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
-    IDI_APPLICATION, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_ENDSESSION,
+    IDI_APPLICATION, KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SetTimer, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP,
+    WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN, WM_TIMER,
     WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
-use crate::{logger, panic_hook, single_instance, tray};
+use crate::{grab, logger, overlay, panic_hook, single_instance, tray};
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
 const WM_APP_TRAY: u32 = WM_APP + 1;
@@ -49,6 +56,10 @@ const SECOND_INSTANCE_MESSAGE: PCWSTR = w!("shunsoku.SecondInstance");
 
 /// トレイのメニューの項目の番号。
 const CMD_EXIT: u32 = 1;
+const CMD_SELECT_CAPTURE: u32 = 2;
+
+/// 依頼の `delay` を待つタイマーの番号（メッセージ専用ウィンドウの WM_TIMER）。
+const TIMER_CAPTURE_DELAY: usize = 1;
 
 /// UI スレッドのパニックで終わったときの終了コード（Rust の既定と同じ）。
 const EXIT_PANIC: i32 = 101;
@@ -64,11 +75,30 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-/// アプリの状態。UI スレッドだけが持つ。drop の順（宣言の順）でトレイを消してからウィンドウを壊す。
+/// アプリの状態。UI スレッドだけが持つ。drop の順（宣言の順）でトレイを消し、範囲選択の画面を閉じてから
+/// ウィンドウを壊す。
 struct App {
     tray: tray::Tray,
+    capture: Capture,
+    gpu: grab::Gpu,
     windows: Windows,
+    module: HINSTANCE,
     _instance: Option<single_instance::Guard>,
+}
+
+/// 進めているキャプチャの依頼。同時に 1 件だけ。
+#[derive(Default)]
+enum Capture {
+    #[default]
+    Idle,
+    /// `delay` を待っている。
+    Waiting(CaptureRequest),
+    /// 範囲選択の画面を開いている。
+    Selecting {
+        #[expect(dead_code, reason = "範囲を選んで撮るチケット（#41）で出力に使う")]
+        request: CaptureRequest,
+        overlay: overlay::Overlay,
+    },
 }
 
 struct Windows {
@@ -192,6 +222,8 @@ fn start(instance: Option<single_instance::Guard>) -> Result<App> {
         return Err(windows::core::Error::from_thread());
     }
 
+    overlay::register_class(module, Some(overlay_wndproc))?;
+
     // SAFETY: 名前は 'static
     let _ = TASKBAR_CREATED.set(unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
 
@@ -254,7 +286,10 @@ fn start(instance: Option<single_instance::Guard>) -> Result<App> {
 
     Ok(App {
         tray,
+        capture: Capture::Idle,
+        gpu: grab::Gpu::default(),
         windows,
+        module,
         _instance: instance,
     })
 }
@@ -293,8 +328,31 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: 受け取った引数をそのまま渡す
+    unsafe { dispatch(on_message, hwnd, msg, wparam, lparam) }
+}
+
+/// 範囲選択の画面のウィンドウのプロシージャ。
+unsafe extern "system" fn overlay_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: 受け取った引数をそのまま渡す
+    unsafe { dispatch(on_overlay_message, hwnd, msg, wparam, lparam) }
+}
+
+/// `handler` をパニックから守って呼ぶ。`handler` が None を返したら DefWindowProcW に任せる。
+unsafe fn dispatch(
+    handler: fn(HWND, u32, WPARAM, LPARAM) -> Option<LRESULT>,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if !panic_hook::ui_panicked() {
-        match catch_unwind(AssertUnwindSafe(|| on_message(hwnd, msg, wparam, lparam))) {
+        match catch_unwind(AssertUnwindSafe(|| handler(hwnd, msg, wparam, lparam))) {
             Ok(Some(result)) => return result,
             Ok(None) => {}
             Err(_) => {
@@ -317,6 +375,14 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             Some(LRESULT(0))
         }
         WM_APP_TEST_PANIC => panic!("test panic on the UI thread (SHUNSOKU_TEST_PANIC)"),
+        WM_TIMER if wparam.0 == TIMER_CAPTURE_DELAY => {
+            // SAFETY: 自分のタイマーを止める
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_CAPTURE_DELAY);
+            }
+            open_overlay();
+            Some(LRESULT(0))
+        }
         WM_CLOSE => {
             // 外から閉じるよう頼まれた（`taskkill` の /F なしなど）。トレイの「終了」と同じく終わる
             log::info!("close requested");
@@ -347,24 +413,176 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
 fn on_tray(owner: HWND, event: tray::Event) {
     match event {
         tray::Event::ContextMenu { x, y } => {
-            let items = [tray::MenuItem {
-                id: CMD_EXIT,
-                label: text("tray.menu.exit"),
-                enabled: true,
-            }];
+            let items = [
+                tray::MenuItem {
+                    id: CMD_SELECT_CAPTURE,
+                    label: text("tray.menu.select_capture"),
+                    enabled: true,
+                },
+                tray::MenuItem {
+                    id: CMD_EXIT,
+                    label: text("tray.menu.exit"),
+                    enabled: true,
+                },
+            ];
             // モーダルなので App を借りずに呼ぶ
             if let Some(command) = tray::show_menu(owner, &items, x, y) {
                 on_command(command);
             }
         }
-        tray::Event::Select | tray::Event::Other => {}
+        tray::Event::Select => request_capture(Source::TrayClick),
+        tray::Event::Other => {}
     }
 }
 
 fn on_command(command: u32) {
-    if command == CMD_EXIT {
-        log::info!("exit requested from the tray menu");
-        // SAFETY: UI スレッドで呼ぶ
-        unsafe { PostQuitMessage(0) };
+    match command {
+        CMD_SELECT_CAPTURE => request_capture(Source::TrayMenu),
+        CMD_EXIT => {
+            log::info!("exit requested from the tray menu");
+            // SAFETY: UI スレッドで呼ぶ
+            unsafe { PostQuitMessage(0) };
+        }
+        _ => {}
     }
+}
+
+/// 範囲選択の画面のウィンドウへのメッセージ。キー入力は前面の 1 枚にしか来ないので、
+/// どのウィンドウに来たかで分けない。
+fn on_overlay_message(_hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+    match msg {
+        WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
+            log::info!("overlay cancelled (Esc)");
+            close_overlay();
+            Some(LRESULT(0))
+        }
+        // 他のアプリに前面を取られるとキー入力が来なくなり、閉じられなくなるので閉じる
+        WM_ACTIVATEAPP if wparam.0 == 0 => {
+            log::info!("overlay lost the foreground; closing");
+            close_overlay();
+            Some(LRESULT(0))
+        }
+        // モニタの構成が変わると、固定された画面は実際の画面と合わなくなる
+        WM_DISPLAYCHANGE => {
+            log::info!("display changed while the overlay is open; closing");
+            close_overlay();
+            Some(LRESULT(0))
+        }
+        // 背景は塗らない（描くのはスワップチェーンだけ）
+        WM_ERASEBKGND => Some(LRESULT(1)),
+        // 画素を等倍のまま出すので、DPI が変わっても大きさを変えない
+        WM_DPICHANGED => Some(LRESULT(0)),
+        _ => None,
+    }
+}
+
+/// 発生源からキャプチャの依頼を受ける。ほかの依頼を進めている間（範囲選択の画面を開いている間など）は無視する。
+fn request_capture(source: Source) {
+    let request = CaptureRequest::from_source(source);
+    let delay = request.delay;
+    let accepted = with_app(|app| {
+        if !matches!(app.capture, Capture::Idle) {
+            return None;
+        }
+        app.capture = Capture::Waiting(request);
+        Some(app.windows.message)
+    })
+    .flatten();
+    let Some(message_window) = accepted else {
+        log::info!("capture requested from {source:?} while another one is in progress; ignored");
+        return;
+    };
+    log::info!("capture requested from {source:?}");
+    if delay.is_zero() {
+        open_overlay();
+        return;
+    }
+    let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: 自分のウィンドウのタイマー
+    if unsafe { SetTimer(Some(message_window), TIMER_CAPTURE_DELAY, ms, None) } == 0 {
+        log::warn!("could not start the capture delay timer; capturing now");
+        open_overlay();
+    }
+}
+
+/// 待っている依頼の画面を取得して、範囲選択の画面を出す。
+fn open_overlay() {
+    let started = Instant::now();
+    // 取得のスレッドは App に触らないので、借りたまま待ってよい
+    let grabbed = with_app(|app| {
+        matches!(app.capture, Capture::Waiting(_)).then(|| (app.gpu.grab(), app.module))
+    })
+    .flatten();
+    let Some((grabbed, module)) = grabbed else {
+        return;
+    };
+    let shots = match grabbed {
+        Ok(shots) => shots,
+        Err(e) => {
+            // 撮れないときの通知は M3
+            log::warn!("could not grab the screen: {e}");
+            end_capture();
+            return;
+        }
+    };
+    let monitors = shots.len();
+    let grab_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    // ウィンドウを作るとメッセージが届くので、App を借りずに開く
+    let overlay = match overlay::Overlay::open(shots, module) {
+        Ok(overlay) => overlay,
+        Err(e) => {
+            log::error!("could not open the overlay: {e}");
+            end_capture();
+            return;
+        }
+    };
+    let rejected = with_app(|app| match std::mem::take(&mut app.capture) {
+        Capture::Waiting(request) => {
+            app.capture = Capture::Selecting { request, overlay };
+            None
+        }
+        other => {
+            app.capture = other;
+            Some(overlay)
+        }
+    });
+    if !matches!(rejected, Some(None)) {
+        // 依頼がもうない（起こらないはず）。開いた画面を App を借りずに閉じる
+        log::warn!("capture request vanished while opening the overlay");
+        drop(rejected);
+        end_capture();
+        return;
+    }
+    log::info!(
+        "overlay opened on {monitors} monitor(s): grab {grab_ms:.1} ms, total {:.1} ms",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+}
+
+/// 範囲選択の画面を閉じ、依頼を終える。
+fn close_overlay() {
+    let overlay = with_app(|app| match std::mem::take(&mut app.capture) {
+        Capture::Selecting { overlay, .. } => Some(overlay),
+        other => {
+            app.capture = other;
+            None
+        }
+    })
+    .flatten();
+    let Some(overlay) = overlay else {
+        return;
+    };
+    // ウィンドウを壊すとメッセージが届くので、App を借りずに閉じる
+    drop(overlay);
+    end_capture();
+    log::info!("overlay closed");
+}
+
+/// 依頼を終えて、取得に使った GPU のメモリを返す。
+fn end_capture() {
+    with_app(|app| {
+        app.capture = Capture::Idle;
+        app.gpu.trim();
+    });
 }

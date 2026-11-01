@@ -82,6 +82,10 @@ mod tests {
     fn bundled_japanese_catalog_has_tray_menu_texts() {
         let catalog = Catalog::parse(include_str!("../../../locales/ja.toml")).unwrap();
         assert_eq!(catalog.text("tray.menu.exit"), "終了");
+        assert_eq!(
+            catalog.text("tray.menu.select_capture"),
+            "範囲選択キャプチャ"
+        );
         assert_eq!(catalog.text("tray.tooltip"), "shunsoku");
     }
 }
