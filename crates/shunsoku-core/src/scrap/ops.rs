@@ -246,19 +246,19 @@ const CTRL_SHIFT_S: Chord = CTRL_S.shift();
 const CTRL_T: Chord = Chord::plain(Key::known(0x54)).ctrl();
 
 /// トリムの範囲を選んでいる間（`Mode::Trimming`）のほかは、いつでも実行できる。
-const fn always(model: &ScrapModel) -> bool {
+const fn not_trimming(model: &ScrapModel) -> bool {
     !model.is_trimming()
 }
 
 /// トリムしていて、畳んでいなければ実行できる（トリムの範囲を選んでいる間は除く）。
 fn trimmed(model: &ScrapModel) -> bool {
-    unfolded(model) && model.is_trimmed()
+    not_compact(model) && model.is_trimmed()
 }
 
 /// コンパクト表示に畳んでいないときだけ実行できる。畳んでいる間に実行できるのは移動・閉じる・コピーと、
 /// 広げる操作だけにする（spec #33）。
-fn unfolded(model: &ScrapModel) -> bool {
-    always(model) && !model.is_compact()
+fn not_compact(model: &ScrapModel) -> bool {
+    not_trimming(model) && !model.is_compact()
 }
 
 /// `(dx, dy)` だけ動かす操作の `run`。
@@ -488,9 +488,9 @@ fn shadow_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
 /// コンパクト表示に畳む、または広げる。畳む基準点は拡大縮小と同じ（マウスならカーソル、ほかは中心）。
 fn toggle_compact(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     if model.is_compact() {
-        model.unfold();
+        model.leave_compact();
     } else {
-        model.fold(zoom_anchor(context));
+        model.enter_compact(zoom_anchor(context));
     }
     vec![Effect::Redraw]
 }
@@ -532,7 +532,7 @@ const fn keyboard_move(
         order,
         drag_only: false,
         in_menu: false,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run,
     }
@@ -549,7 +549,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run: copy,
     },
@@ -562,7 +562,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 20,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: save_default,
     },
@@ -575,7 +575,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 30,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: save_as,
     },
@@ -588,7 +588,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: trim,
     },
@@ -664,7 +664,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 0,
         drag_only: true,
         in_menu: false,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run: drag,
     },
@@ -677,7 +677,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: Some(zoom_choices),
         run: zoom_to,
     },
@@ -690,7 +690,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 11,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: zoom_in,
     },
@@ -703,7 +703,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 12,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: zoom_out,
     },
@@ -716,7 +716,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 13,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: zoom_actual,
     },
@@ -729,7 +729,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 20,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: Some(opacity_choices),
         run: opacity_to,
     },
@@ -742,7 +742,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 21,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: opacity_up,
     },
@@ -755,7 +755,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 22,
         drag_only: false,
         in_menu: false,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: None,
         run: opacity_down,
     },
@@ -768,7 +768,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 23,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: Some(border_choices),
         run: border_to,
     },
@@ -781,7 +781,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 24,
         drag_only: false,
         in_menu: true,
-        can_execute: unfolded,
+        can_execute: not_compact,
         choices: Some(shadow_choices),
         run: shadow_to,
     },
@@ -794,7 +794,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 30,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run: toggle_compact,
     },
@@ -807,7 +807,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: always,
+        can_execute: not_trimming,
         choices: None,
         run: close,
     },
@@ -1598,7 +1598,7 @@ mod tests {
     #[test]
     fn only_moving_closing_copying_and_unfolding_run_while_compact() {
         let mut model = scrap();
-        model.fold(ZoomAnchor::Center);
+        model.enter_compact(ZoomAnchor::Center);
         let runnable: Vec<OperationId> = OPERATIONS
             .iter()
             .filter(|op| (op.can_execute)(&model))
@@ -1634,7 +1634,7 @@ mod tests {
     fn the_menu_greys_out_what_cannot_run_while_compact() {
         let shortcuts = Shortcuts::new(OPERATIONS, &ShortcutOverrides::new());
         let mut model = scrap();
-        model.fold(ZoomAnchor::Center);
+        model.enter_compact(ZoomAnchor::Center);
         let enabled: Vec<(OperationId, bool)> =
             menu(OPERATIONS, &model, &shortcuts, &Appearance::default())
                 .into_iter()
@@ -2148,7 +2148,7 @@ mod tests {
             order,
             drag_only: false,
             in_menu: true,
-            can_execute: always,
+            can_execute: not_trimming,
             choices: None,
             run: nothing,
         }
