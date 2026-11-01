@@ -4,21 +4,28 @@
 //! - 位置と大きさはスクリーン座標の物理ピクセル。画素を等倍で出すので、DPI が変わっても大きさを変えない
 //!   （ウィンドウ プロシージャは `app` が持ち、`WM_DPICHANGED` で 0 を返す）。
 //! - 透明度は `SourceConstantAlpha` で掛ける。
+//! - シェルの全画面の判定から外す（`NonRudeHWND`）。モニタ全体を覆うスクラップを最前面に出すと、
+//!   シェルが全画面のウィンドウとみなしてタスクバーを後ろに回し、動かすたびにモニタを覆う・覆わないが
+//!   切り替わってタスクバーがちらつくため。タスクバーは常にスクラップの上に出る。
 //! - drop でウィンドウを壊す。
 
 use shunsoku_core::geometry::Rect;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, POINT, SIZE};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, IDC_ARROW, LoadCursorW, RegisterClassExW, SW_SHOW,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-    ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED,
+    CreateWindowExW, DestroyWindow, IDC_ARROW, LoadCursorW, RegisterClassExW, RemovePropW, SW_SHOW,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetPropW,
+    SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
 /// スクラップのウィンドウのクラス名。
 const CLASS_NAME: PCWSTR = w!("shunsoku.scrap");
+
+/// シェルの全画面の判定から外すウィンドウのプロパティ。値は何でもよく、あることだけが見られる。
+/// <https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist2-markfullscreenwindow>
+const NON_RUDE: PCWSTR = w!("NonRudeHWND");
 
 /// ウィンドウのクラスを登録する。`wndproc` は `app` のもの。
 pub fn register_class(module: HINSTANCE, wndproc: WNDPROC) -> Result<()> {
@@ -66,6 +73,11 @@ impl ScrapWindow {
                 None,
             )?
         };
+        // 表示する前に付ける（シェルは表示したときに判定する）。付けられなくてもスクラップは使えるので、ログだけ
+        // SAFETY: 自分のウィンドウ。プロパティ名は 'static
+        if let Err(e) = unsafe { SetPropW(hwnd, NON_RUDE, Some(HANDLE(1 as _))) } {
+            log::warn!("could not opt the scrap out of full-screen detection: {e}");
+        }
         Ok(ScrapWindow { hwnd })
     }
 
@@ -141,6 +153,8 @@ impl Drop for ScrapWindow {
     fn drop(&mut self) {
         // SAFETY: 自分で作ったウィンドウを、作ったスレッドで壊す
         unsafe {
+            // ウィンドウのプロパティは壊す前に外す決まり
+            let _ = RemovePropW(self.hwnd, NON_RUDE);
             let _ = DestroyWindow(self.hwnd);
         }
     }
