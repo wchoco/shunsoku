@@ -15,10 +15,11 @@ use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, POINT, SIZE}
 use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, IDC_ARROW, IsWindowVisible, LoadCursorW, RegisterClassExW,
-    RemovePropW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow,
-    WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_DBLCLKS, CreateWindowExW, DestroyWindow, IDC_ARROW, IsWindowVisible, LoadCursorW,
+    RegisterClassExW, RemovePropW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, ULW_ALPHA,
+    UpdateLayeredWindow, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -35,6 +36,8 @@ pub fn register_class(module: HINSTANCE, wndproc: WNDPROC) -> Result<()> {
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW)? };
     let class = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
+        // ダブルクリック（トリムの確定）を WM_LBUTTONDBLCLK で受ける
+        style: CS_DBLCLKS,
         lpfnWndProc: wndproc,
         hInstance: module,
         hCursor: cursor,

@@ -39,6 +39,9 @@
 //! - 閉じたスクラップ（`Effect::MoveToTrash`、Alt+F4 も）は `App::trash`（`trash_store`）に閉じる直前の
 //!   `ScrapModel` のまま入れる。画素は裏のスレッドで一時ファイルに書き、書き終えたら `WM_APP_TRASH` で受ける。
 //!   トレイメニューの「ごみ箱」から選ぶと、その状態のまま浮かべ直してフォーカスを移す（`restore_scrap`）。
+//!   ごみ箱に入れる画素は元の画像（トリム前）で、トリムの範囲は `ScrapModel` に残るので、戻すとトリムしたまま戻る。
+//! - トリムの範囲を選んでいる間（`Effect::EnterTrimMode` から）は、左ボタン・カーソルの移動・Enter・`Esc`・
+//!   ダブルクリックを core の `ScrapModel::trim_input` に渡し、範囲を描き直す（`on_trim_input`）。
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -58,7 +61,7 @@ use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseGesture, OpContext, OperationDescriptor,
     OperationId, Shortcuts,
 };
-use shunsoku_core::scrap::{Appearance, Drag, ScrapModel, Wheel};
+use shunsoku_core::scrap::{Appearance, Drag, Mode, ScrapModel, TrimInput, Wheel};
 use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
 use shunsoku_core::trash::TrashId;
@@ -72,7 +75,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_DOWN,
-    VK_ESCAPE, VK_LEFT, VK_LWIN, VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
+    VK_ESCAPE, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessagePos, GetMessageW,
@@ -80,8 +83,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, RegisterWindowMessageW, SetCursorPos, SetTimer, TranslateMessage,
     WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -199,7 +202,10 @@ struct Scrap {
     /// drop でウィンドウを壊す。
     window: scrap_window::ScrapWindow,
     model: ScrapModel,
+    /// 元の画像（トリム前）。
     image: Image,
+    /// トリムしていれば、`image` から切り出した表示する画像（`ScrapModel::shown_image`）。
+    shown: Option<Image>,
     /// 左ドラッグ。
     drag: Drag,
     /// ホイールの回転（1 ノッチに満たない量をためる）。
@@ -209,6 +215,18 @@ struct Scrap {
 }
 
 impl Scrap {
+    /// 表示する画像（保存・コピーの対象）。トリムしていればトリム後。
+    fn shown(&self) -> &Image {
+        self.shown.as_ref().unwrap_or(&self.image)
+    }
+
+    /// トリムの範囲が `before` から変わっていたら、表示する画像を切り出し直す。
+    fn sync_shown(&mut self, before: &ScrapModel) {
+        if self.model.trim_rect() != before.trim_rect() {
+            self.shown = shown_image(&self.model, &self.image);
+        }
+    }
+
     /// `Effect::Redraw`: `model` のとおりに出し直す。表示の大きさとモードが `before` と同じで、`repaint` でも
     /// なければ、中身は変わらないのでウィンドウを動かすだけにする（ドラッグのたびに描き直さない）。
     fn redraw(
@@ -241,7 +259,7 @@ impl Scrap {
         paint_scrap(
             renderer,
             &self.window,
-            &self.image,
+            self.shown(),
             &self.model,
             appearance,
             label,
@@ -267,7 +285,21 @@ fn paint_scrap(
         Some(painter) => painter,
         None => render::Renderer::new()?,
     };
-    painter.paint_scrap(&canvas, image, model.display_size(), appearance, label)?;
+    let trim = matches!(model.mode, Mode::Trimming(_)).then(|| render::TrimOverlay {
+        // 画像の左上から、ウィンドウの中の画像の位置へ
+        selection: model.trim_selection().map(|r| {
+            let margin = appearance.margin();
+            r.offset(margin - model.position.x, margin - model.position.y)
+        }),
+    });
+    painter.paint_scrap(
+        &canvas,
+        image,
+        model.display_size(),
+        appearance,
+        label,
+        trim,
+    )?;
     *renderer = Some(painter);
     // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
     window.present(canvas.dc(), rect, appearance.opacity)
@@ -885,17 +917,25 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             // SAFETY: 自分のウィンドウ
             unsafe { SetCapture(hwnd) };
             let at = message_screen_point();
-            with_app(|app| {
-                if let Some(scrap) = app.scrap_mut(hwnd) {
-                    scrap.drag.start(at);
-                }
-            });
+            if !on_trim_input(hwnd, TrimInput::Press(at)) {
+                with_app(|app| {
+                    if let Some(scrap) = app.scrap_mut(hwnd) {
+                        scrap.drag.start(at);
+                    }
+                });
+            }
             Some(LRESULT(0))
         }
         WM_MOUSEMOVE => {
-            on_scrap_drag(hwnd, wparam, message_screen_point());
+            if is_trimming(hwnd) {
+                on_trim_move(hwnd, wparam, message_screen_point());
+            } else {
+                on_scrap_drag(hwnd, wparam, message_screen_point());
+            }
             Some(LRESULT(0))
         }
+        // トリムの最中は確定。そうでなければ DefWindowProcW に任せる
+        WM_LBUTTONDBLCLK => on_trim_input(hwnd, TrimInput::Confirm).then_some(LRESULT(0)),
         WM_LBUTTONUP => {
             // ドラッグは WM_CAPTURECHANGED で終える。App を借りる前に放す（そのメッセージが届くため）
             // SAFETY: UI スレッドで呼ぶ
@@ -908,6 +948,7 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
                     scrap.drag.end();
                 }
             });
+            on_trim_input(hwnd, TrimInput::Release);
             Some(LRESULT(0))
         }
         WM_MBUTTONUP => {
@@ -995,6 +1036,66 @@ fn on_scrap_drag(hwnd: HWND, wparam: WPARAM, at: Point) {
     }
 }
 
+/// トリムの範囲を選んでいるか。
+fn is_trimming(hwnd: HWND) -> bool {
+    with_app(|app| {
+        app.scraps
+            .iter()
+            .any(|s| s.window.hwnd() == hwnd && matches!(s.model.mode, Mode::Trimming(_)))
+    })
+    .unwrap_or(false)
+}
+
+/// トリムの最中のカーソルの移動。左ボタンを押していて、このウィンドウがマウスを捕まえているときだけ範囲を
+/// 変える。そうでなければ（離したことを取りこぼしたなど）押していないことにする。
+fn on_trim_move(hwnd: HWND, wparam: WPARAM, at: Point) {
+    const MK_LBUTTON: usize = 0x0001;
+    let left_down = wparam.0 & MK_LBUTTON != 0;
+    // SAFETY: 引数なし
+    let captured = unsafe { GetCapture() } == hwnd;
+    if left_down && captured {
+        on_trim_input(hwnd, TrimInput::Move(at));
+    } else {
+        on_trim_input(hwnd, TrimInput::Release);
+        if captured {
+            // App を借りずに放す（WM_CAPTURECHANGED が届くため）
+            // SAFETY: UI スレッドで呼ぶ
+            let _ = unsafe { ReleaseCapture() };
+        }
+    }
+}
+
+/// トリムの範囲の選択に入力を渡し、変わったら描き直す。トリムの最中でなければ何もせず false。
+fn on_trim_input(hwnd: HWND, input: TrimInput) -> bool {
+    with_app(|app| {
+        let appearance = Appearance::from(app.settings.scrap);
+        let App {
+            scraps, renderer, ..
+        } = app;
+        let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
+        if !matches!(scrap.model.mode, Mode::Trimming(_)) {
+            return Some(false);
+        }
+        let before = scrap.model.clone();
+        if scrap.model.trim_input(input) {
+            scrap.sync_shown(&before);
+            // 動かす・描き直すときに届くメッセージでは App を借りないので、借りたまま描く
+            if let Err(e) = scrap.redraw(&before, &appearance, renderer, true) {
+                // 大きすぎて描けないときなど。ウィンドウは前のままなので、状態も前に戻す
+                log::warn!("could not redraw a trimming scrap: {e}");
+                scrap.model = before.clone();
+                scrap.sync_shown(&before);
+            }
+            if scrap.model.mode == Mode::Normal {
+                log::info!("trim finished (trimmed: {})", scrap.model.is_trimmed());
+            }
+        }
+        Some(true)
+    })
+    .flatten()
+    .unwrap_or(false)
+}
+
 /// `WM_MOUSEWHEEL`: 修飾キーなしのホイールを、ノッチごとにホイールの操作にする（基準点はカーソルの位置）。
 /// 修飾キーつきは対応がないので false（DefWindowProcW に任せる）。
 fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
@@ -1061,6 +1162,15 @@ fn run_mouse_operation(hwnd: HWND, gesture: MouseGesture, context: OpContext) {
 
 /// キーをショートカットの対応表で引いて実行する。対応表になければ false。
 fn on_scrap_key(hwnd: HWND, wparam: WPARAM) -> bool {
+    // トリムの最中は Enter で確定、Esc で中止。ほかのキーの操作は効かない（どの操作も実行できない）
+    if is_trimming(hwnd) {
+        let input = match VIRTUAL_KEY(wparam.0 as u16) {
+            VK_RETURN => TrimInput::Confirm,
+            VK_ESCAPE => TrimInput::Cancel,
+            _ => return false,
+        };
+        return on_trim_input(hwnd, input);
+    }
     // 修飾キーだけのときは名前の表になく、None になる
     let Some(key) = Key::from_vk(wparam.0 as u16) else {
         return false;
@@ -1211,10 +1321,18 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                 // ウィンドウを動かす・描き直すときに届くメッセージ（WM_WINDOWPOSCHANGED、WM_DPICHANGED など）では
                 // App を借りないので、借りたままでよい
                 Effect::Redraw => {
+                    scrap.sync_shown(&before);
                     if let Err(e) = scrap.redraw(&before, &appearance, renderer, show_zoom) {
                         // 大きすぎて描けないときなど。ウィンドウは前のままなので、状態も前に戻す
                         log::warn!("could not redraw a scrap: {e}");
                         scrap.model = before.clone();
+                        scrap.sync_shown(&before);
+                    }
+                }
+                Effect::EnterTrimMode => {
+                    log::info!("trim started");
+                    if let Err(e) = scrap.paint(&appearance, renderer) {
+                        log::warn!("could not show the trim mode: {e}");
                     }
                 }
                 // 倍率が変わらなかった（範囲の端）ときも、倍率だけは出す
@@ -1227,13 +1345,13 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                 Effect::MoveToTrash => deferred.push(Deferred::Close),
                 // 描くだけでメッセージは届かないので、借りたまま描く
                 Effect::CopyToClipboard => {
-                    deferred.push(render_for(&scrap.image, Deferred::Copy, "copy.failed"));
+                    deferred.push(render_for(scrap.shown(), Deferred::Copy, "copy.failed"));
                 }
                 Effect::SaveDefault => {
-                    deferred.push(render_for(&scrap.image, Deferred::Save, "save.failed"));
+                    deferred.push(render_for(scrap.shown(), Deferred::Save, "save.failed"));
                 }
                 Effect::ShowSaveDialog => {
-                    deferred.push(render_for(&scrap.image, Deferred::SaveAs, "save.failed"));
+                    deferred.push(render_for(scrap.shown(), Deferred::SaveAs, "save.failed"));
                 }
             }
         }
@@ -1425,10 +1543,12 @@ fn close_scrap(hwnd: HWND) {
         let index = app.scraps.iter().position(|s| s.window.hwnd() == hwnd)?;
         let Scrap {
             window,
-            model,
+            mut model,
             image,
             ..
         } = app.scraps.remove(index);
+        // トリムの範囲を選んでいる途中で閉じたら、選ぶ前の状態で入れる
+        model.trim_input(TrimInput::Cancel);
         // 一時ファイルは裏のスレッドで書くので、借りたままでよい
         app.trash.push(model, image, save::now());
         Some(window)
@@ -1444,7 +1564,7 @@ fn close_scrap(hwnd: HWND) {
 /// ごみ箱の一覧の項目の文言: 閉じた時刻と画像の大きさ。
 fn trash_label(listed: &trash_store::Listed) -> String {
     let t = listed.closed_at;
-    let size = listed.model.image_size;
+    let size = listed.model.shown_size();
     format!(
         "{:02}:{:02}:{:02}  {}×{}",
         t.hour, t.minute, t.second, size.width, size.height
@@ -1670,6 +1790,11 @@ fn finish_selection() {
     log::info!("overlay closed");
 }
 
+/// トリムしていれば、元の画像から切り出した表示する画像（`Scrap::shown`）。
+fn shown_image(model: &ScrapModel, image: &Image) -> Option<Image> {
+    model.is_trimmed().then(|| model.shown_image(image))
+}
+
 /// 画像を `model` のとおりに浮かべるスクラップを作る。
 fn open_scrap(
     module: HINSTANCE,
@@ -1682,15 +1807,26 @@ fn open_scrap(
     let window = scrap_window::ScrapWindow::create(module, rect)?;
     // 描いて出すときに届くメッセージ（WM_WINDOWPOSCHANGED など）では App を借りないので、借りたまま描いてよい。
     // 借りられなければ（起こらないはず）、その場かぎりの描き手で描く
-    let painted =
-        with_app(|app| paint_scrap(&mut app.renderer, &window, &image, &model, appearance, None))
-            .unwrap_or_else(|| paint_scrap(&mut None, &window, &image, &model, appearance, None));
+    let shown = shown_image(&model, &image);
+    let visible = shown.as_ref().unwrap_or(&image);
+    let painted = with_app(|app| {
+        paint_scrap(
+            &mut app.renderer,
+            &window,
+            visible,
+            &model,
+            appearance,
+            None,
+        )
+    })
+    .unwrap_or_else(|| paint_scrap(&mut None, &window, visible, &model, appearance, None));
     painted?;
     window.show(focus);
     Ok(Scrap {
         window,
         model,
         image,
+        shown,
         drag: Drag::default(),
         wheel: Wheel::default(),
         zoom_label: false,

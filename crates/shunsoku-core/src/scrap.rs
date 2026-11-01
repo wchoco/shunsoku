@@ -3,10 +3,15 @@
 //! 位置はスクリーン座標（物理ピクセル）で持ち、画像の画素に倍率（`ScrapModel::zoom`、100% が画素等倍）を
 //! 掛けた大きさで出す。ウィンドウは画像の外側に
 //! 枠と影の分だけ大きく作り、画像の位置（`ScrapModel::position`）がちょうど撮った範囲に重なるようにする。
+//!
+//! トリムは、元の画像（`ScrapModel::image_size`）の中の表示する範囲だけを持つ。画素は持たず、表示する画像は
+//! 元の画像から `ScrapModel::shown_image` で切り出す。トリムの範囲の選択（`Mode::Trimming`）は
+//! `ScrapModel::trim_input` が受ける。
 
 pub mod ops;
 
 use crate::geometry::{Point, Rect, Size};
+use crate::image::Image;
 use crate::settings::ScrapAppearance;
 
 /// スクラップの表示のモード。
@@ -15,6 +20,34 @@ pub enum Mode {
     /// 画像をそのまま出す。
     #[default]
     Normal,
+    /// トリムの範囲を選んでいる（`ScrapModel::start_trim` から確定か中止まで）。スクラップ操作はどれも効かない。
+    Trimming(TrimState),
+}
+
+/// トリムの範囲の選択の状態。座標は表示している画像（トリム済みならその部分）の画素。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrimState {
+    /// 左ボタンを押した画素。押している間だけ Some。
+    pressed: Option<Point>,
+    /// 押してから、押した画素の外へ動いたか。動いたら範囲を選び直す。
+    dragged: bool,
+    /// 選んだ範囲。動かさずに押して離しても（ダブルクリックの 1 回目）消さない。
+    selection: Option<Rect>,
+}
+
+/// トリムの範囲の選択への入力。座標はスクリーン座標（物理ピクセル）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimInput {
+    /// 左ボタンを押した。
+    Press(Point),
+    /// カーソルが動いた。押している間だけ範囲を変える。
+    Move(Point),
+    /// 左ボタンを離した、またはマウスを捕まえていられなくなった。
+    Release,
+    /// Enter かダブルクリック。選んだ範囲でトリムする。
+    Confirm,
+    /// `Esc`。トリムをやめる。
+    Cancel,
 }
 
 /// 倍率の下限（%）。
@@ -38,11 +71,13 @@ pub enum ZoomAnchor {
 pub struct ScrapModel {
     /// 画像の左上（スクリーン座標、物理ピクセル）。
     pub position: Point,
-    /// 画像の大きさ（画素）。
+    /// 元の画像（トリム前）の大きさ（画素）。
     pub image_size: Size,
     pub mode: Mode,
     /// 倍率（%）。画像の画素が基準で、100 が画素等倍。`ZOOM_MIN..=ZOOM_MAX` に収める。
     zoom: u16,
+    /// トリムしていれば、表示する範囲（元の画像の画素）。
+    trimmed: Option<Rect>,
 }
 
 impl ScrapModel {
@@ -52,6 +87,7 @@ impl ScrapModel {
             image_size,
             mode: Mode::Normal,
             zoom: ZOOM_ACTUAL,
+            trimmed: None,
         }
     }
 
@@ -105,13 +141,158 @@ impl ScrapModel {
         self.set_zoom(ZOOM_ACTUAL, ZoomAnchor::Center)
     }
 
-    /// 画像を出す大きさ（物理ピクセル）。画像の画素に倍率を掛けて四捨五入し、0 にはしない。
+    /// 画像を出す大きさ（物理ピクセル）。表示する画像の画素に倍率を掛けて四捨五入し、0 にはしない。
     pub fn display_size(&self) -> Size {
-        let scale = |pixels: u32| {
-            let scaled = (u64::from(pixels) * u64::from(self.zoom) + 50) / 100;
-            u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
+        let shown = self.shown_size();
+        let scale = |pixels: u32| u32::try_from(self.scale(pixels)).unwrap_or(u32::MAX).max(1);
+        Size::new(scale(shown.width), scale(shown.height))
+    }
+
+    /// 画素の数に倍率を掛けた表示の長さ（四捨五入）。
+    fn scale(&self, pixels: u32) -> u64 {
+        (u64::from(pixels) * u64::from(self.zoom) + 50) / 100
+    }
+
+    /// 表示する画像の大きさ（画素）。トリムしていればその範囲の大きさ。
+    pub fn shown_size(&self) -> Size {
+        self.trimmed.map_or(self.image_size, |r| r.size())
+    }
+
+    /// トリムしているか。
+    pub fn is_trimmed(&self) -> bool {
+        self.trimmed.is_some()
+    }
+
+    /// トリムしていれば、表示する範囲（元の画像の画素）。
+    pub fn trim_rect(&self) -> Option<Rect> {
+        self.trimmed
+    }
+
+    /// 表示する画像（保存・コピーの対象）。`source` は元の画像（大きさが `image_size` のもの）。
+    pub fn shown_image(&self, source: &Image) -> Image {
+        match self.trimmed {
+            Some(rect) => source.crop(rect),
+            None => source.clone(),
+        }
+    }
+
+    /// トリムの範囲の選択を始める。すでに選んでいれば false。
+    pub fn start_trim(&mut self) -> bool {
+        if matches!(self.mode, Mode::Trimming(_)) {
+            return false;
+        }
+        self.mode = Mode::Trimming(TrimState::default());
+        true
+    }
+
+    /// トリムの範囲の選択への入力を受ける。描き直しが要る（範囲かモードか表示が変わった）なら true。
+    /// トリムの最中でなければ何もしない。
+    pub fn trim_input(&mut self, input: TrimInput) -> bool {
+        let Mode::Trimming(mut state) = self.mode else {
+            return false;
         };
-        Size::new(scale(self.image_size.width), scale(self.image_size.height))
+        let before = state;
+        match input {
+            TrimInput::Press(at) => {
+                state.pressed = Some(self.shown_pixel_at(at));
+                state.dragged = false;
+            }
+            TrimInput::Move(at) => {
+                if let Some(from) = state.pressed {
+                    let to = self.shown_pixel_at(at);
+                    // 動かさずに押して離しただけなら、前に選んだ範囲を残す
+                    state.dragged |= to != from;
+                    if state.dragged {
+                        state.selection = Some(Rect::new(
+                            from.x.min(to.x),
+                            from.y.min(to.y),
+                            from.x.max(to.x) + 1,
+                            from.y.max(to.y) + 1,
+                        ));
+                    }
+                }
+            }
+            TrimInput::Release => state.pressed = None,
+            TrimInput::Cancel => {
+                self.mode = Mode::Normal;
+                return true;
+            }
+            TrimInput::Confirm => {
+                let Some(selection) = state.selection else {
+                    return false;
+                };
+                self.mode = Mode::Normal;
+                self.trim_to(selection);
+                return true;
+            }
+        }
+        self.mode = Mode::Trimming(state);
+        state.selection != before.selection
+    }
+
+    /// 選んでいるトリムの範囲（スクリーン座標）。画素の境目に合わせる。選んでいなければ None。
+    pub fn trim_selection(&self) -> Option<Rect> {
+        let Mode::Trimming(TrimState {
+            selection: Some(r), ..
+        }) = self.mode
+        else {
+            return None;
+        };
+        let p = self.position;
+        let at = |origin: i32, pixels: i32| {
+            let offset = i64::try_from(self.scale(pixels.max(0) as u32)).unwrap_or(i64::MAX);
+            (i64::from(origin) + offset).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        Some(Rect::new(
+            at(p.x, r.left),
+            at(p.y, r.top),
+            at(p.x, r.right),
+            at(p.y, r.bottom),
+        ))
+    }
+
+    /// スクリーン座標の点の下にある、表示している画像の画素。画像の外なら端の画素に留める。
+    fn shown_pixel_at(&self, at: Point) -> Point {
+        let shown = self.shown_size();
+        let display = self.display_size();
+        let pixel = |offset: i32, pixels: u32, length: u32| {
+            let px = (i64::from(offset) * i64::from(pixels)).div_euclid(i64::from(length.max(1)));
+            px.clamp(0, i64::from(pixels.max(1)) - 1) as i32
+        };
+        Point::new(
+            pixel(at.x - self.position.x, shown.width, display.width),
+            pixel(at.y - self.position.y, shown.height, display.height),
+        )
+    }
+
+    /// 表示している画像の中の `selection`（画素）だけを表示する。残った部分の画面上の位置は動かさない。
+    fn trim_to(&mut self, selection: Rect) {
+        let shown = Rect::from_origin_size(Point::default(), self.shown_size());
+        if selection == shown {
+            return;
+        }
+        let origin = self.trimmed.map_or(Point::default(), |r| r.origin());
+        self.trimmed = Some(selection.offset(origin.x, origin.y));
+        self.position = self.shifted(selection.origin(), 1);
+    }
+
+    /// トリムを解除して元の画像に戻す。元の画像は、トリムした部分が画面上の同じ位置に来るように出す。
+    /// トリムしていなければ false。
+    pub fn untrim(&mut self) -> bool {
+        let Some(rect) = self.trimmed.take() else {
+            return false;
+        };
+        self.position = self.shifted(rect.origin(), -1);
+        true
+    }
+
+    /// `position` を、画素の `by` に倍率を掛けた長さだけ `sign` の向きにずらした点。
+    fn shifted(&self, by: Point, sign: i64) -> Point {
+        let shift = |from: i32, pixels: i32| {
+            let offset = i64::try_from(self.scale(pixels.max(0) as u32)).unwrap_or(i64::MAX);
+            (i64::from(from) + sign * offset).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        Point::new(shift(self.position.x, by.x), shift(self.position.y, by.y))
     }
 
     /// 画像を出す矩形（スクリーン座標）。大きさは倍率を掛けた表示の大きさ。
@@ -255,6 +436,7 @@ impl Wheel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::Image;
 
     #[test]
     fn a_new_scrap_is_normal_and_shows_its_image_where_it_was_captured() {
@@ -422,6 +604,168 @@ mod tests {
         assert_eq!(wheel.turn(100), 0);
         assert_eq!(wheel.turn(-100), 0);
         assert_eq!(wheel.turn(-20), -1);
+    }
+
+    /// (x, y) の画素の B に x、G に y を入れた画像（切り抜いた位置が分かるように）。
+    fn numbered(size: Size) -> Image {
+        let mut pixels = Vec::new();
+        for y in 0..size.height {
+            for x in 0..size.width {
+                pixels.extend([x as u8, y as u8, 0, 0xFF]);
+            }
+        }
+        Image::from_bgra(size, pixels).unwrap()
+    }
+
+    fn trimming(scrap: &ScrapModel) -> bool {
+        matches!(scrap.mode, Mode::Trimming(_))
+    }
+
+    #[test]
+    fn dragging_while_trimming_selects_the_pixels_under_both_ends() {
+        let mut scrap = ScrapModel::new(Point::new(100, 50), Size::new(300, 200));
+        assert!(scrap.start_trim());
+        assert!(trimming(&scrap));
+        assert_eq!(scrap.trim_selection(), None);
+        // 押す前のホバーでは何も選ばない
+        assert!(!scrap.trim_input(TrimInput::Move(Point::new(120, 60))));
+        assert_eq!(scrap.trim_selection(), None);
+        scrap.trim_input(TrimInput::Press(Point::new(130, 70)));
+        assert!(scrap.trim_input(TrimInput::Move(Point::new(110, 90))));
+        assert_eq!(scrap.trim_selection(), Some(Rect::new(110, 70, 131, 91)));
+        scrap.trim_input(TrimInput::Release);
+        // 押した画素へ戻ると 1 画素の範囲になる
+        scrap.trim_input(TrimInput::Press(Point::new(130, 70)));
+        scrap.trim_input(TrimInput::Move(Point::new(140, 70)));
+        scrap.trim_input(TrimInput::Move(Point::new(130, 70)));
+        assert_eq!(scrap.trim_selection(), Some(Rect::new(130, 70, 131, 71)));
+        scrap.trim_input(TrimInput::Move(Point::new(110, 90)));
+        scrap.trim_input(TrimInput::Release);
+        // 離したあとのホバーでは範囲は変わらない
+        assert!(!scrap.trim_input(TrimInput::Move(Point::new(300, 200))));
+        assert_eq!(scrap.trim_selection(), Some(Rect::new(110, 70, 131, 91)));
+        // 画像の外へはみ出したドラッグは画像の端で止まる
+        scrap.trim_input(TrimInput::Press(Point::new(390, 240)));
+        scrap.trim_input(TrimInput::Move(Point::new(1000, 1000)));
+        assert_eq!(scrap.trim_selection(), Some(Rect::new(390, 240, 400, 250)));
+        // 選んでいる間は大きさも位置も変わらない
+        assert_eq!(scrap.image_rect(), Rect::new(100, 50, 400, 250));
+    }
+
+    #[test]
+    fn a_click_without_moving_keeps_the_selection_so_a_double_click_can_confirm_it() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.start_trim();
+        scrap.trim_input(TrimInput::Press(Point::new(10, 10)));
+        scrap.trim_input(TrimInput::Move(Point::new(19, 29)));
+        scrap.trim_input(TrimInput::Release);
+        // ダブルクリックの 1 回目のクリック（押した画素の中で揺れても範囲は消えない）
+        scrap.trim_input(TrimInput::Press(Point::new(15, 15)));
+        scrap.trim_input(TrimInput::Move(Point::new(15, 15)));
+        scrap.trim_input(TrimInput::Release);
+        assert_eq!(scrap.trim_selection(), Some(Rect::new(10, 10, 20, 30)));
+        assert!(scrap.trim_input(TrimInput::Confirm));
+        assert!(!trimming(&scrap));
+        assert_eq!(scrap.image_rect(), Rect::new(10, 10, 20, 30));
+    }
+
+    #[test]
+    fn confirming_keeps_the_remaining_part_where_it_was_on_the_screen() {
+        let source = numbered(Size::new(300, 200));
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        scrap.start_trim();
+        scrap.trim_input(TrimInput::Press(Point::new(-90, 70)));
+        scrap.trim_input(TrimInput::Move(Point::new(-41, 109)));
+        scrap.trim_input(TrimInput::Release);
+        assert!(scrap.trim_input(TrimInput::Confirm));
+        assert_eq!(scrap.mode, Mode::Normal);
+        assert!(scrap.is_trimmed());
+        assert_eq!(scrap.image_rect(), Rect::new(-90, 70, -40, 110));
+        assert_eq!(scrap.shown_size(), Size::new(50, 40));
+        // 元の画像の大きさは残る
+        assert_eq!(scrap.image_size, Size::new(300, 200));
+        let shown = scrap.shown_image(&source);
+        assert_eq!(shown.size(), Size::new(50, 40));
+        assert_eq!(shown.pixel(0, 0), [10, 20, 0, 0xFF]);
+        assert_eq!(shown.pixel(49, 39), [59, 59, 0, 0xFF]);
+    }
+
+    #[test]
+    fn trimming_a_zoomed_scrap_selects_the_image_pixels_under_the_drag() {
+        let source = numbered(Size::new(300, 200));
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_zoom(200, ZoomAnchor::At(Point::new(0, 0)));
+        scrap.start_trim();
+        // 表示の (21, 41) は画素 (10, 20)、(60, 81) は画素 (30, 40)
+        scrap.trim_input(TrimInput::Press(Point::new(21, 41)));
+        scrap.trim_input(TrimInput::Move(Point::new(60, 81)));
+        scrap.trim_input(TrimInput::Release);
+        // 選んだ範囲は画素の境目に合わせて出す
+        assert_eq!(scrap.trim_selection(), Some(Rect::new(20, 40, 62, 82)));
+        scrap.trim_input(TrimInput::Confirm);
+        assert_eq!(scrap.shown_size(), Size::new(21, 21));
+        assert_eq!(scrap.zoom(), 200);
+        assert_eq!(scrap.image_rect(), Rect::new(20, 40, 62, 82));
+        assert_eq!(scrap.shown_image(&source).pixel(0, 0), [10, 20, 0, 0xFF]);
+    }
+
+    #[test]
+    fn trimming_again_selects_within_the_part_already_shown() {
+        let source = numbered(Size::new(300, 200));
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        for (from, to) in [((10, 10), (109, 109)), ((15, 20), (24, 29))] {
+            scrap.start_trim();
+            scrap.trim_input(TrimInput::Press(Point::new(from.0, from.1)));
+            scrap.trim_input(TrimInput::Move(Point::new(to.0, to.1)));
+            scrap.trim_input(TrimInput::Release);
+            scrap.trim_input(TrimInput::Confirm);
+        }
+        assert_eq!(scrap.image_rect(), Rect::new(15, 20, 25, 30));
+        assert_eq!(scrap.shown_image(&source).pixel(0, 0), [15, 20, 0, 0xFF]);
+    }
+
+    #[test]
+    fn escape_cancels_the_trim_and_leaves_the_scrap_as_it_was() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        let before = scrap.clone();
+        scrap.start_trim();
+        scrap.trim_input(TrimInput::Press(Point::new(10, 10)));
+        scrap.trim_input(TrimInput::Move(Point::new(50, 50)));
+        assert!(scrap.trim_input(TrimInput::Cancel));
+        assert_eq!(scrap, before);
+        assert!(!scrap.is_trimmed());
+    }
+
+    #[test]
+    fn confirming_without_a_selection_keeps_trimming() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.start_trim();
+        assert!(!scrap.trim_input(TrimInput::Confirm));
+        assert!(trimming(&scrap));
+        // トリムの最中でなければ入力は無視する
+        let mut normal = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        assert!(!normal.trim_input(TrimInput::Press(Point::new(1, 1))));
+        assert!(!normal.trim_input(TrimInput::Confirm));
+        assert_eq!(normal.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn untrimming_returns_the_whole_image_to_where_it_was() {
+        let source = numbered(Size::new(300, 200));
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        scrap.set_zoom(150, ZoomAnchor::At(Point::new(-100, 50)));
+        let before = scrap.clone();
+        assert!(!scrap.untrim());
+        scrap.start_trim();
+        scrap.trim_input(TrimInput::Press(Point::new(-40, 80)));
+        scrap.trim_input(TrimInput::Move(Point::new(0, 120)));
+        scrap.trim_input(TrimInput::Release);
+        scrap.trim_input(TrimInput::Confirm);
+        assert!(scrap.is_trimmed());
+        assert!(scrap.untrim());
+        assert_eq!(scrap, before);
+        assert_eq!(scrap.shown_image(&source), source);
+        assert!(!scrap.untrim());
     }
 
     #[test]

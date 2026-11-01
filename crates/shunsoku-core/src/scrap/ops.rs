@@ -16,12 +16,15 @@
 //! 値が `OpContext::choice` で渡る。親はメニュー専用、ほかはキーとマウス専用（`in_menu: false`）にして、
 //! メニューを spec #33 の並び（`Group` の宣言の順）に保つ。ホイールから呼ぶときは `OpContext::cursor` に
 //! カーソルの位置が入り、そこが拡大縮小の基準点になる（キーとメニューからは中心）。
+//!
+//! トリム（`trim`）は範囲の選択を始めるだけで、選んでいる間（`Mode::Trimming`）の入力は表を通さず
+//! `ScrapModel::trim_input` が受ける。その間はどの操作の `can_execute` も false にする。
 
 use std::collections::BTreeMap;
 
 use crate::geometry::Point;
 use crate::keys::{Chord, Key};
-use crate::scrap::{ScrapModel, ZoomAnchor};
+use crate::scrap::{Mode, ScrapModel, ZoomAnchor};
 use crate::settings::{self, Conflict, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
@@ -133,7 +136,8 @@ pub enum Effect {
     Redraw,
     /// スクラップを閉じて、閉じる直前の状態のままごみ箱に移す（上限が 0 なら破棄する）。
     MoveToTrash,
-    /// 画像をクリップボードに置く。
+    /// 画像をクリップボードに置く。コピー・保存の画像は、どれも表示する画像（`ScrapModel::shown_image`、
+    /// トリムしていればトリム後）。
     CopyToClipboard,
     /// 画像を全体設定の保存先に、全体のファイル名テンプレートの名前で保存する（ダイアログなし）。
     SaveDefault,
@@ -141,6 +145,8 @@ pub enum Effect {
     ShowZoom,
     /// 「名前を付けて保存」のダイアログを出し、選ばれた場所に保存する。初期フォルダとファイル名は `SaveDefault` と同じ。
     ShowSaveDialog,
+    /// トリムの範囲の選択を始めた（`Mode::Trimming`）。キーとマウスを `ScrapModel::trim_input` に渡し、範囲を描く。
+    EnterTrimMode,
 }
 
 const ESC: Chord = Chord::plain(Key::known(0x1B));
@@ -157,9 +163,16 @@ const CTRL_NUMPAD_ADD: Chord = Chord::plain(Key::known(0x6B)).ctrl();
 const CTRL_NUMPAD_SUBTRACT: Chord = Chord::plain(Key::known(0x6D)).ctrl();
 const CTRL_0: Chord = Chord::plain(Key::known(0x30)).ctrl();
 const CTRL_SHIFT_S: Chord = CTRL_S.shift();
+const CTRL_T: Chord = Chord::plain(Key::known(0x54)).ctrl();
 
-const fn always(_: &ScrapModel) -> bool {
-    true
+/// トリムの範囲を選んでいる間（`Mode::Trimming`）のほかは、いつでも実行できる。
+const fn always(model: &ScrapModel) -> bool {
+    !matches!(model.mode, Mode::Trimming(_))
+}
+
+/// トリムしていれば実行できる（トリムの範囲を選んでいる間は除く）。
+fn trimmed(model: &ScrapModel) -> bool {
+    always(model) && model.is_trimmed()
 }
 
 /// `(dx, dy)` だけ動かす操作の `run`。
@@ -254,6 +267,22 @@ fn save_as(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     vec![Effect::ShowSaveDialog]
 }
 
+fn trim(model: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
+    if model.start_trim() {
+        vec![Effect::EnterTrimMode]
+    } else {
+        Vec::new()
+    }
+}
+
+fn untrim(model: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
+    if model.untrim() {
+        vec![Effect::Redraw]
+    } else {
+        Vec::new()
+    }
+}
+
 /// キーで動かす操作の行。
 const fn keyboard_move(
     id: OperationId,
@@ -317,6 +346,32 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         can_execute: always,
         choices: None,
         run: save_as,
+    },
+    OperationDescriptor {
+        id: "trim",
+        label_key: "scrap.op.trim",
+        default_shortcut: &[CTRL_T],
+        default_mouse: None,
+        group: Group::Edit,
+        order: 10,
+        drag_only: false,
+        in_menu: true,
+        can_execute: always,
+        choices: None,
+        run: trim,
+    },
+    OperationDescriptor {
+        id: "untrim",
+        label_key: "scrap.op.untrim",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::Edit,
+        order: 20,
+        drag_only: false,
+        in_menu: true,
+        can_execute: trimmed,
+        choices: None,
+        run: untrim,
     },
     keyboard_move(
         "move_left",
@@ -621,7 +676,8 @@ pub fn menu(
 mod tests {
     use super::*;
     use crate::geometry::{Point, Rect, Size};
-    use crate::scrap::{ScrapModel, ZOOM_ACTUAL, ZOOM_MAX, ZOOM_MIN, ZoomAnchor};
+    use crate::image::Image;
+    use crate::scrap::{Mode, ScrapModel, TrimInput, ZOOM_ACTUAL, ZOOM_MAX, ZOOM_MIN, ZoomAnchor};
     use crate::settings::Conflict;
 
     fn scrap() -> ScrapModel {
@@ -756,6 +812,86 @@ mod tests {
         assert_eq!(effects, vec![]);
     }
 
+    /// `scrap()` を (10, 20)〜(59, 59) の画素だけにトリムする。
+    fn trim(model: &mut ScrapModel) {
+        model.trim_input(TrimInput::Press(Point::new(-90, 70)));
+        model.trim_input(TrimInput::Move(Point::new(-41, 109)));
+        model.trim_input(TrimInput::Release);
+        model.trim_input(TrimInput::Confirm);
+    }
+
+    #[test]
+    fn trim_enters_the_trim_mode() {
+        let mut model = scrap();
+        let effects = execute(op("trim"), &mut model, &OpContext::default());
+        assert_eq!(effects, vec![Effect::EnterTrimMode]);
+        assert!(matches!(model.mode, Mode::Trimming(_)));
+        trim(&mut model);
+        assert_eq!(model.mode, Mode::Normal);
+        assert!(model.is_trimmed());
+    }
+
+    #[test]
+    fn no_operation_can_run_while_trimming() {
+        let mut model = scrap();
+        execute(op("trim"), &mut model, &OpContext::default());
+        for op in OPERATIONS {
+            assert!(!(op.can_execute)(&model), "{}", op.id);
+        }
+        let before = model.clone();
+        assert_eq!(
+            execute(
+                find("move_left").unwrap(),
+                &mut model,
+                &OpContext::default()
+            ),
+            vec![]
+        );
+        assert_eq!(model, before);
+    }
+
+    #[test]
+    fn untrim_can_run_only_on_a_trimmed_scrap_and_returns_the_whole_image() {
+        let mut model = scrap();
+        assert!(!(op("untrim").can_execute)(&model));
+        execute(op("trim"), &mut model, &OpContext::default());
+        trim(&mut model);
+        assert!((op("untrim").can_execute)(&model));
+        let effects = execute(op("untrim"), &mut model, &OpContext::default());
+        assert_eq!(effects, vec![Effect::Redraw]);
+        assert_eq!(model, scrap());
+        assert!(!(op("untrim").can_execute)(&model));
+    }
+
+    #[test]
+    fn copy_and_save_hand_over_the_trimmed_image() {
+        let size = Size::new(300, 200);
+        let mut pixels = Vec::new();
+        for y in 0..size.height {
+            for x in 0..size.width {
+                pixels.extend([x as u8, y as u8, 0, 0xFF]);
+            }
+        }
+        let source = Image::from_bgra(size, pixels).unwrap();
+        let mut model = scrap();
+        execute(op("trim"), &mut model, &OpContext::default());
+        trim(&mut model);
+        for (id, effect) in [
+            ("copy", Effect::CopyToClipboard),
+            ("save_default", Effect::SaveDefault),
+            ("save_as", Effect::ShowSaveDialog),
+        ] {
+            assert_eq!(
+                execute(op(id), &mut model, &OpContext::default()),
+                vec![effect],
+                "{id}"
+            );
+        }
+        // Win32 層が渡す画像（`Effect` の説明のとおり、表示する画像）
+        let handed = model.shown_image(&source);
+        assert_eq!(handed, source.crop(Rect::new(10, 20, 60, 60)));
+    }
+
     fn chord(s: &str) -> Chord {
         s.parse().unwrap()
     }
@@ -785,6 +921,7 @@ mod tests {
         assert_eq!(bound(&shortcuts, "Ctrl+NumpadSubtract"), Some("zoom_out"));
         assert_eq!(bound(&shortcuts, "Ctrl+0"), Some("zoom_actual"));
         assert_eq!(bound(&shortcuts, "Ctrl+Shift+S"), Some("save_as"));
+        assert_eq!(bound(&shortcuts, "Ctrl+T"), Some("trim"));
         assert_eq!(bound(&shortcuts, "Ctrl+Left"), None);
         assert_eq!(shortcuts.chords("close"), vec![chord("Esc")]);
         assert_eq!(shortcuts.chords("move"), vec![]);
@@ -870,6 +1007,9 @@ mod tests {
                 item("copy", true, Some("Ctrl+C")),
                 item("save_default", true, Some("Ctrl+S")),
                 item("save_as", true, Some("Ctrl+Shift+S")),
+                MenuEntry::Separator,
+                item("trim", true, Some("Ctrl+T")),
+                item("untrim", false, None),
                 MenuEntry::Separator,
                 MenuEntry::Submenu(Submenu {
                     id: "zoom",

@@ -5,6 +5,7 @@
 //!   （`ScrapModel::display_size`）に伸び縮みさせて描く。拡大と等倍は補間せず（画素が見えるように）、
 //!   縮小は線形補間で描く。
 //! - 倍率を変えた直後は、画像の左上に倍率（`ZoomLabel`）を重ねて描く。
+//! - トリムの範囲を選んでいる間は、選んだ範囲の外を暗くし、範囲の縁に線を引く（`TrimOverlay`）。
 //! - 透明度はここでは掛けない（レイヤード ウィンドウの `SourceConstantAlpha` で掛ける）。
 //! - コピーと保存の画像は、`render_image` で画像だけを画像の大きさに描いてから作る（表示と同じ描き方にするため。
 //!   M1 では書き込みがないので、元の画像と同じになる）。
@@ -48,6 +49,18 @@ const ZOOM_LABEL_PADDING_Y: f32 = 3.0;
 const ZOOM_LABEL_INSET: f32 = 6.0;
 /// 倍率の表示の背景の不透明度。
 const ZOOM_LABEL_BACK_ALPHA: f32 = 0.65;
+
+/// トリムの範囲の外を暗くする黒の不透明度。
+const TRIM_SHADE_ALPHA: f32 = 0.45;
+/// トリムの範囲の縁の線の色。
+const TRIM_EDGE_COLOR: u32 = 0xFF_FF_FF;
+
+/// トリムの範囲を選んでいる間に画像に重ねるもの。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrimOverlay {
+    /// 選んだ範囲（ウィンドウの中の座標）。まだ選んでいなければ None（画像全体を暗くする）。
+    pub selection: Option<Rect>,
+}
 
 /// 画像に重ねる倍率の表示。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -180,7 +193,7 @@ impl Renderer {
 
     /// スクラップのウィンドウの中身を描く。`canvas` はウィンドウの大きさ（`ScrapModel::window_rect`）で、
     /// 画像は余白（`Appearance::margin`）の内側に `display`（`ScrapModel::display_size`）の大きさで置く。
-    /// `label` があれば、画像の左上に倍率を重ねる。
+    /// `label` があれば、画像の左上に倍率を重ねる。`trim` があれば、トリムの範囲を重ねる。
     pub fn paint_scrap(
         &mut self,
         canvas: &Canvas,
@@ -188,6 +201,7 @@ impl Renderer {
         display: Size,
         appearance: &Appearance,
         label: Option<ZoomLabel>,
+        trim: Option<TrimOverlay>,
     ) -> Result<()> {
         let margin = appearance.margin();
         let image_rect = Rect::from_origin_size(Point::new(margin, margin), display);
@@ -226,6 +240,9 @@ impl Renderer {
                 }
             }
             draw_image(target, image, image_rect)?;
+            if let Some(trim) = trim {
+                draw_trim_overlay(target, image_rect, trim)?;
+            }
             match (label, dwrite) {
                 (Some(label), Some(dwrite)) => draw_zoom_label(target, &dwrite, image_rect, label),
                 _ => Ok(()),
@@ -327,6 +344,39 @@ fn draw_image(target: &ID2D1RenderTarget, image: &Image, dest: Rect) -> Result<(
             &props,
         )?;
         target.DrawBitmap(&bitmap, Some(&dest), 1.0, interpolation, None);
+    }
+    Ok(())
+}
+
+/// トリムの範囲の外（画像の中だけ）を暗くし、範囲の縁に 1px の線を引く。
+fn draw_trim_overlay(
+    target: &ID2D1RenderTarget,
+    image_rect: Rect,
+    trim: TrimOverlay,
+) -> Result<()> {
+    let selection = trim.selection.and_then(|r| r.intersect(&image_rect));
+    // SAFETY: BeginDraw と EndDraw の間で呼ぶ
+    unsafe {
+        let shade = target.CreateSolidColorBrush(&rgb(0, TRIM_SHADE_ALPHA), None)?;
+        let Some(selection) = selection else {
+            target.FillRectangle(&to_rect_f(image_rect), &shade);
+            return Ok(());
+        };
+        for strip in ring(image_rect, selection) {
+            if !strip.is_empty() {
+                target.FillRectangle(&to_rect_f(strip), &shade);
+            }
+        }
+        let edge = target.CreateSolidColorBrush(&rgb(TRIM_EDGE_COLOR, 1.0), None)?;
+        // 範囲の内側に線を引く（画像の端でも見えるように）
+        let inner = selection.inflate(-1);
+        if inner.is_empty() {
+            target.FillRectangle(&to_rect_f(selection), &edge);
+        } else {
+            for strip in ring(selection, inner) {
+                target.FillRectangle(&to_rect_f(strip), &edge);
+            }
+        }
     }
     Ok(())
 }
