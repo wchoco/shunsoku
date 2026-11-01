@@ -58,8 +58,8 @@ use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
 use shunsoku_core::perf::Mark;
 use shunsoku_core::scrap::ops::{
-    self, ChoiceLabel, Effect, MenuEntry, MouseGesture, OpContext, OperationDescriptor,
-    OperationId, Shortcuts,
+    self, ChoiceLabel, Effect, MenuEntry, MouseBindings, MouseGesture, OpContext,
+    OperationDescriptor, OperationId, Shortcuts,
 };
 use shunsoku_core::scrap::{Appearance, Drag, Mode, ScrapModel, TrimInput, Wheel, ZoomAnchor};
 use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
@@ -158,6 +158,8 @@ struct App {
     settings_events: mpsc::Receiver<settings_watch::Event>,
     /// スクラップ操作のショートカットの対応表（表の既定値に `settings.shortcuts` を重ねたもの）。
     shortcuts: Shortcuts,
+    /// スクラップ操作のマウスの対応表（表の既定値に `settings.mouse` を重ねたもの）。
+    mouse: MouseBindings,
     capture: Capture,
     scraps: Vec<Scrap>,
     /// 閉じたスクラップ。drop で一時ファイルを消す。
@@ -575,6 +577,7 @@ fn start(
         settings_path,
         settings_events,
         shortcuts: keymap.shortcuts,
+        mouse: keymap.mouse,
         capture: Capture::Idle,
         scraps: Vec::new(),
         trash,
@@ -1232,8 +1235,9 @@ fn hide_zoom_label(hwnd: HWND) {
     });
 }
 
+/// マウスの操作をマウスの対応表で引いて実行する。
 fn run_mouse_operation(hwnd: HWND, gesture: MouseGesture, context: OpContext) {
-    if let Some(op) = ops::mouse_operation(ops::OPERATIONS, gesture) {
+    if let Some(op) = with_app(|app| app.mouse.operation(gesture)).flatten() {
         run_scrap_operation(hwnd, op, context);
     }
 }
@@ -2170,6 +2174,7 @@ fn on_settings_changed() {
         };
         log_failed(&failed);
         app.shortcuts = keymap.shortcuts;
+        app.mouse = keymap.mouse;
         let unset =
             app.settings.hotkeys.select_capture.is_some() && new.hotkeys.select_capture.is_none();
         app.settings = new;
@@ -2242,6 +2247,7 @@ fn settings_notice(
     let mut invalid = Vec::new();
     let mut conflicts = Vec::new();
     let mut overlaps = Vec::new();
+    let mut mouse_conflicts = Vec::new();
     for issue in issues {
         match issue {
             SettingsIssue::NotToml { .. } => {
@@ -2263,12 +2269,16 @@ fn settings_notice(
                 hotkey,
                 shortcut,
             } => overlaps.push(format!("{chord}（{hotkey}, {shortcut}）")),
+            SettingsIssue::MouseConflict { gesture, items } => {
+                mouse_conflicts.push(format!("{gesture}（{}）", items.join(", ")));
+            }
         }
     }
     for (key, items) in [
         ("settings.invalid_items", invalid.join(", ")),
         ("settings.conflicts", conflicts.join(", ")),
         ("settings.overlaps", overlaps.join(", ")),
+        ("settings.mouse_conflicts", mouse_conflicts.join(", ")),
     ] {
         if !items.is_empty() {
             lines.push(format!("{}{items}", text(key)));

@@ -7,7 +7,7 @@
 //! - キーの重なりは `keymap` で見つける。同じ範囲（ホットキー同士、ショートカット同士）の重なりは `assign` の
 //!   規則で両方を無効にし、ホットキーとショートカットの重なりは警告だけにする。
 //!
-//! M1 のスキーマ（書かなかった項目は既定値）:
+//! スキーマ（書かなかった項目は既定値）:
 //!
 //! ```toml
 //! version = 1                                  # 必須。1 だけ
@@ -28,6 +28,10 @@
 //! [shortcuts]                                  # スクラップ操作の id ごとの上書き。"" は割り当てなし
 //! copy = "Ctrl+Shift+C"
 //!
+//! [mouse]                                      # スクラップ操作の id ごとのマウスの上書き。"" は割り当てなし
+//! close = "DoubleClick"                        # WheelUp / WheelDown / Ctrl+WheelUp / Ctrl+WheelDown /
+//! toggle_compact = "MiddleClick"               #   MiddleClick / DoubleClick
+//!
 //! [scrap]                                      # 見た目の既定値
 //! opacity = 100                                # 10〜100（%）
 //! border = true
@@ -42,7 +46,7 @@ use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::keys::Chord;
-use crate::scrap::ops::{OperationDescriptor, Shortcuts};
+use crate::scrap::ops::{MouseBindings, MouseGesture, OperationDescriptor, Shortcuts};
 
 /// 対応している設定ファイルの形式の版。
 pub const VERSION: i64 = 1;
@@ -68,6 +72,7 @@ pub struct Settings {
     pub general: General,
     pub hotkeys: Hotkeys,
     pub shortcuts: ShortcutOverrides,
+    pub mouse: MouseOverrides,
     pub scrap: ScrapAppearance,
     /// ログのレベル（隠し項目）。
     pub log_level: LogLevel,
@@ -160,6 +165,11 @@ impl Hotkeys {
 /// id が表にあるかどうかはここでは確かめない。表と重ねる `scrap::ops::Shortcuts::new` が、表にない id と
 /// 引数のある操作の id を無視して `Shortcuts::ignored_overrides` に載せる。
 pub type ShortcutOverrides = BTreeMap<String, Option<Chord>>;
+
+/// スクラップ操作のマウスの割り当ての上書き。キーはスクラップ操作の id（`scrap::ops` の表）。
+/// 値が None なら、その操作にマウスの操作を割り当てない。書かなかった操作は表の既定値のまま。
+/// id と値が表に合うかどうかはここでは確かめない。表と重ねる `scrap::ops::MouseBindings::new` が確かめる。
+pub type MouseOverrides = BTreeMap<String, Option<MouseGesture>>;
 
 /// スクラップの見た目の既定値。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +291,12 @@ pub enum SettingsIssue {
         hotkey: String,
         shortcut: String,
     },
+    /// 2 つ以上の操作に付いたマウスの操作。どの操作にも付けない。`items` は重なった項目名
+    /// （`mouse.close` など。表の既定値から来たものも含む）。
+    MouseConflict {
+        gesture: MouseGesture,
+        items: Vec<String>,
+    },
 }
 
 /// 設定から作ったキーの割り当て（`keymap`）。
@@ -290,6 +306,8 @@ pub struct Keymap {
     pub hotkeys: Assigned<HotkeyAction>,
     /// スクラップ操作のショートカットの対応表。
     pub shortcuts: Shortcuts,
+    /// スクラップ操作のマウスの対応表。
+    pub mouse: MouseBindings,
     /// 重なりと、無視した上書き。`load` の問題と合わせて通知する。
     pub issues: Vec<SettingsIssue>,
 }
@@ -300,6 +318,8 @@ pub struct Keymap {
 /// - ショートカット同士・ホットキー同士の、同じ範囲での重なりは、両方を無効にして `Conflict` にする。
 /// - ホットキーとショートカットの重なりは、警告（`Overlap`）だけにする。
 /// - 表にない操作と、ショートカットを持てない操作への上書きは、無視して `Invalid` にする。
+/// - マウスの割り当て（`[mouse]`）も同じ規則で表に重ねる。表にない操作・引数のある操作への上書きと、
+///   候補にない値（引数のない操作への左ドラッグ）は `Invalid`、重なりは `MouseConflict` にする。
 pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keymap {
     let hotkeys = settings.hotkeys.assign();
     let shortcuts = Shortcuts::new(ops, &settings.shortcuts);
@@ -335,9 +355,29 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
             });
         }
     }
+    let mouse = MouseBindings::new(ops, &settings.mouse);
+    let mouse_item = |id: &str| format!("mouse.{id}");
+    issues.extend(
+        mouse
+            .ignored_overrides()
+            .iter()
+            .map(|id| SettingsIssue::Invalid {
+                item: mouse_item(id),
+            }),
+    );
+    issues.extend(
+        mouse
+            .conflicts()
+            .iter()
+            .map(|c| SettingsIssue::MouseConflict {
+                gesture: c.gesture,
+                items: c.owners.iter().map(|id| mouse_item(id)).collect(),
+            }),
+    );
     Keymap {
         hotkeys,
         shortcuts,
+        mouse,
         issues,
     }
 }
@@ -349,6 +389,8 @@ pub struct SettingsChanges {
     pub hotkeys: bool,
     /// `[shortcuts]`。ショートカットの対応表とメニューを作り直す。
     pub shortcuts: bool,
+    /// `[mouse]`。マウスの対応表を作り直す。
+    pub mouse: bool,
     /// 全体の保存先かファイル名テンプレート。次の保存から使う。
     pub save: bool,
     /// 通知のオン/オフ。
@@ -373,6 +415,7 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
     SettingsChanges {
         hotkeys: old.hotkeys != new.hotkeys,
         shortcuts: old.shortcuts != new.shortcuts,
+        mouse: old.mouse != new.mouse,
         save: old.general.save_dir != new.general.save_dir
             || old.general.file_name_template != new.general.file_name_template,
         notifications: old.general.notifications != new.general.notifications,
@@ -435,6 +478,14 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
         for (op, _) in shortcuts.iter() {
             if let Some(chord) = r.value(Some(shortcuts), "shortcuts", op, optional_chord) {
                 s.shortcuts.insert(op.to_owned(), chord);
+            }
+        }
+    }
+
+    if let Some(mouse) = r.table(root, "mouse") {
+        for (op, _) in mouse.iter() {
+            if let Some(gesture) = r.value(Some(mouse), "mouse", op, optional_gesture) {
+                s.mouse.insert(op.to_owned(), gesture);
             }
         }
     }
@@ -529,6 +580,15 @@ fn non_empty_str(item: &Item) -> Option<String> {
 
 /// キーの組み合わせ。空の文字列は「割り当てなし」（Some(None)）。
 fn optional_chord(item: &Item) -> Option<Option<Chord>> {
+    let s = item.as_str()?;
+    if s.trim().is_empty() {
+        return Some(None);
+    }
+    s.parse().ok().map(Some)
+}
+
+/// マウスの操作の名前（`MouseGesture` の `FromStr`）。空の文字列は「割り当てなし」（Some(None)）。
+fn optional_gesture(item: &Item) -> Option<Option<MouseGesture>> {
     let s = item.as_str()?;
     if s.trim().is_empty() {
         return Some(None);
@@ -645,6 +705,9 @@ restore_last = "Ctrl+Alt+Z"
 copy = "Ctrl+Shift+C"
 close = ""
 
+[mouse]
+close = "DoubleClick"
+
 [scrap]
 opacity = 80
 border = false
@@ -672,6 +735,7 @@ shadow = false
                     ("close".to_owned(), None),
                     ("copy".to_owned(), Some(chord("Ctrl+Shift+C"))),
                 ]),
+                mouse: BTreeMap::from([("close".to_owned(), Some(MouseGesture::DoubleClick))]),
                 scrap: ScrapAppearance {
                     opacity: 80,
                     border: Border {
@@ -914,6 +978,15 @@ a = 1
             }
         );
         assert_eq!(
+            changed(|s| {
+                s.mouse.insert("close".to_owned(), None);
+            }),
+            SettingsChanges {
+                mouse: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
             changed(|s| s.general.save_dir = Some(PathBuf::from(r"D:\shots"))),
             SettingsChanges {
                 save: true,
@@ -1124,6 +1197,66 @@ a = 1
             "{:?}",
             keymap.issues
         );
+    }
+
+    #[test]
+    fn mouse_overrides_are_read_by_gesture_name_and_empty_removes() {
+        let src = "version = 1\n[mouse]\nclose = \"DoubleClick\"\ntoggle_compact = \"MiddleClick\"\nzoom_in = \"Ctrl+WheelUp\"\nopacity_up = \"wheelup\"\nzoom_out = \"\"\n";
+        let (settings, issues) = load(src);
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.mouse,
+            MouseOverrides::from([
+                ("close".to_owned(), Some(MouseGesture::DoubleClick)),
+                ("opacity_up".to_owned(), Some(MouseGesture::WheelUp)),
+                ("toggle_compact".to_owned(), Some(MouseGesture::MiddleClick)),
+                ("zoom_in".to_owned(), Some(MouseGesture::CtrlWheelUp)),
+                ("zoom_out".to_owned(), None),
+            ])
+        );
+    }
+
+    #[test]
+    fn mouse_overrides_that_are_not_gesture_names_are_invalid_items() {
+        let src =
+            "version = 1\n[mouse]\nclose = \"RightClick\"\nzoom_in = 1\ncopy = \"DoubleClick\"\n";
+        let (settings, issues) = load(src);
+        assert_eq!(
+            issues,
+            vec![invalid("mouse.close"), invalid("mouse.zoom_in")]
+        );
+        assert_eq!(
+            settings.mouse,
+            MouseOverrides::from([("copy".to_owned(), Some(MouseGesture::DoubleClick))])
+        );
+        let (_, issues) = load("version = 1\nmouse = 3\n");
+        assert_eq!(issues, vec![invalid("mouse")]);
+    }
+
+    #[test]
+    fn keymap_names_ignored_and_overlapping_mouse_overrides() {
+        let keymap = keymap_of(
+            "version = 1\n[mouse]\nfly = \"WheelUp\"\nclose = \"LeftDrag\"\ncopy = \"DoubleClick\"\n",
+        );
+        assert_eq!(
+            keymap.issues,
+            vec![
+                invalid("mouse.close"),
+                invalid("mouse.fly"),
+                SettingsIssue::MouseConflict {
+                    gesture: MouseGesture::DoubleClick,
+                    items: vec!["mouse.copy".to_owned(), "mouse.toggle_compact".to_owned()],
+                },
+            ]
+        );
+        assert_eq!(
+            keymap
+                .mouse
+                .operation(MouseGesture::MiddleClick)
+                .map(|op| op.id),
+            Some("close")
+        );
+        assert!(keymap.mouse.operation(MouseGesture::DoubleClick).is_none());
     }
 
     #[test]
