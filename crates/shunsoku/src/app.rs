@@ -243,12 +243,7 @@ impl Scrap {
         renderer: &mut Option<render::Renderer>,
         repaint: bool,
     ) -> Result<()> {
-        let same_content = self.model.image_size == before.image_size
-            && self.model.display_size() == before.display_size()
-            && self.model.mode == before.mode
-            && self.model.is_compact() == before.is_compact()
-            && self.model.appearance_overrides == before.appearance_overrides;
-        if same_content && !repaint {
+        if self.model.same_content(before) && !repaint {
             self.window.move_to(self.model.window_rect(appearance))
         } else {
             self.paint(appearance, renderer)
@@ -305,7 +300,7 @@ fn paint_scrap(
         image
     };
     let display = model.image_rect().size();
-    let trim = matches!(model.mode, Mode::Trimming(_)).then(|| render::TrimOverlay {
+    let trim = model.is_trimming().then(|| render::TrimOverlay {
         // 画像の左上から、ウィンドウの中の画像の位置へ
         selection: model.trim_selection().map(|r| {
             let margin = appearance.margin();
@@ -1095,7 +1090,7 @@ fn is_trimming(hwnd: HWND) -> bool {
     with_app(|app| {
         app.scraps
             .iter()
-            .any(|s| s.window.hwnd() == hwnd && matches!(s.model.mode, Mode::Trimming(_)))
+            .any(|s| s.window.hwnd() == hwnd && s.model.is_trimming())
     })
     .unwrap_or(false)
 }
@@ -1116,7 +1111,7 @@ fn on_trim_input(hwnd: HWND, input: TrimInput) -> bool {
             scraps, renderer, ..
         } = app;
         let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
-        if !matches!(scrap.model.mode, Mode::Trimming(_)) {
+        if !scrap.model.is_trimming() {
             return Some(false);
         }
         let before = scrap.model.clone();

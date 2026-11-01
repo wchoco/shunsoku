@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use crate::geometry::Point;
 use crate::keys::{Chord, Key, Modifiers};
-use crate::scrap::{Appearance, BorderOverride, Mode, ScrapModel, ZoomAnchor};
+use crate::scrap::{Appearance, BorderOverride, ScrapModel, ZoomAnchor};
 use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
@@ -247,7 +247,7 @@ const CTRL_T: Chord = Chord::plain(Key::known(0x54)).ctrl();
 
 /// トリムの範囲を選んでいる間（`Mode::Trimming`）のほかは、いつでも実行できる。
 const fn always(model: &ScrapModel) -> bool {
-    !matches!(model.mode, Mode::Trimming(_))
+    !model.is_trimming()
 }
 
 /// トリムしていて、畳んでいなければ実行できる（トリムの範囲を選んでいる間は除く）。
@@ -1245,7 +1245,7 @@ mod tests {
         let mut model = scrap();
         let effects = execute(op("trim"), &mut model, &OpContext::default());
         assert_eq!(effects, vec![Effect::EnterTrimMode]);
-        assert!(matches!(model.mode, Mode::Trimming(_)));
+        assert!(model.is_trimming());
         trim(&mut model);
         assert_eq!(model.mode, Mode::Normal);
         assert!(model.is_trimmed());

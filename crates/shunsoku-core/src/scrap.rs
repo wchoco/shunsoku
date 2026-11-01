@@ -160,6 +160,21 @@ impl ScrapModel {
         self.folded.is_some()
     }
 
+    /// トリムの範囲を選んでいるか（`Mode::Trimming`）。
+    pub const fn is_trimming(&self) -> bool {
+        matches!(self.mode, Mode::Trimming(_))
+    }
+
+    /// `before` と描く中身が同じか（位置のほかは変わっていない）。同じならウィンドウを動かすだけでよい。
+    pub fn same_content(&self, before: &ScrapModel) -> bool {
+        self.image_size == before.image_size
+            && self.image_rect().size() == before.image_rect().size()
+            && self.display_size() == before.display_size()
+            && self.mode == before.mode
+            && self.is_compact() == before.is_compact()
+            && self.appearance_overrides == before.appearance_overrides
+    }
+
     /// コンパクト表示（一辺 `compact_side` の正方形）に畳む。`anchor` が正方形の中心になる（`Center` なら
     /// 画像の中心）。倍率はそのまま残る。もう畳んでいれば false。
     pub fn fold(&mut self, anchor: ZoomAnchor) -> bool {
@@ -371,7 +386,7 @@ impl ScrapModel {
 
     /// トリムの範囲の選択を始める。すでに選んでいれば false。
     pub fn start_trim(&mut self) -> bool {
-        if matches!(self.mode, Mode::Trimming(_)) {
+        if self.is_trimming() {
             return false;
         }
         self.mode = Mode::Trimming(TrimState::default());
@@ -1085,7 +1100,7 @@ mod tests {
     }
 
     fn trimming(scrap: &ScrapModel) -> bool {
-        matches!(scrap.mode, Mode::Trimming(_))
+        scrap.is_trimming()
     }
 
     #[test]
@@ -1453,5 +1468,45 @@ mod tests {
         assert_eq!(drag.zoom_anchor(cursor), ZoomAnchor::At(cursor));
         drag.end();
         assert_eq!(drag.zoom_anchor(cursor), ZoomAnchor::Center);
+    }
+
+    #[test]
+    fn moving_a_scrap_keeps_its_content_but_zooming_or_folding_does_not() {
+        let before = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        let mut moved = before.clone();
+        moved.position = Point::new(50, 60);
+        assert!(moved.same_content(&before));
+        let mut zoomed = before.clone();
+        zoomed.zoom_in(ZoomAnchor::Center);
+        assert!(!zoomed.same_content(&before));
+        let mut folded = before.clone();
+        folded.fold(ZoomAnchor::Center);
+        assert!(!folded.same_content(&before));
+        let mut restyled = before.clone();
+        restyled.appearance_overrides.shadow = Some(false);
+        assert!(!restyled.same_content(&before));
+        let mut trimming = before.clone();
+        trimming.start_trim();
+        assert!(!trimming.same_content(&before));
+    }
+
+    #[test]
+    fn a_folded_scrap_on_another_dpi_needs_a_repaint_for_its_new_square() {
+        let mut before = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        before.set_dpi(96, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        before.fold(ZoomAnchor::Center);
+        let mut after = before.clone();
+        after.set_dpi(144, DpiScaling::KeepPixels, ZoomAnchor::Center);
+        assert!(!after.same_content(&before));
+    }
+
+    #[test]
+    fn a_scrap_is_trimming_from_start_until_it_confirms_or_cancels() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(100, 100));
+        assert!(!scrap.is_trimming());
+        scrap.start_trim();
+        assert!(scrap.is_trimming());
+        scrap.trim_input(TrimInput::Cancel);
+        assert!(!scrap.is_trimming());
     }
 }
