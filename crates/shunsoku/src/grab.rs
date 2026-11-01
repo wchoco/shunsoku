@@ -11,11 +11,16 @@ use std::ffi::c_void;
 use std::fmt;
 use std::thread;
 
+use shunsoku_core::geometry::{Point, Rect};
+use shunsoku_core::image::{Fragment, Image};
+
 use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, LUID, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
+    ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY,
@@ -26,6 +31,8 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIAdapter1, IDXGIDevice3, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource,
 };
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::WindowsAndMessaging::USER_DEFAULT_SCREEN_DPI;
 use windows::core::{Interface, Result};
 
 /// 開いた直後の空のフレーム（`LastPresentTime == 0`）を捨てて取り直す回数の上限。
@@ -51,6 +58,8 @@ struct AdapterDevice {
 pub struct Shot {
     /// モニタの位置と大きさ（スクリーン座標、物理ピクセル）。
     pub rect: RECT,
+    /// モニタの実効 DPI（100% で 96）。
+    pub dpi: u32,
     /// このモニタが属するアダプタのデバイス。表示のスワップチェーンもこのデバイスで作る。
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
@@ -58,6 +67,76 @@ pub struct Shot {
     /// 切り抜くときは、ここから重なる部分だけを staging のテクスチャへ写して CPU に書き戻す。
     /// None は、この画像をそのまま出せないモニタ（回転したモニタ、8bit BGRA でない HDR のモニタ）。
     pub texture: Option<ID3D11Texture2D>,
+}
+
+impl Shot {
+    /// `area`（スクリーン座標）のうちこのモニタに重なる部分を CPU に書き戻す。重なる部分がないか、
+    /// このモニタの画像を出せない（`texture` が None）ときは None。
+    ///
+    /// UI スレッドで呼ぶ（取得のスレッドはもう終わっている）。
+    pub fn read_back(&self, area: Rect) -> Result<Option<Fragment>> {
+        let Some(texture) = &self.texture else {
+            return Ok(None);
+        };
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: 説明を読むだけ
+        unsafe { texture.GetDesc(&mut desc) };
+        // 画像がモニタより小さいこともあり得るので、画像のある部分に収める
+        let origin = Point::new(self.rect.left, self.rect.top);
+        let shown = Rect::new(
+            self.rect.left,
+            self.rect.top,
+            self.rect.right.min(origin.x + desc.Width as i32),
+            self.rect.bottom.min(origin.y + desc.Height as i32),
+        );
+        let Some(area) = area.intersect(&shown) else {
+            return Ok(None);
+        };
+        let local = area.offset(-origin.x, -origin.y);
+        let size = area.size();
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: size.width,
+            Height: size.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: desc.Format,
+            SampleDesc: desc.SampleDesc,
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let source = D3D11_BOX {
+            left: local.left as u32,
+            top: local.top as u32,
+            front: 0,
+            right: local.right as u32,
+            bottom: local.bottom as u32,
+            back: 1,
+        };
+        // SAFETY: 同じデバイスのテクスチャ同士で写し、写した先を読み終えてから Unmap する
+        unsafe {
+            let mut staging = None;
+            self.device
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))?;
+            let staging = staging.ok_or(windows::Win32::Foundation::E_POINTER)?;
+            self.context
+                .CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, 0, Some(&source));
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let stride = mapped.RowPitch as usize;
+            let len = stride * (size.height as usize - 1) + size.width as usize * 4;
+            let data = std::slice::from_raw_parts(mapped.pData as *const u8, len);
+            let image = Image::from_opaque_rows(size, stride, data);
+            self.context.Unmap(&staging, 0);
+            let image = image.ok_or(windows::Win32::Foundation::E_UNEXPECTED)?;
+            Ok(Some(Fragment {
+                at: area.origin(),
+                image,
+            }))
+        }
+    }
 }
 
 /// 取得の失敗。
@@ -108,7 +187,7 @@ impl Gpu {
         // 抜き差しや配置の変更を拾うため、ファクトリは毎回作り直す（ファクトリは作った時点の一覧を持つ）
         // SAFETY: 引数なしの生成
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
-        let mut jobs: Vec<(usize, IDXGIOutput1, RECT)> = Vec::new();
+        let mut jobs: Vec<(usize, IDXGIOutput1, RECT, u32)> = Vec::new();
         let mut index = 0;
         // SAFETY: 列挙は Err（DXGI_ERROR_NOT_FOUND）で終わる
         while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
@@ -118,7 +197,11 @@ impl Gpu {
                 continue;
             }
             let device = self.device_for(&adapter)?;
-            jobs.extend(outputs.into_iter().map(|(o, rect)| (device, o, rect)));
+            jobs.extend(
+                outputs
+                    .into_iter()
+                    .map(|(o, rect, dpi)| (device, o, rect, dpi)),
+            );
         }
         if jobs.is_empty() {
             return Err(GrabError::NoOutputs);
@@ -127,7 +210,7 @@ impl Gpu {
         let results: Vec<std::result::Result<Grabbed, GrabError>> = thread::scope(|scope| {
             let handles: Vec<_> = jobs
                 .iter()
-                .map(|(device, output, _)| {
+                .map(|(device, output, _, _)| {
                     let device = Raw(self.adapters[*device].device.as_raw());
                     let output = Raw(output.as_raw());
                     thread::Builder::new()
@@ -161,11 +244,12 @@ impl Gpu {
         let mut shots = Vec::with_capacity(jobs.len());
         // 失敗が 1 つでもあれば全体を失敗にする（欠けた画面で範囲を選ばせない）。
         // 先に成功したモニタのテクスチャは shots ごと捨てる
-        for ((device, _, rect), result) in jobs.into_iter().zip(results) {
+        for ((device, _, rect, dpi), result) in jobs.into_iter().zip(results) {
             let grabbed = result?;
             let adapter = &self.adapters[device];
             shots.push(Shot {
                 rect,
+                dpi,
                 device: adapter.device.clone(),
                 context: adapter.context.clone(),
                 texture: grabbed.texture,
@@ -246,8 +330,8 @@ fn same_luid(a: LUID, b: LUID) -> bool {
     a.HighPart == b.HighPart && a.LowPart == b.LowPart
 }
 
-/// デスクトップにつながっている出力と、その位置（スクリーン座標、物理ピクセル）。
-fn attached_outputs(adapter: &IDXGIAdapter1) -> Result<Vec<(IDXGIOutput1, RECT)>> {
+/// デスクトップにつながっている出力と、その位置（スクリーン座標、物理ピクセル）と実効 DPI。
+fn attached_outputs(adapter: &IDXGIAdapter1) -> Result<Vec<(IDXGIOutput1, RECT, u32)>> {
     let mut outputs = Vec::new();
     let mut index = 0;
     // SAFETY: 列挙は Err（DXGI_ERROR_NOT_FOUND）で終わる
@@ -256,7 +340,14 @@ fn attached_outputs(adapter: &IDXGIAdapter1) -> Result<Vec<(IDXGIOutput1, RECT)>
         // SAFETY: 出力の説明を読むだけ
         let desc = unsafe { output.GetDesc()? };
         if desc.AttachedToDesktop.as_bool() {
-            outputs.push((output.cast::<IDXGIOutput1>()?, desc.DesktopCoordinates));
+            let (mut dpi, mut dpi_y) = (USER_DEFAULT_SCREEN_DPI, USER_DEFAULT_SCREEN_DPI);
+            // SAFETY: 出力のモニタのハンドルで DPI を読むだけ。失敗したら 100% とみなす
+            if unsafe { GetDpiForMonitor(desc.Monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y) }
+                .is_err()
+            {
+                dpi = USER_DEFAULT_SCREEN_DPI;
+            }
+            outputs.push((output.cast::<IDXGIOutput1>()?, desc.DesktopCoordinates, dpi));
         }
     }
     Ok(outputs)

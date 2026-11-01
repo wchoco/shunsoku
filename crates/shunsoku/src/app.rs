@@ -17,6 +17,9 @@
 //!   ほかに、範囲選択の画面を開いている間だけ、モニタごとのウィンドウ（`overlay`）がある。
 //! - キャプチャは `capture::request` の依頼 1 本の流れで進める: 依頼 → 待機（`delay`）→ 取得（`grab`）→
 //!   範囲選択の画面（`overlay`）→ 切り抜き → 出力 → 結果。同時に進める依頼は 1 件だけ（`Capture`）。
+//! - 範囲選択の入力（マウス・キー）は core の `selection::Input` にして `Selection::handle` に渡す。
+//!   入力を足すときは `Input` を足し、ここではメッセージから作るだけにする。
+//! - スクラップ（`Scrap`）は `App::scraps` に持つ。ウィンドウは `scrap_window`、中身の描画は `render`。
 //! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に 1 回読む。ファイルは作らず、書き換えない。
 //!   問題（読めない・不正な項目・登録できないホットキー・未設定のホットキー）は、まとめて 1 回だけ通知する。
 //! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。
@@ -29,24 +32,31 @@ use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
 use shunsoku_core::capture::request::{CaptureRequest, Source};
+use shunsoku_core::geometry::Point;
 use shunsoku_core::i18n::Catalog;
+use shunsoku_core::image::{Fragment, Image};
+use shunsoku_core::scrap::{Appearance, ScrapModel};
+use shunsoku_core::selection::{Button, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsIssue};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
     IDI_APPLICATION, KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SetTimer, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP,
     WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
-    WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_TIMER, WNDCLASSEXW,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
-use crate::{grab, hotkey, logger, notify, overlay, panic_hook, single_instance, tray};
+use crate::{
+    grab, hotkey, logger, notify, overlay, panic_hook, render, scrap_window, single_instance, tray,
+};
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
 const WM_APP_TRAY: u32 = WM_APP + 1;
@@ -85,6 +95,7 @@ struct App {
     tray: tray::Tray,
     settings: Settings,
     capture: Capture,
+    scraps: Vec<Scrap>,
     gpu: grab::Gpu,
     hotkeys: hotkey::Registered,
     windows: Windows,
@@ -101,10 +112,21 @@ enum Capture {
     Waiting(CaptureRequest),
     /// 範囲選択の画面を開いている。
     Selecting {
-        #[expect(dead_code, reason = "範囲を選んで撮るチケット（#41）で出力に使う")]
         request: CaptureRequest,
         overlay: overlay::Overlay,
+        selection: Selection,
     },
+}
+
+/// 浮かべているスクラップ 1 枚。
+struct Scrap {
+    /// drop でウィンドウを壊す。
+    #[expect(dead_code, reason = "スクラップの操作のチケット（#42）で使う")]
+    window: scrap_window::ScrapWindow,
+    #[expect(dead_code, reason = "スクラップの操作のチケット（#42）で使う")]
+    model: ScrapModel,
+    #[expect(dead_code, reason = "コピーと保存のチケット（#44）で使う")]
+    image: Image,
 }
 
 struct Windows {
@@ -242,6 +264,7 @@ fn start(
     }
 
     overlay::register_class(module, Some(overlay_wndproc))?;
+    scrap_window::register_class(module, Some(scrap_wndproc))?;
 
     // SAFETY: 名前は 'static
     let _ = TASKBAR_CREATED.set(unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
@@ -317,6 +340,7 @@ fn start(
         tray,
         settings,
         capture: Capture::Idle,
+        scraps: Vec::new(),
         gpu: grab::Gpu::default(),
         hotkeys,
         windows,
@@ -373,6 +397,17 @@ unsafe extern "system" fn overlay_wndproc(
 ) -> LRESULT {
     // SAFETY: 受け取った引数をそのまま渡す
     unsafe { dispatch(on_overlay_message, hwnd, msg, wparam, lparam) }
+}
+
+/// スクラップのウィンドウのプロシージャ。
+unsafe extern "system" fn scrap_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: 受け取った引数をそのまま渡す
+    unsafe { dispatch(on_scrap_message, hwnd, msg, wparam, lparam) }
 }
 
 /// `handler` をパニックから守って呼ぶ。`handler` が None を返したら DefWindowProcW に任せる。
@@ -485,11 +520,42 @@ fn on_command(command: u32) {
 
 /// 範囲選択の画面のウィンドウへのメッセージ。キー入力は前面の 1 枚にしか来ないので、
 /// どのウィンドウに来たかで分けない。
-fn on_overlay_message(_hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+fn on_overlay_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    let at = || overlay::screen_point(hwnd, lparam);
     match msg {
+        WM_LBUTTONDOWN => {
+            // ウィンドウの外（別のモニタ）まで引いても離したことがわかるように、マウスを捕まえる
+            // SAFETY: 自分のウィンドウ
+            unsafe { SetCapture(hwnd) };
+            on_selection_input(Input::Press {
+                button: Button::Left,
+                at: at(),
+            });
+            Some(LRESULT(0))
+        }
+        WM_MOUSEMOVE => {
+            on_selection_input(Input::Move { at: at() });
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONUP => {
+            let at = at();
+            // SAFETY: UI スレッドで呼ぶ。App を借りる前に放す（WM_CAPTURECHANGED が届くため）
+            let _ = unsafe { ReleaseCapture() };
+            on_selection_input(Input::Release {
+                button: Button::Left,
+                at,
+            });
+            Some(LRESULT(0))
+        }
+        WM_RBUTTONDOWN => {
+            on_selection_input(Input::Press {
+                button: Button::Right,
+                at: at(),
+            });
+            Some(LRESULT(0))
+        }
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
-            log::info!("overlay cancelled (Esc)");
-            close_overlay();
+            on_selection_input(Input::Escape);
             Some(LRESULT(0))
         }
         // 他のアプリに前面を取られるとキー入力が来なくなり、閉じられなくなるので閉じる
@@ -510,6 +576,143 @@ fn on_overlay_message(_hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPARAM) ->
         WM_DPICHANGED => Some(LRESULT(0)),
         _ => None,
     }
+}
+
+/// スクラップのウィンドウへのメッセージ。
+fn on_scrap_message(_hwnd: HWND, msg: u32, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+    match msg {
+        // 画素を等倍のまま出すので、DPI の違うモニタに動いても大きさを変えない
+        WM_DPICHANGED => Some(LRESULT(0)),
+        _ => None,
+    }
+}
+
+/// 範囲選択の入力を状態に渡し、描き直す。確定したら撮って出力し、取り消したら画面を閉じる。
+fn on_selection_input(input: Input) {
+    let state = with_app(|app| {
+        let Capture::Selecting {
+            overlay, selection, ..
+        } = &mut app.capture
+        else {
+            return None;
+        };
+        let before = selection.rect();
+        let state = selection.handle(input);
+        if selection.rect() != before {
+            // 描くだけでウィンドウは作らないので、借りたまま描いてよい
+            overlay.redraw(selection);
+        }
+        Some(state)
+    })
+    .flatten();
+    match state {
+        Some(State::Confirmed) => finish_selection(),
+        Some(State::Cancelled) => {
+            log::info!("overlay cancelled");
+            close_overlay();
+        }
+        _ => {}
+    }
+}
+
+/// 確定した範囲を撮り、依頼の出力（M1 ではスクラップ）を出して、範囲選択の画面を閉じる。
+fn finish_selection() {
+    let taken = with_app(|app| match std::mem::take(&mut app.capture) {
+        Capture::Selecting {
+            request,
+            overlay,
+            selection,
+        } => Some((
+            request,
+            overlay,
+            selection,
+            app.module,
+            Appearance::from(app.settings.scrap),
+        )),
+        other => {
+            app.capture = other;
+            None
+        }
+    })
+    .flatten();
+    let Some((request, overlay, selection, module, appearance)) = taken else {
+        return;
+    };
+    let Some(rect) = selection.rect() else {
+        drop(overlay);
+        end_capture();
+        return;
+    };
+    let fragments: Vec<Fragment> = selection
+        .parts()
+        .iter()
+        .filter_map(|part| match overlay.read_back(part) {
+            Ok(fragment) => fragment,
+            Err(e) => {
+                // 撮れなかった部分は透明になる
+                log::warn!("could not read back monitor {}: {e}", part.monitor);
+                None
+            }
+        })
+        .collect();
+    let image = Image::compose(rect, &fragments);
+    log::info!(
+        "captured {}x{} at ({}, {}) from {} part(s)",
+        rect.width(),
+        rect.height(),
+        rect.left,
+        rect.top,
+        fragments.len()
+    );
+
+    // ウィンドウを作るとメッセージが届くので、App を借りずに作る。前面にする権利を失わないよう、
+    // スクラップを前面にしてから範囲選択の画面を閉じる
+    let scrap = if request.outputs.scrap {
+        let focus = request.outputs.focus_scrap;
+        match open_scrap(module, rect.origin(), image, &appearance, focus) {
+            Ok(scrap) => Some(scrap),
+            Err(e) => {
+                log::error!("could not open a scrap: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    drop(overlay);
+    end_capture();
+    if let Some(scrap) = scrap {
+        let rejected = with_app(|app| {
+            app.scraps.push(scrap);
+        });
+        if rejected.is_none() {
+            log::warn!("could not keep the scrap");
+        }
+    }
+    log::info!("overlay closed");
+}
+
+/// 画像をスクリーン座標の `at` に等倍で浮かべるスクラップを作る。
+fn open_scrap(
+    module: HINSTANCE,
+    at: Point,
+    image: Image,
+    appearance: &Appearance,
+    focus: bool,
+) -> Result<Scrap> {
+    let model = ScrapModel::new(at, image.size());
+    let rect = model.window_rect(appearance);
+    let canvas = render::Canvas::new(rect.size())?;
+    render::Renderer::new()?.paint_scrap(&canvas, &image, appearance)?;
+    let window = scrap_window::ScrapWindow::create(module, rect)?;
+    // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
+    window.present(canvas.dc(), rect, appearance.opacity)?;
+    window.show(focus);
+    Ok(Scrap {
+        window,
+        model,
+        image,
+    })
 }
 
 /// 発生源からキャプチャの依頼を受ける。ほかの依頼を進めている間（範囲選択の画面を開いている間など）は無視する。
@@ -578,9 +781,14 @@ fn open_overlay() {
             return;
         }
     };
+    let selection = overlay.new_selection();
     let rejected = with_app(|app| match std::mem::take(&mut app.capture) {
         Capture::Waiting(request) => {
-            app.capture = Capture::Selecting { request, overlay };
+            app.capture = Capture::Selecting {
+                request,
+                overlay,
+                selection,
+            };
             None
         }
         other => {
