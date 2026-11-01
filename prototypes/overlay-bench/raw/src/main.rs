@@ -1,4 +1,7 @@
 // PROTOTYPE — 捨てるコード。shunsoku #5 の計測用（Rust + windows-rs で Win32 を直接呼ぶ案）。
+// #14 で追加: --par（Desktop Duplication をモニタごとに並列取得）、
+//   --display gdi|gpu-per|gpu-one（範囲選択の画面を GDI で描くか、GPU に置いたまま flip-model の
+//   スワップチェーンで出すか。gpu-per はモニタごとに 1 枚、gpu-one は仮想スクリーン全体で 1 枚）。
 // 常駐 → グローバルホットキー (Ctrl+Shift+F9) → 画面を固定して範囲選択 → 最前面のスクラップ表示。
 // 起動引数: --capture dd|gdi|wgc   環境変数 SHUNSOKU_BENCH_LOG に計測ログを追記する。
 // スクラップ: ドラッグで移動 / ホイールで拡大縮小 / 右クリックで半透明切替 / ダブルクリックか Esc で閉じる。
@@ -19,7 +22,7 @@ use windows::{
             Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
             Direct3D11::*,
             Dwm::DwmFlush,
-            Dxgi::*,
+            Dxgi::{Common::*, *},
             Gdi::*,
         },
         System::{
@@ -75,8 +78,41 @@ struct Overlay {
     drag: Option<(POINT, POINT)>,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Display {
+    Gdi,
+    GpuPer,
+    GpuOne,
+}
+
+/// GPU 表示用: モニタ 1 枚分の固定画像（GPU 上）。
+struct Shot {
+    a: usize,
+    rect: RECT,
+    tex: ID3D11Texture2D,
+}
+
+/// GPU 表示用: 範囲選択のウィンドウ 1 枚とそのスワップチェーン。
+struct Surface {
+    hwnd: HWND,
+    rect: RECT,
+    a: usize,
+    swap: IDXGISwapChain1,
+    bb: ID3D11Texture2D,
+    rtv: ID3D11RenderTargetView,
+}
+
+struct GpuOverlay {
+    shots: Vec<Shot>,
+    surfaces: Vec<Surface>,
+    drag: Option<(POINT, POINT)>,
+}
+
 struct App {
     method: Method,
+    display: Display,
+    par: bool,
+    gpu: Option<GpuOverlay>,
     adapters: Vec<Adapter>,
     wgc_dev: Option<IDirect3DDevice>,
     overlay: Option<Overlay>,
@@ -189,7 +225,11 @@ fn init_d3d() -> Result<Vec<Adapter>> {
                 None,
                 Some(&mut ctx),
             )?;
-            out.push(Adapter { dev: dev.unwrap(), ctx: ctx.unwrap(), outputs });
+            let dev = dev.unwrap();
+            if let Ok(mt) = dev.cast::<ID3D11Multithread>() {
+                let _ = mt.SetMultithreadProtected(true);
+            }
+            out.push(Adapter { dev, ctx: ctx.unwrap(), outputs });
         }
         Ok(out)
     }
@@ -275,6 +315,113 @@ fn capture_dd(app: &App, vs: RECT, dib: &Dib) -> Result<()> {
         }
         Ok(())
     }
+}
+
+struct Acquired {
+    a: usize,
+    rect: RECT,
+    dup: IDXGIOutputDuplication,
+    tex: ID3D11Texture2D,
+}
+
+struct Raw(*mut c_void);
+unsafe impl Send for Raw {}
+
+/// 1 モニタ分: Duplication を開き、画像が届いたフレームを取る。(dup, tex, tries, dup_ms, acquire_ms)
+unsafe fn acquire_one(dev: &ID3D11Device, o: &IDXGIOutput1) -> Result<(IDXGIOutputDuplication, ID3D11Texture2D, u32, f64, f64)> {
+    let f = freq() as f64 / 1000.0;
+    let t0 = qpc();
+    let dup = o.DuplicateOutput(dev)?;
+    let t1 = qpc();
+    let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+    let mut res = None;
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        dup.AcquireNextFrame(500, &mut info, &mut res)?;
+        if info.LastPresentTime != 0 || tries >= 10 {
+            break;
+        }
+        res = None;
+        dup.ReleaseFrame()?;
+    }
+    let t2 = qpc();
+    let tex: ID3D11Texture2D = res.unwrap().cast()?;
+    Ok((dup, tex, tries, (t1 - t0) as f64 / f, (t2 - t1) as f64 / f))
+}
+
+/// 全モニタの Duplication フレームを取る（par なら並列）。呼び出し側で ReleaseFrame する。
+fn acquire_all(app: &App, par: bool) -> Result<Vec<Acquired>> {
+    let mut jobs = vec![];
+    unsafe {
+        for (i, a) in app.adapters.iter().enumerate() {
+            for o in &a.outputs {
+                jobs.push((i, o.GetDesc()?.DesktopCoordinates, o.clone()));
+            }
+        }
+    }
+    let t0 = qpc();
+    let results: Vec<std::result::Result<(Raw, Raw, u32, f64, f64), HRESULT>> = if par {
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = jobs
+                .iter()
+                .map(|(i, _, o)| {
+                    let dev = Raw(app.adapters[*i].dev.as_raw());
+                    let out = Raw(o.as_raw());
+                    sc.spawn(move || unsafe {
+                        let (dev, out) = (dev, out);
+                        let d = ID3D11Device::from_raw_borrowed(&dev.0).unwrap();
+                        let o = IDXGIOutput1::from_raw_borrowed(&out.0).unwrap();
+                        acquire_one(d, o)
+                            .map(|(a, b, n, x, y)| (Raw(a.into_raw()), Raw(b.into_raw()), n, x, y))
+                            .map_err(|e| e.code())
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    } else {
+        jobs.iter()
+            .map(|(i, _, o)| unsafe {
+                acquire_one(&app.adapters[*i].dev, o)
+                    .map(|(a, b, n, x, y)| (Raw(a.into_raw()), Raw(b.into_raw()), n, x, y))
+                    .map_err(|e| e.code())
+            })
+            .collect()
+    };
+    let total = (qpc() - t0) as f64 * 1000.0 / freq() as f64;
+    let mut v = vec![];
+    let mut detail = String::new();
+    for ((i, rect, _), r) in jobs.into_iter().zip(results) {
+        let (dup, tex, n, x, y) = r.map_err(Error::from)?;
+        detail += &format!(" [dup={x:.1} acquire={y:.1} tries={n}]");
+        unsafe {
+            v.push(Acquired {
+                a: i,
+                rect,
+                dup: IDXGIOutputDuplication::from_raw(dup.0),
+                tex: ID3D11Texture2D::from_raw(tex.0),
+            });
+        }
+    }
+    log(format!("acquire par={par} total={total:.1}{detail}"));
+    Ok(v)
+}
+
+/// --par で GDI 表示: 並列に取ってから CPU に書き戻す。
+fn capture_dd_par(app: &App, vs: RECT, dib: &Dib) -> Result<()> {
+    let t0 = qpc();
+    let acq = acquire_all(app, true)?;
+    let t1 = qpc();
+    unsafe {
+        for q in &acq {
+            copy_tex(&app.adapters[q.a], &q.tex, q.rect.left - vs.left, q.rect.top - vs.top, dib)?;
+            q.dup.ReleaseFrame()?;
+        }
+    }
+    let f = freq() as f64 / 1000.0;
+    log(format!("ddpar-detail acquire={:.1} readback={:.1}", (t1 - t0) as f64 / f, (qpc() - t1) as f64 / f));
+    Ok(())
 }
 
 unsafe fn staging_like(a: &Adapter, tex: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
@@ -443,8 +590,16 @@ fn freq() -> i64 {
 // ---------- 範囲選択の画面 ----------
 
 fn on_hotkey() {
-    let busy = APP.with(|a| a.borrow().as_ref().unwrap().overlay.is_some());
+    let (busy, display) = APP.with(|a| {
+        let b = a.borrow();
+        let app = b.as_ref().unwrap();
+        (app.overlay.is_some() || app.gpu.is_some(), app.display)
+    });
     if busy {
+        return;
+    }
+    if display != Display::Gdi {
+        on_hotkey_gpu(display);
         return;
     }
     let t_hot = qpc();
@@ -464,6 +619,7 @@ fn on_hotkey() {
                 capture_gdi(vs, &dib);
                 Ok(())
             }
+            Method::Dd if app.par => capture_dd_par(app, vs, &dib),
             Method::Dd => capture_dd(app, vs, &dib),
             Method::DdKeep => capture_dd_keep(app, vs, &dib),
             Method::Wgc => capture_wgc(app, vs, &dib),
@@ -656,6 +812,337 @@ extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 if let Some(ov) = close_overlay() {
                     free_overlay(ov);
                 }
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+}
+
+// ---------- 範囲選択の画面（GPU に置いたまま表示） ----------
+
+fn intersect(a: RECT, b: RECT) -> Option<RECT> {
+    let r = RECT { left: a.left.max(b.left), top: a.top.max(b.top), right: a.right.min(b.right), bottom: a.bottom.min(b.bottom) };
+    (r.right > r.left && r.bottom > r.top).then_some(r)
+}
+
+fn on_hotkey_gpu(display: Display) {
+    let t_hot = qpc();
+    let f = freq() as f64 / 1000.0;
+    // 1) 撮影: Duplication のフレームを自前の GPU テクスチャへ写してすぐ解放する（CPU には書き戻さない）。
+    let (shots, n) = APP.with(|a| {
+        let mut b = a.borrow_mut();
+        let app = b.as_mut().unwrap();
+        app.n += 1;
+        let acq = acquire_all(app, app.par).unwrap();
+        let mut shots = vec![];
+        unsafe {
+            for q in acq {
+                let ad = &app.adapters[q.a];
+                let mut td = D3D11_TEXTURE2D_DESC::default();
+                q.tex.GetDesc(&mut td);
+                td.Usage = D3D11_USAGE_DEFAULT;
+                td.BindFlags = 0;
+                td.CPUAccessFlags = 0;
+                td.MiscFlags = 0;
+                td.MipLevels = 1;
+                td.ArraySize = 1;
+                let mut own = None;
+                ad.dev.CreateTexture2D(&td, None, Some(&mut own)).unwrap();
+                let own = own.unwrap();
+                ad.ctx.CopyResource(&own, &q.tex);
+                q.dup.ReleaseFrame().unwrap();
+                if app.n == 1 {
+                    log(format!("shot format={:?} {}x{}", td.Format, td.Width, td.Height));
+                }
+                shots.push(Shot { a: q.a, rect: q.rect, tex: own });
+            }
+        }
+        (shots, app.n)
+    });
+    let t_cap = qpc();
+    // 2) ウィンドウ（モニタごと or 仮想スクリーン 1 枚）を作る。APP を借りたまま CreateWindow しない。
+    let areas: Vec<(RECT, usize)> = match display {
+        Display::GpuPer => shots.iter().map(|s| (s.rect, s.a)).collect(),
+        _ => vec![(virtual_screen(), 0)],
+    };
+    let hwnds: Vec<HWND> = areas
+        .iter()
+        .map(|(r, _)| unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("proto-gpu-overlay"),
+                w!("shunsoku overlay"),
+                WS_POPUP,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                None,
+                None,
+                Some(hinst()),
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    let t_win = qpc();
+    // 3) スワップチェーンを作る。
+    let surfaces = APP.with(|a| {
+        let b = a.borrow();
+        let app = b.as_ref().unwrap();
+        areas
+            .iter()
+            .zip(&hwnds)
+            .map(|((r, ai), h)| unsafe { make_surface(&app.adapters[*ai], *ai, *h, *r).unwrap() })
+            .collect::<Vec<_>>()
+    });
+    let t_swap = qpc();
+    APP.with(|a| {
+        a.borrow_mut().as_mut().unwrap().gpu = Some(GpuOverlay { shots, surfaces, drag: None });
+    });
+    // 4) 表示して描く。
+    unsafe {
+        for h in &hwnds {
+            let _ = ShowWindow(*h, SW_SHOW);
+        }
+        let _ = SetForegroundWindow(hwnds[0]);
+    }
+    let t_show = qpc();
+    redraw_gpu();
+    let t_shown = qpc();
+    unsafe {
+        let _ = DwmFlush();
+    }
+    let t_flush = qpc();
+    log(format!(
+        "gpu-detail windows={:.1} swapchain={:.1} show={:.1} draw+present={:.1}",
+        (t_win - t_cap) as f64 / f,
+        (t_swap - t_win) as f64 / f,
+        (t_show - t_swap) as f64 / f,
+        (t_shown - t_show) as f64 / f
+    ));
+    log(format!(
+        "trigger n={n} method=Dd display={display:?} hotkey={t_hot} captured={t_cap} shown={t_shown} flushed={t_flush} dpi={}",
+        unsafe { GetDpiForWindow(hwnds[0]) }
+    ));
+}
+
+unsafe fn make_surface(ad: &Adapter, ai: usize, hwnd: HWND, rect: RECT) -> Result<Surface> {
+    let dxgi: IDXGIDevice = ad.dev.cast()?;
+    let factory: IDXGIFactory2 = dxgi.GetAdapter()?.GetParent()?;
+    let desc = DXGI_SWAP_CHAIN_DESC1 {
+        Width: (rect.right - rect.left) as u32,
+        Height: (rect.bottom - rect.top) as u32,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        BufferCount: 2,
+        Scaling: DXGI_SCALING_NONE,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        ..Default::default()
+    };
+    let swap = factory.CreateSwapChainForHwnd(&ad.dev, hwnd, &desc, None, None)?;
+    let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+    let bb: ID3D11Texture2D = swap.GetBuffer(0)?;
+    let mut rtv = None;
+    ad.dev.CreateRenderTargetView(&bb, None, Some(&mut rtv))?;
+    Ok(Surface { hwnd, rect, a: ai, swap, bb, rtv: rtv.unwrap() })
+}
+
+/// 全ウィンドウを描き直す: 固定画像を GPU 上でバックバッファへ写し、選択枠は ClearView の矩形で描く。
+fn redraw_gpu() {
+    APP.with(|a| {
+        let Ok(b) = a.try_borrow() else { return };
+        let app = b.as_ref().unwrap();
+        let Some(g) = app.gpu.as_ref() else { return };
+        unsafe {
+            for s in &g.surfaces {
+                let ctx = &app.adapters[s.a].ctx;
+                for shot in g.shots.iter().filter(|x| x.a == s.a) {
+                    if let Some(ix) = intersect(shot.rect, s.rect) {
+                        let bx = D3D11_BOX {
+                            left: (ix.left - shot.rect.left) as u32,
+                            top: (ix.top - shot.rect.top) as u32,
+                            front: 0,
+                            right: (ix.right - shot.rect.left) as u32,
+                            bottom: (ix.bottom - shot.rect.top) as u32,
+                            back: 1,
+                        };
+                        ctx.CopySubresourceRegion(&s.bb, 0, (ix.left - s.rect.left) as u32, (ix.top - s.rect.top) as u32, 0, &shot.tex, 0, Some(&bx));
+                    }
+                }
+                if let Some((p, q)) = g.drag {
+                    let r = norm(p, q);
+                    let edges = [
+                        RECT { left: r.left, top: r.top, right: r.right + 1, bottom: r.top + 1 },
+                        RECT { left: r.left, top: r.bottom, right: r.right + 1, bottom: r.bottom + 1 },
+                        RECT { left: r.left, top: r.top, right: r.left + 1, bottom: r.bottom + 1 },
+                        RECT { left: r.right, top: r.top, right: r.right + 1, bottom: r.bottom + 1 },
+                    ];
+                    let local: Vec<RECT> = edges
+                        .iter()
+                        .filter_map(|e| intersect(*e, s.rect))
+                        .map(|e| RECT { left: e.left - s.rect.left, top: e.top - s.rect.top, right: e.right - s.rect.left, bottom: e.bottom - s.rect.top })
+                        .collect();
+                    if !local.is_empty() {
+                        let ctx1: ID3D11DeviceContext1 = ctx.cast().unwrap();
+                        ctx1.ClearView(&s.rtv, &[1.0, 0.0, 0.0, 1.0], Some(&local));
+                    }
+                }
+                let _ = s.swap.Present(0, DXGI_PRESENT(0));
+            }
+        }
+    });
+}
+
+/// 選択範囲だけを CPU に書き戻して DIB にする。
+fn crop_gpu(app: &App, g: &GpuOverlay, r: RECT) -> Result<Dib> {
+    let dib = new_dib(r.right - r.left, r.bottom - r.top);
+    unsafe {
+        for shot in &g.shots {
+            let Some(ix) = intersect(shot.rect, r) else { continue };
+            let ad = &app.adapters[shot.a];
+            let td = D3D11_TEXTURE2D_DESC {
+                Width: (ix.right - ix.left) as u32,
+                Height: (ix.bottom - ix.top) as u32,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                ..Default::default()
+            };
+            let mut st = None;
+            ad.dev.CreateTexture2D(&td, None, Some(&mut st))?;
+            let st = st.unwrap();
+            let bx = D3D11_BOX {
+                left: (ix.left - shot.rect.left) as u32,
+                top: (ix.top - shot.rect.top) as u32,
+                front: 0,
+                right: (ix.right - shot.rect.left) as u32,
+                bottom: (ix.bottom - shot.rect.top) as u32,
+                back: 1,
+            };
+            ad.ctx.CopySubresourceRegion(&st, 0, 0, 0, 0, &shot.tex, 0, Some(&bx));
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            ad.ctx.Map(&st, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
+            let (dx, dy, w) = (ix.left - r.left, ix.top - r.top, ix.right - ix.left);
+            for y in 0..(ix.bottom - ix.top) {
+                let src = (m.pData as *const u8).add(y as usize * m.RowPitch as usize);
+                let d = dib.bits.add((((dy + y) * dib.w + dx) * 4) as usize);
+                std::ptr::copy_nonoverlapping(src, d, (w * 4) as usize);
+            }
+            ad.ctx.Unmap(&st, 0);
+        }
+        set_opaque(&dib);
+    }
+    Ok(dib)
+}
+
+/// 範囲選択を閉じる。sel があればその範囲をスクラップにする。
+fn close_gpu(sel: bool) {
+    let (g, crop) = APP.with(|a| {
+        let mut b = a.borrow_mut();
+        let app = b.as_mut().unwrap();
+        let Some(g) = app.gpu.take() else { return (None, None) };
+        let crop = if sel {
+            g.drag.map(|(p, q)| norm(p, q)).filter(|r| r.right - r.left > 2 && r.bottom - r.top > 2).map(|r| {
+                let t = qpc();
+                let d = crop_gpu(app, &g, r).unwrap();
+                log(format!("crop {}x{} readback={:.2}", r.right - r.left, r.bottom - r.top, (qpc() - t) as f64 * 1000.0 / freq() as f64));
+                (r, d)
+            })
+        } else {
+            None
+        };
+        (Some(g), crop)
+    });
+    let Some(g) = g else { return };
+    let hwnds: Vec<HWND> = g.surfaces.iter().map(|s| s.hwnd).collect();
+    drop(g);
+    unsafe {
+        for h in hwnds {
+            let _ = DestroyWindow(h);
+        }
+    }
+    APP.with(|a| {
+        let b = a.borrow();
+        let app = b.as_ref().unwrap();
+        if app.trim {
+            unsafe {
+                for ad in &app.adapters {
+                    ad.ctx.ClearState();
+                    ad.ctx.Flush();
+                    if let Ok(d3) = ad.dev.cast::<IDXGIDevice3>() {
+                        d3.Trim();
+                    }
+                }
+            }
+        }
+    });
+    if let Some((r, d)) = crop {
+        create_scrap(r.left, r.top, d);
+    }
+}
+
+fn screen_pt(hwnd: HWND, lp: LPARAM) -> POINT {
+    let mut p = lp_pt(lp);
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut p);
+    }
+    p
+}
+
+extern "system" fn gpu_overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                let _ = ValidateRect(Some(hwnd), None);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                let p = screen_pt(hwnd, lp);
+                APP.with(|a| {
+                    if let Ok(mut b) = a.try_borrow_mut() {
+                        if let Some(g) = b.as_mut().unwrap().gpu.as_mut() {
+                            g.drag = Some((p, p));
+                        }
+                    }
+                });
+                SetCapture(hwnd);
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                let p = screen_pt(hwnd, lp);
+                let moved = APP.with(|a| {
+                    if let Ok(mut b) = a.try_borrow_mut() {
+                        if let Some(d) = b.as_mut().unwrap().gpu.as_mut().and_then(|g| g.drag.as_mut()) {
+                            d.1 = p;
+                            return true;
+                        }
+                    }
+                    false
+                });
+                if moved {
+                    redraw_gpu();
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let _ = ReleaseCapture();
+                close_gpu(true);
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                close_gpu(false);
+                LRESULT(0)
+            }
+            WM_KEYDOWN if wp.0 as u16 == VK_ESCAPE.0 => {
+                close_gpu(false);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -890,6 +1377,12 @@ fn main() {
         Some("dd-keep") => Method::DdKeep,
         _ => Method::Dd,
     };
+    let display = match args.iter().position(|a| a == "--display").and_then(|i| args.get(i + 1)).map(|s| s.as_str()) {
+        Some("gpu-per") => Display::GpuPer,
+        Some("gpu-one") => Display::GpuOne,
+        _ => Display::Gdi,
+    };
+    let par = args.iter().any(|a| a == "--par");
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let mut adapters = vec![];
@@ -905,10 +1398,11 @@ fn main() {
             wgc_dev = Some(CreateDirect3D11DeviceFromDXGIDevice(&dxgi).unwrap().cast().unwrap());
         }
         let keep = if method == Method::DdKeep { init_keep(&adapters).unwrap() } else { vec![] };
-        APP.with(|a| *a.borrow_mut() = Some(App { method, adapters, wgc_dev, overlay: None, n: 0, keep, prewarm: None, trim, lazy }));
+        APP.with(|a| *a.borrow_mut() = Some(App { method, display, par, gpu: None, adapters, wgc_dev, overlay: None, n: 0, keep, prewarm: None, trim, lazy }));
 
         register(w!("proto-main"), Some(main_proc), IDC_ARROW, false);
         register(w!("proto-overlay"), Some(overlay_proc), IDC_CROSS, false);
+        register(w!("proto-gpu-overlay"), Some(gpu_overlay_proc), IDC_CROSS, false);
         register(w!("proto-scrap"), Some(scrap_proc), IDC_SIZEALL, true);
         let main = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -934,7 +1428,7 @@ fn main() {
         }
         tray(main, true);
         log(format!(
-            "ready entry={t_entry} ready={} freq={} method={method:?} pid={}",
+            "ready entry={t_entry} ready={} freq={} method={method:?} display={display:?} par={par} pid={}",
             qpc(),
             freq(),
             GetCurrentProcessId()
