@@ -34,6 +34,7 @@
 //!   中身を持たないので、クリックで開くフォルダ（`App::notice_folder`）を覚えておき、新しい通知を出したら忘れる。
 //! - コピーと保存の画像は `render::render_image` で表示と同じ描き方で作る。保存先とファイル名は UI スレッドで
 //!   決め（`save::destination`）、PNG の書き出しと書き込みは裏のスレッドで行い、結果は `WM_APP_SAVED` で受ける。
+//!   結果を受けるまでの保存先は `App::pending_saves` に持ち、続けて保存しても同じ名前にしない。
 //!   保存先とファイル名テンプレートは設定（`[general]`）のものを使う。
 
 use std::cell::RefCell;
@@ -138,6 +139,9 @@ struct App {
     scraps: Vec<Scrap>,
     /// 保存の裏のスレッドが結果を入れる口と、UI スレッドが受ける口。
     saves: (mpsc::Sender<Saved>, mpsc::Receiver<Saved>),
+    /// 名前を決めて裏のスレッドに渡し、まだ結果（`WM_APP_SAVED`）を受けていない保存先。次の名前を決めるとき、
+    /// 使われている名前として数える（`save::destination`）。
+    pending_saves: Vec<PathBuf>,
     /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
     notice_folder: Option<PathBuf>,
     gpu: grab::Gpu,
@@ -452,6 +456,7 @@ fn start(
         capture: Capture::Idle,
         scraps: Vec::new(),
         saves: mpsc::channel(),
+        pending_saves: Vec::new(),
         notice_folder: None,
         gpu: grab::Gpu::default(),
         hotkeys,
@@ -974,11 +979,12 @@ fn copy_to_clipboard(image: &Image) {
 /// 保存先とファイル名はここ（UI スレッド）で決め、PNG の書き出しと書き込みは裏のスレッドで行う。
 /// 失敗してもスクラップはそのまま残る。
 fn save_default(image: Image) {
-    let Some((save_dir, template, sender, message_window)) = with_app(|app| {
+    let Some((save_dir, template, pending, sender, message_window)) = with_app(|app| {
         let general = &app.settings.general;
         (
             general.save_dir.clone(),
             general.file_name_template.clone(),
+            app.pending_saves.clone(),
             app.saves.0.clone(),
             app.windows.message,
         )
@@ -996,7 +1002,7 @@ fn save_default(image: Image) {
             }
         },
     };
-    let path = match save::destination(&dir, &template, save::now()) {
+    let path = match save::destination(&dir, &template, save::now(), &pending) {
         Ok(path) => path,
         Err(e) => {
             log::error!("could not prepare the save folder {}: {e}", dir.display());
@@ -1004,6 +1010,10 @@ fn save_default(image: Image) {
             return;
         }
     };
+    // 書き終えるまでの間に次の保存が同じ名前を選ばないように、結果を受けるまで覚えておく
+    if with_app(|app| app.pending_saves.push(path.clone())).is_none() {
+        log::warn!("could not remember the pending save {}", path.display());
+    }
     // HWND は Send でないので、番号にして渡す
     let window = message_window.0 as isize;
     let job_path = path.clone();
@@ -1029,8 +1039,14 @@ fn save_default(image: Image) {
         });
     if let Err(e) = spawned {
         log::error!("could not start the save thread: {e}");
+        forget_pending_save(&path);
         save_failed(Some(&path), &e.to_string());
     }
+}
+
+/// 保存先を、書き込み中の保存先から外す。
+fn forget_pending_save(path: &Path) {
+    with_app(|app| app.pending_saves.retain(|p| p != path));
 }
 
 /// `WM_APP_SAVED`: 保存の結果を通知する。成功なら、通知のクリックで保存先のフォルダを開けるようにする。
@@ -1039,6 +1055,7 @@ fn on_saved() {
         return;
     };
     for saved in results {
+        forget_pending_save(&saved.path);
         match saved.result {
             Ok(()) => {
                 log::info!("saved {}", saved.path.display());

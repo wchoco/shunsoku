@@ -1,7 +1,7 @@
 //! 保存画像をファイルに書き出す。
 //!
 //! - 保存先とファイル名（`destination`）は UI スレッドで決める: フォルダがなければ作り、既存のファイル名の
-//!   一覧から core の `template` で重ならない名前を付ける。
+//!   一覧と書き込み中の保存先から core の `template` で重ならない名前を付ける。
 //! - PNG の書き出しと書き込み（`write_png`）は裏のスレッドで行う。書き込みは新しいファイルとしてだけ作り
 //!   （`create_new`）、名前を決めたあとに同じ名前のファイルができていても上書きしない。
 
@@ -51,15 +51,25 @@ pub fn now() -> LocalTime {
 }
 
 /// `dir` に保存するファイルのパスを決める。フォルダがなければ作る。
+///
+/// `pending` は名前を決めたがまだ書き終えていない保存先。裏のスレッドが書き終えるまではフォルダに
+/// ないので、続けて保存したときに同じ名前にならないよう、これも使われている名前として数える。
 pub fn destination(
     dir: &Path,
     file_name_template: &str,
     now: LocalTime,
+    pending: &[PathBuf],
 ) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
+    let in_flight = pending
+        .iter()
+        .filter(|path| path.parent() == Some(dir))
+        .filter_map(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned());
     let existing: Vec<String> = std::fs::read_dir(dir)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .chain(in_flight)
         .collect();
     let context = template::Context { name: "", now };
     let name = template::file_name(file_name_template, &context, &existing, EXTENSION);
