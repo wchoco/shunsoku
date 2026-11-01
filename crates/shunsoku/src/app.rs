@@ -1018,6 +1018,7 @@ fn show_scrap_menu(hwnd: HWND, lparam: LPARAM) {
 enum Deferred {
     Copy(Image),
     Save(Image),
+    SaveAs(Image),
     /// コピーや保存の画像を作れなかった。`failed_key` はその仕事の失敗の文言のキー。
     RenderFailed {
         failed_key: &'static str,
@@ -1060,6 +1061,9 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                 Effect::SaveDefault => {
                     deferred.push(render_for(&scrap.image, Deferred::Save, "save.failed"));
                 }
+                Effect::ShowSaveDialog => {
+                    deferred.push(render_for(&scrap.image, Deferred::SaveAs, "save.failed"));
+                }
             }
         }
         Some(deferred)
@@ -1071,6 +1075,7 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
         match action {
             Deferred::Copy(image) => copy_to_clipboard(&image),
             Deferred::Save(image) => save_default(image),
+            Deferred::SaveAs(image) => save_as(hwnd, image),
             Deferred::RenderFailed { failed_key, reason } => {
                 log::error!("could not render the scrap image ({failed_key}): {reason}");
                 notify_user(
@@ -1108,18 +1113,39 @@ fn copy_to_clipboard(image: &Image) {
 /// 保存先とファイル名はここ（UI スレッド）で決め、PNG の書き出しと書き込みは裏のスレッドで行う。
 /// 失敗してもスクラップはそのまま残る。
 fn save_default(image: Image) {
-    let Some((save_dir, template, pending, sender, message_window)) = with_app(|app| {
+    if let Some(path) = default_destination() {
+        start_save(path, image, save::Overwrite::Deny);
+    }
+}
+
+/// `Effect::ShowSaveDialog`: 「名前を付けて保存」のダイアログを出し、選ばれた場所に保存する。初期フォルダと
+/// ファイル名は既定の保存（`default_destination`）と同じ。キャンセルしたら何もしない。失敗は既定の保存と同じく通知する。
+fn save_as(owner: HWND, image: Image) {
+    let Some(proposed) = default_destination() else {
+        return;
+    };
+    // モーダルなので App を借りずに呼ぶ
+    match save::ask_path(owner, &proposed, text("save.png_filter")) {
+        Ok(Some(path)) => start_save(path, image, save::Overwrite::Allow),
+        Ok(None) => log::info!("save as cancelled"),
+        Err(e) => {
+            log::error!("could not show the save dialog: {e}");
+            save_failed(None, &e.to_string());
+        }
+    }
+}
+
+/// 既定の保存先: 全体設定の保存先に、全体のファイル名テンプレートで付けた重ならない名前。フォルダがなければ作る。
+/// 決められなければ失敗を通知して None を返す。
+fn default_destination() -> Option<PathBuf> {
+    let (save_dir, template, pending) = with_app(|app| {
         let general = &app.settings.general;
         (
             general.save_dir.clone(),
             general.file_name_template.clone(),
             app.pending_saves.clone(),
-            app.saves.0.clone(),
-            app.windows.message,
         )
-    }) else {
-        return;
-    };
+    })?;
     let dir = match save_dir {
         Some(dir) => dir,
         None => match save::default_dir() {
@@ -1127,17 +1153,25 @@ fn save_default(image: Image) {
             Err(e) => {
                 log::error!("could not find the Pictures folder: {e}");
                 save_failed(None, &e.to_string());
-                return;
+                return None;
             }
         },
     };
-    let path = match save::destination(&dir, &template, save::now(), &pending) {
-        Ok(path) => path,
+    match save::destination(&dir, &template, save::now(), &pending) {
+        Ok(path) => Some(path),
         Err(e) => {
             log::error!("could not prepare the save folder {}: {e}", dir.display());
             save_failed(Some(&dir), &e.to_string());
-            return;
+            None
         }
+    }
+}
+
+/// `path` に PNG を書く仕事を裏のスレッドで始める。結果は `WM_APP_SAVED` で受ける。
+fn start_save(path: PathBuf, image: Image, overwrite: save::Overwrite) {
+    let Some((sender, message_window)) = with_app(|app| (app.saves.0.clone(), app.windows.message))
+    else {
+        return;
     };
     // 書き終えるまでの間に次の保存が同じ名前を選ばないように、結果を受けるまで覚えておく
     if with_app(|app| app.pending_saves.push(path.clone())).is_none() {
@@ -1149,9 +1183,11 @@ fn save_default(image: Image) {
     let spawned = std::thread::Builder::new()
         .name("save".into())
         .spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| save::write_png(&job_path, &image)))
-                .map_err(|_| text("job.panicked").to_owned())
-                .and_then(|written| written.map_err(|e| e.to_string()));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                save::write_png(&job_path, &image, overwrite)
+            }))
+            .map_err(|_| text("job.panicked").to_owned())
+            .and_then(|written| written.map_err(|e| e.to_string()));
             let _ = sender.send(Saved {
                 path: job_path,
                 result,

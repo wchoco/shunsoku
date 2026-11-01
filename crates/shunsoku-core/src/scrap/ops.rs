@@ -103,6 +103,8 @@ pub enum Effect {
     CopyToClipboard,
     /// 画像を全体設定の保存先に、全体のファイル名テンプレートの名前で保存する（ダイアログなし）。
     SaveDefault,
+    /// 「名前を付けて保存」のダイアログを出し、選ばれた場所に保存する。初期フォルダとファイル名は `SaveDefault` と同じ。
+    ShowSaveDialog,
 }
 
 const ESC: Chord = Chord::plain(Key::known(0x1B));
@@ -112,6 +114,7 @@ const RIGHT: Chord = Chord::plain(Key::known(0x27));
 const DOWN: Chord = Chord::plain(Key::known(0x28));
 const CTRL_C: Chord = Chord::plain(Key::known(0x43)).ctrl();
 const CTRL_S: Chord = Chord::plain(Key::known(0x53)).ctrl();
+const CTRL_SHIFT_S: Chord = CTRL_S.shift();
 
 const fn always(_: &ScrapModel) -> bool {
     true
@@ -150,6 +153,10 @@ fn copy(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
 
 fn save_default(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     vec![Effect::SaveDefault]
+}
+
+fn save_as(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
+    vec![Effect::ShowSaveDialog]
 }
 
 /// キーで動かす操作の行。
@@ -199,6 +206,18 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         can_execute: always,
         choices: None,
         run: save_default,
+    },
+    OperationDescriptor {
+        id: "save_as",
+        label_key: "scrap.op.save_as",
+        default_shortcut: &[CTRL_SHIFT_S],
+        default_mouse: None,
+        group: Group::Output,
+        order: 30,
+        drag_only: false,
+        can_execute: always,
+        choices: None,
+        run: save_as,
     },
     keyboard_move(
         "move_left",
@@ -485,6 +504,7 @@ mod tests {
         for (id, effect) in [
             ("copy", Effect::CopyToClipboard),
             ("save_default", Effect::SaveDefault),
+            ("save_as", Effect::ShowSaveDialog),
         ] {
             let mut model = scrap();
             let effects = execute(op(id), &mut model, &OpContext::default());
@@ -501,6 +521,7 @@ mod tests {
             "move_down_10",
             "copy",
             "save_default",
+            "save_as",
             "close",
         ] {
             assert!((op(id).can_execute)(&scrap()), "{id}");
@@ -529,6 +550,7 @@ mod tests {
         assert_eq!(bound(&shortcuts, "Esc"), Some("close"));
         assert_eq!(bound(&shortcuts, "Ctrl+C"), Some("copy"));
         assert_eq!(bound(&shortcuts, "Ctrl+S"), Some("save_default"));
+        assert_eq!(bound(&shortcuts, "Ctrl+Shift+S"), Some("save_as"));
         assert_eq!(bound(&shortcuts, "Ctrl+Left"), None);
         assert_eq!(shortcuts.chords("close"), vec![chord("Esc")]);
         assert_eq!(shortcuts.chords("move"), vec![]);
@@ -601,6 +623,7 @@ mod tests {
             vec![
                 item("copy", true, Some("Ctrl+C")),
                 item("save_default", true, Some("Ctrl+S")),
+                item("save_as", true, Some("Ctrl+Shift+S")),
                 MenuEntry::Separator,
                 item("move_left", true, Some("Left")),
                 item("move_right", true, Some("Right")),
