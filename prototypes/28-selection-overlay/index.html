@@ -1,0 +1,526 @@
+<!doctype html>
+<!--
+  PROTOTYPE（使い捨て。main にはマージしない）
+  問い: 範囲選択の画面で、何をどう見せ、どう操作させるか（wchoco/shunsoku#28）
+  形: 仮のデスクトップ（M1 3840x2160@150% / M2 1920x1200@100%）の上に範囲選択の画面を重ねる。
+      プリセット 3 案を ?variant=A|B|C で切り替え、左下のオプションで要素を混ぜられる。
+  実物は Rust + Win32 + D3D11（ADR-0002）。これはブラウザ上の見た目と操作の確認用。
+
+  結論（2026-11-01）: 既定は A（離したら即確定、操作バーなし）＝通常モード。Tab で B ＝精密モードに切り替えられる
+  （拡大鏡・色コード・十字線・調整して Enter）。選ぶ前は暗くしない。モニタはまたげる。
+  ウィンドウは Shift を押している間だけ、子ウィンドウは Shift+Ctrl。C の操作バーは不採用。
+  詳細は wchoco/shunsoku#28 の解決コメント。このファイルは結論に合わせて直していない。
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>PROTOTYPE 範囲選択の画面</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:"Segoe UI","Yu Gothic UI",sans-serif}
+  canvas{display:block;cursor:none}
+  #switcher{position:fixed;left:50%;bottom:12px;transform:translateX(-50%);background:#ffeb3b;color:#000;border-radius:999px;padding:5px 10px;display:flex;gap:10px;align-items:center;font:600 13px sans-serif;box-shadow:0 2px 12px #000c;z-index:10;cursor:default;user-select:none}
+  #switcher button{border:0;background:#000;color:#ffeb3b;border-radius:999px;width:26px;height:26px;cursor:pointer;font-weight:700}
+  #switcher small{font-weight:400;opacity:.7}
+  #state{position:fixed;right:8px;bottom:56px;background:#000d;color:#7f7;font:11px/1.45 Consolas,monospace;padding:8px 10px;white-space:pre;z-index:10;pointer-events:none;border:1px solid #ffeb3b;max-width:46vw;overflow:hidden}
+  #opts{position:fixed;left:8px;bottom:56px;background:#fffbe0;color:#000;font:12px sans-serif;padding:6px 10px;z-index:10;border-radius:6px;border:2px solid #ffeb3b;cursor:default;max-height:70vh;overflow:auto}
+  #opts summary{font-weight:700;cursor:pointer}
+  #opts table{border-collapse:collapse;margin-top:4px}
+  #opts td{padding:2px 4px}
+  #opts select{font-size:12px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="opts"><details><summary>オプション（プリセットを上書き）</summary><table id="optTable"></table>
+  <label><input type="checkbox" id="regMode"> 定型領域の登録モード（R）</label><br>
+  <button id="resetOpts">プリセットに戻す</button></details></div>
+<div id="state"></div>
+<div id="switcher"><button id="prev">‹</button><span id="vlabel"></span><button id="next">›</button><small>［ ］で切替 / H: 状態 / R: 登録モード</small></div>
+<script>
+// ---------- プリセットとオプション ----------
+const PRESETS = {
+  A: {label:'A: 離したら即確定（最小）', dimBefore:true,  crosshair:'none', magnifier:'off',    coords:'selection', confirm:'release', actionBar:false, highlight:'border',    child:'none', cross:'clamp', desktopClick:false},
+  B: {label:'B: 調整してから Enter（精密）', dimBefore:true,  crosshair:'full', magnifier:'follow', coords:'cursor',    confirm:'enter',   actionBar:false, highlight:'spotlight', child:'none', cross:'allow', desktopClick:false},
+  C: {label:'C: ウィンドウ優先＋操作バー', dimBefore:false, crosshair:'full', magnifier:'drag',   coords:'bar',       confirm:'enter',   actionBar:true,  highlight:'label',     child:'ctrl', cross:'clamp', desktopClick:true},
+};
+const OPTION_DEFS = {
+  dimBefore:   {label:'選ぶ前から暗くする', values:[true,false], names:['する','しない']},
+  crosshair:   {label:'十字線', values:['none','full'], names:['なし','モニタいっぱい']},
+  magnifier:   {label:'拡大鏡', values:['off','follow','drag'], names:['なし','常にカーソルに追従','ドラッグ中だけ']},
+  coords:      {label:'座標・サイズ', values:['none','selection','cursor','bar'], names:['なし','選択範囲の角にサイズ','カーソル横','モニタ上端のバー']},
+  confirm:     {label:'確定', values:['release','enter'], names:['離した時点','調整して Enter / ダブルクリック']},
+  actionBar:   {label:'選択後の操作バー', values:[false,true], names:['なし','あり']},
+  highlight:   {label:'ウィンドウのハイライト', values:['border','spotlight','label'], names:['枠だけ','周りを暗く','枠＋名前とサイズ']},
+  child:       {label:'子ウィンドウ', values:['none','ctrl'], names:['選べない','Ctrl を押す間だけ']},
+  cross:       {label:'モニタをまたぐ', values:['clamp','allow'], names:['始点のモニタ内に制限','またげる']},
+  desktopClick:{label:'デスクトップをクリック', values:[false,true], names:['何もしない','そのモニタ全体']},
+};
+const params = new URLSearchParams(location.search);
+let variant = PRESETS[params.get('variant')] ? params.get('variant') : 'A';
+let opts = {...PRESETS[variant]};
+let reg = false;           // 定型領域の登録モード
+let showState = true;
+
+// ---------- レイアウト ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const desk = document.createElement('canvas');
+const dctx = desk.getContext('2d', {willReadFrequently:true});
+let W, H, monitors = [], windows = [];
+const TITLE_H = 22;
+
+function layout() {
+  W = innerWidth; H = innerHeight;
+  canvas.width = desk.width = W; canvas.height = desk.height = H;
+  const total = Math.min(W - 20, Math.floor((H - 110) / (0.6 * 9 / 16)));
+  const ox = Math.floor((W - total) / 2);
+  const m1w = Math.round(total * 0.6), m1h = Math.round(m1w * 9 / 16);
+  const m2w = total - m1w, m2h = Math.round(m2w * 10 / 16);
+  const top = 10;
+  monitors = [
+    {id:'M1', x:ox, y:top, w:m1w, h:m1h, pw:3840, ph:2160, scale:150, wall:['#1d4e89','#6aa9d8']},
+    {id:'M2', x:ox + m1w, y:top + Math.round(m1h * 0.18), w:m2w, h:m2h, pw:1920, ph:1200, scale:100, wall:['#3b2a5a','#c27aa8']},
+  ];
+  const [M1, M2] = monitors;
+  const R = (m, fx, fy, fw, fh) => ({x:m.x + m.w*fx, y:m.y + m.h*fy, w:m.w*fw, h:m.h*fh});
+  const ch = (name, fx, fy, fw, fh) => ({name, fx, fy, fw, fh});
+  windows = [
+    {title:'エクスプローラー', kind:'explorer', ...R(M1,.04,.06,.42,.52), children:[ch('ナビゲーション ウィンドウ',0,0,.28,1), ch('ファイル一覧',.28,0,.72,1)]},
+    {title:'ブラウザ - shunsoku の README', kind:'browser', ...R(M1,.32,.18,.56,.66), children:[ch('アドレスバー',0,0,1,.09), ch('ページ本文',0,.09,1,.91)]},
+    {title:'メモ帳', kind:'notepad', ...R(M2,.06,.08,.58,.5), children:[ch('メニュー',0,0,1,.08), ch('テキスト入力欄',0,.08,1,.92)]},
+    {title:'ペイント', kind:'paint', ...R(M2,.3,.42,.64,.48), children:[ch('ツールバー（色の一覧）',0,0,1,.22), ch('キャンバス',0,.22,1,.78)]},
+    {title:'タスクバー', kind:'taskbar', ...R(M1,0,.95,1,.05), children:[], noTitle:true},
+    {title:'タスクバー', kind:'taskbar', ...R(M2,0,.94,1,.06), children:[], noTitle:true},
+  ];
+  for (const w of windows) for (const c of w.children) {
+    const cy = w.y + (w.noTitle ? 0 : TITLE_H), chh = w.h - (w.noTitle ? 0 : TITLE_H);
+    Object.assign(c, {x:w.x + w.w*c.fx, y:cy + chh*c.fy, w:w.w*c.fw, h:chh*c.fh});
+  }
+  paintDesktop();
+}
+
+// ---------- 仮のデスクトップを描く（これが「押した瞬間の固定画像」） ----------
+function paintDesktop() {
+  const g = dctx;
+  g.fillStyle = '#000'; g.fillRect(0,0,W,H);
+  for (const m of monitors) {
+    const gr = g.createLinearGradient(m.x, m.y, m.x + m.w, m.y + m.h);
+    gr.addColorStop(0, m.wall[0]); gr.addColorStop(1, m.wall[1]);
+    g.fillStyle = gr; g.fillRect(m.x, m.y, m.w, m.h);
+    for (let i = 0; i < 6; i++) { g.fillStyle = `hsla(${i*50},70%,70%,.18)`; g.beginPath(); g.arc(m.x + m.w*(.15+i*.14), m.y + m.h*(.75 - (i%3)*.2), m.h*.12, 0, 7); g.fill(); }
+    for (let i = 0; i < 3; i++) { g.fillStyle = '#ffffffcc'; g.fillRect(m.x + 14, m.y + 14 + i*52, 30, 30); g.fillStyle = '#fff'; g.font = '10px sans-serif'; g.fillText(['ごみ箱','資料','画像'][i], m.x + 12, m.y + 56 + i*52); }
+  }
+  for (const w of windows) paintWindow(g, w);
+}
+function paintWindow(g, w) {
+  if (w.kind === 'taskbar') {
+    g.fillStyle = '#1f1f1f'; g.fillRect(w.x, w.y, w.w, w.h);
+    const cols = ['#0078d4','#ffb900','#e81123','#107c10','#8764b8'];
+    cols.forEach((c, i) => { g.fillStyle = c; g.fillRect(w.x + w.w/2 - 70 + i*28, w.y + w.h*.2, w.h*.6, w.h*.6); });
+    g.fillStyle = '#ddd'; g.font = '11px sans-serif'; g.fillText('12:34', w.x + w.w - 44, w.y + w.h*.65);
+    return;
+  }
+  g.save(); g.shadowColor = '#0008'; g.shadowBlur = 18; g.fillStyle = '#fff'; g.fillRect(w.x, w.y, w.w, w.h); g.restore();
+  g.fillStyle = '#e8e8e8'; g.fillRect(w.x, w.y, w.w, TITLE_H);
+  g.fillStyle = '#222'; g.font = '12px "Segoe UI",sans-serif'; g.fillText(w.title, w.x + 8, w.y + 15);
+  ['—','□','✕'].forEach((s, i) => g.fillText(s, w.x + w.w - 60 + i*20, w.y + 15));
+  const [a, b] = w.children;
+  g.save(); g.beginPath(); g.rect(w.x, w.y + TITLE_H, w.w, w.h - TITLE_H); g.clip();
+  if (w.kind === 'explorer') {
+    g.fillStyle = '#f3f3f3'; g.fillRect(a.x, a.y, a.w, a.h);
+    g.fillStyle = '#333'; g.font = '11px sans-serif';
+    ['クイック アクセス','デスクトップ','ドキュメント','ピクチャ','PC'].forEach((s,i)=>g.fillText(s, a.x+8, a.y+18+i*18));
+    ['report_2026.docx','shunsoku_20261101-1200.png','budget.xlsx','memo.txt','design.fig','photo.jpg'].forEach((s,i)=>{
+      g.fillStyle = ['#2b579a','#c43e1c','#217346','#666','#a259ff','#e3a21a'][i]; g.fillRect(b.x+8, b.y+8+i*20, 12, 12);
+      g.fillStyle = '#222'; g.fillText(s, b.x+26, b.y+18+i*20);
+    });
+  } else if (w.kind === 'browser') {
+    g.fillStyle = '#f1f3f4'; g.fillRect(a.x, a.y, a.w, a.h);
+    g.fillStyle = '#fff'; g.fillRect(a.x+10, a.y+a.h*.2, a.w-20, a.h*.6);
+    g.fillStyle = '#555'; g.font = '11px sans-serif'; g.fillText('https://github.com/wchoco/shunsoku', a.x+18, a.y+a.h*.65);
+    g.fillStyle = '#111'; g.font = 'bold 18px sans-serif'; g.fillText('shunsoku', b.x+16, b.y+30);
+    g.fillStyle = '#bbb'; for (let i=0;i<5;i++) g.fillRect(b.x+16, b.y+44+i*14, b.w*(.5+((i*37)%40)/100), 6);
+    const gr = g.createLinearGradient(b.x+16, 0, b.x+b.w*.6, 0);
+    ['#ff5f6d','#ffc371','#47e891','#2fa0ff','#a64bf4'].forEach((c,i)=>gr.addColorStop(i/4,c));
+    g.fillStyle = gr; g.fillRect(b.x+16, b.y+120, b.w*.55, b.h*.4);
+    g.fillStyle = '#bbb'; for (let i=0;i<4;i++) g.fillRect(b.x+b.w*.62, b.y+124+i*14, b.w*.3, 6);
+  } else if (w.kind === 'notepad') {
+    g.fillStyle = '#f7f7f7'; g.fillRect(a.x, a.y, a.w, a.h);
+    g.fillStyle = '#333'; g.font = '11px sans-serif'; g.fillText('ファイル  編集  表示', a.x+8, a.y+a.h*.72);
+    g.font = '12px Consolas,monospace'; g.fillStyle = '#111';
+    ['範囲選択の画面のメモ','- 拡大鏡はいる？','- Esc で中止','- 矢印キーで 1px','#0078D4 #E53935'].forEach((s,i)=>g.fillText(s, b.x+8, b.y+18+i*17));
+  } else if (w.kind === 'paint') {
+    g.fillStyle = '#f5f6f7'; g.fillRect(a.x, a.y, a.w, a.h);
+    const sw = Math.max(8, Math.floor(a.h/2.6));
+    for (let i=0;i<24;i++){ g.fillStyle = `hsl(${i*15},85%,${i%2?45:60}%)`; g.fillRect(a.x+8+(i%12)*(sw+3), a.y+5+Math.floor(i/12)*(sw+3), sw, sw); }
+    g.fillStyle = '#fff'; g.fillRect(b.x, b.y, b.w, b.h);
+    g.fillStyle = '#e53935'; g.fillRect(b.x+b.w*.1, b.y+b.h*.2, b.w*.25, b.h*.4);
+    g.strokeStyle = '#1e88e5'; g.lineWidth = 3; g.beginPath(); g.arc(b.x+b.w*.6, b.y+b.h*.45, b.h*.25, 0, 7); g.stroke();
+    g.strokeStyle = '#43a047'; g.beginPath(); g.moveTo(b.x+b.w*.1, b.y+b.h*.85); g.lineTo(b.x+b.w*.9, b.y+b.h*.7); g.stroke();
+  }
+  g.restore();
+  g.strokeStyle = '#888'; g.lineWidth = 1; g.strokeRect(w.x+.5, w.y+.5, w.w-1, w.h-1);
+}
+
+// ---------- 座標の換算 ----------
+const monitorAt = p => monitors.find(m => p.x >= m.x && p.x < m.x+m.w && p.y >= m.y && p.y < m.y+m.h)
+  || monitors.reduce((best, m) => { const d = Math.hypot(clamp(p.x,m.x,m.x+m.w)-p.x, clamp(p.y,m.y,m.y+m.h)-p.y); return !best || d < best.d ? {m, d} : best; }, null).m;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const toPhysPt = p => { const m = monitorAt(p); return {m, x:Math.round((p.x-m.x)*m.pw/m.w), y:Math.round((p.y-m.y)*m.ph/m.h)}; };
+function physSegments(r) {
+  const out = [];
+  for (const m of monitors) {
+    const x0 = Math.max(r.x, m.x), y0 = Math.max(r.y, m.y), x1 = Math.min(r.x+r.w, m.x+m.w), y1 = Math.min(r.y+r.h, m.y+m.h);
+    if (x1 > x0 && y1 > y0) {
+      const kx = m.pw/m.w, ky = m.ph/m.h;
+      const px = Math.round((x0-m.x)*kx), py = Math.round((y0-m.y)*ky);
+      out.push({m, x:px, y:py, w:Math.round((x1-m.x)*kx)-px, h:Math.round((y1-m.y)*ky)-py});
+    }
+  }
+  return out;
+}
+const segText = s => `${s.m.id} 相対 (${s.x}, ${s.y}) ${s.w}×${s.h}`;
+const physText = r => { const s = physSegments(r); return s.length ? s.map(segText).join(' ＋ ') : '（モニタ外）'; };
+const sizeText = r => physSegments(r).map(s => `${s.w} × ${s.h}`).join(' ＋ ');
+const physPerCss = m => m.w / m.pw; // 物理 1px が何 CSS px か
+
+// ---------- 状態 ----------
+let mode = 'idle';   // idle | pressing | dragging | adjust | moving | resizing | closed
+let cur = {x: 200, y: 200};
+let ctrlDown = false;
+let pressPt = null, sel = null, anchor = null, startPt = null, handle = null, limitMon = null;
+let hover = null;    // {win, child, rect, label}
+let lastResult = '', lastEvent = '';
+let barButtons = [];
+let kbPress = false; // Space で始めたキーボード選択
+
+const selActive = () => ['dragging','adjust','moving','resizing'].includes(mode);
+const clampMode = () => reg || opts.cross === 'clamp';
+const norm = (a, b) => ({x:Math.min(a.x,b.x), y:Math.min(a.y,b.y), w:Math.abs(a.x-b.x), h:Math.abs(a.y-b.y)});
+const inRect = (p, r) => r && p.x >= r.x && p.x <= r.x+r.w && p.y >= r.y && p.y <= r.y+r.h;
+const virtBounds = () => { const xs = monitors.flatMap(m=>[m.x,m.x+m.w]), ys = monitors.flatMap(m=>[m.y,m.y+m.h]); return {x:Math.min(...xs), y:Math.min(...ys), w:Math.max(...xs)-Math.min(...xs), h:Math.max(...ys)-Math.min(...ys)}; };
+function clampPt(p, m) { const r = m || virtBounds(); return {x:clamp(p.x, r.x, r.x+r.w), y:clamp(p.y, r.y, r.y+r.h)}; }
+function clampRect(r, m) { const b = m || virtBounds(); const w = Math.min(r.w, b.w), h = Math.min(r.h, b.h); return {x:clamp(r.x, b.x, b.x+b.w-w), y:clamp(r.y, b.y, b.y+b.h-h), w, h}; }
+
+function updateHover() {
+  hover = null;
+  if (reg || selActive()) return;
+  for (let i = windows.length - 1; i >= 0; i--) {
+    const w = windows[i];
+    if (inRect(cur, w)) {
+      if (opts.child === 'ctrl' && ctrlDown) {
+        const c = w.children.find(c => inRect(cur, c));
+        if (c) { hover = {win:w, child:c, rect:c, label:`${w.title} › ${c.name}`}; return; }
+      }
+      hover = {win:w, child:null, rect:w, label:w.title}; return;
+    }
+  }
+}
+
+function finish(text) { lastResult = text; mode = 'closed'; sel = null; hover = null; kbPress = false; render(); }
+function confirmSel(action) {
+  if (!sel || sel.w < 1 || sel.h < 1) { mode = 'idle'; sel = null; return; }
+  if (reg) finish(`定型領域を登録: ${physText(sel)}\n→ 名前の入力へ（設定 GUI の定型領域タブ）`);
+  else finish(`範囲選択キャプチャ → ${action || 'スクラップ'}\n${physText(sel)}`);
+}
+function cancelStep() {
+  if (selActive() || mode === 'pressing') { mode = 'idle'; sel = null; kbPress = false; lastEvent = '選択を解除'; }
+  else finish(reg ? '定型領域の登録を中止' : '中止（何も撮らない）');
+}
+function afterRelease() {
+  if (opts.confirm === 'release') confirmSel();
+  else { mode = 'adjust'; lastEvent = '調整の状態へ（つまみ・移動・矢印キー、Enter で確定）'; }
+}
+function selectMonitor(all) {
+  if (all && clampMode()) { lastEvent = 'モニタをまたげない設定なので全モニタは不可'; return; }
+  sel = all ? virtBounds() : {...monitorAt(cur)};
+  sel = {x:sel.x, y:sel.y, w:sel.w, h:sel.h};
+  limitMon = all ? null : monitorAt(cur);
+  lastEvent = all ? '全モニタを選択' : `${limitMon.id} 全体を選択`;
+  afterRelease();
+}
+
+// ---------- 入力 ----------
+const HANDLES = ['nw','n','ne','e','se','s','sw','w'];
+function handlePos(r, h) {
+  const x = h.includes('w') ? r.x : h.includes('e') ? r.x+r.w : r.x+r.w/2;
+  const y = h.includes('n') ? r.y : h.includes('s') ? r.y+r.h : r.y+r.h/2;
+  return {x, y};
+}
+const hitHandle = p => HANDLES.find(h => { const q = handlePos(sel, h); return Math.abs(q.x-p.x) <= 6 && Math.abs(q.y-p.y) <= 6; });
+
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('mousemove', e => { cur = {x:e.clientX, y:e.clientY}; ctrlDown = e.ctrlKey; onMove(); });
+function onMove() {
+  if (mode === 'pressing' && Math.hypot(cur.x-pressPt.x, cur.y-pressPt.y) > 4) { mode = 'dragging'; limitMon = monitorAt(pressPt); lastEvent = 'ドラッグ開始 → 範囲選択'; }
+  if (mode === 'dragging') { const p = clampPt(cur, clampMode() ? limitMon : null); sel = norm(pressPt, p); }
+  if (mode === 'moving') { sel = clampRect({...anchor, x:anchor.x + cur.x - startPt.x, y:anchor.y + cur.y - startPt.y}, clampMode() ? limitMon : null); }
+  if (mode === 'resizing') {
+    const p = clampPt(cur, clampMode() ? limitMon : null);
+    let x0 = anchor.x, y0 = anchor.y, x1 = anchor.x+anchor.w, y1 = anchor.y+anchor.h;
+    if (handle.includes('w')) x0 = p.x; if (handle.includes('e')) x1 = p.x;
+    if (handle.includes('n')) y0 = p.y; if (handle.includes('s')) y1 = p.y;
+    sel = norm({x:x0,y:y0}, {x:x1,y:y1});
+  }
+  updateHover(); render();
+}
+canvas.addEventListener('mousedown', e => {
+  cur = {x:e.clientX, y:e.clientY};
+  if (mode === 'closed') { reopen(); return; }
+  if (e.button === 2) { cancelStep(); render(); return; }
+  if (e.button !== 0) return;
+  if (mode === 'adjust') {
+    const b = barButtons.find(b => inRect(cur, b));
+    if (b) { b.run(); render(); return; }
+    const h = hitHandle(cur);
+    if (h) { mode = 'resizing'; handle = h; anchor = {...sel}; render(); return; }
+    if (inRect(cur, sel)) { mode = 'moving'; anchor = {...sel}; startPt = {...cur}; render(); return; }
+  }
+  if (mode === 'idle' || mode === 'adjust') { mode = 'pressing'; pressPt = {...cur}; }
+  render();
+});
+canvas.addEventListener('mouseup', e => {
+  if (e.button !== 0) return;
+  if (mode === 'pressing') onClick();
+  else if (mode === 'dragging') afterRelease();
+  else if (mode === 'moving' || mode === 'resizing') mode = 'adjust';
+  render();
+});
+canvas.addEventListener('dblclick', () => { if (mode === 'adjust' && inRect(cur, sel)) { confirmSel(); render(); } });
+function onClick() {
+  const hadSel = sel; mode = 'idle'; sel = null;
+  if (hadSel) { lastEvent = '範囲の外をクリック → 選択を解除'; return; }
+  updateHover();
+  if (hover && hover.win.kind !== 'taskbar' && !reg) {
+    finish(`ウィンドウキャプチャ: 「${hover.label}」\n（隠れた部分も含めて撮る → スクラップ）`);
+  } else if (opts.desktopClick && !hover) {
+    selectMonitor(false);
+  } else {
+    lastEvent = reg ? '登録モードではウィンドウを選べない' : hover ? 'タスクバーは対象外にした（仮）' : 'デスクトップのクリック: 何もしない';
+  }
+}
+function reopen() { mode = 'idle'; sel = null; lastEvent = 'ホットキー（再表示）'; updateHover(); render(); }
+
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+  ctrlDown = e.ctrlKey;
+  if (e.key === '[' || e.key === ']') { switchVariant(e.key === ']' ? 1 : -1); return; }
+  if (e.key === 'h' || e.key === 'H') { showState = !showState; render(); return; }
+  if (e.key === 'r' || e.key === 'R') { setReg(!reg); return; }
+  if (mode === 'closed') { if (!['Control','Shift','Alt'].includes(e.key)) reopen(); return; }
+  e.preventDefault();
+  const m = monitorAt(cur), step = physPerCss(m) * (e.ctrlKey ? 10 : 1);
+  const d = {ArrowLeft:[-1,0], ArrowRight:[1,0], ArrowUp:[0,-1], ArrowDown:[0,1]}[e.key];
+  if (e.key === 'Escape') cancelStep();
+  else if (e.key === 'Enter') {
+    if (mode === 'adjust') confirmSel();
+    else if (mode === 'idle' && hover && !reg && hover.win.kind !== 'taskbar') finish(`ウィンドウキャプチャ（Enter）: 「${hover.label}」`);
+  }
+  else if ((e.key === 'a' || e.key === 'A') && e.ctrlKey) selectMonitor(e.shiftKey);
+  else if (e.key === 'c' && e.ctrlKey && mode === 'adjust' && !reg) confirmSel('クリップボードにコピー');
+  else if (e.key === 's' && e.ctrlKey && mode === 'adjust' && !reg) confirmSel('保存（既定の保存先）');
+  else if (e.key === ' ') {
+    if (mode === 'idle') { mode = 'dragging'; pressPt = {...cur}; sel = norm(cur, cur); limitMon = monitorAt(cur); kbPress = true; lastEvent = 'Space: キーボードで範囲選択を開始'; }
+    else if (mode === 'dragging' && kbPress) { kbPress = false; afterRelease(); }
+  }
+  else if (d) {
+    if (mode === 'adjust') {
+      if (e.shiftKey) { sel = {...sel, w:Math.max(1, sel.w + d[0]*step), h:Math.max(1, sel.h + d[1]*step)}; lastEvent = 'Shift+矢印: 右下の辺でサイズ調整'; }
+      else { sel = clampRect({...sel, x:sel.x + d[0]*step, y:sel.y + d[1]*step}, clampMode() ? limitMon : null); lastEvent = '矢印: 範囲を移動'; }
+    } else {
+      cur = clampPt({x:cur.x + d[0]*step, y:cur.y + d[1]*step}, mode === 'dragging' && clampMode() ? limitMon : null);
+      lastEvent = '矢印: カーソルを物理 ' + (e.ctrlKey ? 10 : 1) + 'px 移動';
+      onMove(); return;
+    }
+  }
+  updateHover(); render();
+});
+addEventListener('keyup', e => { if (e.key === 'Control') { ctrlDown = false; updateHover(); render(); } });
+
+// ---------- 描画 ----------
+const ACCENT = '#29a3ff';
+function render() {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.drawImage(desk, 0, 0);
+  drawMonitorLabels();
+  barButtons = [];
+  if (mode !== 'closed') {
+    const hv = !selActive() && !reg ? hover : null;
+    const hole = selActive() ? sel : (hv && opts.highlight === 'spotlight' ? hv.rect : null);
+    if (opts.dimBefore || selActive() || hole) {
+      ctx.fillStyle = 'rgba(0,0,0,.45)';
+      for (const m of monitors) ctx.fillRect(m.x, m.y, m.w, m.h);
+      if (hole) { ctx.save(); ctx.beginPath(); ctx.rect(hole.x, hole.y, hole.w, hole.h); ctx.clip(); ctx.drawImage(desk, 0, 0); ctx.restore(); }
+    }
+    if (hv) drawHover(hv);
+    if (selActive()) drawSel();
+    if (opts.crosshair === 'full' && ['idle','pressing','dragging'].includes(mode)) drawCrosshair();
+    drawCoords();
+    if (opts.magnifier === 'follow' && mode !== 'adjust' && mode !== 'moving' || opts.magnifier === 'drag' && (mode === 'dragging' || mode === 'resizing')) drawMagnifier();
+    if (mode === 'adjust' && (opts.actionBar || reg)) drawActionBar();
+    if (opts.coords !== 'bar') drawHint();
+  } else drawToast();
+  drawCursor();
+  updateStatePanel();
+}
+function drawMonitorLabels() {
+  ctx.fillStyle = '#888'; ctx.font = '11px sans-serif';
+  for (const m of monitors) ctx.fillText(`${m.id}  ${m.pw}×${m.ph}  拡大率 ${m.scale}%`, m.x + 4, m.y + m.h + 14);
+}
+function strokeRect(r, color, width, dash) {
+  ctx.save(); ctx.setLineDash(dash || []); ctx.lineWidth = width; ctx.strokeStyle = color;
+  ctx.strokeRect(Math.round(r.x) + .5, Math.round(r.y) + .5, Math.round(r.w) - 1, Math.round(r.h) - 1); ctx.restore();
+}
+function label(text, x, y, opt = {}) {
+  ctx.font = (opt.font || '12px "Segoe UI",sans-serif');
+  const lines = text.split('\n'), pad = 5, lh = 16;
+  const w = Math.max(...lines.map(l => ctx.measureText(l).width)) + pad*2, h = lines.length*lh + pad;
+  let bx = x, by = y;
+  if (opt.center) bx = x - w/2;
+  if (opt.within) { const r = opt.within; bx = clamp(bx, r.x + 2, r.x + r.w - w - 2); by = clamp(by, r.y + 2, r.y + r.h - h - 2); }
+  ctx.fillStyle = opt.bg || 'rgba(20,20,20,.85)'; ctx.fillRect(bx, by, w, h);
+  ctx.fillStyle = opt.fg || '#fff'; lines.forEach((l, i) => ctx.fillText(l, bx + pad, by + 15 + i*lh));
+  return {x:bx, y:by, w, h};
+}
+function drawHover(hv) {
+  strokeRect(hv.rect, ACCENT, opts.highlight === 'border' ? 3 : 2);
+  if (opts.highlight !== 'border') { ctx.fillStyle = 'rgba(41,163,255,.10)'; ctx.fillRect(hv.rect.x, hv.rect.y, hv.rect.w, hv.rect.h); }
+  if (opts.highlight === 'label') {
+    const s = physSegments(hv.rect)[0];
+    label(`${hv.label}\n${s ? s.w + ' × ' + s.h : ''}${opts.child === 'ctrl' && !hv.child ? '   （Ctrl で部品を選ぶ）' : ''}`, hv.rect.x, hv.rect.y - 38, {within:monitorAt(cur), bg:ACCENT});
+  }
+}
+function drawSel() {
+  strokeRect(sel, ACCENT, 1);
+  if (['adjust','moving','resizing'].includes(mode) && opts.confirm === 'enter') {
+    for (const h of HANDLES) { const q = handlePos(sel, h); ctx.fillStyle = '#fff'; ctx.fillRect(q.x-4, q.y-4, 8, 8); ctx.strokeStyle = ACCENT; ctx.strokeRect(q.x-3.5, q.y-3.5, 7, 7); }
+  }
+  for (const m of monitors) { // モニタ境界で範囲が分かれることを示す
+    if (sel.x < m.x && sel.x + sel.w > m.x) { ctx.save(); ctx.setLineDash([4,3]); ctx.strokeStyle = '#ffeb3b'; ctx.beginPath(); ctx.moveTo(m.x + .5, sel.y); ctx.lineTo(m.x + .5, sel.y + sel.h); ctx.stroke(); ctx.restore(); }
+  }
+}
+function drawCrosshair() {
+  const m = monitorAt(cur);
+  const x = Math.round(cur.x) + .5, y = Math.round(cur.y) + .5;
+  for (const [c, off] of [['rgba(0,0,0,.6)', 1], ['rgba(255,255,255,.85)', 0]]) {
+    ctx.strokeStyle = c; ctx.lineWidth = 1; ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(m.x, y + off); ctx.lineTo(m.x + m.w, y + off); ctx.moveTo(x + off, m.y); ctx.lineTo(x + off, m.y + m.h); ctx.stroke();
+  }
+}
+function drawCursor() {
+  const x = Math.round(cur.x) + .5, y = Math.round(cur.y) + .5;
+  ctx.lineWidth = 3; ctx.strokeStyle = '#000'; ctx.beginPath(); ctx.moveTo(x-8, y); ctx.lineTo(x+8, y); ctx.moveTo(x, y-8); ctx.lineTo(x, y+8); ctx.stroke();
+  ctx.lineWidth = 1; ctx.strokeStyle = '#fff'; ctx.stroke();
+}
+function drawCoords() {
+  const p = toPhysPt(cur);
+  if (opts.coords === 'selection' && selActive() && sel.w > 0) {
+    const t = sizeText(sel);
+    const y = sel.y - 22 < monitorAt(sel).y ? sel.y + 4 : sel.y - 22;
+    label(t, sel.x, y, {font:'12px Consolas,monospace'});
+  } else if (opts.coords === 'cursor') {
+    const t = selActive() && sel.w > 0 ? `${sizeText(sel)}\n${p.m.id} (${p.x}, ${p.y})` : `${p.m.id} (${p.x}, ${p.y})`;
+    label(t, cur.x + 16, cur.y + (opts.magnifier === 'follow' ? 160 : 18), {font:'12px Consolas,monospace', within:p.m});
+  } else if (opts.coords === 'bar') {
+    const m = p.m;
+    let t = `${reg ? '【定型領域の登録】 ' : ''}${m.id} ${m.pw}×${m.ph} ${m.scale}%   カーソル (${p.x}, ${p.y})`;
+    if (selActive() && sel.w > 0) t += `   選択 ${physText(sel)}`;
+    t += mode === 'adjust' ? '   ｜ Enter: 確定  Esc: やり直し' : reg ? '   ｜ ドラッグ: 範囲  Esc: 中止' : '   ｜ ドラッグ: 範囲  クリック: ウィンドウ  Esc: 中止';
+    label(t, m.x + m.w/2, m.y + 4, {center:true, font:'12px "Segoe UI",sans-serif', within:m});
+  }
+}
+function drawMagnifier() {
+  const m = monitorAt(cur), Z = 8, S = 15, size = Z*S;
+  let mx = cur.x + 20, my = cur.y + 20;
+  if (mx + size > m.x + m.w) mx = cur.x - 20 - size;
+  if (my + size + 22 > m.y + m.h) my = cur.y - 20 - size - 22;
+  const sx = Math.floor(cur.x) - (S>>1), sy = Math.floor(cur.y) - (S>>1);
+  ctx.save(); ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = '#000'; ctx.fillRect(mx-1, my-1, size+2, size+2);
+  ctx.drawImage(desk, sx, sy, S, S, mx, my, size, size);
+  ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1;
+  for (let i = 1; i < S; i++) { ctx.beginPath(); ctx.moveTo(mx + i*Z + .5, my); ctx.lineTo(mx + i*Z + .5, my + size); ctx.moveTo(mx, my + i*Z + .5); ctx.lineTo(mx + size, my + i*Z + .5); ctx.stroke(); }
+  ctx.strokeStyle = '#fff'; ctx.strokeRect(mx + (S>>1)*Z + .5, my + (S>>1)*Z + .5, Z-1, Z-1);
+  ctx.restore();
+  const [r, g, b] = dctx.getImageData(Math.floor(cur.x), Math.floor(cur.y), 1, 1).data;
+  const hex = '#' + [r,g,b].map(v => v.toString(16).padStart(2,'0')).join('').toUpperCase();
+  ctx.fillStyle = hex; ctx.fillRect(mx, my + size + 2, 18, 18);
+  label(`${hex}  rgb(${r},${g},${b})`, mx + 20, my + size + 2, {font:'11px Consolas,monospace'});
+}
+function drawActionBar() {
+  const items = reg
+    ? [['登録 (Enter)', () => confirmSel()], ['✕ (Esc)', () => cancelStep()]]
+    : [['スクラップ (Enter)', () => confirmSel('スクラップ')], ['コピー (Ctrl+C)', () => confirmSel('クリップボードにコピー')], ['保存 (Ctrl+S)', () => confirmSel('保存（既定の保存先）')], ['✕ (Esc)', () => cancelStep()]];
+  ctx.font = '12px "Segoe UI",sans-serif';
+  const widths = items.map(([t]) => ctx.measureText(t).width + 16), total = widths.reduce((a,b)=>a+b, 0) + (items.length-1)*4;
+  const m = monitorAt({x:sel.x + sel.w, y:sel.y + sel.h});
+  let x = clamp(sel.x + sel.w - total, m.x + 2, m.x + m.w - total - 2), y = sel.y + sel.h + 6;
+  if (y + 26 > m.y + m.h) y = sel.y + sel.h - 32;
+  items.forEach(([t, run], i) => {
+    const b = {x, y, w:widths[i], h:24, run};
+    ctx.fillStyle = i === 0 ? ACCENT : '#2b2b2b'; ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.fillStyle = '#fff'; ctx.fillText(t, b.x + 8, b.y + 16);
+    barButtons.push(b); x += widths[i] + 4;
+  });
+}
+function drawHint() {
+  const m = monitorAt(cur);
+  let t;
+  if (reg) t = mode === 'adjust' ? '定型領域の登録 — Enter: 登録 / 矢印: 移動 / Shift+矢印: サイズ / Esc: やり直し' : '定型領域の登録 — 1 枚のモニタの中でドラッグ / Esc・右クリック: 中止';
+  else if (mode === 'adjust') t = 'Enter・ダブルクリック: 確定 / つまみ: サイズ / 中をドラッグ: 移動 / 矢印: 1px / Esc: やり直し';
+  else t = `ドラッグ: 範囲 / クリック: ウィンドウ / Ctrl+A: モニタ全体${clampMode() ? '' : ' / Ctrl+Shift+A: 全モニタ'} / Esc・右クリック: 中止`;
+  label(t, m.x + m.w/2, m.y + 4, {center:true, within:m, bg:'rgba(20,20,20,.7)'});
+}
+function drawToast() {
+  label(lastResult + '\n\n（実物ではここで範囲選択の画面が閉じる。クリックかキーでもう一度開く）', W/2, H*0.4, {center:true, font:'14px "Segoe UI",sans-serif', bg:'rgba(0,0,0,.85)'});
+}
+function updateStatePanel() {
+  const el = document.getElementById('state');
+  el.style.display = showState ? '' : 'none';
+  if (!showState) return;
+  const p = toPhysPt(cur);
+  el.textContent = [
+    `variant   : ${variant}  ${reg ? '［定型領域の登録モード］' : ''}`,
+    `mode      : ${mode}`,
+    `cursor    : ${p.m.id} 物理 (${p.x}, ${p.y})`,
+    `hover     : ${hover ? hover.label : '-'}`,
+    `selection : ${sel && selActive() ? physText(sel) : '-'}`,
+    `last event: ${lastEvent || '-'}`,
+    `last result:`, ...(lastResult || '-').split('\n').map(l => '  ' + l),
+    ``, ...Object.keys(OPTION_DEFS).map(k => `${k.padEnd(12)}: ${opts[k]}`),
+  ].join('\n');
+}
+
+// ---------- プロトタイプの操作 UI ----------
+function buildOpts() {
+  const t = document.getElementById('optTable'); t.innerHTML = '';
+  for (const [k, def] of Object.entries(OPTION_DEFS)) {
+    const tr = document.createElement('tr');
+    const sel = document.createElement('select');
+    def.values.forEach((v, i) => { const o = document.createElement('option'); o.value = i; o.textContent = def.names[i]; if (opts[k] === v) o.selected = true; sel.appendChild(o); });
+    sel.onchange = () => { opts[k] = def.values[+sel.value]; sel.blur(); updateHover(); render(); };
+    tr.innerHTML = `<td>${def.label}</td>`; const td = document.createElement('td'); td.appendChild(sel); tr.appendChild(td); t.appendChild(tr);
+  }
+  document.getElementById('regMode').checked = reg;
+}
+function switchVariant(dir) {
+  const keys = Object.keys(PRESETS);
+  variant = keys[(keys.indexOf(variant) + dir + keys.length) % keys.length];
+  opts = {...PRESETS[variant]}; mode = 'idle'; sel = null;
+  history.replaceState(null, '', '?variant=' + variant);
+  document.getElementById('vlabel').textContent = PRESETS[variant].label;
+  buildOpts(); updateHover(); render();
+}
+function setReg(v) { reg = v; mode = 'idle'; sel = null; lastEvent = v ? '定型領域の登録モードに入った' : 'キャプチャのモードに戻った'; document.getElementById('regMode').checked = v; updateHover(); render(); }
+document.getElementById('prev').onclick = () => switchVariant(-1);
+document.getElementById('next').onclick = () => switchVariant(1);
+document.getElementById('regMode').onchange = e => { setReg(e.target.checked); e.target.blur(); };
+document.getElementById('resetOpts').onclick = e => { opts = {...PRESETS[variant]}; buildOpts(); e.target.blur(); render(); };
+addEventListener('resize', () => { layout(); render(); });
+
+layout();
+document.getElementById('vlabel').textContent = PRESETS[variant].label;
+buildOpts(); render();
+</script>
+</body>
+</html>
