@@ -34,6 +34,7 @@
 //!   中身を持たないので、クリックで開くフォルダ（`App::notice_folder`）を覚えておき、新しい通知を出したら忘れる。
 //! - コピーと保存の画像は `render::render_image` で表示と同じ描き方で作る。保存先とファイル名は UI スレッドで
 //!   決め（`save::destination`）、PNG の書き出しと書き込みは裏のスレッドで行い、結果は `WM_APP_SAVED` で受ける。
+//!   結果を受けるまでの保存先は `App::pending_saves` に持ち、続けて保存しても同じ名前にしない。
 //!   保存先とファイル名テンプレートは設定（`[general]`）のものを使う。
 
 use std::cell::RefCell;
@@ -87,7 +88,8 @@ use crate::{
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
 const WM_APP_TRAY: u32 = WM_APP + 1;
-/// 環境変数 `SHUNSOKU_TEST_PANIC=ui` のとき、UI スレッドでパニックを起こす（手で確かめる用）。
+/// 環境変数 `SHUNSOKU_TEST_PANIC=ui` のとき、UI スレッドでパニックを起こす（手で確かめる用。デバッグ ビルドだけ）。
+#[cfg(debug_assertions)]
 const WM_APP_TEST_PANIC: u32 = WM_APP + 2;
 /// 保存の裏のスレッドが書き終えた（結果は `App::saves` の受け口に入っている）。
 const WM_APP_SAVED: u32 = WM_APP + 3;
@@ -126,6 +128,8 @@ struct App {
     /// 設定ファイルの監視。`APPDATA` がないときや始められなかったときは None。
     watcher: Option<settings_watch::Watcher>,
     tray: tray::Tray,
+    /// トレイの登録に 1 度でも成功したか。性能の区切り `TrayRegistered` は最初の成功のときだけ書く。
+    tray_registered: bool,
     /// いま使っている設定（読み込み直しで TOML として読めなかったときは、直前の有効な設定のまま）。
     settings: Settings,
     /// 設定ファイルのパス。通知に出す。
@@ -138,6 +142,11 @@ struct App {
     scraps: Vec<Scrap>,
     /// 保存の裏のスレッドが結果を入れる口と、UI スレッドが受ける口。
     saves: (mpsc::Sender<Saved>, mpsc::Receiver<Saved>),
+    /// 名前を決めて裏のスレッドに渡し、まだ結果（`WM_APP_SAVED`）を受けていない保存先。次の名前を決めるとき、
+    /// 使われている名前として数える（`save::destination`）。
+    pending_saves: Vec<PathBuf>,
+    /// スクラップの中身を描く Direct2D の描き手。描き直しのたびに作らないよう使い回す（`paint_scrap`）。
+    renderer: Option<render::Renderer>,
     /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
     notice_folder: Option<PathBuf>,
     gpu: grab::Gpu,
@@ -182,13 +191,18 @@ struct Scrap {
 impl Scrap {
     /// `Effect::Redraw`: `model` のとおりに出し直す。大きさとモードが `before` と同じなら、中身は変わらないので
     /// ウィンドウを動かすだけにする（ドラッグのたびに描き直さない）。
-    fn redraw(&self, before: &ScrapModel, appearance: &Appearance) {
+    fn redraw(
+        &self,
+        before: &ScrapModel,
+        appearance: &Appearance,
+        renderer: &mut Option<render::Renderer>,
+    ) {
         let rect = self.model.window_rect(appearance);
         let result = if self.model.image_size == before.image_size && self.model.mode == before.mode
         {
             self.window.move_to(rect)
         } else {
-            paint_scrap(&self.window, &self.image, rect, appearance)
+            paint_scrap(renderer, &self.window, &self.image, rect, appearance)
         };
         if let Err(e) = result {
             log::warn!("could not redraw a scrap: {e}");
@@ -197,14 +211,23 @@ impl Scrap {
 }
 
 /// スクラップの中身を描いて、ウィンドウを `rect` に出す。
+///
+/// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
+/// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
 fn paint_scrap(
+    renderer: &mut Option<render::Renderer>,
     window: &scrap_window::ScrapWindow,
     image: &Image,
     rect: Rect,
     appearance: &Appearance,
 ) -> Result<()> {
     let canvas = render::Canvas::new(rect.size())?;
-    render::Renderer::new()?.paint_scrap(&canvas, image, appearance)?;
+    let painter = match renderer.take() {
+        Some(painter) => painter,
+        None => render::Renderer::new()?,
+    };
+    painter.paint_scrap(&canvas, image, appearance)?;
+    *renderer = Some(painter);
     // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
     window.present(canvas.dc(), rect, appearance.opacity)
 }
@@ -306,13 +329,31 @@ pub fn run() -> i32 {
         unset,
         app.settings_path.as_deref(),
     );
-    let message_window = app.windows.message;
+    #[cfg(debug_assertions)]
+    start_test_panic(app.windows.message);
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     if let Some((level, body)) = notice {
         notify_user(level, &body);
     }
     log::info!("started");
 
+    let code = message_loop();
+    // トレイを消してからウィンドウを壊す。APP から出してから drop するので、
+    // 壊すときに呼ばれるウィンドウ プロシージャは App を見ない
+    let app = APP.with(|cell| cell.borrow_mut().take());
+    drop(app);
+    if com.is_ok() {
+        // SAFETY: 成功した CoInitializeEx と対にする
+        unsafe { CoUninitialize() };
+    }
+    log::info!("exiting (code {code})");
+    code
+}
+
+/// 手で確かめる用のパニック（デバッグ ビルドだけ）。環境変数 `SHUNSOKU_TEST_PANIC` が `ui` なら UI スレッドで、
+/// `worker` なら裏のスレッドでパニックを起こす。UI スレッドの分はメッセージ ループが回ってから起きる。
+#[cfg(debug_assertions)]
+fn start_test_panic(message_window: HWND) {
     match std::env::var("SHUNSOKU_TEST_PANIC").as_deref() {
         Ok("ui") => {
             // SAFETY: 自分のウィンドウに送る
@@ -332,18 +373,6 @@ pub fn run() -> i32 {
         }
         _ => {}
     }
-
-    let code = message_loop();
-    // トレイを消してからウィンドウを壊す。APP から出してから drop するので、
-    // 壊すときに呼ばれるウィンドウ プロシージャは App を見ない
-    let app = APP.with(|cell| cell.borrow_mut().take());
-    drop(app);
-    if com.is_ok() {
-        // SAFETY: 成功した CoInitializeEx と対にする
-        unsafe { CoUninitialize() };
-    }
-    log::info!("exiting (code {code})");
-    code
 }
 
 /// 起動する。キーの割り当ての問題（`settings::keymap`）と、登録できなかったホットキーも返す。
@@ -423,7 +452,8 @@ fn start(
         icon,
         text("tray.tooltip").to_owned(),
     );
-    if tray.register() {
+    let tray_registered = tray.register();
+    if tray_registered {
         perf::mark(Mark::TrayRegistered);
         log::info!("tray icon registered");
     } else {
@@ -445,6 +475,7 @@ fn start(
     let app = App {
         watcher,
         tray,
+        tray_registered,
         settings,
         settings_path,
         settings_events,
@@ -452,6 +483,8 @@ fn start(
         capture: Capture::Idle,
         scraps: Vec::new(),
         saves: mpsc::channel(),
+        pending_saves: Vec::new(),
+        renderer: None,
         notice_folder: None,
         gpu: grab::Gpu::default(),
         hotkeys,
@@ -553,6 +586,7 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             on_tray(hwnd, tray::event(wparam, lparam));
             Some(LRESULT(0))
         }
+        #[cfg(debug_assertions)]
         WM_APP_TEST_PANIC => panic!("test panic on the UI thread (SHUNSOKU_TEST_PANIC)"),
         WM_APP_SAVED => {
             on_saved();
@@ -588,7 +622,15 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
         }
         // 登録メッセージは定数でないので match の外で比べる
         _ if Some(&msg) == TASKBAR_CREATED.get() => {
-            let ok = with_app(|app| app.tray.register());
+            let ok = with_app(|app| {
+                let ok = app.tray.register();
+                // 起動時に登録できず、ここで初めて登録できたときも、コールドスタートの終わりとして書く
+                if ok && !app.tray_registered {
+                    app.tray_registered = true;
+                    perf::mark(Mark::TrayRegistered);
+                }
+                ok
+            });
             log::info!("taskbar re-created; tray icon re-registered: {ok:?}");
             Some(LRESULT(0))
         }
@@ -898,31 +940,47 @@ fn show_scrap_menu(hwnd: HWND, lparam: LPARAM) {
 enum Deferred {
     Copy(Image),
     Save(Image),
-    /// コピーや保存の画像を作れなかった。
-    RenderFailed(Effect, String),
+    /// コピーや保存の画像を作れなかった。`failed_key` はその仕事の失敗の文言のキー。
+    RenderFailed {
+        failed_key: &'static str,
+        reason: String,
+    },
     Close,
+}
+
+/// コピーや保存の画像を表示と同じ描き方で作り、`job` の `Deferred` にする。作れなければ `failed_key` の失敗にする。
+fn render_for(image: &Image, job: fn(Image) -> Deferred, failed_key: &'static str) -> Deferred {
+    match render::render_image(image) {
+        Ok(image) => job(image),
+        Err(e) => Deferred::RenderFailed {
+            failed_key,
+            reason: e.to_string(),
+        },
+    }
 }
 
 /// スクラップ操作を実行し、返った `Effect` を実行する。スクラップのキー・マウス・メニューはすべてここを通る。
 fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
     let deferred = with_app(|app| {
         let appearance = Appearance::from(app.settings.scrap);
-        let scrap = app.scrap_mut(hwnd)?;
+        let App {
+            scraps, renderer, ..
+        } = app;
+        let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
         let before = scrap.model.clone();
         let mut deferred = Vec::new();
         for effect in ops::execute(op, &mut scrap.model, &context) {
             match effect {
                 // ウィンドウを動かす・描き直すときに届くメッセージ（WM_WINDOWPOSCHANGED、WM_DPICHANGED など）では
                 // App を借りないので、借りたままでよい
-                Effect::Redraw => scrap.redraw(&before, &appearance),
+                Effect::Redraw => scrap.redraw(&before, &appearance, renderer),
                 Effect::Close => deferred.push(Deferred::Close),
                 // 描くだけでメッセージは届かないので、借りたまま描く
-                Effect::CopyToClipboard | Effect::SaveDefault => {
-                    deferred.push(match render::render_image(&scrap.image) {
-                        Ok(image) if effect == Effect::CopyToClipboard => Deferred::Copy(image),
-                        Ok(image) => Deferred::Save(image),
-                        Err(e) => Deferred::RenderFailed(effect, e.to_string()),
-                    });
+                Effect::CopyToClipboard => {
+                    deferred.push(render_for(&scrap.image, Deferred::Copy, "copy.failed"));
+                }
+                Effect::SaveDefault => {
+                    deferred.push(render_for(&scrap.image, Deferred::Save, "save.failed"));
                 }
             }
         }
@@ -935,14 +993,12 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
         match action {
             Deferred::Copy(image) => copy_to_clipboard(&image),
             Deferred::Save(image) => save_default(image),
-            Deferred::RenderFailed(effect, e) => {
-                log::error!("could not render the scrap image for {effect:?}: {e}");
-                let key = if effect == Effect::CopyToClipboard {
-                    "copy.failed"
-                } else {
-                    "save.failed"
-                };
-                notify_user(notify::Level::Error, &format!("{}\n{e}", text(key)));
+            Deferred::RenderFailed { failed_key, reason } => {
+                log::error!("could not render the scrap image ({failed_key}): {reason}");
+                notify_user(
+                    notify::Level::Error,
+                    &format!("{}\n{reason}", text(failed_key)),
+                );
             }
             Deferred::Close => close_scrap(hwnd),
         }
@@ -974,11 +1030,12 @@ fn copy_to_clipboard(image: &Image) {
 /// 保存先とファイル名はここ（UI スレッド）で決め、PNG の書き出しと書き込みは裏のスレッドで行う。
 /// 失敗してもスクラップはそのまま残る。
 fn save_default(image: Image) {
-    let Some((save_dir, template, sender, message_window)) = with_app(|app| {
+    let Some((save_dir, template, pending, sender, message_window)) = with_app(|app| {
         let general = &app.settings.general;
         (
             general.save_dir.clone(),
             general.file_name_template.clone(),
+            app.pending_saves.clone(),
             app.saves.0.clone(),
             app.windows.message,
         )
@@ -996,7 +1053,7 @@ fn save_default(image: Image) {
             }
         },
     };
-    let path = match save::destination(&dir, &template, save::now()) {
+    let path = match save::destination(&dir, &template, save::now(), &pending) {
         Ok(path) => path,
         Err(e) => {
             log::error!("could not prepare the save folder {}: {e}", dir.display());
@@ -1004,6 +1061,10 @@ fn save_default(image: Image) {
             return;
         }
     };
+    // 書き終えるまでの間に次の保存が同じ名前を選ばないように、結果を受けるまで覚えておく
+    if with_app(|app| app.pending_saves.push(path.clone())).is_none() {
+        log::warn!("could not remember the pending save {}", path.display());
+    }
     // HWND は Send でないので、番号にして渡す
     let window = message_window.0 as isize;
     let job_path = path.clone();
@@ -1011,7 +1072,7 @@ fn save_default(image: Image) {
         .name("save".into())
         .spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| save::write_png(&job_path, &image)))
-                .map_err(|_| "panic".to_owned())
+                .map_err(|_| text("job.panicked").to_owned())
                 .and_then(|written| written.map_err(|e| e.to_string()));
             let _ = sender.send(Saved {
                 path: job_path,
@@ -1029,8 +1090,14 @@ fn save_default(image: Image) {
         });
     if let Err(e) = spawned {
         log::error!("could not start the save thread: {e}");
+        forget_pending_save(&path);
         save_failed(Some(&path), &e.to_string());
     }
+}
+
+/// 保存先を、書き込み中の保存先から外す。
+fn forget_pending_save(path: &Path) {
+    with_app(|app| app.pending_saves.retain(|p| p != path));
 }
 
 /// `WM_APP_SAVED`: 保存の結果を通知する。成功なら、通知のクリックで保存先のフォルダを開けるようにする。
@@ -1039,6 +1106,7 @@ fn on_saved() {
         return;
     };
     for saved in results {
+        forget_pending_save(&saved.path);
         match saved.result {
             Ok(()) => {
                 log::info!("saved {}", saved.path.display());
@@ -1087,6 +1155,7 @@ fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
     // 押しっぱなしの自動リピート（lParam の bit 30 = 直前も押されていた）
     let repeat = lparam.0 & (1 << 30) != 0;
     let shift = down(VK_SHIFT);
+    let win = down(VK_LWIN) || down(VK_RWIN);
     let arrow = |direction| Some(Input::Arrow { direction, shift });
     match VIRTUAL_KEY(wparam.0 as u16) {
         VK_ESCAPE => Some(Input::Escape),
@@ -1096,7 +1165,8 @@ fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
         VK_DOWN => arrow(Direction::Down),
         // 押しっぱなしで始点と終点が続けて決まらないよう、リピートは無視する
         VK_SPACE if !repeat => Some(Input::Space),
-        VK_A if down(VK_CONTROL) && !repeat => Some(if shift {
+        // Ctrl+A と Ctrl+Shift+A だけ。Ctrl+Alt+A などほかの修飾キーとの組み合わせは対象にしない
+        VK_A if down(VK_CONTROL) && !down(VK_MENU) && !win && !repeat => Some(if shift {
             Input::SelectAllMonitors
         } else {
             Input::SelectMonitor
@@ -1233,7 +1303,11 @@ fn open_scrap(
     let model = ScrapModel::new(at, image.size());
     let rect = model.window_rect(appearance);
     let window = scrap_window::ScrapWindow::create(module, rect)?;
-    paint_scrap(&window, &image, rect, appearance)?;
+    // 描いて出すときに届くメッセージ（WM_WINDOWPOSCHANGED など）では App を借りないので、借りたまま描いてよい。
+    // 借りられなければ（起こらないはず）、その場かぎりの描き手で描く
+    let painted = with_app(|app| paint_scrap(&mut app.renderer, &window, &image, rect, appearance))
+        .unwrap_or_else(|| paint_scrap(&mut None, &window, &image, rect, appearance));
+    painted?;
     window.show(focus);
     Ok(Scrap {
         window,
@@ -1291,9 +1365,15 @@ fn open_overlay() {
     let shots = match grabbed {
         Ok(shots) => shots,
         Err(e) => {
-            // 撮れないときの通知は M3
             log::warn!("could not grab the screen: {e}");
             end_capture();
+            // 取得のスレッドのパニックはその仕事の失敗として通知する。ほかの撮れないときの通知は M3
+            if matches!(e, grab::GrabError::Panicked) {
+                notify_user(
+                    notify::Level::Error,
+                    &format!("{}\n{}", text("capture.failed"), text("job.panicked")),
+                );
+            }
             return;
         }
     };
@@ -1497,7 +1577,13 @@ fn apply_changes(app: &mut App, changes: &SettingsChanges) {
         let appearance = Appearance::from(app.settings.scrap);
         for scrap in &app.scraps {
             let rect = scrap.model.window_rect(&appearance);
-            if let Err(e) = paint_scrap(&scrap.window, &scrap.image, rect, &appearance) {
+            if let Err(e) = paint_scrap(
+                &mut app.renderer,
+                &scrap.window,
+                &scrap.image,
+                rect,
+                &appearance,
+            ) {
                 log::warn!("could not redraw a scrap with the new appearance: {e}");
             }
         }

@@ -187,12 +187,26 @@ fn measure_memory(options: &Options, workspace: &Workspace) -> Result<Memory> {
         sleep(IDLE_AFTER_TRAY.saturating_sub(since));
         memory.idle.push(app.private_working_set()? as f64 / MIB);
 
-        // 参考値: 範囲選択の画面を開いて閉じるのを 10 回
+        // 参考値: 撮ってスクラップを出し、閉じるのを 10 回。主モニタの左上寄りを 200×150 px ドラッグし、
+        // 前面になったスクラップを Esc で閉じる（取得・読み戻し・スクラップの経路を通す）
+        let mut captured = 0;
         for i in 0..CAPTURES {
             send_hotkey(options.hotkey);
             app.wait(Mark::OverlayFlushed, i, OVERLAY_TIMEOUT)?;
             sleep(Duration::from_millis(200));
-            send_keys(&[VK_ESCAPE]);
+            if scrap_missing {
+                send_keys(&[VK_ESCAPE]);
+            } else {
+                drag((100, 100), (300, 250));
+                if app.wait(Mark::ScrapShown, captured, SCRAP_TIMEOUT).is_ok() {
+                    captured += 1;
+                    sleep(Duration::from_millis(200));
+                } else {
+                    // スクラップを出せない版（区切り scrap_shown を書かない）。範囲選択の画面を閉じるだけにする
+                    scrap_missing = true;
+                }
+                send_keys(&[VK_ESCAPE]);
+            }
             sleep(Duration::from_millis(300));
         }
         sleep(SETTLE);
@@ -205,7 +219,7 @@ fn measure_memory(options: &Options, workspace: &Workspace) -> Result<Memory> {
         app.wait(Mark::OverlayFlushed, CAPTURES, OVERLAY_TIMEOUT)?;
         sleep(Duration::from_millis(200));
         drag((100, 100), (500, 400));
-        if !scrap_missing && app.wait(Mark::ScrapShown, 0, SCRAP_TIMEOUT).is_ok() {
+        if !scrap_missing && app.wait(Mark::ScrapShown, captured, SCRAP_TIMEOUT).is_ok() {
             sleep(SETTLE);
             memory.scrap.push(app.private_working_set()? as f64 / MIB);
         } else {
