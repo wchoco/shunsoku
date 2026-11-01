@@ -242,7 +242,8 @@ impl Scrap {
         let same_content = self.model.image_size == before.image_size
             && self.model.display_size() == before.display_size()
             && self.model.mode == before.mode
-            && self.model.is_compact() == before.is_compact();
+            && self.model.is_compact() == before.is_compact()
+            && self.model.appearance_overrides == before.appearance_overrides;
         if same_content && !repaint {
             self.window.move_to(self.model.window_rect(appearance))
         } else {
@@ -271,7 +272,8 @@ impl Scrap {
     }
 }
 
-/// スクラップの中身を描いて、ウィンドウを `model` の矩形（`ScrapModel::window_rect`）に出す。
+/// スクラップの中身を描いて、ウィンドウを `model` の矩形（`ScrapModel::window_rect`）に出す。`appearance` は全体の
+/// 見た目の既定値で、スクラップごとの上書きを重ねて描く。
 /// コンパクト表示のときは、画像の代わりに `COMPACT_FACE` の色で正方形を塗る（中身は隠す）。
 ///
 /// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
@@ -285,6 +287,7 @@ fn paint_scrap(
     label: Option<render::ZoomLabel>,
 ) -> Result<()> {
     let rect = model.window_rect(appearance);
+    let appearance = &model.appearance(appearance);
     let canvas = render::Canvas::new(rect.size())?;
     let mut painter = match renderer.take() {
         Some(painter) => painter,
@@ -1136,15 +1139,16 @@ fn on_trim_input(hwnd: HWND, input: TrimInput) -> bool {
     .unwrap_or(false)
 }
 
-/// `WM_MOUSEWHEEL`: 修飾キーなしのホイールを、ノッチごとにホイールの操作にする（基準点はカーソルの位置）。
-/// 修飾キーつきは対応がないので false（DefWindowProcW に任せる）。
+/// `WM_MOUSEWHEEL`: 修飾キーなしと Ctrl だけのホイールを、ノッチごとにホイールの操作にする（基準点はカーソルの
+/// 位置）。ほかの修飾キーつきは対応がないので false（DefWindowProcW に任せる）。
 fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
     // wparam の下位は押されているキーとボタン（MK_*）、上位は回転量（上が正）
     const MK_SHIFT: usize = 0x0004;
     const MK_CONTROL: usize = 0x0008;
-    if wparam.0 & (MK_SHIFT | MK_CONTROL) != 0 || held_modifiers().alt {
+    if wparam.0 & MK_SHIFT != 0 || held_modifiers().alt {
         return false;
     }
+    let ctrl = wparam.0 & MK_CONTROL != 0;
     let delta = i32::from((wparam.0 >> 16) as u16 as i16);
     // WM_MOUSEWHEEL の座標はスクリーン座標。左や上のモニタでは負になる
     let cursor = Point::new(
@@ -1155,10 +1159,11 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
     else {
         return true;
     };
-    let gesture = if notches > 0 {
-        MouseGesture::WheelUp
-    } else {
-        MouseGesture::WheelDown
+    let gesture = match (ctrl, notches > 0) {
+        (false, true) => MouseGesture::WheelUp,
+        (false, false) => MouseGesture::WheelDown,
+        (true, true) => MouseGesture::CtrlWheelUp,
+        (true, false) => MouseGesture::CtrlWheelDown,
     };
     let context = OpContext {
         cursor: Some(cursor),
@@ -1275,7 +1280,8 @@ fn held_modifiers() -> Modifiers {
 fn show_scrap_menu(hwnd: HWND, lparam: LPARAM) {
     let built = with_app(|app| {
         let scrap = app.scraps.iter().find(|s| s.window.hwnd() == hwnd)?;
-        let entries = ops::menu(ops::OPERATIONS, &scrap.model, &app.shortcuts);
+        let defaults = Appearance::from(app.settings.scrap);
+        let entries = ops::menu(ops::OPERATIONS, &scrap.model, &app.shortcuts, &defaults);
         Some((entries, scrap.model.position))
     })
     .flatten();
@@ -1292,42 +1298,7 @@ fn show_scrap_menu(hwnd: HWND, lparam: LPARAM) {
     };
     // 項目の番号は commands の添字 + 1（0 は「選ばなかった」）。子メニューの選択肢は選択肢ごとに番号を振る
     let mut commands: Vec<(OperationId, Option<i32>)> = Vec::new();
-    let mut command = |id: OperationId, choice: Option<i32>| {
-        commands.push((id, choice));
-        commands.len() as u32
-    };
-    let items: Vec<menu::Entry> = entries
-        .iter()
-        .map(|entry| match entry {
-            MenuEntry::Item(item) => menu::Entry::Item {
-                id: command(item.id, None),
-                label: match item.shortcut {
-                    Some(chord) => format!("{}\t{chord}", text(item.label_key)).into(),
-                    None => text(item.label_key).into(),
-                },
-                enabled: item.enabled,
-                checked: false,
-            },
-            MenuEntry::Submenu(submenu) => menu::Entry::Submenu {
-                label: text(submenu.label_key).into(),
-                enabled: submenu.enabled,
-                items: submenu
-                    .choices
-                    .iter()
-                    .map(|choice| menu::Entry::Item {
-                        id: command(submenu.id, Some(choice.value)),
-                        label: match choice.label {
-                            ChoiceLabel::Key(key) => text(key).into(),
-                            ChoiceLabel::Percent(percent) => format!("{percent}%").into(),
-                        },
-                        enabled: true,
-                        checked: choice.checked,
-                    })
-                    .collect(),
-            },
-            MenuEntry::Separator => menu::Entry::Separator,
-        })
-        .collect();
+    let items = scrap_menu_entries(&entries, &mut commands);
     // モーダルなので App を借りずに呼ぶ
     let Some(chosen) = menu::show(hwnd, &items, at.x, at.y) else {
         return;
@@ -1342,6 +1313,59 @@ fn show_scrap_menu(hwnd: HWND, lparam: LPARAM) {
         };
         run_scrap_operation(hwnd, op, context);
     }
+}
+
+/// 右クリックメニューの行を Win32 のメニューの行にする。選べる項目には `commands` の添字 + 1 の番号を振る。
+fn scrap_menu_entries(
+    entries: &[MenuEntry],
+    commands: &mut Vec<(OperationId, Option<i32>)>,
+) -> Vec<menu::Entry<'static>> {
+    fn command(
+        commands: &mut Vec<(OperationId, Option<i32>)>,
+        id: OperationId,
+        choice: Option<i32>,
+    ) -> u32 {
+        commands.push((id, choice));
+        commands.len() as u32
+    }
+    let mut items = Vec::with_capacity(entries.len());
+    for entry in entries {
+        items.push(match entry {
+            MenuEntry::Item(item) => menu::Entry::Item {
+                id: command(commands, item.id, None),
+                label: match item.shortcut {
+                    Some(chord) => format!("{}\t{chord}", text(item.label_key)).into(),
+                    None => text(item.label_key).into(),
+                },
+                enabled: item.enabled,
+                checked: false,
+            },
+            MenuEntry::Submenu(submenu) => menu::Entry::Submenu {
+                label: text(submenu.label_key).into(),
+                enabled: submenu.enabled,
+                items: submenu
+                    .choices
+                    .iter()
+                    .map(|choice| menu::Entry::Item {
+                        id: command(commands, submenu.id, Some(choice.value)),
+                        label: match choice.label {
+                            ChoiceLabel::Key(key) => text(key).into(),
+                            ChoiceLabel::Percent(percent) => format!("{percent}%").into(),
+                        },
+                        enabled: true,
+                        checked: choice.checked,
+                    })
+                    .collect(),
+            },
+            MenuEntry::Folder(folder) => menu::Entry::Submenu {
+                label: text(folder.label_key).into(),
+                enabled: true,
+                items: scrap_menu_entries(&folder.entries, commands),
+            },
+            MenuEntry::Separator => menu::Entry::Separator,
+        });
+    }
+    items
 }
 
 /// `App` を返したあとに行う `Effect`。
@@ -1378,6 +1402,10 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
         let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
         let before = scrap.model.clone();
         let mut deferred = Vec::new();
+        let context = OpContext {
+            appearance,
+            ..context
+        };
         let effects = ops::execute(op, &mut scrap.model, &context);
         let show_zoom = effects.contains(&Effect::ShowZoom);
         if show_zoom {

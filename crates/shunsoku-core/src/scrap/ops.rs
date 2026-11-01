@@ -19,13 +19,18 @@
 //!
 //! トリム（`trim`）は範囲の選択を始めるだけで、選んでいる間（`Mode::Trimming`）の入力は表を通さず
 //! `ScrapModel::trim_input` が受ける。その間はどの操作の `can_execute` も false にする。
+//!
+//! 見た目（透明度・枠・影）は、一覧を `choices` に持つ `opacity` / `border` / `shadow` と、`Ctrl+ホイール` の
+//! `opacity_up` / `opacity_down` に分ける。どれもスクラップごとの上書き（`ScrapModel::appearance_overrides`）を
+//! 変える。いまの見た目は全体の既定値に上書きを重ねて決まるので、既定値を `OpContext::appearance` と `menu` の
+//! 引数で受け取る。メニューでは 3 つの一覧を「見た目」の子メニュー（`FOLDERS`、`MenuEntry::Folder`）にまとめる。
 
 use std::collections::BTreeMap;
 
 use crate::geometry::Point;
 use crate::keys::{Chord, Key};
-use crate::scrap::{Mode, ScrapModel, ZoomAnchor};
-use crate::settings::{self, Conflict, ShortcutOverrides};
+use crate::scrap::{Appearance, Mode, ScrapModel, ZoomAnchor};
+use crate::settings::{self, Conflict, OPACITY_RANGE, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
 pub type OperationId = &'static str;
@@ -52,7 +57,8 @@ pub struct OperationDescriptor {
     pub can_execute: fn(&ScrapModel) -> bool,
     /// 引数の選択肢（倍率の一覧など）。Some の操作はショートカットを持たず、メニューでは子メニューになる。
     /// 選ばれた選択肢の `Choice::value` は `OpContext::choice` で `run` に渡る。
-    pub choices: Option<fn(&ScrapModel) -> Vec<Choice>>,
+    /// 引数は全体の見た目の既定値（チェックをいまの見た目に付けるため）。
+    pub choices: Option<fn(&ScrapModel, &Appearance) -> Vec<Choice>>,
     pub run: fn(&mut ScrapModel, &OpContext) -> Vec<Effect>,
 }
 
@@ -81,6 +87,10 @@ pub enum MouseGesture {
     WheelUp,
     /// ホイールを下（手前）へ 1 ノッチ。修飾キーなし。
     WheelDown,
+    /// Ctrl を押しながらホイールを上（奥）へ 1 ノッチ。
+    CtrlWheelUp,
+    /// Ctrl を押しながらホイールを下（手前）へ 1 ノッチ。
+    CtrlWheelDown,
     /// 左ボタンのダブルクリック（`WM_LBUTTONDBLCLK`）。
     DoubleClick,
 }
@@ -122,6 +132,8 @@ pub enum ChoiceLabel {
 /// 操作を呼び出したときの引数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OpContext {
+    /// 全体の見た目の既定値（設定ファイルの `[scrap]`）。見た目を変える操作が、いまの見た目を知るのに使う。
+    pub appearance: Appearance,
     /// 左ドラッグで前回からカーソルが動いた量（物理ピクセル）。
     pub drag: Point,
     /// 選ばれた選択肢の `Choice::value`。
@@ -243,7 +255,7 @@ fn zoom_out(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
 /// 右クリックメニューの倍率の一覧（%）。
 const ZOOM_LIST: [u16; 10] = [10, 25, 50, 75, 100, 150, 200, 300, 400, 800];
 
-fn zoom_choices(model: &ScrapModel) -> Vec<Choice> {
+fn zoom_choices(model: &ScrapModel, _: &Appearance) -> Vec<Choice> {
     ZOOM_LIST
         .iter()
         .map(|&percent| Choice {
@@ -269,6 +281,133 @@ fn zoom_actual(model: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     } else {
         Vec::new()
     }
+}
+
+/// 見た目を変えたあとの `Effect`。
+fn redrawn(changed: bool) -> Vec<Effect> {
+    if changed {
+        vec![Effect::Redraw]
+    } else {
+        Vec::new()
+    }
+}
+
+/// 透明度の刻み（%）。`Ctrl+ホイール` の 1 ノッチと、一覧の間隔。
+const OPACITY_STEP: u8 = 10;
+
+/// 透明度の上書きを `opacity`（範囲に収める）にする。いまの透明度と同じなら false。
+fn set_opacity(model: &mut ScrapModel, defaults: &Appearance, opacity: u8) -> bool {
+    let opacity = opacity.clamp(*OPACITY_RANGE.start(), *OPACITY_RANGE.end());
+    if model.appearance(defaults).opacity == opacity {
+        return false;
+    }
+    model.appearance_overrides.opacity = Some(opacity);
+    true
+}
+
+/// 1 段濃くする（10% の倍数のうち、いまより大きい最初のもの）。
+fn opacity_up(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let now = model.appearance(&context.appearance).opacity;
+    let next = (now / OPACITY_STEP + 1).saturating_mul(OPACITY_STEP);
+    redrawn(set_opacity(model, &context.appearance, next))
+}
+
+/// 1 段薄くする（10% の倍数のうち、いまより小さい最初のもの）。
+fn opacity_down(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let now = model.appearance(&context.appearance).opacity;
+    let next = (now.saturating_sub(1) / OPACITY_STEP) * OPACITY_STEP;
+    redrawn(set_opacity(model, &context.appearance, next))
+}
+
+fn opacity_choices(model: &ScrapModel, defaults: &Appearance) -> Vec<Choice> {
+    let now = model.appearance(defaults).opacity;
+    (1..=10)
+        .rev()
+        .map(|n| n * OPACITY_STEP)
+        .map(|percent| Choice {
+            label: ChoiceLabel::Percent(i32::from(percent)),
+            value: i32::from(percent),
+            checked: now == percent,
+        })
+        .collect()
+}
+
+/// 透明度の一覧から選んだ透明度にする。
+fn opacity_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let Some(choice) = context.choice else {
+        return Vec::new();
+    };
+    let percent = u8::try_from(choice.max(0)).unwrap_or(u8::MAX);
+    redrawn(set_opacity(model, &context.appearance, percent))
+}
+
+/// 枠の一覧の「枠なし」の値。色の値（`0xRRGGBB`）は 0 以上なので重ならない。
+const NO_BORDER: i32 = -1;
+
+/// 枠の一覧の色（文言のキー、`0xRRGGBB`）。先頭は設定の既定の色。
+const BORDER_COLORS: [(&str, u32); 5] = [
+    ("scrap.border.gray", 0x80_80_80),
+    ("scrap.border.black", 0x00_00_00),
+    ("scrap.border.white", 0xFF_FF_FF),
+    ("scrap.border.red", 0xFF_00_00),
+    ("scrap.border.blue", 0x00_00_FF),
+];
+
+fn border_choices(model: &ScrapModel, defaults: &Appearance) -> Vec<Choice> {
+    let now = model.appearance(defaults).border.map(|b| b.color);
+    let none = Choice {
+        label: ChoiceLabel::Key("scrap.border.none"),
+        value: NO_BORDER,
+        checked: now.is_none(),
+    };
+    let colors = BORDER_COLORS.iter().map(|&(key, color)| Choice {
+        label: ChoiceLabel::Key(key),
+        value: color as i32,
+        checked: now == Some(color),
+    });
+    std::iter::once(none).chain(colors).collect()
+}
+
+/// 枠の一覧から選んだ枠にする（`NO_BORDER` なら枠なし、ほかはその色の枠）。
+fn border_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let Some(choice) = context.choice else {
+        return Vec::new();
+    };
+    let color = u32::try_from(choice).ok().map(|c| c & 0xFF_FF_FF);
+    if model
+        .appearance(&context.appearance)
+        .border
+        .map(|b| b.color)
+        == color
+    {
+        return Vec::new();
+    }
+    model.appearance_overrides.border = Some(color);
+    vec![Effect::Redraw]
+}
+
+fn shadow_choices(model: &ScrapModel, defaults: &Appearance) -> Vec<Choice> {
+    let now = model.appearance(defaults).shadow;
+    [("scrap.shadow.on", true), ("scrap.shadow.off", false)]
+        .map(|(key, shadow)| Choice {
+            label: ChoiceLabel::Key(key),
+            value: i32::from(shadow),
+            checked: now == shadow,
+        })
+        .to_vec()
+}
+
+/// 影の一覧から選んだ有無にする（1 であり、0 でなし）。
+fn shadow_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let Some(choice) = context.choice else {
+        return Vec::new();
+    };
+    let shadow = choice != 0;
+    if model.appearance(&context.appearance).shadow == shadow {
+        return Vec::new();
+    }
+    model.appearance_overrides.shadow = Some(shadow);
+    vec![Effect::Redraw]
 }
 
 /// コンパクト表示に畳む、または広げる。畳む基準点は拡大縮小と同じ（マウスならカーソル、ほかは中心）。
@@ -507,6 +646,71 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         run: zoom_actual,
     },
     OperationDescriptor {
+        id: "opacity",
+        label_key: "scrap.op.opacity",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::View,
+        order: 20,
+        drag_only: false,
+        in_menu: true,
+        can_execute: unfolded,
+        choices: Some(opacity_choices),
+        run: opacity_to,
+    },
+    OperationDescriptor {
+        id: "opacity_up",
+        label_key: "scrap.op.opacity_up",
+        default_shortcut: &[],
+        default_mouse: Some(MouseGesture::CtrlWheelUp),
+        group: Group::View,
+        order: 21,
+        drag_only: false,
+        in_menu: false,
+        can_execute: unfolded,
+        choices: None,
+        run: opacity_up,
+    },
+    OperationDescriptor {
+        id: "opacity_down",
+        label_key: "scrap.op.opacity_down",
+        default_shortcut: &[],
+        default_mouse: Some(MouseGesture::CtrlWheelDown),
+        group: Group::View,
+        order: 22,
+        drag_only: false,
+        in_menu: false,
+        can_execute: unfolded,
+        choices: None,
+        run: opacity_down,
+    },
+    OperationDescriptor {
+        id: "border",
+        label_key: "scrap.op.border",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::View,
+        order: 23,
+        drag_only: false,
+        in_menu: true,
+        can_execute: unfolded,
+        choices: Some(border_choices),
+        run: border_to,
+    },
+    OperationDescriptor {
+        id: "shadow",
+        label_key: "scrap.op.shadow",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::View,
+        order: 24,
+        drag_only: false,
+        in_menu: true,
+        can_execute: unfolded,
+        choices: Some(shadow_choices),
+        run: shadow_to,
+    },
+    OperationDescriptor {
         id: "toggle_compact",
         label_key: "scrap.op.toggle_compact",
         default_shortcut: &[],
@@ -640,8 +844,21 @@ pub enum MenuEntry {
     Item(MenuItem),
     /// 引数のある操作（`choices` が Some）。選択肢を子メニューに並べる。
     Submenu(Submenu),
+    /// 操作をまとめた子メニュー（「見た目」など。`FOLDERS`）。それ自体は操作ではない。
+    Folder(Folder),
     Separator,
 }
+
+/// 操作をまとめた子メニュー。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Folder {
+    pub label_key: &'static str,
+    pub entries: Vec<MenuEntry>,
+}
+
+/// メニューで子メニューにまとめる操作（文言のキー、操作の id）。まとめた操作は、最初の操作の位置に並ぶ。
+const FOLDERS: &[(&str, &[OperationId])] =
+    &[("scrap.op.appearance", &["opacity", "border", "shadow"])];
 
 /// 子メニューに展開する操作。選んだ選択肢の `value` を `OpContext::choice` に入れて実行する。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,11 +883,13 @@ pub struct MenuItem {
 
 /// 右クリックメニューを `ops`（ふつうは `OPERATIONS`）から作る。`group` の宣言の順、その中は `order` の順に並べ、
 /// `group` の変わり目に区切りを入れる。ドラッグでしか呼べない操作と `in_menu` が false の操作は出さない。
-/// 引数のある操作（`choices`）は子メニュー（`MenuEntry::Submenu`）にする。
+/// 引数のある操作（`choices`）は子メニュー（`MenuEntry::Submenu`）にし、`FOLDERS` の操作は `MenuEntry::Folder`
+/// にまとめる。`defaults` は全体の見た目の既定値（見た目の一覧のチェックに使う）。
 pub fn menu(
     ops: &'static [OperationDescriptor],
     model: &ScrapModel,
     shortcuts: &Shortcuts,
+    defaults: &Appearance,
 ) -> Vec<MenuEntry> {
     let mut listed: Vec<&OperationDescriptor> = ops
         .iter()
@@ -685,12 +904,12 @@ pub fn menu(
         }
         group = Some(op.group);
         let enabled = (op.can_execute)(model);
-        entries.push(match op.choices {
+        let entry = match op.choices {
             Some(choices) => MenuEntry::Submenu(Submenu {
                 id: op.id,
                 label_key: op.label_key,
                 enabled,
-                choices: choices(model),
+                choices: choices(model, defaults),
             }),
             None => MenuEntry::Item(MenuItem {
                 id: op.id,
@@ -698,7 +917,20 @@ pub fn menu(
                 enabled,
                 shortcut: shortcuts.chords(op.id).first().copied(),
             }),
-        });
+        };
+        let Some(&(label_key, _)) = FOLDERS.iter().find(|(_, ids)| ids.contains(&op.id)) else {
+            entries.push(entry);
+            continue;
+        };
+        match entries.last_mut() {
+            Some(MenuEntry::Folder(folder)) if folder.label_key == label_key => {
+                folder.entries.push(entry);
+            }
+            _ => entries.push(MenuEntry::Folder(Folder {
+                label_key,
+                entries: vec![entry],
+            })),
+        }
     }
     entries
 }
@@ -708,7 +940,10 @@ mod tests {
     use super::*;
     use crate::geometry::{Point, Rect, Size};
     use crate::image::Image;
-    use crate::scrap::{Mode, ScrapModel, TrimInput, ZOOM_ACTUAL, ZOOM_MAX, ZOOM_MIN, ZoomAnchor};
+    use crate::scrap::{
+        Appearance, Border, Mode, ScrapModel, TrimInput, ZOOM_ACTUAL, ZOOM_MAX, ZOOM_MIN,
+        ZoomAnchor,
+    };
     use crate::settings::Conflict;
 
     fn scrap() -> ScrapModel {
@@ -923,6 +1158,207 @@ mod tests {
         assert_eq!(handed, source.crop(Rect::new(10, 20, 60, 60)));
     }
 
+    /// 全体の既定値を `defaults` にして呼んだときの引数。
+    fn with_defaults(defaults: Appearance) -> OpContext {
+        OpContext {
+            appearance: defaults,
+            ..OpContext::default()
+        }
+    }
+
+    fn checked_values(id: &str, model: &ScrapModel, defaults: &Appearance) -> Vec<i32> {
+        (op(id).choices.expect("has choices"))(model, defaults)
+            .iter()
+            .filter(|c| c.checked)
+            .map(|c| c.value)
+            .collect()
+    }
+
+    #[test]
+    fn ctrl_wheel_changes_the_opacity_by_10_within_10_to_100() {
+        let id = |g| mouse_operation(OPERATIONS, g).map(|op| op.id);
+        assert_eq!(id(MouseGesture::CtrlWheelUp), Some("opacity_up"));
+        assert_eq!(id(MouseGesture::CtrlWheelDown), Some("opacity_down"));
+        let defaults = Appearance::default();
+        let mut model = scrap();
+        let context = with_defaults(defaults);
+        // 既定値の 100% より上はない
+        assert_eq!(execute(op("opacity_up"), &mut model, &context), vec![]);
+        assert_eq!(model.appearance_overrides.opacity, None);
+        let mut seen = Vec::new();
+        while execute(op("opacity_down"), &mut model, &context) == [Effect::Redraw] {
+            seen.push(model.appearance(&defaults).opacity);
+        }
+        assert_eq!(seen, [90, 80, 70, 60, 50, 40, 30, 20, 10]);
+        assert_eq!(execute(op("opacity_down"), &mut model, &context), vec![]);
+        assert_eq!(
+            execute(op("opacity_up"), &mut model, &context),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(model.appearance(&defaults).opacity, 20);
+        // 既定値が刻みの間なら、次の刻みに合わせる
+        let mut model = scrap();
+        let context = with_defaults(Appearance {
+            opacity: 85,
+            ..defaults
+        });
+        execute(op("opacity_up"), &mut model, &context);
+        assert_eq!(model.appearance_overrides.opacity, Some(90));
+        let mut model = scrap();
+        execute(op("opacity_down"), &mut model, &context);
+        assert_eq!(model.appearance_overrides.opacity, Some(80));
+    }
+
+    #[test]
+    fn the_opacity_list_checks_the_actual_opacity_and_choosing_overrides_it() {
+        let defaults = Appearance {
+            opacity: 70,
+            ..Appearance::default()
+        };
+        let choices = (op("opacity").choices.unwrap())(&scrap(), &defaults);
+        assert_eq!(
+            choices.iter().map(|c| c.label).collect::<Vec<_>>(),
+            [100, 90, 80, 70, 60, 50, 40, 30, 20, 10].map(ChoiceLabel::Percent)
+        );
+        assert_eq!(checked_values("opacity", &scrap(), &defaults), [70]);
+        let mut model = scrap();
+        let chosen = OpContext {
+            choice: Some(30),
+            ..with_defaults(defaults)
+        };
+        assert_eq!(
+            execute(op("opacity"), &mut model, &chosen),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(model.appearance(&defaults).opacity, 30);
+        assert_eq!(checked_values("opacity", &model, &defaults), [30]);
+        // 範囲の外の値は範囲に収める。選択肢なしなら何もしない
+        let out = OpContext {
+            choice: Some(5),
+            ..with_defaults(defaults)
+        };
+        execute(op("opacity"), &mut model, &out);
+        assert_eq!(model.appearance(&defaults).opacity, 10);
+        assert_eq!(
+            execute(op("opacity"), &mut model, &with_defaults(defaults)),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn the_border_list_offers_none_and_colors_and_checks_the_actual_border() {
+        let defaults = Appearance::default();
+        let choices = (op("border").choices.unwrap())(&scrap(), &defaults);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|c| (c.label, c.value))
+                .collect::<Vec<_>>(),
+            [
+                (ChoiceLabel::Key("scrap.border.none"), -1),
+                (ChoiceLabel::Key("scrap.border.gray"), 0x80_80_80),
+                (ChoiceLabel::Key("scrap.border.black"), 0x00_00_00),
+                (ChoiceLabel::Key("scrap.border.white"), 0xFF_FF_FF),
+                (ChoiceLabel::Key("scrap.border.red"), 0xFF_00_00),
+                (ChoiceLabel::Key("scrap.border.blue"), 0x00_00_FF),
+            ]
+        );
+        // 既定値は 1px の灰色
+        assert_eq!(checked_values("border", &scrap(), &defaults), [0x80_80_80]);
+        let no_border = Appearance {
+            border: None,
+            ..defaults
+        };
+        assert_eq!(checked_values("border", &scrap(), &no_border), [-1]);
+        // 一覧にない色なら、どれにもチェックを付けない
+        let custom = Appearance {
+            border: Some(Border {
+                width: 2,
+                color: 0x12_34_56,
+            }),
+            ..defaults
+        };
+        assert_eq!(checked_values("border", &scrap(), &custom), [] as [i32; 0]);
+    }
+
+    #[test]
+    fn choosing_a_border_changes_only_this_scrap_and_redraws() {
+        let defaults = Appearance::default();
+        let mut model = scrap();
+        let choose = |value| OpContext {
+            choice: Some(value),
+            ..with_defaults(defaults)
+        };
+        assert_eq!(
+            execute(op("border"), &mut model, &choose(-1)),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(model.appearance(&defaults).border, None);
+        assert_eq!(checked_values("border", &model, &defaults), [-1]);
+        assert_eq!(
+            execute(op("border"), &mut model, &choose(0xFF_00_00)),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(
+            model.appearance(&defaults).border,
+            Some(Border {
+                width: 1,
+                color: 0xFF_00_00,
+            })
+        );
+        // 同じものを選び直しても変わらない
+        assert_eq!(
+            execute(op("border"), &mut model, &choose(0xFF_00_00)),
+            vec![]
+        );
+        assert_eq!(scrap().appearance(&defaults), defaults);
+    }
+
+    #[test]
+    fn the_shadow_list_offers_on_and_off_and_choosing_switches_it() {
+        let defaults = Appearance::default();
+        let choices = (op("shadow").choices.unwrap())(&scrap(), &defaults);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|c| (c.label, c.value))
+                .collect::<Vec<_>>(),
+            [
+                (ChoiceLabel::Key("scrap.shadow.on"), 1),
+                (ChoiceLabel::Key("scrap.shadow.off"), 0),
+            ]
+        );
+        assert_eq!(checked_values("shadow", &scrap(), &defaults), [1]);
+        let mut model = scrap();
+        let off = OpContext {
+            choice: Some(0),
+            ..with_defaults(defaults)
+        };
+        assert_eq!(
+            execute(op("shadow"), &mut model, &off),
+            vec![Effect::Redraw]
+        );
+        assert!(!model.appearance(&defaults).shadow);
+        assert_eq!(checked_values("shadow", &model, &defaults), [0]);
+        assert_eq!(execute(op("shadow"), &mut model, &off), vec![]);
+    }
+
+    #[test]
+    fn the_appearance_lists_take_no_shortcut() {
+        let overrides = ShortcutOverrides::from([
+            ("opacity".to_owned(), Some(chord("O"))),
+            ("border".to_owned(), Some(chord("B"))),
+            ("shadow".to_owned(), Some(chord("H"))),
+            ("opacity_up".to_owned(), Some(chord("Ctrl+Up"))),
+        ]);
+        let shortcuts = Shortcuts::new(OPERATIONS, &overrides);
+        assert_eq!(
+            shortcuts.ignored_overrides(),
+            ["border", "opacity", "shadow"]
+        );
+        assert_eq!(bound(&shortcuts, "Ctrl+Up"), Some("opacity_up"));
+    }
+
     #[test]
     fn a_double_click_folds_around_the_cursor_and_toggles_back() {
         let id = |g| mouse_operation(OPERATIONS, g).map(|op| op.id);
@@ -988,14 +1424,19 @@ mod tests {
         let shortcuts = Shortcuts::new(OPERATIONS, &ShortcutOverrides::new());
         let mut model = scrap();
         model.fold(ZoomAnchor::Center);
-        let enabled: Vec<(OperationId, bool)> = menu(OPERATIONS, &model, &shortcuts)
-            .iter()
-            .filter_map(|entry| match entry {
-                MenuEntry::Item(item) => Some((item.id, item.enabled)),
-                MenuEntry::Submenu(submenu) => Some((submenu.id, submenu.enabled)),
-                MenuEntry::Separator => None,
-            })
-            .collect();
+        let enabled: Vec<(OperationId, bool)> =
+            menu(OPERATIONS, &model, &shortcuts, &Appearance::default())
+                .into_iter()
+                .flat_map(|entry| match entry {
+                    MenuEntry::Folder(folder) => folder.entries,
+                    other => vec![other],
+                })
+                .filter_map(|entry| match entry {
+                    MenuEntry::Item(item) => Some((item.id, item.enabled)),
+                    MenuEntry::Submenu(submenu) => Some((submenu.id, submenu.enabled)),
+                    MenuEntry::Folder(_) | MenuEntry::Separator => None,
+                })
+                .collect();
         assert_eq!(
             enabled,
             [
@@ -1005,6 +1446,9 @@ mod tests {
                 ("trim", false),
                 ("untrim", false),
                 ("zoom", false),
+                ("opacity", false),
+                ("border", false),
+                ("shadow", false),
                 ("toggle_compact", true),
                 ("close", true),
             ]
@@ -1078,7 +1522,7 @@ mod tests {
 
     #[test]
     fn an_operation_with_choices_gets_no_shortcut() {
-        fn opacity_choices(_: &ScrapModel) -> Vec<Choice> {
+        fn opacity_choices(_: &ScrapModel, _: &Appearance) -> Vec<Choice> {
             vec![Choice {
                 label: ChoiceLabel::Percent(50),
                 value: 50,
@@ -1121,7 +1565,7 @@ mod tests {
             .map(|p| zoom_choice(p, p == 100))
             .to_vec();
         assert_eq!(
-            menu(OPERATIONS, &scrap(), &shortcuts),
+            menu(OPERATIONS, &scrap(), &shortcuts, &Appearance::default()),
             vec![
                 item("copy", true, Some("Ctrl+C")),
                 item("save_default", true, Some("Ctrl+S")),
@@ -1136,6 +1580,17 @@ mod tests {
                     enabled: true,
                     choices: zoom_list,
                 }),
+                MenuEntry::Folder(Folder {
+                    label_key: "scrap.op.appearance",
+                    entries: ["opacity", "border", "shadow"]
+                        .map(|id| MenuEntry::Submenu(Submenu {
+                            id,
+                            label_key: op(id).label_key,
+                            enabled: true,
+                            choices: (op(id).choices.unwrap())(&scrap(), &Appearance::default()),
+                        }))
+                        .to_vec(),
+                }),
                 item("toggle_compact", true, None),
                 MenuEntry::Separator,
                 item("close", true, Some("Esc")),
@@ -1148,14 +1603,18 @@ mod tests {
         let choices = op("zoom").choices.expect("zoom has choices");
         let mut model = scrap();
         model.set_zoom(200, ZoomAnchor::Center);
-        let checked: Vec<i32> = choices(&model)
+        let checked: Vec<i32> = choices(&model, &Appearance::default())
             .iter()
             .filter(|c| c.checked)
             .map(|c| c.value)
             .collect();
         assert_eq!(checked, [200]);
         model.set_zoom(125, ZoomAnchor::Center);
-        assert!(choices(&model).iter().all(|c| !c.checked));
+        assert!(
+            choices(&model, &Appearance::default())
+                .iter()
+                .all(|c| !c.checked)
+        );
     }
 
     #[test]
@@ -1191,7 +1650,7 @@ mod tests {
         fn never(_: &ScrapModel) -> bool {
             false
         }
-        fn levels(_: &ScrapModel) -> Vec<Choice> {
+        fn levels(_: &ScrapModel, _: &Appearance) -> Vec<Choice> {
             vec![
                 Choice {
                     label: ChoiceLabel::Key("low"),
@@ -1227,11 +1686,11 @@ mod tests {
                 id,
                 label_key: id,
                 enabled,
-                choices: levels(&scrap()),
+                choices: levels(&scrap(), &Appearance::default()),
             })
         };
         assert_eq!(
-            menu(TABLE, &scrap(), &shortcuts),
+            menu(TABLE, &scrap(), &shortcuts, &Appearance::default()),
             vec![
                 submenu("level", true),
                 submenu("blocked", false),
@@ -1248,7 +1707,7 @@ mod tests {
             ("copy".to_owned(), None),
         ]);
         let shortcuts = Shortcuts::new(OPERATIONS, &overrides);
-        let entries = menu(OPERATIONS, &scrap(), &shortcuts);
+        let entries = menu(OPERATIONS, &scrap(), &shortcuts, &Appearance::default());
         assert_eq!(entries.first(), Some(&item("copy", true, None)));
         assert_eq!(entries.last(), Some(&item("close", true, Some("Ctrl+W"))));
     }
@@ -1272,7 +1731,7 @@ mod tests {
         ];
         let shortcuts = Shortcuts::new(TABLE, &ShortcutOverrides::new());
         assert_eq!(
-            menu(TABLE, &scrap(), &shortcuts),
+            menu(TABLE, &scrap(), &shortcuts, &Appearance::default()),
             vec![
                 item("a", false, None),
                 item("b", true, None),
@@ -1339,6 +1798,23 @@ mod tests {
             for chord in op.default_shortcut {
                 // Key::known で作ったキーが名前の表にある（設定ファイルに書け、表示できる）
                 assert_eq!(chord.to_string().parse::<Chord>(), Ok(*chord), "{}", op.id);
+            }
+        }
+    }
+
+    #[test]
+    fn every_choice_and_folder_has_a_label() {
+        let catalog =
+            crate::i18n::Catalog::parse(include_str!("../../../../locales/ja.toml")).unwrap();
+        for (key, _) in FOLDERS {
+            assert_ne!(catalog.text(key), *key);
+        }
+        for op in OPERATIONS {
+            let Some(choices) = op.choices else { continue };
+            for choice in choices(&scrap(), &Appearance::default()) {
+                if let ChoiceLabel::Key(key) = choice.label {
+                    assert_ne!(catalog.text(key), key, "{}", op.id);
+                }
             }
         }
     }

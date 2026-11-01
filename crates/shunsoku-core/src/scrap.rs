@@ -89,6 +89,8 @@ pub struct ScrapModel {
     pub mode: Mode,
     /// 倍率（%）。画像の画素が基準で、100 が画素等倍。`ZOOM_MIN..=ZOOM_MAX` に収める。
     zoom: u16,
+    /// 見た目のスクラップごとの上書き。全体の既定値に重ねる（`ScrapModel::appearance`）。
+    pub appearance_overrides: AppearanceOverrides,
     /// ウィンドウのあるモニタの DPI。最初の `set_dpi` までは分からない。
     dpi: Option<u32>,
     /// 「見かけの大きさを保つ」で倍率を計算し直す元: 最後に倍率を決めたときの倍率と DPI。倍率を DPI の比で
@@ -108,6 +110,7 @@ impl ScrapModel {
             image_size,
             mode: Mode::Normal,
             zoom: ZOOM_ACTUAL,
+            appearance_overrides: AppearanceOverrides::default(),
             dpi: None,
             dpi_origin: None,
             folded: None,
@@ -158,6 +161,11 @@ impl ScrapModel {
             unfolded.y.saturating_add(p.y.saturating_sub(folded.y)),
         );
         true
+    }
+
+    /// 実際の見た目。全体の既定値 `defaults` に、このスクラップの上書きを重ねる。
+    pub fn appearance(&self, defaults: &Appearance) -> Appearance {
+        self.appearance_overrides.apply(defaults)
     }
 
     /// 倍率（%）。
@@ -414,9 +422,11 @@ impl ScrapModel {
         Rect::from_origin_size(self.position, size)
     }
 
-    /// ウィンドウの矩形（スクリーン座標）。画像の外側に枠と影の分を足す。
-    pub fn window_rect(&self, appearance: &Appearance) -> Rect {
-        self.image_rect().inflate(appearance.margin())
+    /// ウィンドウの矩形（スクリーン座標）。画像の外側に、実際の見た目（既定値 `defaults` に上書きを重ねたもの）の
+    /// 枠と影の分を足す。
+    pub fn window_rect(&self, defaults: &Appearance) -> Rect {
+        self.image_rect()
+            .inflate(self.appearance(defaults).margin())
     }
 }
 
@@ -448,6 +458,39 @@ pub struct Appearance {
     pub opacity: u8,
     pub border: Option<Border>,
     pub shadow: bool,
+}
+
+/// 見た目のスクラップごとの上書き。None の項目は全体の既定値（設定ファイルの `[scrap]`）のまま。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppearanceOverrides {
+    /// 透明度（%）。
+    pub opacity: Option<u8>,
+    /// 枠。`Some(None)` で枠なし、`Some(Some(color))` でその色（`0xRRGGBB`）の枠。太さは既定値の太さ（既定値が
+    /// 枠なしなら設定の既定の太さ）。
+    pub border: Option<Option<u32>>,
+    /// 影の有無。
+    pub shadow: Option<bool>,
+}
+
+impl AppearanceOverrides {
+    /// `defaults` に重ねた見た目。
+    fn apply(&self, defaults: &Appearance) -> Appearance {
+        let border = match self.border {
+            None => defaults.border,
+            Some(None) => None,
+            Some(Some(color)) => Some(Border {
+                width: defaults
+                    .border
+                    .map_or(crate::settings::Border::default().width, |b| b.width),
+                color,
+            }),
+        };
+        Appearance {
+            opacity: self.opacity.unwrap_or(defaults.opacity),
+            border,
+            shadow: self.shadow.unwrap_or(defaults.shadow),
+        }
+    }
 }
 
 /// 影の幅（物理ピクセル）。枠の外側に広がる。
@@ -610,6 +653,95 @@ mod tests {
             ..ScrapAppearance::default()
         };
         assert_eq!(Appearance::from(hidden).border, None);
+    }
+
+    #[test]
+    fn without_overrides_the_scrap_looks_like_the_defaults() {
+        let scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        let defaults = Appearance {
+            opacity: 80,
+            border: Some(Border {
+                width: 3,
+                color: 0x12_34_56,
+            }),
+            shadow: false,
+        };
+        assert_eq!(scrap.appearance(&defaults), defaults);
+    }
+
+    #[test]
+    fn overriding_some_of_the_appearance_keeps_the_defaults_for_the_rest() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.appearance_overrides.opacity = Some(50);
+        let defaults = Appearance::default();
+        assert_eq!(
+            scrap.appearance(&defaults),
+            Appearance {
+                opacity: 50,
+                ..defaults
+            }
+        );
+        // 枠の色だけを変えても、太さは既定値のまま
+        let thick = Appearance {
+            border: Some(Border {
+                width: 4,
+                color: 0x80_80_80,
+            }),
+            ..defaults
+        };
+        scrap.appearance_overrides.border = Some(Some(0xFF_00_00));
+        assert_eq!(
+            scrap.appearance(&thick).border,
+            Some(Border {
+                width: 4,
+                color: 0xFF_00_00,
+            })
+        );
+    }
+
+    #[test]
+    fn overriding_all_of_the_appearance_ignores_the_defaults() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.appearance_overrides = AppearanceOverrides {
+            opacity: Some(30),
+            border: Some(Some(0x00_00_FF)),
+            shadow: Some(true),
+        };
+        let plain = Appearance {
+            opacity: 100,
+            border: None,
+            shadow: false,
+        };
+        // 既定値で枠がなければ、枠を付けたときの太さは設定の既定の太さ
+        assert_eq!(
+            scrap.appearance(&plain),
+            Appearance {
+                opacity: 30,
+                border: Some(Border {
+                    width: 1,
+                    color: 0x00_00_FF,
+                }),
+                shadow: true,
+            }
+        );
+        scrap.appearance_overrides.border = Some(None);
+        scrap.appearance_overrides.shadow = Some(false);
+        assert_eq!(scrap.appearance(&Appearance::default()).border, None);
+        assert!(!scrap.appearance(&Appearance::default()).shadow);
+    }
+
+    #[test]
+    fn the_window_follows_the_overridden_border_and_shadow() {
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        let defaults = Appearance::default();
+        assert_eq!(scrap.window_rect(&defaults), Rect::new(-109, 41, 209, 259));
+        scrap.appearance_overrides.shadow = Some(false);
+        assert_eq!(scrap.window_rect(&defaults), Rect::new(-101, 49, 201, 251));
+        scrap.appearance_overrides.border = Some(None);
+        assert_eq!(scrap.window_rect(&defaults), Rect::new(-100, 50, 200, 250));
+        // 透明度は大きさに関係しない
+        scrap.appearance_overrides.opacity = Some(10);
+        assert_eq!(scrap.window_rect(&defaults), Rect::new(-100, 50, 200, 250));
     }
 
     #[test]
