@@ -22,7 +22,7 @@ pub fn log_path(value: Option<OsString>) -> Option<PathBuf> {
 pub enum Mark {
     /// プロセスの開始（`main` に入った直後）。
     ProcessStart,
-    /// トレイの登録の完了（起動時の 1 回目）。
+    /// トレイの最初の登録の完了（起動時に登録できなければ、あとで初めて登録できた時点）。
     TrayRegistered,
     /// ホットキーの受信（`WM_HOTKEY`）。
     HotkeyReceived,

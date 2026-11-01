@@ -128,6 +128,8 @@ struct App {
     /// 設定ファイルの監視。`APPDATA` がないときや始められなかったときは None。
     watcher: Option<settings_watch::Watcher>,
     tray: tray::Tray,
+    /// トレイの登録に 1 度でも成功したか。性能の区切り `TrayRegistered` は最初の成功のときだけ書く。
+    tray_registered: bool,
     /// いま使っている設定（読み込み直しで TOML として読めなかったときは、直前の有効な設定のまま）。
     settings: Settings,
     /// 設定ファイルのパス。通知に出す。
@@ -450,7 +452,8 @@ fn start(
         icon,
         text("tray.tooltip").to_owned(),
     );
-    if tray.register() {
+    let tray_registered = tray.register();
+    if tray_registered {
         perf::mark(Mark::TrayRegistered);
         log::info!("tray icon registered");
     } else {
@@ -472,6 +475,7 @@ fn start(
     let app = App {
         watcher,
         tray,
+        tray_registered,
         settings,
         settings_path,
         settings_events,
@@ -618,7 +622,15 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
         }
         // 登録メッセージは定数でないので match の外で比べる
         _ if Some(&msg) == TASKBAR_CREATED.get() => {
-            let ok = with_app(|app| app.tray.register());
+            let ok = with_app(|app| {
+                let ok = app.tray.register();
+                // 起動時に登録できず、ここで初めて登録できたときも、コールドスタートの終わりとして書く
+                if ok && !app.tray_registered {
+                    app.tray_registered = true;
+                    perf::mark(Mark::TrayRegistered);
+                }
+                ok
+            });
             log::info!("taskbar re-created; tray icon re-registered: {ok:?}");
             Some(LRESULT(0))
         }

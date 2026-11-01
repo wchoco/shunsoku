@@ -56,7 +56,7 @@ M1 の行は、ユーザーが実機で測ってから入れる。測った環�
   | 区切り | 時点 |
   |---|---|
   | `process_start` | プロセスの開始（`main` に入った直後） |
-  | `tray_registered` | 起動時のトレイの登録の完了 |
+  | `tray_registered` | トレイの最初の登録の完了（起動時に登録できなければ、`TaskbarCreated` のあとに初めて登録できた時点） |
   | `hotkey_received` | ホットキーの受信（`WM_HOTKEY`） |
   | `overlay_flushed` | 範囲選択の画面を出し、全モニタで `DwmFlush` が返った時点 |
   | `scrap_shown` | スクラップを 1 枚出し終えた時点 |
