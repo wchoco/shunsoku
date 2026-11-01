@@ -734,14 +734,16 @@ fn on_tray(owner: HWND, event: tray::Event) {
             let hide_or_show = if any_hidden {
                 menu::Entry::Item {
                     id: CMD_SHOW_ALL,
-                    label: text("tray.menu.show_all"),
+                    label: text("tray.menu.show_all").into(),
                     enabled: true,
+                    checked: false,
                 }
             } else {
                 menu::Entry::Item {
                     id: CMD_HIDE_ALL,
-                    label: text("tray.menu.hide_all"),
+                    label: text("tray.menu.hide_all").into(),
                     enabled: any_scrap,
+                    checked: false,
                 }
             };
             let items = [
@@ -758,8 +760,9 @@ fn on_tray(owner: HWND, event: tray::Event) {
                 },
                 menu::Entry::Item {
                     id: CMD_CLOSE_ALL,
-                    label: text("tray.menu.close_all"),
+                    label: text("tray.menu.close_all").into(),
                     enabled: any_scrap,
+                    checked: false,
                 },
                 hide_or_show,
                 menu::Entry::Item {
