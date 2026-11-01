@@ -1,0 +1,8 @@
+[package]
+name = "perf-harness"
+description = "性能を計測するハーネス（M1 では中身がない）"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

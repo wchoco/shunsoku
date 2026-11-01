@@ -1,0 +1,8 @@
+[package]
+name = "shunsoku-cli"
+description = "コマンドラインから常駐本体を操作する CLI（M1 では中身がない）"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
