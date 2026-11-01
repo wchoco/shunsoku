@@ -1112,6 +1112,7 @@ fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
     // 押しっぱなしの自動リピート（lParam の bit 30 = 直前も押されていた）
     let repeat = lparam.0 & (1 << 30) != 0;
     let shift = down(VK_SHIFT);
+    let win = down(VK_LWIN) || down(VK_RWIN);
     let arrow = |direction| Some(Input::Arrow { direction, shift });
     match VIRTUAL_KEY(wparam.0 as u16) {
         VK_ESCAPE => Some(Input::Escape),
@@ -1121,7 +1122,8 @@ fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
         VK_DOWN => arrow(Direction::Down),
         // 押しっぱなしで始点と終点が続けて決まらないよう、リピートは無視する
         VK_SPACE if !repeat => Some(Input::Space),
-        VK_A if down(VK_CONTROL) && !repeat => Some(if shift {
+        // Ctrl+A と Ctrl+Shift+A だけ。Ctrl+Alt+A などほかの修飾キーとの組み合わせは対象にしない
+        VK_A if down(VK_CONTROL) && !down(VK_MENU) && !win && !repeat => Some(if shift {
             Input::SelectAllMonitors
         } else {
             Input::SelectMonitor
