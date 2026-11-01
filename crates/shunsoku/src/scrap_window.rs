@@ -1,8 +1,9 @@
 //! スクラップのウィンドウ: 最前面のレイヤード ウィンドウ。中身は `UpdateLayeredWindow` で
 //! premultiplied BGRA の DIB（`render::Canvas` の DC）から出す。
 //!
-//! - 位置と大きさはスクリーン座標の物理ピクセル。画素を等倍で出すので、DPI が変わっても大きさを変えない
-//!   （ウィンドウ プロシージャは `app` が持ち、`WM_DPICHANGED` で 0 を返す）。
+//! - 位置と大きさはスクリーン座標の物理ピクセル。大きさは core の `ScrapModel::window_rect`（倍率を掛けた
+//!   表示の大きさ + 余白）で決まり、DPI が変わっても変えない（ウィンドウ プロシージャは `app` が持ち、
+//!   `WM_DPICHANGED` で 0 を返す）。
 //! - 透明度は `SourceConstantAlpha` で掛ける。
 //! - シェルの全画面の判定から外す（`NonRudeHWND`）。モニタ全体を覆うスクラップを最前面に出すと、
 //!   シェルが全画面のウィンドウとみなしてタスクバーを後ろに回し、動かすたびにモニタを覆う・覆わないが
@@ -12,6 +13,7 @@
 use shunsoku_core::geometry::Rect;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, IDC_ARROW, LoadCursorW, RegisterClassExW, RemovePropW, SW_SHOW,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetPropW,
@@ -117,6 +119,15 @@ impl ScrapWindow {
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    /// ウィンドウのあるモニタの DPI。取れなければ 96。
+    pub fn dpi(&self) -> u32 {
+        // SAFETY: 自分のウィンドウ
+        match unsafe { GetDpiForWindow(self.hwnd) } {
+            0 => 96,
+            dpi => dpi,
+        }
     }
 
     /// 大きさを変えずに、左上を `rect` の左上に動かす（中身は描き直さない）。
