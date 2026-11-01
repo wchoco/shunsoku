@@ -911,9 +911,23 @@ fn show_scrap_menu(hwnd: HWND, lparam: LPARAM) {
 enum Deferred {
     Copy(Image),
     Save(Image),
-    /// コピーや保存の画像を作れなかった。
-    RenderFailed(Effect, String),
+    /// コピーや保存の画像を作れなかった。`failed_key` はその仕事の失敗の文言のキー。
+    RenderFailed {
+        failed_key: &'static str,
+        reason: String,
+    },
     Close,
+}
+
+/// コピーや保存の画像を表示と同じ描き方で作り、`job` の `Deferred` にする。作れなければ `failed_key` の失敗にする。
+fn render_for(image: &Image, job: fn(Image) -> Deferred, failed_key: &'static str) -> Deferred {
+    match render::render_image(image) {
+        Ok(image) => job(image),
+        Err(e) => Deferred::RenderFailed {
+            failed_key,
+            reason: e.to_string(),
+        },
+    }
 }
 
 /// スクラップ操作を実行し、返った `Effect` を実行する。スクラップのキー・マウス・メニューはすべてここを通る。
@@ -930,12 +944,11 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                 Effect::Redraw => scrap.redraw(&before, &appearance),
                 Effect::Close => deferred.push(Deferred::Close),
                 // 描くだけでメッセージは届かないので、借りたまま描く
-                Effect::CopyToClipboard | Effect::SaveDefault => {
-                    deferred.push(match render::render_image(&scrap.image) {
-                        Ok(image) if effect == Effect::CopyToClipboard => Deferred::Copy(image),
-                        Ok(image) => Deferred::Save(image),
-                        Err(e) => Deferred::RenderFailed(effect, e.to_string()),
-                    });
+                Effect::CopyToClipboard => {
+                    deferred.push(render_for(&scrap.image, Deferred::Copy, "copy.failed"));
+                }
+                Effect::SaveDefault => {
+                    deferred.push(render_for(&scrap.image, Deferred::Save, "save.failed"));
                 }
             }
         }
@@ -948,14 +961,12 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
         match action {
             Deferred::Copy(image) => copy_to_clipboard(&image),
             Deferred::Save(image) => save_default(image),
-            Deferred::RenderFailed(effect, e) => {
-                log::error!("could not render the scrap image for {effect:?}: {e}");
-                let key = if effect == Effect::CopyToClipboard {
-                    "copy.failed"
-                } else {
-                    "save.failed"
-                };
-                notify_user(notify::Level::Error, &format!("{}\n{e}", text(key)));
+            Deferred::RenderFailed { failed_key, reason } => {
+                log::error!("could not render the scrap image ({failed_key}): {reason}");
+                notify_user(
+                    notify::Level::Error,
+                    &format!("{}\n{reason}", text(failed_key)),
+                );
             }
             Deferred::Close => close_scrap(hwnd),
         }
