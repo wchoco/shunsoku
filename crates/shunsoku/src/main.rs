@@ -17,6 +17,10 @@ mod overlay;
 #[cfg(windows)]
 mod panic_hook;
 #[cfg(windows)]
+mod render;
+#[cfg(windows)]
+mod scrap_window;
+#[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
 mod tray;
