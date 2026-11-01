@@ -36,6 +36,9 @@
 //!   決め（`save::destination`）、PNG の書き出しと書き込みは裏のスレッドで行い、結果は `WM_APP_SAVED` で受ける。
 //!   結果を受けるまでの保存先は `App::pending_saves` に持ち、続けて保存しても同じ名前にしない。
 //!   保存先とファイル名テンプレートは設定（`[general]`）のものを使う。
+//! - 閉じたスクラップ（`Effect::MoveToTrash`、Alt+F4 も）は `App::trash`（`trash_store`）に閉じる直前の
+//!   `ScrapModel` のまま入れる。画素は裏のスレッドで一時ファイルに書き、書き終えたら `WM_APP_TRASH` で受ける。
+//!   トレイメニューの「ごみ箱」から選ぶと、その状態のまま浮かべ直してフォーカスを移す（`restore_scrap`）。
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -58,6 +61,7 @@ use shunsoku_core::scrap::ops::{
 use shunsoku_core::scrap::{Appearance, Drag, ScrapModel, Wheel};
 use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
+use shunsoku_core::trash::TrashId;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
@@ -83,7 +87,7 @@ use windows::core::{PCWSTR, Result, w};
 
 use crate::{
     clipboard, grab, hotkey, logger, menu, notify, overlay, panic_hook, perf, render, save,
-    scrap_window, settings_watch, single_instance, tray,
+    scrap_window, settings_watch, single_instance, trash_store, tray,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
@@ -95,6 +99,8 @@ const WM_APP_TEST_PANIC: u32 = WM_APP + 2;
 const WM_APP_SAVED: u32 = WM_APP + 3;
 /// 設定ファイルの監視が知らせを入れた（中身は `App::settings_events` の受け口に入っている）。
 const WM_APP_SETTINGS: u32 = WM_APP + 4;
+/// ごみ箱の画素を一時ファイルに書き終えた（結果は `App::trash` の受け口に入っている）。
+const WM_APP_TRASH: u32 = WM_APP + 5;
 
 /// 2 つのウィンドウのクラス名。2 つ目のプロセスはこの名前でメッセージ専用ウィンドウを探す。
 const CLASS_NAME: PCWSTR = w!("shunsoku.app");
@@ -104,6 +110,8 @@ const SECOND_INSTANCE_MESSAGE: PCWSTR = w!("shunsoku.SecondInstance");
 /// トレイのメニューの項目の番号。
 const CMD_EXIT: u32 = 1;
 const CMD_SELECT_CAPTURE: u32 = 2;
+/// ごみ箱の一覧の項目の番号は、これに一覧の添字を足したもの。
+const CMD_TRASH_FIRST: u32 = 100;
 
 /// 依頼の `delay` を待つタイマーの番号（メッセージ専用ウィンドウの WM_TIMER）。
 const TIMER_CAPTURE_DELAY: usize = 1;
@@ -143,6 +151,8 @@ struct App {
     shortcuts: Shortcuts,
     capture: Capture,
     scraps: Vec<Scrap>,
+    /// 閉じたスクラップ。drop で一時ファイルを消す。
+    trash: trash_store::TrashStore,
     /// 保存の裏のスレッドが結果を入れる口と、UI スレッドが受ける口。
     saves: (mpsc::Sender<Saved>, mpsc::Receiver<Saved>),
     /// 名前を決めて裏のスレッドに渡し、まだ結果（`WM_APP_SAVED`）を受けていない保存先。次の名前を決めるとき、
@@ -500,6 +510,8 @@ fn start(
             .ok()
     });
 
+    let trash =
+        trash_store::TrashStore::new(settings.general.trash_limit, windows.message, WM_APP_TRASH);
     let app = App {
         watcher,
         tray,
@@ -510,6 +522,7 @@ fn start(
         shortcuts: keymap.shortcuts,
         capture: Capture::Idle,
         scraps: Vec::new(),
+        trash,
         saves: mpsc::channel(),
         pending_saves: Vec::new(),
         renderer: None,
@@ -624,6 +637,10 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             on_settings_changed();
             Some(LRESULT(0))
         }
+        WM_APP_TRASH => {
+            with_app(|app| app.trash.on_written());
+            Some(LRESULT(0))
+        }
         WM_HOTKEY => {
             on_hotkey(wparam);
             Some(LRESULT(0))
@@ -644,7 +661,9 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             Some(LRESULT(0))
         }
         WM_ENDSESSION if wparam.0 != 0 => {
-            // ログオフ・シャットダウン。戻るとプロセスは終わらされる（Explorer も終わるのでトレイは消さない）
+            // ログオフ・シャットダウン。戻るとプロセスは終わらされる（Explorer も終わるのでトレイは消さない）。
+            // drop されないので、ごみ箱の一時ファイルはここで消す
+            with_app(|app| app.trash.shutdown());
             log::info!("exiting (session end)");
             Some(LRESULT(0))
         }
@@ -674,12 +693,44 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
 fn on_tray(owner: HWND, event: tray::Event) {
     match event {
         tray::Event::ContextMenu { x, y } => {
+            // ごみ箱の一覧（新しいものから）。項目の番号は CMD_TRASH_FIRST + 添字
+            let trashed: Vec<(TrashId, String)> = with_app(|app| {
+                app.trash
+                    .list()
+                    .iter()
+                    .map(|listed| (listed.id, trash_label(listed)))
+                    .collect()
+            })
+            .unwrap_or_default();
+            let mut trash_entries: Vec<menu::Entry> = trashed
+                .iter()
+                .enumerate()
+                .map(|(i, (_, label))| menu::Entry::Item {
+                    id: CMD_TRASH_FIRST + i as u32,
+                    label: label.as_str().into(),
+                    enabled: true,
+                    checked: false,
+                })
+                .collect();
+            if trash_entries.is_empty() {
+                trash_entries.push(menu::Entry::Item {
+                    id: CMD_TRASH_FIRST,
+                    label: text("tray.menu.trash_empty").into(),
+                    enabled: false,
+                    checked: false,
+                });
+            }
             let items = [
                 menu::Entry::Item {
                     id: CMD_SELECT_CAPTURE,
                     label: text("tray.menu.select_capture").into(),
                     enabled: true,
                     checked: false,
+                },
+                menu::Entry::Submenu {
+                    label: text("tray.menu.trash").into(),
+                    enabled: true,
+                    items: trash_entries,
                 },
                 menu::Entry::Item {
                     id: CMD_EXIT,
@@ -689,8 +740,16 @@ fn on_tray(owner: HWND, event: tray::Event) {
                 },
             ];
             // モーダルなので App を借りずに呼ぶ
-            if let Some(command) = menu::show(owner, &items, x, y) {
-                on_command(command);
+            let Some(command) = menu::show(owner, &items, x, y) else {
+                return;
+            };
+            match command.checked_sub(CMD_TRASH_FIRST) {
+                Some(i) => {
+                    if let Some(&(id, _)) = trashed.get(i as usize) {
+                        restore_scrap(id);
+                    }
+                }
+                None => on_command(command),
             }
         }
         tray::Event::Select => request_capture(Source::TrayClick),
@@ -1070,6 +1129,7 @@ fn show_scrap_menu(hwnd: HWND, lparam: LPARAM) {
 enum Deferred {
     Copy(Image),
     Save(Image),
+    SaveAs(Image),
     /// コピーや保存の画像を作れなかった。`failed_key` はその仕事の失敗の文言のキー。
     RenderFailed {
         failed_key: &'static str,
@@ -1128,13 +1188,16 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                     }
                 }
                 Effect::ShowZoom => {}
-                Effect::Close => deferred.push(Deferred::Close),
+                Effect::MoveToTrash => deferred.push(Deferred::Close),
                 // 描くだけでメッセージは届かないので、借りたまま描く
                 Effect::CopyToClipboard => {
                     deferred.push(render_for(&scrap.image, Deferred::Copy, "copy.failed"));
                 }
                 Effect::SaveDefault => {
                     deferred.push(render_for(&scrap.image, Deferred::Save, "save.failed"));
+                }
+                Effect::ShowSaveDialog => {
+                    deferred.push(render_for(&scrap.image, Deferred::SaveAs, "save.failed"));
                 }
             }
         }
@@ -1147,6 +1210,7 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
         match action {
             Deferred::Copy(image) => copy_to_clipboard(&image),
             Deferred::Save(image) => save_default(image),
+            Deferred::SaveAs(image) => save_as(hwnd, image),
             Deferred::RenderFailed { failed_key, reason } => {
                 log::error!("could not render the scrap image ({failed_key}): {reason}");
                 notify_user(
@@ -1184,18 +1248,39 @@ fn copy_to_clipboard(image: &Image) {
 /// 保存先とファイル名はここ（UI スレッド）で決め、PNG の書き出しと書き込みは裏のスレッドで行う。
 /// 失敗してもスクラップはそのまま残る。
 fn save_default(image: Image) {
-    let Some((save_dir, template, pending, sender, message_window)) = with_app(|app| {
+    if let Some(path) = default_destination() {
+        start_save(path, image, save::Overwrite::Deny);
+    }
+}
+
+/// `Effect::ShowSaveDialog`: 「名前を付けて保存」のダイアログを出し、選ばれた場所に保存する。初期フォルダと
+/// ファイル名は既定の保存（`default_destination`）と同じ。キャンセルしたら何もしない。失敗は既定の保存と同じく通知する。
+fn save_as(owner: HWND, image: Image) {
+    let Some(proposed) = default_destination() else {
+        return;
+    };
+    // モーダルなので App を借りずに呼ぶ
+    match save::ask_path(owner, &proposed, text("save.png_filter")) {
+        Ok(Some(path)) => start_save(path, image, save::Overwrite::Allow),
+        Ok(None) => log::info!("save as cancelled"),
+        Err(e) => {
+            log::error!("could not show the save dialog: {e}");
+            save_failed(None, &e.to_string());
+        }
+    }
+}
+
+/// 既定の保存先: 全体設定の保存先に、全体のファイル名テンプレートで付けた重ならない名前。フォルダがなければ作る。
+/// 決められなければ失敗を通知して None を返す。
+fn default_destination() -> Option<PathBuf> {
+    let (save_dir, template, pending) = with_app(|app| {
         let general = &app.settings.general;
         (
             general.save_dir.clone(),
             general.file_name_template.clone(),
             app.pending_saves.clone(),
-            app.saves.0.clone(),
-            app.windows.message,
         )
-    }) else {
-        return;
-    };
+    })?;
     let dir = match save_dir {
         Some(dir) => dir,
         None => match save::default_dir() {
@@ -1203,17 +1288,25 @@ fn save_default(image: Image) {
             Err(e) => {
                 log::error!("could not find the Pictures folder: {e}");
                 save_failed(None, &e.to_string());
-                return;
+                return None;
             }
         },
     };
-    let path = match save::destination(&dir, &template, save::now(), &pending) {
-        Ok(path) => path,
+    match save::destination(&dir, &template, save::now(), &pending) {
+        Ok(path) => Some(path),
         Err(e) => {
             log::error!("could not prepare the save folder {}: {e}", dir.display());
             save_failed(Some(&dir), &e.to_string());
-            return;
+            None
         }
+    }
+}
+
+/// `path` に PNG を書く仕事を裏のスレッドで始める。結果は `WM_APP_SAVED` で受ける。
+fn start_save(path: PathBuf, image: Image, overwrite: save::Overwrite) {
+    let Some((sender, message_window)) = with_app(|app| (app.saves.0.clone(), app.windows.message))
+    else {
+        return;
     };
     // 書き終えるまでの間に次の保存が同じ名前を選ばないように、結果を受けるまで覚えておく
     if with_app(|app| app.pending_saves.push(path.clone())).is_none() {
@@ -1225,9 +1318,11 @@ fn save_default(image: Image) {
     let spawned = std::thread::Builder::new()
         .name("save".into())
         .spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| save::write_png(&job_path, &image)))
-                .map_err(|_| text("job.panicked").to_owned())
-                .and_then(|written| written.map_err(|e| e.to_string()));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                save::write_png(&job_path, &image, overwrite)
+            }))
+            .map_err(|_| text("job.panicked").to_owned())
+            .and_then(|written| written.map_err(|e| e.to_string()));
             let _ = sender.send(Saved {
                 path: job_path,
                 result,
@@ -1288,17 +1383,68 @@ fn save_failed(path: Option<&Path>, reason: &str) {
     notify_user(notify::Level::Error, &body);
 }
 
-/// スクラップを閉じる（M1 は破棄。M2 でごみ箱に移す）。
+/// スクラップを閉じて、閉じる直前の状態のままごみ箱に移す（上限が 0 なら破棄する）。
 fn close_scrap(hwnd: HWND) {
     let removed = with_app(|app| {
         let index = app.scraps.iter().position(|s| s.window.hwnd() == hwnd)?;
-        Some(app.scraps.remove(index))
+        let Scrap {
+            window,
+            model,
+            image,
+            ..
+        } = app.scraps.remove(index);
+        // 一時ファイルは裏のスレッドで書くので、借りたままでよい
+        app.trash.push(model, image, save::now());
+        Some(window)
     })
     .flatten();
     // ウィンドウを壊すとメッセージが届くので、App を借りずに壊す
-    if let Some(scrap) = removed {
-        drop(scrap);
+    if let Some(window) = removed {
+        drop(window);
         log::info!("scrap closed");
+    }
+}
+
+/// ごみ箱の一覧の項目の文言: 閉じた時刻と画像の大きさ。
+fn trash_label(listed: &trash_store::Listed) -> String {
+    let t = listed.closed_at;
+    let size = listed.model.image_size;
+    format!(
+        "{:02}:{:02}:{:02}  {}×{}",
+        t.hour, t.minute, t.second, size.width, size.height
+    )
+}
+
+/// ごみ箱の `id` のスクラップを、閉じる直前の状態のまま浮かべ直し、フォーカスを移す。
+fn restore_scrap(id: TrashId) {
+    let taken = with_app(|app| {
+        let restored = app.trash.restore(id)?;
+        Some((restored, app.module, Appearance::from(app.settings.scrap)))
+    })
+    .flatten();
+    let Some((restored, module, appearance)) = taken else {
+        return;
+    };
+    let trashed = match restored {
+        Ok(trashed) => trashed,
+        Err(e) => {
+            log::error!("could not read the trashed scrap back: {e}");
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{e}", text("trash.restore_failed")),
+            );
+            return;
+        }
+    };
+    // ウィンドウを作るとメッセージが届くので、App を借りずに作る
+    match open_scrap(module, trashed.model, trashed.image, &appearance, true) {
+        Ok(scrap) => {
+            if with_app(|app| app.scraps.push(scrap)).is_none() {
+                log::warn!("could not keep the restored scrap");
+            }
+            log::info!("scrap restored from the trash");
+        }
+        Err(e) => log::error!("could not open the restored scrap: {e}"),
     }
 }
 
@@ -1422,7 +1568,8 @@ fn finish_selection() {
     // スクラップを前面にしてから範囲選択の画面を閉じる
     let scrap = if request.outputs.scrap {
         let focus = request.outputs.focus_scrap;
-        match open_scrap(module, rect.origin(), image, &appearance, focus) {
+        let model = ScrapModel::new(rect.origin(), image.size());
+        match open_scrap(module, model, image, &appearance, focus) {
             Ok(scrap) => Some(scrap),
             Err(e) => {
                 log::error!("could not open a scrap: {e}");
@@ -1446,15 +1593,14 @@ fn finish_selection() {
     log::info!("overlay closed");
 }
 
-/// 画像をスクリーン座標の `at` に等倍で浮かべるスクラップを作る。
+/// 画像を `model` のとおりに浮かべるスクラップを作る。
 fn open_scrap(
     module: HINSTANCE,
-    at: Point,
+    model: ScrapModel,
     image: Image,
     appearance: &Appearance,
     focus: bool,
 ) -> Result<Scrap> {
-    let model = ScrapModel::new(at, image.size());
     let rect = model.window_rect(appearance);
     let window = scrap_window::ScrapWindow::create(module, rect)?;
     // 描いて出すときに届くメッセージ（WM_WINDOWPOSCHANGED など）では App を借りないので、借りたまま描いてよい。
@@ -1727,6 +1873,9 @@ fn on_settings_changed() {
 fn apply_changes(app: &mut App, changes: &SettingsChanges) {
     if changes.log_level {
         log::set_max_level(level_filter(app.settings.log_level));
+    }
+    if changes.trash {
+        app.trash.set_limit(app.settings.general.trash_limit);
     }
     if changes.appearance {
         // 枠と影の幅が変わるとウィンドウの大きさも変わるので、描き直して出し直す。描くだけで App を借りる

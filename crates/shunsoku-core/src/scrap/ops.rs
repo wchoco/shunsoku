@@ -131,14 +131,16 @@ pub struct OpContext {
 pub enum Effect {
     /// `ScrapModel` のとおりに出し直す（位置と中身）。
     Redraw,
-    /// スクラップを閉じる。M1 は破棄する（M2 でごみ箱への移動に置き換える）。
-    Close,
+    /// スクラップを閉じて、閉じる直前の状態のままごみ箱に移す（上限が 0 なら破棄する）。
+    MoveToTrash,
     /// 画像をクリップボードに置く。
     CopyToClipboard,
     /// 画像を全体設定の保存先に、全体のファイル名テンプレートの名前で保存する（ダイアログなし）。
     SaveDefault,
     /// 倍率（`ScrapModel::zoom`）を少しの間だけスクラップの上に出す。
     ShowZoom,
+    /// 「名前を付けて保存」のダイアログを出し、選ばれた場所に保存する。初期フォルダとファイル名は `SaveDefault` と同じ。
+    ShowSaveDialog,
 }
 
 const ESC: Chord = Chord::plain(Key::known(0x1B));
@@ -154,6 +156,7 @@ const CTRL_MINUS: Chord = Chord::plain(Key::known(0xBD)).ctrl();
 const CTRL_NUMPAD_ADD: Chord = Chord::plain(Key::known(0x6B)).ctrl();
 const CTRL_NUMPAD_SUBTRACT: Chord = Chord::plain(Key::known(0x6D)).ctrl();
 const CTRL_0: Chord = Chord::plain(Key::known(0x30)).ctrl();
+const CTRL_SHIFT_S: Chord = CTRL_S.shift();
 
 const fn always(_: &ScrapModel) -> bool {
     true
@@ -183,7 +186,7 @@ fn drag(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
 }
 
 fn close(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
-    vec![Effect::Close]
+    vec![Effect::MoveToTrash]
 }
 
 fn copy(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
@@ -247,6 +250,10 @@ fn zoom_actual(model: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     }
 }
 
+fn save_as(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
+    vec![Effect::ShowSaveDialog]
+}
+
 /// キーで動かす操作の行。
 const fn keyboard_move(
     id: OperationId,
@@ -297,6 +304,19 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         can_execute: always,
         choices: None,
         run: save_default,
+    },
+    OperationDescriptor {
+        id: "save_as",
+        label_key: "scrap.op.save_as",
+        default_shortcut: &[CTRL_SHIFT_S],
+        default_mouse: None,
+        group: Group::Output,
+        order: 30,
+        drag_only: false,
+        in_menu: true,
+        can_execute: always,
+        choices: None,
+        run: save_as,
     },
     keyboard_move(
         "move_left",
@@ -648,10 +668,10 @@ mod tests {
     }
 
     #[test]
-    fn close_closes_the_scrap_without_changing_it() {
+    fn close_moves_the_scrap_to_the_trash_without_changing_it() {
         let mut model = scrap();
         let effects = (op("close").run)(&mut model, &OpContext::default());
-        assert_eq!(effects, vec![Effect::Close]);
+        assert_eq!(effects, vec![Effect::MoveToTrash]);
         assert_eq!(model, scrap());
     }
 
@@ -660,6 +680,7 @@ mod tests {
         for (id, effect) in [
             ("copy", Effect::CopyToClipboard),
             ("save_default", Effect::SaveDefault),
+            ("save_as", Effect::ShowSaveDialog),
         ] {
             let mut model = scrap();
             let effects = execute(op(id), &mut model, &OpContext::default());
@@ -676,6 +697,7 @@ mod tests {
             "move_down_10",
             "copy",
             "save_default",
+            "save_as",
             "close",
         ] {
             assert!((op(id).can_execute)(&scrap()), "{id}");
@@ -762,6 +784,7 @@ mod tests {
         assert_eq!(bound(&shortcuts, "Ctrl+Minus"), Some("zoom_out"));
         assert_eq!(bound(&shortcuts, "Ctrl+NumpadSubtract"), Some("zoom_out"));
         assert_eq!(bound(&shortcuts, "Ctrl+0"), Some("zoom_actual"));
+        assert_eq!(bound(&shortcuts, "Ctrl+Shift+S"), Some("save_as"));
         assert_eq!(bound(&shortcuts, "Ctrl+Left"), None);
         assert_eq!(shortcuts.chords("close"), vec![chord("Esc")]);
         assert_eq!(shortcuts.chords("move"), vec![]);
@@ -846,6 +869,7 @@ mod tests {
             vec![
                 item("copy", true, Some("Ctrl+C")),
                 item("save_default", true, Some("Ctrl+S")),
+                item("save_as", true, Some("Ctrl+Shift+S")),
                 MenuEntry::Separator,
                 MenuEntry::Submenu(Submenu {
                     id: "zoom",

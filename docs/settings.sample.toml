@@ -38,6 +38,10 @@ file_name_template = "shunsoku_{date}-{time}"
 # エラーと警告は常に出します。
 notifications = true
 
+# ごみ箱（閉じたスクラップを預かり、トレイメニューの「ごみ箱」から戻せる）に残す数。0〜100 の整数。
+# 超えたら古いものから消えます。0 なら閉じたらすぐに破棄します。終了するとごみ箱は空になります。
+trash_limit = 10
+
 [hotkeys]
 # 範囲選択キャプチャを呼び出すホットキー。既定は未設定（"" も未設定）なので、使うには下の行の # を外して
 # 好きなキーにしてください。
@@ -61,6 +65,7 @@ notifications = true
 # id              操作（右クリックメニューの名前）  既定のショートカット
 # copy            コピー                            Ctrl+C
 # save_default    既定の保存先へ保存                Ctrl+S
+# save_as         保存先を確認して保存              Ctrl+Shift+S
 # move_left       左へ移動（1px）                   Left
 # move_right      右へ移動（1px）                   Right
 # move_up         上へ移動（1px）                   Up

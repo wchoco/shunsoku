@@ -7,6 +7,8 @@ tooltip = "shunsoku"
 
 [tray.menu]
 select_capture = "範囲選択キャプチャ"
+trash = "ごみ箱"
+trash_empty = "（空）"
 exit = "終了"
 
 [panic]
@@ -32,6 +34,7 @@ unset = "範囲選択キャプチャのホットキーが未設定です。設�
 [scrap.op]
 copy = "コピー"
 save_default = "既定の保存先へ保存"
+save_as = "保存先を確認して保存"
 move = "移動"
 move_left = "左へ移動（1px）"
 move_right = "右へ移動（1px）"
@@ -57,6 +60,11 @@ failed = "画面を撮れませんでした。"
 [copy]
 failed = "クリップボードにコピーできませんでした。"
 
+[trash]
+restore_failed = "ごみ箱から戻せませんでした。"
+
 [save]
 saved = "保存しました（クリックでフォルダを開きます）:"
 failed = "保存できませんでした。スクラップは残っています。"
+# 「名前を付けて保存」のファイルの種類
+png_filter = "PNG 画像"
