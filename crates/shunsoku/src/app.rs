@@ -110,6 +110,9 @@ const SECOND_INSTANCE_MESSAGE: PCWSTR = w!("shunsoku.SecondInstance");
 /// トレイのメニューの項目の番号。
 const CMD_EXIT: u32 = 1;
 const CMD_SELECT_CAPTURE: u32 = 2;
+const CMD_CLOSE_ALL: u32 = 3;
+const CMD_HIDE_ALL: u32 = 4;
+const CMD_SHOW_ALL: u32 = 5;
 /// ごみ箱の一覧の項目の番号は、これに一覧の添字を足したもの。
 const CMD_TRASH_FIRST: u32 = 100;
 
@@ -690,6 +693,27 @@ fn on_tray(owner: HWND, event: tray::Event) {
                     enabled: false,
                 });
             }
+            // 1 枚でも隠れていれば「すべて表示」、なければ「すべて隠す」
+            let (any_scrap, any_hidden) = with_app(|app| {
+                (
+                    !app.scraps.is_empty(),
+                    app.scraps.iter().any(|s| !s.window.is_visible()),
+                )
+            })
+            .unwrap_or_default();
+            let hide_or_show = if any_hidden {
+                menu::Entry::Item {
+                    id: CMD_SHOW_ALL,
+                    label: text("tray.menu.show_all"),
+                    enabled: true,
+                }
+            } else {
+                menu::Entry::Item {
+                    id: CMD_HIDE_ALL,
+                    label: text("tray.menu.hide_all"),
+                    enabled: any_scrap,
+                }
+            };
             let items = [
                 menu::Entry::Item {
                     id: CMD_SELECT_CAPTURE,
@@ -700,6 +724,12 @@ fn on_tray(owner: HWND, event: tray::Event) {
                     label: text("tray.menu.trash"),
                     entries: trash_entries,
                 },
+                menu::Entry::Item {
+                    id: CMD_CLOSE_ALL,
+                    label: text("tray.menu.close_all"),
+                    enabled: any_scrap,
+                },
+                hide_or_show,
                 menu::Entry::Item {
                     id: CMD_EXIT,
                     label: text("tray.menu.exit"),
@@ -736,6 +766,9 @@ fn on_tray(owner: HWND, event: tray::Event) {
 fn on_command(command: u32) {
     match command {
         CMD_SELECT_CAPTURE => request_capture(Source::TrayMenu),
+        CMD_CLOSE_ALL => close_all_scraps(),
+        CMD_HIDE_ALL => set_scraps_visible(false),
+        CMD_SHOW_ALL => set_scraps_visible(true),
         CMD_EXIT => {
             log::info!("exit requested from the tray menu");
             // SAFETY: UI スレッドで呼ぶ
@@ -1280,10 +1313,51 @@ fn trash_label(listed: &trash_store::Listed) -> String {
     )
 }
 
+/// すべてのスクラップを閉じて、ごみ箱に移す。
+fn close_all_scraps() {
+    let hwnds: Vec<HWND> =
+        with_app(|app| app.scraps.iter().map(|s| s.window.hwnd()).collect()).unwrap_or_default();
+    for hwnd in hwnds {
+        close_scrap(hwnd);
+    }
+}
+
+/// すべてのスクラップを隠す・出す（出すときはフォーカスを移さない）。
+fn set_scraps_visible(visible: bool) {
+    with_app(|app| {
+        for scrap in &app.scraps {
+            if visible {
+                scrap.window.show(false);
+            } else {
+                scrap.window.hide();
+            }
+        }
+    });
+}
+
 /// ごみ箱の `id` のスクラップを、閉じる直前の状態のまま浮かべ直し、フォーカスを移す。
 fn restore_scrap(id: TrashId) {
+    restore_from_trash(|trash| trash.restore(id));
+}
+
+/// 最後に閉じたスクラップを復元する（復元のホットキー）。範囲選択の画面を開いている間は、画面より前に出て
+/// キー入力を奪うので無視する。
+fn restore_last_scrap() {
+    let selecting =
+        with_app(|app| matches!(app.capture, Capture::Selecting { .. })).unwrap_or(true);
+    if selecting {
+        log::info!("restore requested while the overlay is open; ignored");
+        return;
+    }
+    restore_from_trash(trash_store::TrashStore::restore_last);
+}
+
+/// ごみ箱から `take` で取り出したスクラップを浮かべ直し、フォーカスを移す。何も取り出せなければ何もしない。
+fn restore_from_trash(
+    take: impl FnOnce(&mut trash_store::TrashStore) -> Option<std::io::Result<trash_store::Trashed>>,
+) {
     let taken = with_app(|app| {
-        let restored = app.trash.restore(id)?;
+        let restored = take(&mut app.trash)?;
         Some((restored, app.module, Appearance::from(app.settings.scrap)))
     })
     .flatten();
@@ -1619,6 +1693,7 @@ fn on_hotkey(wparam: WPARAM) {
     let action = with_app(|app| app.hotkeys.action(wparam)).flatten();
     match action {
         Some(settings::HotkeyAction::SelectCapture) => request_capture(Source::Hotkey),
+        Some(settings::HotkeyAction::RestoreLast) => restore_last_scrap(),
         None => log::warn!("unknown hotkey id {}", wparam.0),
     }
 }

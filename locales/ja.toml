@@ -9,6 +9,9 @@ tooltip = "shunsoku"
 select_capture = "範囲選択キャプチャ"
 trash = "ごみ箱"
 trash_empty = "（空）"
+close_all = "すべてのスクラップを閉じる"
+hide_all = "すべて隠す"
+show_all = "すべて表示"
 exit = "終了"
 
 [panic]
