@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 
 use crate::geometry::Point;
-use crate::keys::{Chord, Key};
+use crate::keys::{Chord, Key, Modifiers};
 use crate::scrap::{Appearance, BorderOverride, Mode, ScrapModel, ZoomAnchor};
 use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, ShortcutOverrides};
 
@@ -96,6 +96,31 @@ pub enum MouseGesture {
 }
 
 impl MouseGesture {
+    /// ホイールの回転（`rotation`、上が正）と、そのとき押している修飾キーから決まるホイールの操作。修飾キーなしと
+    /// Ctrl だけなら上下の向きで決め、ほかの修飾キーつきと回っていない（0）なら None（対応がない）。
+    pub fn wheel(modifiers: Modifiers, rotation: i32) -> Option<MouseGesture> {
+        let Modifiers {
+            win: false,
+            ctrl,
+            alt: false,
+            shift: false,
+        } = modifiers
+        else {
+            return None;
+        };
+        let up = match rotation.signum() {
+            1 => true,
+            -1 => false,
+            _ => return None,
+        };
+        Some(match (ctrl, up) {
+            (false, true) => MouseGesture::WheelUp,
+            (false, false) => MouseGesture::WheelDown,
+            (true, true) => MouseGesture::CtrlWheelUp,
+            (true, false) => MouseGesture::CtrlWheelDown,
+        })
+    }
+
     /// 設定ファイル（`[mouse]`）での名前。
     const NAMES: [(MouseGesture, &'static str); 7] = [
         (MouseGesture::LeftDrag, "LeftDrag"),
@@ -2126,6 +2151,37 @@ mod tests {
             can_execute: always,
             choices: None,
             run: nothing,
+        }
+    }
+
+    #[test]
+    fn the_wheel_maps_to_a_gesture_only_without_modifiers_or_with_ctrl_alone() {
+        let none = Modifiers::default();
+        let ctrl = Modifiers { ctrl: true, ..none };
+        assert_eq!(MouseGesture::wheel(none, 120), Some(MouseGesture::WheelUp));
+        assert_eq!(MouseGesture::wheel(none, -1), Some(MouseGesture::WheelDown));
+        assert_eq!(
+            MouseGesture::wheel(ctrl, 1),
+            Some(MouseGesture::CtrlWheelUp)
+        );
+        assert_eq!(
+            MouseGesture::wheel(ctrl, -120),
+            Some(MouseGesture::CtrlWheelDown)
+        );
+        assert_eq!(MouseGesture::wheel(none, 0), None);
+        for other in [
+            Modifiers {
+                shift: true,
+                ..none
+            },
+            Modifiers { alt: true, ..none },
+            Modifiers { win: true, ..none },
+            Modifiers {
+                shift: true,
+                ..ctrl
+            },
+        ] {
+            assert_eq!(MouseGesture::wheel(other, 120), None, "{other:?}");
         }
     }
 }

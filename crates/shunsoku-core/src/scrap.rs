@@ -669,6 +669,16 @@ impl Drag {
         self.from.is_some()
     }
 
+    /// 大きさを変えるとき（DPI が変わったときなど）の基準点。ドラッグ中ならつかんだところが離れないようにカーソルの
+    /// 位置 `cursor`、そうでなければ中心。
+    pub fn zoom_anchor(&self, cursor: Point) -> ZoomAnchor {
+        if self.is_active() {
+            ZoomAnchor::At(cursor)
+        } else {
+            ZoomAnchor::Center
+        }
+    }
+
     /// カーソルが `at` に動いた。ドラッグの間なら前回からの移動量。ドラッグしていなければ None。
     /// 押したまま（`Pointer::holding`）でなければ、離したことを取りこぼしたものとしてドラッグを終える
     /// （ホバーだけでスクラップが動かないように）。
@@ -1432,5 +1442,16 @@ mod tests {
         // 押していないことになったので、そのあとの移動では範囲を選ばない
         assert!(!scrap.trim_input(TrimInput::Move(Point::new(40, 40))));
         assert_eq!(scrap.trim_selection(), None);
+    }
+
+    #[test]
+    fn a_dpi_change_anchors_at_the_cursor_only_while_dragging() {
+        let mut drag = Drag::default();
+        let cursor = Point::new(30, 40);
+        assert_eq!(drag.zoom_anchor(cursor), ZoomAnchor::Center);
+        drag.start(Point::new(10, 10));
+        assert_eq!(drag.zoom_anchor(cursor), ZoomAnchor::At(cursor));
+        drag.end();
+        assert_eq!(drag.zoom_anchor(cursor), ZoomAnchor::Center);
     }
 }

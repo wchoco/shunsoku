@@ -1139,17 +1139,23 @@ fn on_trim_input(hwnd: HWND, input: TrimInput) -> bool {
     .unwrap_or(false)
 }
 
-/// `WM_MOUSEWHEEL`: 修飾キーなしと Ctrl だけのホイールを、ノッチごとにホイールの操作にする（基準点はカーソルの
-/// 位置）。ほかの修飾キーつきは対応がないので false（DefWindowProcW に任せる）。
+/// `WM_MOUSEWHEEL`: ホイールを、ノッチごとにホイールの操作（`MouseGesture::wheel`）にする（基準点はカーソルの
+/// 位置）。対応のない修飾キーつきは false（DefWindowProcW に任せる）。
 fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
     // wparam の下位は押されているキーとボタン（MK_*）、上位は回転量（上が正）
     const MK_SHIFT: usize = 0x0004;
     const MK_CONTROL: usize = 0x0008;
-    if wparam.0 & MK_SHIFT != 0 || held_modifiers().alt {
-        return false;
-    }
-    let ctrl = wparam.0 & MK_CONTROL != 0;
     let delta = i32::from((wparam.0 >> 16) as u16 as i16);
+    // Alt と Win は wparam にないので、キーの状態から読む
+    let held = held_modifiers();
+    let modifiers = Modifiers {
+        ctrl: wparam.0 & MK_CONTROL != 0,
+        shift: wparam.0 & MK_SHIFT != 0,
+        ..held
+    };
+    let Some(gesture) = MouseGesture::wheel(modifiers, delta) else {
+        return false;
+    };
     // WM_MOUSEWHEEL の座標はスクリーン座標。左や上のモニタでは負になる
     let cursor = Point::new(
         i32::from((lparam.0 & 0xFFFF) as u16 as i16),
@@ -1159,12 +1165,7 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
     else {
         return true;
     };
-    let gesture = match (ctrl, notches > 0) {
-        (false, true) => MouseGesture::WheelUp,
-        (false, false) => MouseGesture::WheelDown,
-        (true, true) => MouseGesture::CtrlWheelUp,
-        (true, false) => MouseGesture::CtrlWheelDown,
-    };
+    // 向きが変わるとためた分は捨てるので、ノッチの向きは回転の向きと同じ
     let context = OpContext {
         cursor: Some(cursor),
         ..OpContext::default()
@@ -1186,11 +1187,7 @@ fn on_scrap_dpi_changed(hwnd: HWND, dpi: u32) {
             scraps, renderer, ..
         } = app;
         let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
-        let anchor = if scrap.drag.is_active() {
-            ZoomAnchor::At(at)
-        } else {
-            ZoomAnchor::Center
-        };
+        let anchor = scrap.drag.zoom_anchor(at);
         let before = scrap.model.clone();
         if scrap.model.set_dpi(dpi, scaling, anchor) {
             log::debug!(
