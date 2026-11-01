@@ -15,10 +15,11 @@ use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, POINT, SIZE}
 use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, IDC_ARROW, IsWindowVisible, LoadCursorW, RegisterClassExW,
-    RemovePropW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow,
-    WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_DBLCLKS, CreateWindowExW, DestroyWindow, IDC_ARROW, IsWindowVisible, LoadCursorW,
+    RegisterClassExW, RemovePropW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, ULW_ALPHA,
+    UpdateLayeredWindow, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -29,12 +30,14 @@ const CLASS_NAME: PCWSTR = w!("shunsoku.scrap");
 /// <https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist2-markfullscreenwindow>
 const NON_RUDE: PCWSTR = w!("NonRudeHWND");
 
-/// ウィンドウのクラスを登録する。`wndproc` は `app` のもの。
+/// ウィンドウのクラスを登録する。`wndproc` は `app` のもの。ダブルクリック（コンパクト表示の切り替え）を
+/// 受けるため `CS_DBLCLKS` を付ける。
 pub fn register_class(module: HINSTANCE, wndproc: WNDPROC) -> Result<()> {
     // SAFETY: 共有のカーソルなので壊さなくてよい
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW)? };
     let class = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
+        style: CS_DBLCLKS,
         lpfnWndProc: wndproc,
         hInstance: module,
         hCursor: cursor,
