@@ -24,8 +24,12 @@
 //!   `App::shortcuts`、`ops::mouse_operation`、`ops::menu`）でスクラップ操作に変え、`run_scrap_operation` で
 //!   実行する。操作が返す `Effect` を実行するのはここ（`run_scrap_operation`）。操作を足すときは core の表に
 //!   行を足し、新しい `Effect` があればそこに足す。
-//! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に 1 回読む。ファイルは作らず、書き換えない。
-//!   問題（読めない・不正な項目・登録できないホットキー・未設定のホットキー）は、まとめて 1 回だけ通知する。
+//! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
+//!   読み込み直す。ファイルは作らず、書き換えない。読み込み直しでは core の `settings::diff` で変わった部分を調べ、
+//!   ホットキーの登録し直し・スクラップの描き直しなど、変わったものだけを反映する（`on_settings_changed`）。
+//!   保存先・ファイル名テンプレート・通知のオン/オフは、使うときに `App::settings` から読むので、次から効く。
+//!   キーの割り当てと重なりは core の `settings::keymap` で決める。
+//!   問題（読めない・不正な項目・重なったキー・登録できないホットキー・未設定のホットキー）は、まとめて 1 回だけ通知する。
 //! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。通知のクリックは
 //!   中身を持たないので、クリックで開くフォルダ（`App::notice_folder`）を覚えておき、新しい通知を出したら忘れる。
 //! - コピーと保存の画像は `render::render_image` で表示と同じ描き方で作る。保存先とファイル名は UI スレッドで
@@ -52,7 +56,7 @@ use shunsoku_core::scrap::ops::{
 };
 use shunsoku_core::scrap::{Appearance, ScrapModel};
 use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
-use shunsoku_core::settings::{self, LogLevel, Settings, SettingsIssue};
+use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
@@ -78,7 +82,7 @@ use windows::core::{PCWSTR, Result, w};
 
 use crate::{
     clipboard, grab, hotkey, logger, menu, notify, overlay, panic_hook, perf, render, save,
-    scrap_window, single_instance, tray,
+    scrap_window, settings_watch, single_instance, tray,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
@@ -87,6 +91,8 @@ const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_TEST_PANIC: u32 = WM_APP + 2;
 /// 保存の裏のスレッドが書き終えた（結果は `App::saves` の受け口に入っている）。
 const WM_APP_SAVED: u32 = WM_APP + 3;
+/// 設定ファイルの監視が知らせを入れた（中身は `App::settings_events` の受け口に入っている）。
+const WM_APP_SETTINGS: u32 = WM_APP + 4;
 
 /// 2 つのウィンドウのクラス名。2 つ目のプロセスはこの名前でメッセージ専用ウィンドウを探す。
 const CLASS_NAME: PCWSTR = w!("shunsoku.app");
@@ -114,11 +120,18 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-/// アプリの状態。UI スレッドだけが持つ。drop の順（宣言の順）でトレイを消し、範囲選択の画面を閉じ、
-/// ホットキーの登録を外してからウィンドウを壊す。
+/// アプリの状態。UI スレッドだけが持つ。drop の順（宣言の順）で設定ファイルの監視を止め、トレイを消し、
+/// 範囲選択の画面を閉じ、ホットキーの登録を外してからウィンドウを壊す。
 struct App {
+    /// 設定ファイルの監視。`APPDATA` がないときや始められなかったときは None。
+    watcher: Option<settings_watch::Watcher>,
     tray: tray::Tray,
+    /// いま使っている設定（読み込み直しで TOML として読めなかったときは、直前の有効な設定のまま）。
     settings: Settings,
+    /// 設定ファイルのパス。通知に出す。
+    settings_path: Option<PathBuf>,
+    /// 設定ファイルの監視が知らせを入れる口。
+    settings_events: mpsc::Receiver<settings_watch::Event>,
     /// スクラップ操作のショートカットの対応表（表の既定値に `settings.shortcuts` を重ねたもの）。
     shortcuts: Shortcuts,
     capture: Capture,
@@ -277,14 +290,22 @@ pub fn run() -> i32 {
     let (settings, issues) = read_settings(settings_path.as_deref());
     log::set_max_level(level_filter(settings.log_level));
 
-    let (app, failed) = match start(instance, settings) {
+    let unset = settings.hotkeys.select_capture.is_none();
+    let (app, key_issues, failed) = match start(instance, settings, settings_path) {
         Ok(started) => started,
         Err(e) => {
             log::error!("failed to start: {e}");
             return 1;
         }
     };
-    let notice = startup_notice(&issues, &failed, &app.settings, settings_path.as_deref());
+    let issues: Vec<SettingsIssue> = issues.into_iter().chain(key_issues).collect();
+    let notice = settings_notice(
+        Moment::Startup,
+        &issues,
+        &failed,
+        unset,
+        app.settings_path.as_deref(),
+    );
     let message_window = app.windows.message;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     if let Some((level, body)) = notice {
@@ -325,11 +346,12 @@ pub fn run() -> i32 {
     code
 }
 
-/// 起動する。登録できなかったホットキーも返す。
+/// 起動する。キーの割り当ての問題（`settings::keymap`）と、登録できなかったホットキーも返す。
 fn start(
     instance: Option<single_instance::Guard>,
     settings: Settings,
-) -> Result<(App, Vec<hotkey::Failed>)> {
+    settings_path: Option<PathBuf>,
+) -> Result<(App, Vec<SettingsIssue>, Vec<hotkey::Failed>)> {
     // SAFETY: 自分のモジュールのハンドル
     let module: HINSTANCE = unsafe { GetModuleHandleW(None)? }.into();
     let class = WNDCLASSEXW {
@@ -408,31 +430,25 @@ fn start(
         log::warn!("could not register the tray icon; waiting for TaskbarCreated");
     }
 
-    let (hotkeys, failed) = hotkey::register(windows.message, &settings.hotkeys);
-    for f in &failed {
-        log::warn!(
-            "could not register the hotkey {} for {:?}: {}",
-            f.chord,
-            f.action,
-            f.error
-        );
-    }
+    let keymap = settings::keymap(&settings, ops::OPERATIONS);
+    log_issues(&keymap.issues);
+    let (hotkeys, failed) = hotkey::register(windows.message, &keymap.hotkeys.bound);
+    log_failed(&failed);
 
-    // 無視した上書きと重なったショートカットの通知は、設定の監視のチケット（#46）で足す
-    let shortcuts = Shortcuts::new(ops::OPERATIONS, &settings.shortcuts);
-    for id in shortcuts.ignored_overrides() {
-        log::warn!(
-            "shortcut override for an unknown or argument-taking scrap operation ignored: {id}"
-        );
-    }
-    for chord in shortcuts.conflicts() {
-        log::warn!("shortcut {chord} is assigned to several scrap operations; disabled");
-    }
+    let (sender, settings_events) = mpsc::channel();
+    let watcher = settings_path.as_deref().and_then(|path| {
+        settings_watch::start(path, sender, windows.message, WM_APP_SETTINGS)
+            .inspect_err(|e| log::error!("could not start watching the settings: {e}"))
+            .ok()
+    });
 
     let app = App {
+        watcher,
         tray,
         settings,
-        shortcuts,
+        settings_path,
+        settings_events,
+        shortcuts: keymap.shortcuts,
         capture: Capture::Idle,
         scraps: Vec::new(),
         saves: mpsc::channel(),
@@ -443,7 +459,7 @@ fn start(
         module,
         _instance: instance,
     };
-    Ok((app, failed))
+    Ok((app, keymap.issues, failed))
 }
 
 fn message_loop() -> i32 {
@@ -540,6 +556,10 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
         WM_APP_TEST_PANIC => panic!("test panic on the UI thread (SHUNSOKU_TEST_PANIC)"),
         WM_APP_SAVED => {
             on_saved();
+            Some(LRESULT(0))
+        }
+        WM_APP_SETTINGS => {
+            on_settings_changed();
             Some(LRESULT(0))
         }
         WM_HOTKEY => {
@@ -1379,10 +1399,109 @@ fn read_settings(path: Option<&Path>) -> (Settings, Vec<SettingsIssue>) {
         }
     };
     log::info!("settings loaded from {}", path.display());
-    for issue in &issues {
+    log_issues(&issues);
+    (settings, issues)
+}
+
+fn log_issues(issues: &[SettingsIssue]) {
+    for issue in issues {
         log::warn!("settings issue: {issue:?}");
     }
-    (settings, issues)
+}
+
+fn log_failed(failed: &[hotkey::Failed]) {
+    for f in failed {
+        log::warn!(
+            "could not register the hotkey {} for {:?}: {}",
+            f.chord,
+            f.action,
+            f.error
+        );
+    }
+}
+
+/// `WM_APP_SETTINGS`: 設定ファイルの監視の知らせを受け、読み込み直した設定を反映する。
+///
+/// - TOML として読めなければ、直前の有効な設定のまま動き、エラーを通知する（`settings::reload`）。
+/// - `settings::diff` で変わったものだけを反映する: ホットキーの登録し直し、浮かべているスクラップの描き直し、
+///   ログのレベル。ショートカットの対応表は毎回作り直す（右クリックメニューは開くたびにこれから作る）。
+/// - 問題はまとめて 1 回だけ通知する。範囲選択キャプチャのホットキーが空になったら、それも通知する。
+fn on_settings_changed() {
+    let Some(events) = with_app(|app| app.settings_events.try_iter().collect::<Vec<_>>()) else {
+        return;
+    };
+    let mut content = None;
+    for event in events {
+        match event {
+            settings_watch::Event::Changed(c) => content = Some(c),
+            settings_watch::Event::Stopped(reason) => {
+                with_app(|app| app.watcher = None);
+                notify_user(
+                    notify::Level::Error,
+                    &format!("{}\n{reason}", text("settings.watch_stopped")),
+                );
+            }
+        }
+    }
+    let Some(content) = content else {
+        return;
+    };
+    let notice = with_app(|app| {
+        let current = &app.settings;
+        let (new, mut issues) = match content {
+            settings_watch::Content::Missing => settings::reload(current, None),
+            settings_watch::Content::Text(src) => settings::reload(current, Some(&src)),
+            settings_watch::Content::Unreadable(message) => {
+                (current.clone(), vec![SettingsIssue::NotToml { message }])
+            }
+        };
+        let changes = settings::diff(current, &new);
+        log::info!("settings reloaded: {changes:?}");
+        log_issues(&issues);
+        let keymap = settings::keymap(&new, ops::OPERATIONS);
+        log_issues(&keymap.issues);
+        issues.extend(keymap.issues);
+        let failed = if changes.hotkeys {
+            app.hotkeys.reregister(&keymap.hotkeys.bound)
+        } else {
+            Vec::new()
+        };
+        log_failed(&failed);
+        app.shortcuts = keymap.shortcuts;
+        let unset =
+            app.settings.hotkeys.select_capture.is_some() && new.hotkeys.select_capture.is_none();
+        app.settings = new;
+        apply_changes(app, &changes);
+        settings_notice(
+            Moment::Reload,
+            &issues,
+            &failed,
+            unset,
+            app.settings_path.as_deref(),
+        )
+    })
+    .flatten();
+    if let Some((level, body)) = notice {
+        notify_user(level, &body);
+    }
+}
+
+/// 読み込み直した設定（`app.settings`）のうち、使うときに読むのでは足りないものを反映する。
+fn apply_changes(app: &mut App, changes: &SettingsChanges) {
+    if changes.log_level {
+        log::set_max_level(level_filter(app.settings.log_level));
+    }
+    if changes.appearance {
+        // 枠と影の幅が変わるとウィンドウの大きさも変わるので、描き直して出し直す。描くだけで App を借りる
+        // メッセージは届かないので、借りたままでよい（`run_scrap_operation` と同じ）
+        let appearance = Appearance::from(app.settings.scrap);
+        for scrap in &app.scraps {
+            let rect = scrap.model.window_rect(&appearance);
+            if let Err(e) = paint_scrap(&scrap.window, &scrap.image, rect, &appearance) {
+                log::warn!("could not redraw a scrap with the new appearance: {e}");
+            }
+        }
+    }
 }
 
 fn level_filter(level: LogLevel) -> log::LevelFilter {
@@ -1396,38 +1515,66 @@ fn level_filter(level: LogLevel) -> log::LevelFilter {
     }
 }
 
-/// 起動時の設定とホットキーの問題を、1 つの通知の本文にまとめる。問題がなければ None。
-/// 通知は前の通知を置き換えるので、別々に出すと最後の 1 つしか見えない。
-fn startup_notice(
+/// 設定を読んだとき。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Moment {
+    Startup,
+    /// 実行中の読み込み直し。
+    Reload,
+}
+
+/// 設定とホットキーの問題を、1 つの通知の本文にまとめる。問題がなければ None。
+/// 通知は前の通知を置き換えるので、別々に出すと最後の 1 つしか見えない。`unset` なら、範囲選択キャプチャの
+/// ホットキーが未設定であることも載せる。
+fn settings_notice(
+    moment: Moment,
     issues: &[SettingsIssue],
     failed: &[hotkey::Failed],
-    settings: &Settings,
+    unset: bool,
     path: Option<&Path>,
 ) -> Option<(notify::Level, String)> {
     let mut level = notify::Level::Warning;
     let mut lines = Vec::new();
     let mut invalid = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut overlaps = Vec::new();
     for issue in issues {
         match issue {
             SettingsIssue::NotToml { .. } => {
                 level = notify::Level::Error;
-                lines.push(text("settings.unreadable").to_owned());
+                lines.push(
+                    text(match moment {
+                        Moment::Startup => "settings.unreadable",
+                        Moment::Reload => "settings.unreadable_kept",
+                    })
+                    .to_owned(),
+                );
             }
             SettingsIssue::Invalid { item } => invalid.push(item.as_str()),
+            SettingsIssue::Conflict { chord, items } => {
+                conflicts.push(format!("{chord}（{}）", items.join(", ")));
+            }
+            SettingsIssue::Overlap {
+                chord,
+                hotkey,
+                shortcut,
+            } => overlaps.push(format!("{chord}（{hotkey}, {shortcut}）")),
         }
     }
-    if !invalid.is_empty() {
-        lines.push(format!(
-            "{}{}",
-            text("settings.invalid_items"),
-            invalid.join(", ")
-        ));
+    for (key, items) in [
+        ("settings.invalid_items", invalid.join(", ")),
+        ("settings.conflicts", conflicts.join(", ")),
+        ("settings.overlaps", overlaps.join(", ")),
+    ] {
+        if !items.is_empty() {
+            lines.push(format!("{}{items}", text(key)));
+        }
     }
     if !failed.is_empty() {
         let chords: Vec<String> = failed.iter().map(|f| f.chord.to_string()).collect();
         lines.push(format!("{}{}", text("hotkey.failed"), chords.join(", ")));
     }
-    if settings.hotkeys.select_capture.is_none() {
+    if unset {
         lines.push(text("hotkey.unset").to_owned());
     }
     if lines.is_empty() {

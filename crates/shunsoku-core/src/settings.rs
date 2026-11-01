@@ -2,7 +2,10 @@
 //!
 //! - `load` は項目ごとに値を取り出す。不正な項目はその項目だけ既定値にし、項目名を `SettingsIssue` に載せる。
 //!   知らないキーは無視する。ファイル全体が TOML として読めなければ、すべて既定値にする。
-//! - ファイルは書き換えない（`write` は M3）。読み込み直しの差分と重なりの検出は設定の監視のチケット（#46）で足す。
+//! - ファイルは書き換えない（`write` は M3）。
+//! - 読み込み直しでは `diff` で変わった部分を調べ、`app` が変わったものだけを反映し直す。
+//! - キーの重なりは `keymap` で見つける。同じ範囲（ホットキー同士、ショートカット同士）の重なりは `assign` の
+//!   規則で両方を無効にし、ホットキーとショートカットの重なりは警告だけにする。
 //!
 //! M1 のスキーマ（書かなかった項目は既定値）:
 //!
@@ -35,6 +38,7 @@ use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::keys::Chord;
+use crate::scrap::ops::{OperationDescriptor, Shortcuts};
 
 /// 対応している設定ファイルの形式の版。
 pub const VERSION: i64 = 1;
@@ -113,6 +117,15 @@ impl Hotkeys {
         }
     }
 
+    /// 空でないホットキーを割り当てる（ホットキー同士の重なりは、どれにも付けない）。
+    pub fn assign(&self) -> Assigned<HotkeyAction> {
+        assign(
+            HotkeyAction::ALL
+                .into_iter()
+                .filter_map(|action| Some((self.get(action)?, action))),
+        )
+    }
+
     fn get_mut(&mut self, action: HotkeyAction) -> &mut Option<Chord> {
         match action {
             HotkeyAction::SelectCapture => &mut self.select_capture,
@@ -181,13 +194,157 @@ pub enum LogLevel {
     Trace,
 }
 
+/// 同じ範囲（ホットキー同士、ショートカット同士）でのキーの割り当て（`assign`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assigned<T> {
+    /// 1 つにだけ付いたキーの組み合わせと、その持ち主。
+    pub bound: BTreeMap<Chord, T>,
+    /// 2 つ以上に付いたため、どれにも付けなかったキーの組み合わせ。
+    pub conflicts: Vec<Conflict<T>>,
+}
+
+/// 同じ範囲で重なったキーの組み合わせ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict<T> {
+    pub chord: Chord,
+    /// 重なった持ち主（候補の順）。
+    pub owners: Vec<T>,
+}
+
+/// キーの組み合わせと持ち主の候補から、同じ範囲での割り当てを決める。同じ組み合わせが 2 つ以上の持ち主に
+/// 付いたら、どれにも付けない（どちらが効くか分からない状態を避ける。spec #32）。ホットキー同士と
+/// ショートカット同士（`scrap::ops::Shortcuts`）の重なりは、どちらもこの規則で決める。
+pub fn assign<T>(candidates: impl IntoIterator<Item = (Chord, T)>) -> Assigned<T> {
+    let mut grouped: BTreeMap<Chord, Vec<T>> = BTreeMap::new();
+    for (chord, owner) in candidates {
+        grouped.entry(chord).or_default().push(owner);
+    }
+    let mut bound = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for (chord, mut owners) in grouped {
+        if owners.len() == 1 {
+            bound.insert(chord, owners.remove(0));
+        } else {
+            conflicts.push(Conflict { chord, owners });
+        }
+    }
+    Assigned { bound, conflicts }
+}
+
 /// 設定ファイルの問題。通知で知らせる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsIssue {
     /// ファイル全体が TOML として読めない。すべて既定値になる。
     NotToml { message: String },
     /// 不正な項目。その項目だけ既定値になる。`item` は `general.save_dir` のような `.` でつないだ名前。
+    /// 表にない操作と、ショートカットを持てない操作への `[shortcuts]` の上書きもこれにする（無視する）。
     Invalid { item: String },
+    /// 同じ範囲（ホットキー同士、ショートカット同士）で重なったキーの組み合わせ。重なった項目のどれにも
+    /// 付けない。`items` は重なった項目名（`shortcuts.close` など。表の既定値から来たものも含む）。
+    Conflict { chord: Chord, items: Vec<String> },
+    /// ホットキーとショートカットの重なり。警告だけで、どちらも付けたままにする（OS に登録したホットキーが
+    /// 先にキーを取るので、そのショートカットは効かない）。
+    Overlap {
+        chord: Chord,
+        hotkey: String,
+        shortcut: String,
+    },
+}
+
+/// 設定から作ったキーの割り当て（`keymap`）。
+#[derive(Debug, Clone)]
+pub struct Keymap {
+    /// 登録するホットキー（ホットキー同士の重なりを除いたもの）。
+    pub hotkeys: Assigned<HotkeyAction>,
+    /// スクラップ操作のショートカットの対応表。
+    pub shortcuts: Shortcuts,
+    /// 重なりと、無視した上書き。`load` の問題と合わせて通知する。
+    pub issues: Vec<SettingsIssue>,
+}
+
+/// 設定のホットキーと、`ops`（ふつうは `scrap::ops::OPERATIONS`）の既定値に `[shortcuts]` を重ねた
+/// ショートカットを割り当て、重なりを見つける。
+///
+/// - ショートカット同士・ホットキー同士の、同じ範囲での重なりは、両方を無効にして `Conflict` にする。
+/// - ホットキーとショートカットの重なりは、警告（`Overlap`）だけにする。
+/// - 表にない操作と、ショートカットを持てない操作への上書きは、無視して `Invalid` にする。
+pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keymap {
+    let hotkeys = settings.hotkeys.assign();
+    let shortcuts = Shortcuts::new(ops, &settings.shortcuts);
+    let shortcut_item = |id: &str| format!("shortcuts.{id}");
+    let hotkey_item = |action: HotkeyAction| format!("hotkeys.{}", action.key());
+
+    let mut issues: Vec<SettingsIssue> = shortcuts
+        .ignored_overrides()
+        .iter()
+        .map(|id| SettingsIssue::Invalid {
+            item: shortcut_item(id),
+        })
+        .collect();
+    issues.extend(
+        shortcuts
+            .conflicts()
+            .iter()
+            .map(|c| SettingsIssue::Conflict {
+                chord: c.chord,
+                items: c.owners.iter().map(|id| shortcut_item(id)).collect(),
+            }),
+    );
+    issues.extend(hotkeys.conflicts.iter().map(|c| SettingsIssue::Conflict {
+        chord: c.chord,
+        items: c.owners.iter().map(|&a| hotkey_item(a)).collect(),
+    }));
+    for (&chord, &action) in &hotkeys.bound {
+        if let Some(op) = shortcuts.operation(chord) {
+            issues.push(SettingsIssue::Overlap {
+                chord,
+                hotkey: hotkey_item(action),
+                shortcut: shortcut_item(op.id),
+            });
+        }
+    }
+    Keymap {
+        hotkeys,
+        shortcuts,
+        issues,
+    }
+}
+
+/// 読み込み直しで変わった部分（`diff`）。`app` はこれを見て、変わったものだけを反映し直す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SettingsChanges {
+    /// `[hotkeys]`。ホットキーを登録し直す。
+    pub hotkeys: bool,
+    /// `[shortcuts]`。ショートカットの対応表とメニューを作り直す。
+    pub shortcuts: bool,
+    /// 全体の保存先かファイル名テンプレート。次の保存から使う。
+    pub save: bool,
+    /// 通知のオン/オフ。
+    pub notifications: bool,
+    /// 見た目の既定値（`[scrap]`）。浮かべているスクラップを描き直す。
+    pub appearance: bool,
+    /// ログのレベル。
+    pub log_level: bool,
+}
+
+impl SettingsChanges {
+    /// 何も変わっていない。
+    pub fn is_empty(&self) -> bool {
+        *self == SettingsChanges::default()
+    }
+}
+
+/// `old` から `new` への変化。
+pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
+    SettingsChanges {
+        hotkeys: old.hotkeys != new.hotkeys,
+        shortcuts: old.shortcuts != new.shortcuts,
+        save: old.general.save_dir != new.general.save_dir
+            || old.general.file_name_template != new.general.file_name_template,
+        notifications: old.general.notifications != new.general.notifications,
+        appearance: old.scrap != new.scrap,
+        log_level: old.log_level != new.log_level,
+    }
 }
 
 /// 設定ファイルの中身を読む。問題があっても、読めた項目と既定値で `Settings` を返す。
@@ -259,6 +416,23 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
 
     (s, r.issues)
+}
+
+/// 実行中に設定ファイルを読み込み直す。`src` は新しい中身（ファイルがなければ None で、既定値にする）。
+/// ファイル全体が TOML として読めなければ、`current`（直前の有効な設定）を使い続け、問題だけを返す
+/// （書きかけの保存で壊れないように。spec #32）。起動時は `load` を使い、既定値で起動する。
+pub fn reload(current: &Settings, src: Option<&str>) -> (Settings, Vec<SettingsIssue>) {
+    let Some(src) = src else {
+        return (Settings::default(), Vec::new());
+    };
+    let (settings, issues) = load(src);
+    if issues
+        .iter()
+        .any(|i| matches!(i, SettingsIssue::NotToml { .. }))
+    {
+        return (current.clone(), issues);
+    }
+    (settings, issues)
 }
 
 /// 項目を読みながら問題を集める。
@@ -366,6 +540,7 @@ fn log_level(item: &Item) -> Option<LogLevel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scrap::ops::OPERATIONS;
 
     #[test]
     fn version_only_file_gives_defaults_without_issues() {
@@ -584,6 +759,249 @@ a = 1
             assert_eq!(issues, vec![invalid("version")], "{src:?}");
             assert!(!settings.general.notifications, "{src:?}");
         }
+    }
+
+    #[test]
+    fn diff_of_equal_settings_has_no_changes() {
+        let (settings, _) = load(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Alt+S\"\n[scrap]\nopacity = 50\n",
+        );
+        assert_eq!(
+            diff(&settings, &settings.clone()),
+            SettingsChanges::default()
+        );
+        assert!(diff(&settings, &settings.clone()).is_empty());
+    }
+
+    #[test]
+    fn diff_tells_which_parts_changed() {
+        let old = Settings::default();
+        let changed = |f: fn(&mut Settings)| {
+            let mut new = old.clone();
+            f(&mut new);
+            diff(&old, &new)
+        };
+        assert_eq!(
+            changed(|s| s.hotkeys.select_capture = Some(chord("Ctrl+Alt+S"))),
+            SettingsChanges {
+                hotkeys: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
+            changed(|s| {
+                s.shortcuts.insert("close".to_owned(), None);
+            }),
+            SettingsChanges {
+                shortcuts: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
+            changed(|s| s.general.save_dir = Some(PathBuf::from(r"D:\shots"))),
+            SettingsChanges {
+                save: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
+            changed(|s| s.general.file_name_template = "x_{date}".to_owned()),
+            SettingsChanges {
+                save: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
+            changed(|s| s.general.notifications = false),
+            SettingsChanges {
+                notifications: true,
+                ..SettingsChanges::default()
+            }
+        );
+        for f in [
+            (|s: &mut Settings| s.scrap.opacity = 50) as fn(&mut Settings),
+            |s| s.scrap.border.visible = false,
+            |s| s.scrap.border.width = 4,
+            |s| s.scrap.border.color = Rgb(1, 2, 3),
+            |s| s.scrap.shadow = false,
+        ] {
+            assert_eq!(
+                changed(f),
+                SettingsChanges {
+                    appearance: true,
+                    ..SettingsChanges::default()
+                }
+            );
+        }
+        assert_eq!(
+            changed(|s| s.log_level = LogLevel::Trace),
+            SettingsChanges {
+                log_level: true,
+                ..SettingsChanges::default()
+            }
+        );
+        let mut new = old.clone();
+        new.hotkeys.select_capture = Some(chord("Ctrl+Alt+S"));
+        new.scrap.shadow = false;
+        let both = diff(&old, &new);
+        assert!(both.hotkeys && both.appearance && !both.shortcuts && !both.is_empty());
+    }
+
+    #[test]
+    fn keys_overlapping_in_the_same_scope_are_disabled_for_all_their_owners() {
+        let assigned = assign([
+            (chord("Ctrl+A"), "a"),
+            (chord("Ctrl+B"), "b"),
+            (chord("Ctrl+A"), "c"),
+            (chord("Esc"), "d"),
+            (chord("Ctrl+A"), "e"),
+        ]);
+        assert_eq!(
+            assigned.bound,
+            BTreeMap::from([(chord("Ctrl+B"), "b"), (chord("Esc"), "d")])
+        );
+        assert_eq!(
+            assigned.conflicts,
+            vec![Conflict {
+                chord: chord("Ctrl+A"),
+                owners: vec!["a", "c", "e"],
+            }]
+        );
+    }
+
+    #[test]
+    fn hotkeys_are_assigned_without_the_unset_ones() {
+        assert!(Hotkeys::default().assign().bound.is_empty());
+        let hotkeys = Hotkeys {
+            select_capture: Some(chord("Ctrl+Alt+S")),
+        };
+        let assigned = hotkeys.assign();
+        assert_eq!(
+            assigned.bound,
+            BTreeMap::from([(chord("Ctrl+Alt+S"), HotkeyAction::SelectCapture)])
+        );
+        assert!(assigned.conflicts.is_empty());
+    }
+
+    fn keymap_of(src: &str) -> Keymap {
+        let (settings, issues) = load(src);
+        assert_eq!(issues, vec![], "{src}");
+        keymap(&settings, OPERATIONS)
+    }
+
+    fn bound_op(keymap: &Keymap, s: &str) -> Option<&'static str> {
+        keymap.shortcuts.operation(chord(s)).map(|op| op.id)
+    }
+
+    #[test]
+    fn keymap_of_the_defaults_has_no_issues() {
+        let keymap = keymap_of("version = 1\n");
+        assert!(keymap.hotkeys.bound.is_empty());
+        assert_eq!(bound_op(&keymap, "Esc"), Some("close"));
+        assert_eq!(keymap.issues, vec![]);
+    }
+
+    #[test]
+    fn overlapping_shortcuts_are_disabled_and_named_as_an_issue() {
+        let keymap = keymap_of("version = 1\n[shortcuts]\ncopy = \"Ctrl+W\"\nclose = \"Ctrl+W\"\n");
+        assert_eq!(bound_op(&keymap, "Ctrl+W"), None);
+        assert_eq!(bound_op(&keymap, "Ctrl+C"), None);
+        assert_eq!(bound_op(&keymap, "Esc"), None);
+        assert_eq!(bound_op(&keymap, "Ctrl+S"), Some("save_default"));
+        assert_eq!(
+            keymap.issues,
+            vec![SettingsIssue::Conflict {
+                chord: chord("Ctrl+W"),
+                items: vec!["shortcuts.copy".to_owned(), "shortcuts.close".to_owned()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_shortcut_overriding_onto_a_default_one_disables_both() {
+        let keymap = keymap_of("version = 1\n[shortcuts]\nclose = \"Ctrl+S\"\n");
+        assert_eq!(bound_op(&keymap, "Ctrl+S"), None);
+        assert_eq!(
+            keymap.issues,
+            vec![SettingsIssue::Conflict {
+                chord: chord("Ctrl+S"),
+                items: vec![
+                    "shortcuts.save_default".to_owned(),
+                    "shortcuts.close".to_owned()
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_hotkey_on_a_shortcut_is_only_a_warning_and_keeps_both() {
+        let keymap = keymap_of("version = 1\n[hotkeys]\nselect_capture = \"Ctrl+C\"\n");
+        assert_eq!(
+            keymap.hotkeys.bound,
+            BTreeMap::from([(chord("Ctrl+C"), HotkeyAction::SelectCapture)])
+        );
+        assert_eq!(bound_op(&keymap, "Ctrl+C"), Some("copy"));
+        assert_eq!(
+            keymap.issues,
+            vec![SettingsIssue::Overlap {
+                chord: chord("Ctrl+C"),
+                hotkey: "hotkeys.select_capture".to_owned(),
+                shortcut: "shortcuts.copy".to_owned(),
+            }]
+        );
+        // 重なりで無効になったショートカットとは、重ならない
+        let keymap = keymap_of(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+W\"\n[shortcuts]\ncopy = \"Ctrl+W\"\nclose = \"Ctrl+W\"\n",
+        );
+        assert!(
+            keymap
+                .issues
+                .iter()
+                .all(|i| !matches!(i, SettingsIssue::Overlap { .. })),
+            "{:?}",
+            keymap.issues
+        );
+    }
+
+    #[test]
+    fn overrides_that_cannot_take_a_shortcut_are_invalid_items() {
+        let keymap =
+            keymap_of("version = 1\n[shortcuts]\nfly = \"F\"\nmove = \"M\"\nclose = \"Q\"\n");
+        assert_eq!(bound_op(&keymap, "Q"), Some("close"));
+        assert_eq!(
+            keymap.issues,
+            vec![invalid("shortcuts.fly"), invalid("shortcuts.move")]
+        );
+    }
+
+    #[test]
+    fn reloading_text_that_is_not_toml_keeps_the_current_settings() {
+        let (current, _) = load("version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Alt+S\"\n");
+        let (settings, issues) = reload(&current, Some("version = 1\n[hotkeys\n"));
+        assert_eq!(settings, current);
+        assert!(
+            matches!(issues.as_slice(), [SettingsIssue::NotToml { .. }]),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn reloading_reads_the_new_file_and_its_invalid_items_fall_back_to_defaults() {
+        let (current, _) = load("version = 1\n[scrap]\nopacity = 50\nshadow = false\n");
+        let (settings, issues) = reload(
+            &current,
+            Some("version = 1\n[scrap]\nopacity = 5\n[general]\nnotifications = false\n"),
+        );
+        assert_eq!(issues, vec![invalid("scrap.opacity")]);
+        let mut expected = Settings::default();
+        expected.general.notifications = false;
+        assert_eq!(settings, expected);
+    }
+
+    #[test]
+    fn reloading_without_a_file_gives_the_defaults() {
+        let (current, _) = load("version = 1\n[scrap]\nopacity = 50\n");
+        assert_eq!(reload(&current, None), (Settings::default(), vec![]));
     }
 
     #[test]
