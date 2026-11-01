@@ -53,6 +53,7 @@ zoom = "拡大縮小"
 zoom_in = "拡大"
 zoom_out = "縮小"
 zoom_actual = "元のサイズに戻す"
+toggle_compact = "コンパクト表示"
 close = "閉じる"
 
 # 裏のスレッドのパニック（その仕事の失敗の理由として出す）
