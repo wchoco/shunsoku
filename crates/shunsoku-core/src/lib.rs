@@ -2,7 +2,9 @@
 
 pub mod capture;
 pub mod i18n;
+pub mod keys;
 pub mod log_file;
+pub mod settings;
 
 /// アプリの名前。
 pub const APP_NAME: &str = "shunsoku";
