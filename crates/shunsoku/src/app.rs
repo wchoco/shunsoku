@@ -41,11 +41,12 @@ use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
+use shunsoku_core::perf::Mark;
 use shunsoku_core::scrap::ops::{
     self, Effect, MenuEntry, MouseGesture, OpContext, OperationDescriptor, Shortcuts,
 };
 use shunsoku_core::scrap::{Appearance, ScrapModel};
-use shunsoku_core::selection::{Button, Input, Selection, State};
+use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsIssue};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -53,23 +54,23 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN,
-    VK_SHIFT,
+    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_DOWN, VK_ESCAPE,
+    VK_LEFT, VK_LWIN, VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessagePos, GetMessageW,
     HWND_MESSAGE, IDI_APPLICATION, KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, RegisterWindowMessageW, SetTimer, TranslateMessage, WINDOW_EX_STYLE,
-    WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    RegisterClassExW, RegisterWindowMessageW, SetCursorPos, SetTimer, TranslateMessage,
+    WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
+    WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
 use crate::{
-    grab, hotkey, logger, menu, notify, overlay, panic_hook, render, scrap_window, single_instance,
-    tray,
+    grab, hotkey, logger, menu, notify, overlay, panic_hook, perf, render, scrap_window,
+    single_instance, tray,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
@@ -196,10 +197,14 @@ fn text(key: &'static str) -> &'static str {
 
 /// 常駐本体を動かし、終了コードを返す。
 pub fn run() -> i32 {
+    let perf_started = perf::start();
     // 設定ファイルとログを置くフォルダ
     let app_dir = std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join(APP_NAME));
     let log_path = app_dir.as_deref().and_then(|dir| logger::init(dir).ok());
     log::info!("starting {APP_NAME} v{}", env!("CARGO_PKG_VERSION"));
+    if let Err(e) = perf_started {
+        log::warn!("could not open the perf log: {e}");
+    }
 
     let catalog = Catalog::parse(include_str!("../../../locales/ja.toml")).unwrap_or_else(|e| {
         log::error!("bundled locale is not valid TOML: {e}");
@@ -366,6 +371,7 @@ fn start(
         text("tray.tooltip").to_owned(),
     );
     if tray.register() {
+        perf::mark(Mark::TrayRegistered);
         log::info!("tray icon registered");
     } else {
         log::warn!("could not register the tray icon; waiting for TaskbarCreated");
@@ -611,8 +617,10 @@ fn on_overlay_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> O
             });
             Some(LRESULT(0))
         }
-        WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
-            on_selection_input(Input::Escape);
+        WM_KEYDOWN => {
+            if let Some(input) = selection_key(wparam, lparam) {
+                on_selection_input(input);
+            }
             Some(LRESULT(0))
         }
         // 他のアプリに前面を取られるとキー入力が来なくなり、閉じられなくなるので閉じる
@@ -857,6 +865,31 @@ fn close_scrap(hwnd: HWND) {
     }
 }
 
+/// 範囲選択の画面での `WM_KEYDOWN` を入力にする。対象でないキーは None。
+fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
+    // SAFETY: GetKeyState は引数のキーの状態を読むだけ
+    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
+    // 押しっぱなしの自動リピート（lParam の bit 30 = 直前も押されていた）
+    let repeat = lparam.0 & (1 << 30) != 0;
+    let shift = down(VK_SHIFT);
+    let arrow = |direction| Some(Input::Arrow { direction, shift });
+    match VIRTUAL_KEY(wparam.0 as u16) {
+        VK_ESCAPE => Some(Input::Escape),
+        VK_LEFT => arrow(Direction::Left),
+        VK_RIGHT => arrow(Direction::Right),
+        VK_UP => arrow(Direction::Up),
+        VK_DOWN => arrow(Direction::Down),
+        // 押しっぱなしで始点と終点が続けて決まらないよう、リピートは無視する
+        VK_SPACE if !repeat => Some(Input::Space),
+        VK_A if down(VK_CONTROL) && !repeat => Some(if shift {
+            Input::SelectAllMonitors
+        } else {
+            Input::SelectMonitor
+        }),
+        _ => None,
+    }
+}
+
 /// 範囲選択の入力を状態に渡し、描き直す。確定したら撮って出力し、取り消したら画面を閉じる。
 fn on_selection_input(input: Input) {
     let state = with_app(|app| {
@@ -872,9 +905,20 @@ fn on_selection_input(input: Input) {
             // 描くだけでウィンドウは作らないので、借りたまま描いてよい
             overlay.redraw(selection);
         }
-        Some(state)
+        Some((state, selection.cursor()))
     })
     .flatten();
+    let state = state.map(|(state, cursor)| {
+        // 矢印で動かしたカーソルの位置に、実際のマウスのカーソルを合わせる。
+        // 合わせたあとの WM_MOUSEMOVE は同じ位置なので、状態は変わらない
+        if matches!(input, Input::Arrow { .. }) && matches!(state, State::Idle | State::Selecting) {
+            // SAFETY: UI スレッドで呼ぶ。座標はスクリーン座標（物理ピクセル、PMv2）
+            if let Err(e) = unsafe { SetCursorPos(cursor.x, cursor.y) } {
+                log::warn!("could not move the cursor: {e}");
+            }
+        }
+        state
+    });
     match state {
         Some(State::Confirmed) => finish_selection(),
         Some(State::Cancelled) => {
@@ -958,6 +1002,7 @@ fn finish_selection() {
         if rejected.is_none() {
             log::warn!("could not keep the scrap");
         }
+        perf::mark(Mark::ScrapShown);
     }
     log::info!("overlay closed");
 }
@@ -1042,7 +1087,11 @@ fn open_overlay() {
 
     // ウィンドウを作るとメッセージが届くので、App を借りずに開く
     let overlay = match overlay::Overlay::open(shots, module) {
-        Ok(overlay) => overlay,
+        Ok(overlay) => {
+            // open は全モニタで DwmFlush が返ってから戻る
+            perf::mark(Mark::OverlayFlushed);
+            overlay
+        }
         Err(e) => {
             log::error!("could not open the overlay: {e}");
             end_capture();
@@ -1106,6 +1155,7 @@ fn end_capture() {
 
 /// `WM_HOTKEY`。範囲選択の画面を開いている間に押されたものは `request_capture` が無視する。
 fn on_hotkey(wparam: WPARAM) {
+    perf::mark(Mark::HotkeyReceived);
     let action = with_app(|app| app.hotkeys.action(wparam)).flatten();
     match action {
         Some(settings::HotkeyAction::SelectCapture) => request_capture(Source::Hotkey),
