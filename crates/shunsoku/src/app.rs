@@ -36,21 +36,24 @@ use shunsoku_core::geometry::Point;
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::scrap::{Appearance, ScrapModel};
-use shunsoku_core::selection::{Button, Input, Selection, State};
+use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsIssue};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_DOWN, VK_ESCAPE,
+    VK_LEFT, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
     IDI_APPLICATION, KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SetTimer, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP,
-    WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_TIMER, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    RegisterWindowMessageW, SetCursorPos, SetTimer, TranslateMessage, WINDOW_EX_STYLE,
+    WM_ACTIVATEAPP, WM_APP, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION,
+    WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_RBUTTONDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -554,8 +557,10 @@ fn on_overlay_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> O
             });
             Some(LRESULT(0))
         }
-        WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
-            on_selection_input(Input::Escape);
+        WM_KEYDOWN => {
+            if let Some(input) = selection_key(wparam, lparam) {
+                on_selection_input(input);
+            }
             Some(LRESULT(0))
         }
         // 他のアプリに前面を取られるとキー入力が来なくなり、閉じられなくなるので閉じる
@@ -587,6 +592,31 @@ fn on_scrap_message(_hwnd: HWND, msg: u32, _wparam: WPARAM, _lparam: LPARAM) -> 
     }
 }
 
+/// 範囲選択の画面での `WM_KEYDOWN` を入力にする。対象でないキーは None。
+fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
+    // SAFETY: GetKeyState は引数のキーの状態を読むだけ
+    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
+    // 押しっぱなしの自動リピート（lParam の bit 30 = 直前も押されていた）
+    let repeat = lparam.0 & (1 << 30) != 0;
+    let shift = down(VK_SHIFT);
+    let arrow = |direction| Some(Input::Arrow { direction, shift });
+    match VIRTUAL_KEY(wparam.0 as u16) {
+        VK_ESCAPE => Some(Input::Escape),
+        VK_LEFT => arrow(Direction::Left),
+        VK_RIGHT => arrow(Direction::Right),
+        VK_UP => arrow(Direction::Up),
+        VK_DOWN => arrow(Direction::Down),
+        // 押しっぱなしで始点と終点が続けて決まらないよう、リピートは無視する
+        VK_SPACE if !repeat => Some(Input::Space),
+        VK_A if down(VK_CONTROL) && !repeat => Some(if shift {
+            Input::SelectAllMonitors
+        } else {
+            Input::SelectMonitor
+        }),
+        _ => None,
+    }
+}
+
 /// 範囲選択の入力を状態に渡し、描き直す。確定したら撮って出力し、取り消したら画面を閉じる。
 fn on_selection_input(input: Input) {
     let state = with_app(|app| {
@@ -602,9 +632,20 @@ fn on_selection_input(input: Input) {
             // 描くだけでウィンドウは作らないので、借りたまま描いてよい
             overlay.redraw(selection);
         }
-        Some(state)
+        Some((state, selection.cursor()))
     })
     .flatten();
+    let state = state.map(|(state, cursor)| {
+        // 矢印で動かしたカーソルの位置に、実際のマウスのカーソルを合わせる。
+        // 合わせたあとの WM_MOUSEMOVE は同じ位置なので、状態は変わらない
+        if matches!(input, Input::Arrow { .. }) && matches!(state, State::Idle | State::Selecting) {
+            // SAFETY: UI スレッドで呼ぶ。座標はスクリーン座標（物理ピクセル、PMv2）
+            if let Err(e) = unsafe { SetCursorPos(cursor.x, cursor.y) } {
+                log::warn!("could not move the cursor: {e}");
+            }
+        }
+        state
+    });
     match state {
         Some(State::Confirmed) => finish_selection(),
         Some(State::Cancelled) => {
