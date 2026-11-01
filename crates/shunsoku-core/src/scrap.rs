@@ -50,6 +50,39 @@ pub enum TrimInput {
     Cancel,
 }
 
+impl TrimInput {
+    /// カーソルが `at` に動いたときの入力。押したまま（`Pointer::holding`）でなければ、離したことを取りこぼした
+    /// ものとして `Release` にする。
+    pub fn pointer_move(at: Point, pointer: Pointer) -> TrimInput {
+        if pointer.holding() {
+            TrimInput::Move(at)
+        } else {
+            TrimInput::Release
+        }
+    }
+}
+
+/// カーソルが動いたとき（`WM_MOUSEMOVE`）の左ボタンとマウスの捕まえ方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pointer {
+    /// 左ボタンを押している。
+    pub left_down: bool,
+    /// このウィンドウがマウスを捕まえている。
+    pub captured: bool,
+}
+
+impl Pointer {
+    /// 押したまま動かしている。ドラッグと範囲の選択は、このときだけ続ける。
+    pub fn holding(&self) -> bool {
+        self.left_down && self.captured
+    }
+
+    /// 左ボタンを離したのに、まだマウスを捕まえている（離したことを取りこぼした）。放す。
+    pub fn stray_capture(&self) -> bool {
+        self.captured && !self.left_down
+    }
+}
+
 /// 倍率の下限（%）。
 pub const ZOOM_MIN: u16 = 10;
 /// 倍率の上限（%）。
@@ -637,7 +670,13 @@ impl Drag {
     }
 
     /// カーソルが `at` に動いた。ドラッグの間なら前回からの移動量。ドラッグしていなければ None。
-    pub fn move_to(&mut self, at: Point) -> Option<Point> {
+    /// 押したまま（`Pointer::holding`）でなければ、離したことを取りこぼしたものとしてドラッグを終える
+    /// （ホバーだけでスクラップが動かないように）。
+    pub fn move_to(&mut self, at: Point, pointer: Pointer) -> Option<Point> {
+        if !pointer.holding() {
+            self.end();
+            return None;
+        }
         // 押していないときに位置を覚えると、次の移動がドラッグになってしまう
         let from = self.from.as_mut()?;
         let delta = Point::new(at.x - from.x, at.y - from.y);
@@ -1305,11 +1344,17 @@ mod tests {
         assert_eq!(scrap.image_rect(), Rect::new(0, 0, 600, 400));
     }
 
+    /// 左ボタンを押していて、ウィンドウがマウスを捕まえている。
+    const HOLDING: Pointer = Pointer {
+        left_down: true,
+        captured: true,
+    };
+
     #[test]
     fn hovering_without_pressing_never_moves_the_scrap() {
         let mut drag = Drag::default();
-        assert_eq!(drag.move_to(Point::new(10, 10)), None);
-        assert_eq!(drag.move_to(Point::new(15, 12)), None);
+        assert_eq!(drag.move_to(Point::new(10, 10), HOLDING), None);
+        assert_eq!(drag.move_to(Point::new(15, 12), HOLDING), None);
         assert!(!drag.is_active());
     }
 
@@ -1317,10 +1362,75 @@ mod tests {
     fn a_drag_reports_each_move_from_the_previous_position_until_it_ends() {
         let mut drag = Drag::default();
         drag.start(Point::new(10, 10));
-        assert_eq!(drag.move_to(Point::new(15, 8)), Some(Point::new(5, -2)));
-        assert_eq!(drag.move_to(Point::new(14, 8)), Some(Point::new(-1, 0)));
+        assert_eq!(
+            drag.move_to(Point::new(15, 8), HOLDING),
+            Some(Point::new(5, -2))
+        );
+        assert_eq!(
+            drag.move_to(Point::new(14, 8), HOLDING),
+            Some(Point::new(-1, 0))
+        );
         drag.end();
-        assert_eq!(drag.move_to(Point::new(20, 20)), None);
-        assert_eq!(drag.move_to(Point::new(25, 20)), None);
+        assert_eq!(drag.move_to(Point::new(20, 20), HOLDING), None);
+        assert_eq!(drag.move_to(Point::new(25, 20), HOLDING), None);
+    }
+
+    #[test]
+    fn a_drag_ends_when_a_move_arrives_without_the_button_or_the_capture() {
+        for pointer in [
+            Pointer {
+                left_down: false,
+                captured: true,
+            },
+            Pointer {
+                left_down: true,
+                captured: false,
+            },
+        ] {
+            let mut drag = Drag::default();
+            drag.start(Point::new(10, 10));
+            // 離したことを取りこぼしても、ホバーでスクラップを動かさない
+            assert_eq!(drag.move_to(Point::new(15, 8), pointer), None);
+            assert!(!drag.is_active());
+            assert_eq!(drag.move_to(Point::new(20, 8), HOLDING), None);
+        }
+    }
+
+    #[test]
+    fn the_capture_is_stray_only_when_it_outlives_the_button() {
+        let stray = |left_down, captured| {
+            Pointer {
+                left_down,
+                captured,
+            }
+            .stray_capture()
+        };
+        assert!(stray(false, true));
+        assert!(!stray(true, true));
+        assert!(!stray(true, false));
+        assert!(!stray(false, false));
+    }
+
+    #[test]
+    fn a_trim_move_without_the_button_or_the_capture_releases_the_press() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(100, 100));
+        scrap.start_trim();
+        scrap.trim_input(TrimInput::Press(Point::new(10, 10)));
+        let lost = Pointer {
+            left_down: false,
+            captured: true,
+        };
+        assert_eq!(
+            TrimInput::pointer_move(Point::new(30, 30), lost),
+            TrimInput::Release
+        );
+        assert_eq!(
+            TrimInput::pointer_move(Point::new(30, 30), HOLDING),
+            TrimInput::Move(Point::new(30, 30))
+        );
+        scrap.trim_input(TrimInput::pointer_move(Point::new(30, 30), lost));
+        // 押していないことになったので、そのあとの移動では範囲を選ばない
+        assert!(!scrap.trim_input(TrimInput::Move(Point::new(40, 40))));
+        assert_eq!(scrap.trim_selection(), None);
     }
 }

@@ -61,7 +61,9 @@ use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseBindings, MouseGesture, OpContext,
     OperationDescriptor, OperationId, Shortcuts,
 };
-use shunsoku_core::scrap::{Appearance, Drag, Mode, ScrapModel, TrimInput, Wheel, ZoomAnchor};
+use shunsoku_core::scrap::{
+    Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
+};
 use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
 use shunsoku_core::trash::TrashId;
@@ -1043,36 +1045,42 @@ impl App {
     }
 }
 
-/// 左ドラッグの間のカーソルの移動を、ドラッグの操作に渡す。
-///
-/// 左ボタンを押していて、このウィンドウがマウスを捕まえているときだけ動かす。そうでなければ
-/// （離したことを取りこぼしたなど）ドラッグを終える。ホバーだけでスクラップが動かないようにするため。
-fn on_scrap_drag(hwnd: HWND, wparam: WPARAM, at: Point) {
+/// `WM_MOUSEMOVE` の `wparam` と、`hwnd` がマウスを捕まえているかから作る、左ボタンの様子。
+fn pointer_on_move(hwnd: HWND, wparam: WPARAM) -> Pointer {
     // WM_MOUSEMOVE の wparam の MK_LBUTTON（Win32_System_SystemServices を足さないよう値で持つ）
     const MK_LBUTTON: usize = 0x0001;
-    let left_down = wparam.0 & MK_LBUTTON != 0;
-    // SAFETY: 引数なし
-    let captured = unsafe { GetCapture() } == hwnd;
-    if !(left_down && captured) {
-        let was_dragging = with_app(|app| {
-            let scrap = app.scrap_mut(hwnd)?;
-            let active = scrap.drag.is_active();
-            scrap.drag.end();
-            Some(active)
-        })
-        .flatten()
-        .unwrap_or(false);
-        if was_dragging {
-            log::debug!("scrap drag ended without a button release");
-        }
-        if captured {
-            // App を借りずに放す（WM_CAPTURECHANGED が届くため）
-            // SAFETY: UI スレッドで呼ぶ
-            let _ = unsafe { ReleaseCapture() };
-        }
-        return;
+    Pointer {
+        left_down: wparam.0 & MK_LBUTTON != 0,
+        // SAFETY: 引数なし
+        captured: unsafe { GetCapture() } == hwnd,
     }
-    let delta = with_app(|app| app.scrap_mut(hwnd)?.drag.move_to(at)).flatten();
+}
+
+/// 離したことを取りこぼしてマウスを捕まえたままなら放す。WM_CAPTURECHANGED が届くので、App を借りずに呼ぶ。
+fn release_stray_capture(pointer: Pointer) {
+    if pointer.stray_capture() {
+        // SAFETY: UI スレッドで呼ぶ
+        let _ = unsafe { ReleaseCapture() };
+    }
+}
+
+/// 左ドラッグの間のカーソルの移動を、ドラッグの操作に渡す。押したままでなければ（離したことを取りこぼした
+/// など）ドラッグを終える（`Drag::move_to`）。
+fn on_scrap_drag(hwnd: HWND, wparam: WPARAM, at: Point) {
+    let pointer = pointer_on_move(hwnd, wparam);
+    let moved = with_app(|app| {
+        let drag = &mut app.scrap_mut(hwnd)?.drag;
+        let was_dragging = drag.is_active();
+        Some((was_dragging, drag.move_to(at, pointer)))
+    })
+    .flatten();
+    release_stray_capture(pointer);
+    let Some((was_dragging, delta)) = moved else {
+        return;
+    };
+    if was_dragging && !pointer.holding() {
+        log::debug!("scrap drag ended without a button release");
+    }
     if let Some(drag) = delta {
         let context = OpContext {
             drag,
@@ -1092,23 +1100,12 @@ fn is_trimming(hwnd: HWND) -> bool {
     .unwrap_or(false)
 }
 
-/// トリムの最中のカーソルの移動。左ボタンを押していて、このウィンドウがマウスを捕まえているときだけ範囲を
-/// 変える。そうでなければ（離したことを取りこぼしたなど）押していないことにする。
+/// トリムの最中のカーソルの移動。押したままでなければ（離したことを取りこぼしたなど）押していないことにする
+/// （`TrimInput::pointer_move`）。
 fn on_trim_move(hwnd: HWND, wparam: WPARAM, at: Point) {
-    const MK_LBUTTON: usize = 0x0001;
-    let left_down = wparam.0 & MK_LBUTTON != 0;
-    // SAFETY: 引数なし
-    let captured = unsafe { GetCapture() } == hwnd;
-    if left_down && captured {
-        on_trim_input(hwnd, TrimInput::Move(at));
-    } else {
-        on_trim_input(hwnd, TrimInput::Release);
-        if captured {
-            // App を借りずに放す（WM_CAPTURECHANGED が届くため）
-            // SAFETY: UI スレッドで呼ぶ
-            let _ = unsafe { ReleaseCapture() };
-        }
-    }
+    let pointer = pointer_on_move(hwnd, wparam);
+    on_trim_input(hwnd, TrimInput::pointer_move(at, pointer));
+    release_stray_capture(pointer);
 }
 
 /// トリムの範囲の選択に入力を渡し、変わったら描き直す。トリムの最中でなければ何もせず false。
