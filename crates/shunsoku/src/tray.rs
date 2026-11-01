@@ -2,8 +2,9 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIN_SELECT,
-    NINF_KEY, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
+    NIN_BALLOONUSERCLICK, NIN_SELECT, NINF_KEY, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{HICON, WM_CONTEXTMENU};
 
@@ -29,6 +30,8 @@ pub enum Event {
         x: i32,
         y: i32,
     },
+    /// 通知（`notify`）がクリックされた。何の通知だったかは持たない。
+    NotificationClick,
     Other,
 }
 
@@ -92,6 +95,8 @@ pub fn event(wparam: WPARAM, lparam: LPARAM) -> Event {
             x: (wparam.0 & 0xFFFF) as u16 as i16 as i32,
             y: ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32,
         }
+    } else if code == NIN_BALLOONUSERCLICK {
+        Event::NotificationClick
     } else {
         Event::Other
     }

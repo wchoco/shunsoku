@@ -3,7 +3,8 @@
 //! - 描いた DIB は premultiplied BGRA。`UpdateLayeredWindow` にそのまま渡せる。
 //! - Direct2D の座標は 1 DIP = 1 物理ピクセル（DPI 96 固定）。画像は等倍で、補間せずに描く。
 //! - 透明度はここでは掛けない（レイヤード ウィンドウの `SourceConstantAlpha` で掛ける）。
-//! - 画像だけを画像の大きさで描く `paint_image` は、コピーや保存（#44）で使う。
+//! - コピーと保存の画像は、`render_image` で画像だけを画像の大きさに描いてから作る（表示と同じ描き方にするため。
+//!   M1 では書き込みがないので、元の画像と同じになる）。
 
 use std::ffi::c_void;
 
@@ -23,7 +24,7 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-    DeleteDC, DeleteObject, HBITMAP, HDC, HGDIOBJ, SelectObject,
+    DeleteDC, DeleteObject, GdiFlush, HBITMAP, HDC, HGDIOBJ, SelectObject,
 };
 use windows::core::Result;
 
@@ -35,6 +36,8 @@ pub struct Canvas {
     dc: HDC,
     bitmap: HBITMAP,
     old: HGDIOBJ,
+    /// DIB の画素（`bitmap` が生きている間だけ有効）。
+    bits: *const u8,
     size: Size,
 }
 
@@ -73,6 +76,7 @@ impl Canvas {
                 dc,
                 bitmap,
                 old,
+                bits: bits.cast_const().cast(),
                 size,
             })
         }
@@ -85,6 +89,21 @@ impl Canvas {
 
     pub fn size(&self) -> Size {
         self.size
+    }
+
+    /// 描いた中身（premultiplied）を、アルファを割り戻した画像にする。
+    pub fn to_image(&self) -> Option<Image> {
+        let len = self.size.width as usize * self.size.height as usize * 4;
+        if self.bits.is_null() {
+            return None;
+        }
+        // SAFETY: bits は CreateDIBSection が返した、上の行から並ぶ 32bit の DIB で、len バイトある。
+        // GdiFlush で GDI の描き込みを終えてから読む
+        let pixels = unsafe {
+            let _ = GdiFlush();
+            std::slice::from_raw_parts(self.bits, len).to_vec()
+        };
+        Image::from_premultiplied(self.size, pixels)
     }
 }
 
@@ -174,7 +193,6 @@ impl Renderer {
     }
 
     /// 画像だけを画像の大きさの `canvas` に描く（コピーや保存で、表示と同じ描き方を使うため）。
-    #[expect(dead_code, reason = "コピーと保存のチケット（#44）で使う")]
     pub fn paint_image(&self, canvas: &Canvas, image: &Image) -> Result<()> {
         self.paint(canvas, |target| draw_image(target, image, Point::default()))
     }
@@ -204,6 +222,18 @@ impl Renderer {
             drawn.and(ended)
         }
     }
+}
+
+/// コピーと保存の画像を作る: 画像だけを画像の画素の大きさに、表示と同じ描き方で描く。
+pub fn render_image(image: &Image) -> Result<Image> {
+    if image.width() == 0 || image.height() == 0 {
+        return Ok(image.clone());
+    }
+    let canvas = Canvas::new(image.size())?;
+    Renderer::new()?.paint_image(&canvas, image)?;
+    canvas
+        .to_image()
+        .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED))
 }
 
 /// 画像を `at` を左上として等倍で描く。

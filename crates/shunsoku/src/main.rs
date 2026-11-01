@@ -6,6 +6,8 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod clipboard;
+#[cfg(windows)]
 mod grab;
 #[cfg(windows)]
 mod hotkey;
@@ -23,6 +25,8 @@ mod panic_hook;
 mod perf;
 #[cfg(windows)]
 mod render;
+#[cfg(windows)]
+mod save;
 #[cfg(windows)]
 mod scrap_window;
 #[cfg(windows)]
