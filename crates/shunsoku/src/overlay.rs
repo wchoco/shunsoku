@@ -6,7 +6,8 @@
 //! - キー入力は前面にした 1 枚にしか来ない。どのウィンドウのイベントも、ウィンドウごとではなく
 //!   画面全体の状態に渡すこと。
 //! - ウィンドウ プロシージャは `app` が持つ（Win32 層のモジュールは `app` を通してつながる）。
-//! - 範囲を選んでいる間は、固定された画面をバックバッファに写したうえに Direct2D で範囲の外を暗くし、
+//! - 画面は暗くしない。範囲を選んでいる間は、固定された画面をバックバッファに写したうえに Direct2D で
+//!   範囲のすぐ外側に細い枠（内側が白、外側が黒の 1 物理ピクセルずつ。どんな背景でも見えるように）を描き、
 //!   範囲の左上の外側にサイズを出す。Direct2D の資源は初めて範囲を描くときに作る（開くまでの時間を
 //!   延ばさないため）。Direct2D の座標は 1 DIP = 1 物理ピクセル。
 //! - drop で Direct2D の描画先、スワップチェーンの順に解放してからウィンドウを壊す。そのあと
@@ -55,12 +56,19 @@ use crate::grab::Shot;
 /// 範囲選択の画面のウィンドウのクラス名。
 const CLASS_NAME: PCWSTR = w!("shunsoku.overlay");
 
-/// 範囲の外を暗くする色（黒の半透明）。
-const DIM: D2D1_COLOR_F = D2D1_COLOR_F {
+/// 範囲の枠の内側の線の色（白）。
+const FRAME_INNER: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 1.0,
+};
+/// 範囲の枠の外側の線の色（黒）。
+const FRAME_OUTER: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 0.0,
     g: 0.0,
     b: 0.0,
-    a: 0.5,
+    a: 1.0,
 };
 /// サイズの表示の背景の色。
 const LABEL_BACK: D2D1_COLOR_F = D2D1_COLOR_F {
@@ -126,7 +134,8 @@ struct Surface {
 
 /// バックバッファに描く Direct2D のデバイス コンテキストとブラシ。
 struct D2dTarget {
-    dim: ID2D1SolidColorBrush,
+    frame_inner: ID2D1SolidColorBrush,
+    frame_outer: ID2D1SolidColorBrush,
     label_back: ID2D1SolidColorBrush,
     label_text: ID2D1SolidColorBrush,
     _target: ID2D1Bitmap1,
@@ -212,7 +221,7 @@ impl Overlay {
     }
 
     /// 全モニタのウィンドウを描き直す。範囲がなければ固定された画面をそのまま出し、
-    /// 範囲があればその外を暗くしてサイズを出す。
+    /// 範囲があればその枠とサイズを出す。
     pub fn redraw(&mut self, selection: &Selection) {
         let rect = selection.rect();
         let label = match rect {
@@ -363,7 +372,7 @@ impl Painter {
 }
 
 impl MonitorView {
-    /// 固定された画面を写し、範囲（`rect`）があれば範囲の外を暗くしてサイズを出す。
+    /// 固定された画面を写し、範囲（`rect`）があれば範囲の枠とサイズを出す。
     /// `factory` がなければ範囲は描かない。
     fn draw(
         &mut self,
@@ -388,7 +397,7 @@ impl MonitorView {
         }
     }
 
-    /// 範囲の外を暗くし、サイズを出す。スクリーン座標からこのウィンドウの座標に直して描く。
+    /// 範囲の枠とサイズを出す。スクリーン座標からこのウィンドウの座標に直して描く。
     fn draw_selection(
         &mut self,
         factory: &ID2D1Factory1,
@@ -416,20 +425,24 @@ impl MonitorView {
             right: r.right - ox,
             bottom: r.bottom - oy,
         };
-        // 範囲の外 = 範囲の上・下・左・右の 4 つの帯。このモニタに重なる部分だけ塗る
-        let outside = [
-            Rect::new(monitor.left, monitor.top, monitor.right, rect.top),
-            Rect::new(monitor.left, rect.bottom, monitor.right, monitor.bottom),
-            Rect::new(monitor.left, rect.top, rect.left, rect.bottom),
-            Rect::new(rect.right, rect.top, monitor.right, rect.bottom),
+        // 枠は範囲の外側に 1 画素ずつ、内側の白と外側の黒の 2 本（範囲の画素には重ねない）
+        let lines = [
+            (rect.inflate(1), rect, &d2d.frame_inner),
+            (rect.inflate(2), rect.inflate(1), &d2d.frame_outer),
         ];
         let context = &d2d.context;
         // SAFETY: このモニタのバックバッファに描く。UI スレッドで呼ぶ
         unsafe {
             context.BeginDraw();
             context.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-            for band in outside.iter().filter_map(|b| b.intersect(&monitor)) {
-                context.FillRectangle(&local(&to_rect_f(band)), &d2d.dim);
+            for (outer, inner, brush) in lines {
+                // このモニタに重なる部分だけ塗る
+                for band in ring(outer, inner)
+                    .iter()
+                    .filter_map(|b| b.intersect(&monitor))
+                {
+                    context.FillRectangle(&local(&to_rect_f(band)), brush);
+                }
             }
             if let Some(label) = label {
                 context.FillRectangle(&local(&label.back), &d2d.label_back);
@@ -540,7 +553,8 @@ impl D2dTarget {
             context.SetTarget(&target);
             context.SetDpi(96.0, 96.0);
             Ok(D2dTarget {
-                dim: context.CreateSolidColorBrush(&DIM, None)?,
+                frame_inner: context.CreateSolidColorBrush(&FRAME_INNER, None)?,
+                frame_outer: context.CreateSolidColorBrush(&FRAME_OUTER, None)?,
                 label_back: context.CreateSolidColorBrush(&LABEL_BACK, None)?,
                 label_text: context.CreateSolidColorBrush(&LABEL_TEXT, None)?,
                 _target: target,
@@ -548,6 +562,16 @@ impl D2dTarget {
             })
         }
     }
+}
+
+/// `outer` から `inner`（`outer` の内側）を除いた輪を、上・下・左・右の 4 つの帯で返す。
+fn ring(outer: Rect, inner: Rect) -> [Rect; 4] {
+    [
+        Rect::new(outer.left, outer.top, outer.right, inner.top),
+        Rect::new(outer.left, inner.bottom, outer.right, outer.bottom),
+        Rect::new(outer.left, inner.top, inner.left, inner.bottom),
+        Rect::new(inner.right, inner.top, outer.right, inner.bottom),
+    ]
 }
 
 /// マウスのメッセージの座標（クライアント座標、符号付き 16 bit）をスクリーン座標にする。
