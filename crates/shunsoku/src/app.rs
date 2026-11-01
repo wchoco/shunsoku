@@ -55,7 +55,7 @@ use shunsoku_core::perf::Mark;
 use shunsoku_core::scrap::ops::{
     self, Effect, MenuEntry, MouseGesture, OpContext, OperationDescriptor, Shortcuts,
 };
-use shunsoku_core::scrap::{Appearance, ScrapModel};
+use shunsoku_core::scrap::{Appearance, Drag, ScrapModel};
 use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -67,8 +67,8 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_DOWN, VK_ESCAPE,
-    VK_LEFT, VK_LWIN, VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
+    GetCapture, GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_DOWN,
+    VK_ESCAPE, VK_LEFT, VK_LWIN, VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessagePos, GetMessageW,
@@ -184,8 +184,8 @@ struct Scrap {
     window: scrap_window::ScrapWindow,
     model: ScrapModel,
     image: Image,
-    /// 左ドラッグの間、前回のカーソルの位置（スクリーン座標）。
-    drag_from: Option<Point>,
+    /// 左ドラッグ。
+    drag: Drag,
 }
 
 impl Scrap {
@@ -762,13 +762,13 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             let at = message_screen_point();
             with_app(|app| {
                 if let Some(scrap) = app.scrap_mut(hwnd) {
-                    scrap.drag_from = Some(at);
+                    scrap.drag.start(at);
                 }
             });
             Some(LRESULT(0))
         }
         WM_MOUSEMOVE => {
-            on_scrap_drag(hwnd, message_screen_point());
+            on_scrap_drag(hwnd, wparam, message_screen_point());
             Some(LRESULT(0))
         }
         WM_LBUTTONUP => {
@@ -780,7 +780,7 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
         WM_CAPTURECHANGED => {
             with_app(|app| {
                 if let Some(scrap) = app.scrap_mut(hwnd) {
-                    scrap.drag_from = None;
+                    scrap.drag.end();
                 }
             });
             Some(LRESULT(0))
@@ -827,13 +827,35 @@ impl App {
 }
 
 /// 左ドラッグの間のカーソルの移動を、ドラッグの操作に渡す。
-fn on_scrap_drag(hwnd: HWND, at: Point) {
-    let delta = with_app(|app| {
-        let scrap = app.scrap_mut(hwnd)?;
-        let from = scrap.drag_from.replace(at)?;
-        Some(Point::new(at.x - from.x, at.y - from.y))
-    })
-    .flatten();
+///
+/// 左ボタンを押していて、このウィンドウがマウスを捕まえているときだけ動かす。そうでなければ
+/// （離したことを取りこぼしたなど）ドラッグを終える。ホバーだけでスクラップが動かないようにするため。
+fn on_scrap_drag(hwnd: HWND, wparam: WPARAM, at: Point) {
+    // WM_MOUSEMOVE の wparam の MK_LBUTTON（Win32_System_SystemServices を足さないよう値で持つ）
+    const MK_LBUTTON: usize = 0x0001;
+    let left_down = wparam.0 & MK_LBUTTON != 0;
+    // SAFETY: 引数なし
+    let captured = unsafe { GetCapture() } == hwnd;
+    if !(left_down && captured) {
+        let was_dragging = with_app(|app| {
+            let scrap = app.scrap_mut(hwnd)?;
+            let active = scrap.drag.is_active();
+            scrap.drag.end();
+            Some(active)
+        })
+        .flatten()
+        .unwrap_or(false);
+        if was_dragging {
+            log::debug!("scrap drag ended without a button release");
+        }
+        if captured {
+            // App を借りずに放す（WM_CAPTURECHANGED が届くため）
+            // SAFETY: UI スレッドで呼ぶ
+            let _ = unsafe { ReleaseCapture() };
+        }
+        return;
+    }
+    let delta = with_app(|app| app.scrap_mut(hwnd)?.drag.move_to(at)).flatten();
     if let Some(drag) = delta {
         let context = OpContext {
             drag,
@@ -1313,7 +1335,7 @@ fn open_scrap(
         window,
         model,
         image,
-        drag_from: None,
+        drag: Drag::default(),
     })
 }
 

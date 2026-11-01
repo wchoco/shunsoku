@@ -106,6 +106,38 @@ impl From<ScrapAppearance> for Appearance {
     }
 }
 
+/// スクラップの左ドラッグ。押したところから離すまでの間だけ、カーソルの移動量を返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Drag {
+    /// ドラッグの間、前回のカーソルの位置（スクリーン座標）。
+    from: Option<Point>,
+}
+
+impl Drag {
+    /// 左ボタンを `at`（スクリーン座標）で押した。
+    pub fn start(&mut self, at: Point) {
+        self.from = Some(at);
+    }
+
+    /// 左ボタンを離した、またはマウスを捕まえていられなくなった。
+    pub fn end(&mut self) {
+        self.from = None;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.from.is_some()
+    }
+
+    /// カーソルが `at` に動いた。ドラッグの間なら前回からの移動量。ドラッグしていなければ None。
+    pub fn move_to(&mut self, at: Point) -> Option<Point> {
+        // 押していないときに位置を覚えると、次の移動がドラッグになってしまう
+        let from = self.from.as_mut()?;
+        let delta = Point::new(at.x - from.x, at.y - from.y);
+        *from = at;
+        Some(delta)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +200,24 @@ mod tests {
             ..ScrapAppearance::default()
         };
         assert_eq!(Appearance::from(hidden).border, None);
+    }
+
+    #[test]
+    fn hovering_without_pressing_never_moves_the_scrap() {
+        let mut drag = Drag::default();
+        assert_eq!(drag.move_to(Point::new(10, 10)), None);
+        assert_eq!(drag.move_to(Point::new(15, 12)), None);
+        assert!(!drag.is_active());
+    }
+
+    #[test]
+    fn a_drag_reports_each_move_from_the_previous_position_until_it_ends() {
+        let mut drag = Drag::default();
+        drag.start(Point::new(10, 10));
+        assert_eq!(drag.move_to(Point::new(15, 8)), Some(Point::new(5, -2)));
+        assert_eq!(drag.move_to(Point::new(14, 8)), Some(Point::new(-1, 0)));
+        drag.end();
+        assert_eq!(drag.move_to(Point::new(20, 20)), None);
+        assert_eq!(drag.move_to(Point::new(25, 20)), None);
     }
 }
