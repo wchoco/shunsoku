@@ -1021,7 +1021,7 @@ fn save_default(image: Image) {
         .name("save".into())
         .spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| save::write_png(&job_path, &image)))
-                .map_err(|_| "panic".to_owned())
+                .map_err(|_| text("job.panicked").to_owned())
                 .and_then(|written| written.map_err(|e| e.to_string()));
             let _ = sender.send(Saved {
                 path: job_path,
@@ -1308,9 +1308,15 @@ fn open_overlay() {
     let shots = match grabbed {
         Ok(shots) => shots,
         Err(e) => {
-            // 撮れないときの通知は M3
             log::warn!("could not grab the screen: {e}");
             end_capture();
+            // 取得のスレッドのパニックはその仕事の失敗として通知する。ほかの撮れないときの通知は M3
+            if matches!(e, grab::GrabError::Panicked) {
+                notify_user(
+                    notify::Level::Error,
+                    &format!("{}\n{}", text("capture.failed"), text("job.panicked")),
+                );
+            }
             return;
         }
     };
