@@ -18,6 +18,8 @@ mod overlay;
 #[cfg(windows)]
 mod panic_hook;
 #[cfg(windows)]
+mod perf;
+#[cfg(windows)]
 mod render;
 #[cfg(windows)]
 mod scrap_window;
