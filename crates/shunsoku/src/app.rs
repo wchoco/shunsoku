@@ -58,7 +58,7 @@ use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseGesture, OpContext, OperationDescriptor,
     OperationId, Shortcuts,
 };
-use shunsoku_core::scrap::{Appearance, Drag, ScrapModel, Wheel};
+use shunsoku_core::scrap::{Appearance, Drag, ScrapModel, Wheel, ZoomAnchor};
 use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
 use shunsoku_core::trash::TrashId;
@@ -121,6 +121,9 @@ const TIMER_CAPTURE_DELAY: usize = 1;
 /// 倍率の表示を消すタイマーの番号（スクラップのウィンドウの WM_TIMER）と、出しておく時間。
 const TIMER_ZOOM_LABEL: usize = 1;
 const ZOOM_LABEL_MS: u32 = 1000;
+/// スクラップのウィンドウのモニタの DPI が変わった（wparam が新しい DPI）。`WM_DPICHANGED` はウィンドウを
+/// 動かしている間（App を借りている間）に届くので、自分に送り直して借りられるときに core へ渡す。
+const WM_APP_SCRAP_DPI: u32 = WM_APP + 0x100;
 
 /// UI スレッドのパニックで終わったときの終了コード（Rust の既定と同じ）。
 const EXIT_PANIC: i32 = 101;
@@ -932,8 +935,21 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             close_scrap(hwnd);
             Some(LRESULT(0))
         }
-        // 画素を等倍のまま出すので、DPI の違うモニタに動いても大きさを変えない
-        WM_DPICHANGED => Some(LRESULT(0)),
+        // 提案された矩形は当てない（大きさは core が決める。`settings::DpiScaling`）
+        WM_DPICHANGED => {
+            let dpi = wparam.0 & 0xFFFF;
+            // SAFETY: 自分のウィンドウに送る
+            if let Err(e) =
+                unsafe { PostMessageW(Some(hwnd), WM_APP_SCRAP_DPI, WPARAM(dpi), LPARAM(0)) }
+            {
+                log::warn!("could not post the dpi change of a scrap: {e}");
+            }
+            Some(LRESULT(0))
+        }
+        WM_APP_SCRAP_DPI => {
+            on_scrap_dpi_changed(hwnd, wparam.0 as u32);
+            Some(LRESULT(0))
+        }
         _ => None,
     }
 }
@@ -1027,6 +1043,39 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
         run_mouse_operation(hwnd, gesture, context);
     }
     true
+}
+
+/// `WM_APP_SCRAP_DPI`: 新しい DPI を core に渡し、表示の大きさが変わったら描き直す。基準点はドラッグ中なら
+/// カーソル（つかんだところが離れないように）、そうでなければ中心。
+fn on_scrap_dpi_changed(hwnd: HWND, dpi: u32) {
+    let at = message_screen_point();
+    with_app(|app| {
+        let appearance = Appearance::from(app.settings.scrap);
+        let scaling = app.settings.general.dpi_scaling;
+        let App {
+            scraps, renderer, ..
+        } = app;
+        let scrap = scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)?;
+        let anchor = if scrap.drag.is_active() {
+            ZoomAnchor::At(at)
+        } else {
+            ZoomAnchor::Center
+        };
+        let before = scrap.model.clone();
+        if scrap.model.set_dpi(dpi, scaling, anchor) {
+            log::debug!(
+                "scrap zoom {}% -> {}% at {dpi} dpi",
+                before.zoom(),
+                scrap.model.zoom()
+            );
+            // 描くだけで App を借りるメッセージは届かないので、借りたまま描く
+            if let Err(e) = scrap.redraw(&before, &appearance, renderer, false) {
+                log::warn!("could not resize a scrap for the new dpi: {e}");
+                scrap.model = before;
+            }
+        }
+        Some(())
+    });
 }
 
 /// `TIMER_ZOOM_LABEL`: 倍率の表示を消して描き直す。
@@ -1680,6 +1729,10 @@ fn open_scrap(
 ) -> Result<Scrap> {
     let rect = model.window_rect(appearance);
     let window = scrap_window::ScrapWindow::create(module, rect)?;
+    // 開いたモニタの DPI を覚える。ごみ箱から戻したものは、閉じたときと DPI が違えば設定に従って大きさを変える
+    let mut model = model;
+    let scaling = with_app(|app| app.settings.general.dpi_scaling).unwrap_or_default();
+    model.set_dpi(window.dpi(), scaling, ZoomAnchor::Center);
     // 描いて出すときに届くメッセージ（WM_WINDOWPOSCHANGED など）では App を借りないので、借りたまま描いてよい。
     // 借りられなければ（起こらないはず）、その場かぎりの描き手で描く
     let painted =
