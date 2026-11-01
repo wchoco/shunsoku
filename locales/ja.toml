@@ -7,6 +7,8 @@ tooltip = "shunsoku"
 
 [tray.menu]
 select_capture = "範囲選択キャプチャ"
+trash = "ごみ箱"
+trash_empty = "（空）"
 exit = "終了"
 
 [panic]
@@ -53,6 +55,9 @@ failed = "画面を撮れませんでした。"
 
 [copy]
 failed = "クリップボードにコピーできませんでした。"
+
+[trash]
+restore_failed = "ごみ箱から戻せませんでした。"
 
 [save]
 saved = "保存しました（クリックでフォルダを開きます）:"

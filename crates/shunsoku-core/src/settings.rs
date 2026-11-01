@@ -17,6 +17,7 @@
 //! save_dir = 'D:\shots'                        # 既定: ピクチャ フォルダの下の shunsoku
 //! file_name_template = "shunsoku_{date}-{time}"
 //! notifications = true                         # false で止まるのは成功の通知だけ
+//! trash_limit = 10                             # ごみ箱の上限（0〜100 件）。0 なら閉じたらすぐに破棄
 //!
 //! [hotkeys]
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
@@ -49,6 +50,12 @@ pub const DEFAULT_FILE_NAME_TEMPLATE: &str = "shunsoku_{date}-{time}";
 /// 透明度（%）として書ける範囲。
 pub const OPACITY_RANGE: std::ops::RangeInclusive<u8> = 10..=100;
 
+/// ごみ箱の上限（件）の既定値。
+pub const DEFAULT_TRASH_LIMIT: u8 = 10;
+
+/// ごみ箱の上限（件）として書ける範囲。
+pub const TRASH_LIMIT_RANGE: std::ops::RangeInclusive<u8> = 0..=100;
+
 /// 枠の太さ（px）として書ける範囲。
 pub const BORDER_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 1..=16;
 
@@ -72,6 +79,8 @@ pub struct General {
     pub file_name_template: String,
     /// 通知。オフで止めるのは成功の通知だけで、エラーと警告は常に出す（spec #32）。
     pub notifications: bool,
+    /// ごみ箱の上限（件）。0 なら閉じたらすぐに破棄する。
+    pub trash_limit: u8,
 }
 
 impl Default for General {
@@ -80,6 +89,7 @@ impl Default for General {
             save_dir: None,
             file_name_template: DEFAULT_FILE_NAME_TEMPLATE.to_owned(),
             notifications: true,
+            trash_limit: DEFAULT_TRASH_LIMIT,
         }
     }
 }
@@ -321,6 +331,8 @@ pub struct SettingsChanges {
     pub save: bool,
     /// 通知のオン/オフ。
     pub notifications: bool,
+    /// ごみ箱の上限。下げたら超えた分を古いものから捨てる。
+    pub trash: bool,
     /// 見た目の既定値（`[scrap]`）。浮かべているスクラップを描き直す。
     pub appearance: bool,
     /// ログのレベル。
@@ -342,6 +354,7 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
         save: old.general.save_dir != new.general.save_dir
             || old.general.file_name_template != new.general.file_name_template,
         notifications: old.general.notifications != new.general.notifications,
+        trash: old.general.trash_limit != new.general.trash_limit,
         appearance: old.scrap != new.scrap,
         log_level: old.log_level != new.log_level,
     }
@@ -379,6 +392,11 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
     if let Some(on) = r.value(general, "general", "notifications", Item::as_bool) {
         s.general.notifications = on;
+    }
+    if let Some(limit) = r.value(general, "general", "trash_limit", |i| {
+        in_range(i, TRASH_LIMIT_RANGE)
+    }) {
+        s.general.trash_limit = limit;
     }
 
     let hotkeys = r.table(root, "hotkeys");
@@ -583,6 +601,7 @@ log_level = "debug"
 save_dir = 'D:\shots'
 file_name_template = "cap_{datetime:yyyy}"
 notifications = false
+trash_limit = 3
 
 [hotkeys]
 select_capture = "Win+Shift+PrintScreen"
@@ -607,6 +626,7 @@ shadow = false
                     save_dir: Some(PathBuf::from(r"D:\shots")),
                     file_name_template: "cap_{datetime:yyyy}".to_owned(),
                     notifications: false,
+                    trash_limit: 3,
                 },
                 hotkeys: Hotkeys {
                     select_capture: Some(chord("Win+Shift+PrintScreen")),
@@ -715,6 +735,23 @@ shadow = 1
             (settings.scrap.opacity, settings.scrap.border.width),
             (10, 16)
         );
+    }
+
+    #[test]
+    fn the_trash_limit_defaults_to_10_and_out_of_range_values_fall_back_to_it() {
+        assert_eq!(load("version = 1\n").0.general.trash_limit, 10);
+        for (value, limit) in [("0", 0), ("2", 2), ("100", 100)] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[general]\ntrash_limit = {value}\n"));
+            assert_eq!(issues, vec![], "{value}");
+            assert_eq!(settings.general.trash_limit, limit, "{value}");
+        }
+        for value in ["101", "-1", "\"5\"", "2.5"] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[general]\ntrash_limit = {value}\n"));
+            assert_eq!(issues, vec![invalid("general.trash_limit")], "{value}");
+            assert_eq!(settings.general.trash_limit, 10, "{value}");
+        }
     }
 
     #[test]
@@ -833,6 +870,13 @@ a = 1
                 }
             );
         }
+        assert_eq!(
+            changed(|s| s.general.trash_limit = 2),
+            SettingsChanges {
+                trash: true,
+                ..SettingsChanges::default()
+            }
+        );
         assert_eq!(
             changed(|s| s.log_level = LogLevel::Trace),
             SettingsChanges {

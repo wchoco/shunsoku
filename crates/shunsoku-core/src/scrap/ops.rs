@@ -97,8 +97,8 @@ pub struct OpContext {
 pub enum Effect {
     /// `ScrapModel` のとおりに出し直す（位置と中身）。
     Redraw,
-    /// スクラップを閉じる。M1 は破棄する（M2 でごみ箱への移動に置き換える）。
-    Close,
+    /// スクラップを閉じて、閉じる直前の状態のままごみ箱に移す（上限が 0 なら破棄する）。
+    MoveToTrash,
     /// 画像をクリップボードに置く。
     CopyToClipboard,
     /// 画像を全体設定の保存先に、全体のファイル名テンプレートの名前で保存する（ダイアログなし）。
@@ -144,7 +144,7 @@ fn drag(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
 }
 
 fn close(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
-    vec![Effect::Close]
+    vec![Effect::MoveToTrash]
 }
 
 fn copy(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
@@ -492,10 +492,10 @@ mod tests {
     }
 
     #[test]
-    fn close_closes_the_scrap_without_changing_it() {
+    fn close_moves_the_scrap_to_the_trash_without_changing_it() {
         let mut model = scrap();
         let effects = (op("close").run)(&mut model, &OpContext::default());
-        assert_eq!(effects, vec![Effect::Close]);
+        assert_eq!(effects, vec![Effect::MoveToTrash]);
         assert_eq!(model, scrap());
     }
 
