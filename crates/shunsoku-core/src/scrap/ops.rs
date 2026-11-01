@@ -1,7 +1,7 @@
 //! スクラップ操作の表（ADR-0005）。
 //!
 //! スクラップ操作は静的な表 `OPERATIONS` に 1 行足せば、右クリックメニュー（`menu`）とショートカットの
-//! 対応表（`Shortcuts`）とマウスの対応（`mouse_operation`）の全部に出る。`run` は `ScrapModel` を変え、
+//! 対応表（`Shortcuts`）とマウスの対応表（`MouseBindings`）の全部に出る。`run` は `ScrapModel` を変え、
 //! Win32 が要る仕事（描き直し、閉じる、クリップボード、保存など）は実行せずに `Effect` として返す。
 //! `Effect` を実行するのは Win32 層の `app`。操作を足すときは、表に行を足し、新しい `Effect` があれば
 //! `app` でそれを実行する。
@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use crate::geometry::Point;
 use crate::keys::{Chord, Key};
 use crate::scrap::{Appearance, Mode, ScrapModel, ZoomAnchor};
-use crate::settings::{self, Conflict, OPACITY_RANGE, ShortcutOverrides};
+use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
 pub type OperationId = &'static str;
@@ -63,8 +63,8 @@ pub struct OperationDescriptor {
 }
 
 impl OperationDescriptor {
-    /// ショートカットを付けられるか。引数のない操作だけに付く。
-    fn takes_shortcut(&self) -> bool {
+    /// ショートカットとマウスの割り当てを設定で変えられるか。引数のない操作だけ。
+    fn takes_binding(&self) -> bool {
         self.choices.is_none() && !self.drag_only
     }
 }
@@ -79,7 +79,7 @@ impl std::fmt::Debug for OperationDescriptor {
 }
 
 /// マウスの操作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MouseGesture {
     LeftDrag,
     MiddleClick,
@@ -93,6 +93,47 @@ pub enum MouseGesture {
     CtrlWheelDown,
     /// 左ボタンのダブルクリック（`WM_LBUTTONDBLCLK`）。
     DoubleClick,
+}
+
+impl MouseGesture {
+    /// 設定ファイル（`[mouse]`）での名前。
+    const NAMES: [(MouseGesture, &'static str); 7] = [
+        (MouseGesture::LeftDrag, "LeftDrag"),
+        (MouseGesture::MiddleClick, "MiddleClick"),
+        (MouseGesture::WheelUp, "WheelUp"),
+        (MouseGesture::WheelDown, "WheelDown"),
+        (MouseGesture::CtrlWheelUp, "Ctrl+WheelUp"),
+        (MouseGesture::CtrlWheelDown, "Ctrl+WheelDown"),
+        (MouseGesture::DoubleClick, "DoubleClick"),
+    ];
+}
+
+impl std::fmt::Display for MouseGesture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = MouseGesture::NAMES
+            .iter()
+            .find(|(g, _)| g == self)
+            .map_or("?", |(_, name)| name);
+        f.write_str(name)
+    }
+}
+
+/// 名前の表にないマウスの操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownGesture;
+
+impl std::str::FromStr for MouseGesture {
+    type Err = UnknownGesture;
+
+    /// 大文字と小文字は区別しない。`Ctrl+` の前後の空白は無視する（`Ctrl + WheelUp`）。
+    fn from_str(s: &str) -> Result<MouseGesture, UnknownGesture> {
+        let normalized: String = s.split('+').map(str::trim).collect::<Vec<_>>().join("+");
+        MouseGesture::NAMES
+            .iter()
+            .find(|(_, name)| name.eq_ignore_ascii_case(&normalized))
+            .map(|&(g, _)| g)
+            .ok_or(UnknownGesture)
+    }
 }
 
 /// メニューの区切りのまとまり。宣言の順にメニューに並ぶ（spec #33: コピー / 保存 ─ トリム / 書き込み ─
@@ -762,13 +803,13 @@ pub struct Shortcuts {
 impl Shortcuts {
     /// `ops`（ふつうは `OPERATIONS`）の既定値に `overrides` を重ねる。
     pub fn new(ops: &'static [OperationDescriptor], overrides: &ShortcutOverrides) -> Shortcuts {
-        let bindable = |id: &str| ops.iter().any(|op| op.id == id && op.takes_shortcut());
+        let bindable = |id: &str| ops.iter().any(|op| op.id == id && op.takes_binding());
         let ignored = overrides
             .keys()
             .filter(|id| !bindable(id))
             .cloned()
             .collect();
-        let candidates = ops.iter().filter(|op| op.takes_shortcut()).flat_map(|op| {
+        let candidates = ops.iter().filter(|op| op.takes_binding()).flat_map(|op| {
             let chords = match overrides.get(op.id) {
                 Some(chord) => chord.as_slice(),
                 None => op.default_shortcut,
@@ -816,12 +857,90 @@ impl Shortcuts {
     }
 }
 
-/// マウスの操作に付いた操作（表の既定値。まだ割り当て直せない）。
-pub fn mouse_operation(
-    ops: &'static [OperationDescriptor],
-    gesture: MouseGesture,
-) -> Option<&'static OperationDescriptor> {
-    ops.iter().find(|op| op.default_mouse == Some(gesture))
+/// マウスの対応表。表の既定値に、設定ファイルの上書き（`[mouse]`）を重ねて作る。規則は `Shortcuts` と同じ。
+///
+/// - 上書きは操作の id ごとに 1 つ。Some ならその操作のマウスの操作をそれに置き換え、None（設定ファイルの
+///   `""`）なら割り当てを外す。書かなかった操作は既定値のまま。
+/// - 付けられるのは引数のない操作だけ（ショートカットと同じ）。表にない id、引数のある操作（`choices` が
+///   Some、`drag_only`）への上書き、候補にない値（引数のない操作への `LeftDrag`）は無視し、
+///   `ignored_overrides` に載せる。左ドラッグは移動（`move`）に付いたまま変えられない。
+/// - ホイールの上下は別々のマウスの操作で、別々の操作（`zoom_in` と `zoom_out` など）に 1 つずつ付く。
+///   上下をまとめて引数のある操作に付ける書き方はない。入れ替えるなら上と下を両方書く。
+/// - 同じマウスの操作が 2 つ以上の操作に付いたら、どれにも付けず `conflicts` に載せる（表の既定値から
+///   来たものも数える）。
+#[derive(Debug, Clone)]
+pub struct MouseBindings {
+    bindings: BTreeMap<MouseGesture, &'static OperationDescriptor>,
+    ignored: Vec<String>,
+    conflicts: Vec<MouseConflict>,
+}
+
+/// 2 つ以上の操作に付いたため、どれにも付けなかったマウスの操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MouseConflict {
+    pub gesture: MouseGesture,
+    /// 重なった操作（表の順）。
+    pub owners: Vec<OperationId>,
+}
+
+impl MouseBindings {
+    /// `ops`（ふつうは `OPERATIONS`）の既定値に `overrides` を重ねる。
+    pub fn new(ops: &'static [OperationDescriptor], overrides: &MouseOverrides) -> MouseBindings {
+        // 左ドラッグはドラッグの量を取る操作（`drag_only`）のもので、引数のない操作の候補にはない
+        let accepts = |id: &str, gesture: Option<MouseGesture>| {
+            gesture != Some(MouseGesture::LeftDrag)
+                && ops.iter().any(|op| op.id == id && op.takes_binding())
+        };
+        let ignored = overrides
+            .iter()
+            .filter(|&(id, &gesture)| !accepts(id, gesture))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut grouped: BTreeMap<MouseGesture, Vec<&'static OperationDescriptor>> =
+            BTreeMap::new();
+        for op in ops {
+            let gesture = match overrides.get(op.id) {
+                Some(&gesture) if accepts(op.id, gesture) => gesture,
+                _ => op.default_mouse,
+            };
+            if let Some(gesture) = gesture {
+                grouped.entry(gesture).or_default().push(op);
+            }
+        }
+        let mut bindings = BTreeMap::new();
+        let mut conflicts = Vec::new();
+        for (gesture, owners) in grouped {
+            match owners.as_slice() {
+                [op] => {
+                    bindings.insert(gesture, *op);
+                }
+                _ => conflicts.push(MouseConflict {
+                    gesture,
+                    owners: owners.iter().map(|op| op.id).collect(),
+                }),
+            }
+        }
+        MouseBindings {
+            bindings,
+            ignored,
+            conflicts,
+        }
+    }
+
+    /// マウスの操作に付いた操作。
+    pub fn operation(&self, gesture: MouseGesture) -> Option<&'static OperationDescriptor> {
+        self.bindings.get(&gesture).copied()
+    }
+
+    /// 無視した上書きの id。
+    pub fn ignored_overrides(&self) -> &[String] {
+        &self.ignored
+    }
+
+    /// 2 つ以上の操作に付いたため、どれにも付けなかったマウスの操作と、その操作。
+    pub fn conflicts(&self) -> &[MouseConflict] {
+        &self.conflicts
+    }
 }
 
 /// 操作を実行する。いま実行できなければ何もしない（`Effect` なし）。ショートカット、マウス、メニューの
@@ -1045,7 +1164,8 @@ mod tests {
             cursor: Some(Point::new(40, 20)),
             ..OpContext::default()
         };
-        let id = |g| mouse_operation(OPERATIONS, g).map(|op| op.id);
+        let mouse = MouseBindings::new(OPERATIONS, &MouseOverrides::new());
+        let id = |g| mouse_bound(&mouse, g);
         assert_eq!(id(MouseGesture::WheelUp), Some("zoom_in"));
         assert_eq!(id(MouseGesture::WheelDown), Some("zoom_out"));
         execute(op("zoom_in"), &mut model, &at_cursor);
@@ -1176,7 +1296,8 @@ mod tests {
 
     #[test]
     fn ctrl_wheel_changes_the_opacity_by_10_within_10_to_100() {
-        let id = |g| mouse_operation(OPERATIONS, g).map(|op| op.id);
+        let mouse = MouseBindings::new(OPERATIONS, &MouseOverrides::new());
+        let id = |g| mouse_bound(&mouse, g);
         assert_eq!(id(MouseGesture::CtrlWheelUp), Some("opacity_up"));
         assert_eq!(id(MouseGesture::CtrlWheelDown), Some("opacity_down"));
         let defaults = Appearance::default();
@@ -1361,7 +1482,8 @@ mod tests {
 
     #[test]
     fn a_double_click_folds_around_the_cursor_and_toggles_back() {
-        let id = |g| mouse_operation(OPERATIONS, g).map(|op| op.id);
+        let mouse = MouseBindings::new(OPERATIONS, &MouseOverrides::new());
+        let id = |g| mouse_bound(&mouse, g);
         assert_eq!(id(MouseGesture::DoubleClick), Some("toggle_compact"));
         let mut model = scrap();
         let at_cursor = OpContext {
@@ -1757,11 +1879,110 @@ mod tests {
         );
     }
 
+    fn mouse_bound(mouse: &MouseBindings, gesture: MouseGesture) -> Option<OperationId> {
+        mouse.operation(gesture).map(|op| op.id)
+    }
+
     #[test]
-    fn mouse_gestures_map_to_move_and_close() {
-        let id = |g| mouse_operation(OPERATIONS, g).map(|op| op.id);
-        assert_eq!(id(MouseGesture::LeftDrag), Some("move"));
-        assert_eq!(id(MouseGesture::MiddleClick), Some("close"));
+    fn without_overrides_the_mouse_bindings_are_the_table_defaults() {
+        let mouse = MouseBindings::new(OPERATIONS, &MouseOverrides::new());
+        let bound = |g| mouse_bound(&mouse, g);
+        assert_eq!(bound(MouseGesture::LeftDrag), Some("move"));
+        assert_eq!(bound(MouseGesture::MiddleClick), Some("close"));
+        assert_eq!(bound(MouseGesture::WheelUp), Some("zoom_in"));
+        assert_eq!(bound(MouseGesture::WheelDown), Some("zoom_out"));
+        assert_eq!(bound(MouseGesture::CtrlWheelUp), Some("opacity_up"));
+        assert_eq!(bound(MouseGesture::CtrlWheelDown), Some("opacity_down"));
+        assert_eq!(bound(MouseGesture::DoubleClick), Some("toggle_compact"));
+        assert!(mouse.ignored_overrides().is_empty());
+        assert!(mouse.conflicts().is_empty());
+    }
+
+    #[test]
+    fn mouse_overrides_swap_double_click_and_middle_click() {
+        let overrides = MouseOverrides::from([
+            ("close".to_owned(), Some(MouseGesture::DoubleClick)),
+            ("toggle_compact".to_owned(), Some(MouseGesture::MiddleClick)),
+        ]);
+        let mouse = MouseBindings::new(OPERATIONS, &overrides);
+        assert_eq!(
+            mouse_bound(&mouse, MouseGesture::DoubleClick),
+            Some("close")
+        );
+        assert_eq!(
+            mouse_bound(&mouse, MouseGesture::MiddleClick),
+            Some("toggle_compact")
+        );
+        assert_eq!(mouse_bound(&mouse, MouseGesture::WheelUp), Some("zoom_in"));
+        assert!(mouse.conflicts().is_empty());
+    }
+
+    #[test]
+    fn an_empty_mouse_override_removes_the_binding_of_that_operation_only() {
+        let overrides = MouseOverrides::from([("zoom_in".to_owned(), None)]);
+        let mouse = MouseBindings::new(OPERATIONS, &overrides);
+        assert_eq!(mouse_bound(&mouse, MouseGesture::WheelUp), None);
+        assert_eq!(
+            mouse_bound(&mouse, MouseGesture::WheelDown),
+            Some("zoom_out")
+        );
+    }
+
+    #[test]
+    fn mouse_overrides_for_unknown_or_argument_taking_operations_are_ignored_and_reported() {
+        let overrides = MouseOverrides::from([
+            ("fly".to_owned(), Some(MouseGesture::WheelUp)),
+            ("move".to_owned(), None),
+            ("zoom".to_owned(), Some(MouseGesture::DoubleClick)),
+            ("close".to_owned(), Some(MouseGesture::CtrlWheelUp)),
+        ]);
+        let mouse = MouseBindings::new(OPERATIONS, &overrides);
+        assert_eq!(mouse.ignored_overrides(), ["fly", "move", "zoom"]);
+        // 無視した上書きは既定値を変えない
+        assert_eq!(mouse_bound(&mouse, MouseGesture::LeftDrag), Some("move"));
+        assert_eq!(
+            mouse_bound(&mouse, MouseGesture::DoubleClick),
+            Some("toggle_compact")
+        );
+        // 無視しなかった上書きは効く（opacity_up の既定と重なる）
+        assert_eq!(mouse_bound(&mouse, MouseGesture::CtrlWheelUp), None);
+        assert_eq!(mouse_bound(&mouse, MouseGesture::MiddleClick), None);
+    }
+
+    #[test]
+    fn left_drag_is_not_a_candidate_for_operations_without_arguments() {
+        // 左ドラッグはドラッグの量を取る移動だけのもの。引数のない操作には付けられない
+        let overrides = MouseOverrides::from([("close".to_owned(), Some(MouseGesture::LeftDrag))]);
+        let mouse = MouseBindings::new(OPERATIONS, &overrides);
+        assert_eq!(mouse.ignored_overrides(), ["close"]);
+        assert_eq!(mouse_bound(&mouse, MouseGesture::LeftDrag), Some("move"));
+        assert_eq!(
+            mouse_bound(&mouse, MouseGesture::MiddleClick),
+            Some("close")
+        );
+        assert!(mouse.conflicts().is_empty());
+    }
+
+    #[test]
+    fn wheel_directions_are_bound_one_by_one() {
+        // 上下は別々の操作に付く。上だけ書き換えれば、下は既定値のまま
+        let overrides =
+            MouseOverrides::from([("opacity_up".to_owned(), Some(MouseGesture::WheelUp))]);
+        let mouse = MouseBindings::new(OPERATIONS, &overrides);
+        assert_eq!(mouse_bound(&mouse, MouseGesture::CtrlWheelUp), None);
+        assert_eq!(
+            mouse_bound(&mouse, MouseGesture::CtrlWheelDown),
+            Some("opacity_down")
+        );
+        // 既定の zoom_in と重なるので、どちらにも付かない
+        assert_eq!(mouse_bound(&mouse, MouseGesture::WheelUp), None);
+        assert_eq!(
+            mouse.conflicts(),
+            [MouseConflict {
+                gesture: MouseGesture::WheelUp,
+                owners: vec!["zoom_in", "opacity_up"],
+            }]
+        );
     }
 
     #[test]

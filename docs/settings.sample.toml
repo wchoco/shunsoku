@@ -81,6 +81,32 @@ trash_limit = 10
 # copy = "Ctrl+Shift+C"
 # close = ""
 
+[mouse]
+# スクラップの上でのマウスの操作の割り当てを、スクラップ操作の id ごとに上書きします。
+# 値は次のどれか 1 つです（大文字と小文字は区別しません）:
+#   WheelUp / WheelDown             ホイールを上 / 下へ
+#   Ctrl+WheelUp / Ctrl+WheelDown   Ctrl を押しながらホイールを上 / 下へ
+#   MiddleClick                     中クリック
+#   DoubleClick                     左ボタンのダブルクリック
+# "" と書くと、その操作のマウスの割り当てを外します。書かなかった操作は既定のままです。
+# ホイールの上と下は別々に割り当てます（入れ替えるなら上と下の両方を書きます）。
+# 同じマウスの操作を 2 つ以上の操作に付けると（既定の割り当てと重なった場合も）、どの操作にも付かず、
+# 通知で知らせます。表にない id、値の候補にない名前は無視して通知で知らせます。
+# ドラッグでの移動（左ドラッグ）は変えられません。
+#
+# id              操作                        既定のマウスの操作
+# zoom_in         拡大                        WheelUp
+# zoom_out        縮小                        WheelDown
+# opacity_up      濃くする                    Ctrl+WheelUp
+# opacity_down    薄くする                    Ctrl+WheelDown
+# toggle_compact  コンパクト表示              DoubleClick
+# close           閉じる                      MiddleClick
+# （ほかの引数のない操作、たとえば copy や save_default にも割り当てられます）
+#
+# 例（ダブルクリックと中クリックを入れ替える）:
+# close = "DoubleClick"
+# toggle_compact = "MiddleClick"
+
 [scrap]
 # 新しく作るスクラップの見た目。
 # 透明度（%）。10〜100 の整数で、100 で不透明。
