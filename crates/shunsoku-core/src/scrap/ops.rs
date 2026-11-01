@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use crate::geometry::Point;
 use crate::keys::{Chord, Key};
 use crate::scrap::ScrapModel;
-use crate::settings::ShortcutOverrides;
+use crate::settings::{self, Conflict, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
 pub type OperationId = &'static str;
@@ -286,15 +286,15 @@ pub fn find(id: &str) -> Option<&'static OperationDescriptor> {
 /// - 上書きは操作の id ごとに 1 つ。Some ならその操作の既定のショートカットを全部それ 1 つに置き換え、
 ///   None（設定ファイルの `""`）なら割り当てを外す。書かなかった操作は既定値のまま。
 /// - 表にない id と、引数のある操作（`choices` が Some）への上書きは無視し、`ignored_overrides` に載せる
-///   （設定の通知で項目名を出すため。通知するのは設定の監視のチケット #46）。
+///   （設定の通知で項目名を出すため。`settings::keymap` が `SettingsIssue` にする）。
 /// - 同じキーの組み合わせが 2 つ以上の操作に付いたら、どれにも付けず `conflicts` に載せる
-///   （どちらが効くか分からない状態を避ける。spec #32）。
+///   （同じ範囲の重なりの規則 `settings::assign`。ホットキー同士と同じ）。
 /// - スクラップにフォーカスがあるときだけ引く（ホットキーと違って OS には登録しない）。
 #[derive(Debug, Clone)]
 pub struct Shortcuts {
     bindings: BTreeMap<Chord, &'static OperationDescriptor>,
     ignored: Vec<String>,
-    conflicts: Vec<Chord>,
+    conflicts: Vec<Conflict<OperationId>>,
 }
 
 impl Shortcuts {
@@ -306,28 +306,24 @@ impl Shortcuts {
             .filter(|id| !bindable(id))
             .cloned()
             .collect();
-        let mut candidates: BTreeMap<Chord, Vec<&'static OperationDescriptor>> = BTreeMap::new();
-        for op in ops.iter().filter(|op| op.takes_shortcut()) {
+        let candidates = ops.iter().filter(|op| op.takes_shortcut()).flat_map(|op| {
             let chords = match overrides.get(op.id) {
                 Some(chord) => chord.as_slice(),
                 None => op.default_shortcut,
             };
-            for &chord in chords {
-                candidates.entry(chord).or_default().push(op);
-            }
-        }
-        let mut bindings = BTreeMap::new();
-        let mut conflicts = Vec::new();
-        for (chord, ops) in candidates {
-            match ops.as_slice() {
-                [op] => {
-                    bindings.insert(chord, *op);
-                }
-                _ => conflicts.push(chord),
-            }
-        }
+            chords.iter().map(move |&chord| (chord, op))
+        });
+        let assigned = settings::assign(candidates);
+        let conflicts = assigned
+            .conflicts
+            .into_iter()
+            .map(|c| Conflict {
+                chord: c.chord,
+                owners: c.owners.iter().map(|op| op.id).collect(),
+            })
+            .collect();
         Shortcuts {
-            bindings,
+            bindings: assigned.bound,
             ignored,
             conflicts,
         }
@@ -352,8 +348,8 @@ impl Shortcuts {
         &self.ignored
     }
 
-    /// 2 つ以上の操作に付いたため、どれにも付けなかったキーの組み合わせ。
-    pub fn conflicts(&self) -> &[Chord] {
+    /// 2 つ以上の操作に付いたため、どれにも付けなかったキーの組み合わせと、その操作。
+    pub fn conflicts(&self) -> &[Conflict<OperationId>] {
         &self.conflicts
     }
 }
@@ -431,6 +427,7 @@ mod tests {
     use super::*;
     use crate::geometry::{Point, Size};
     use crate::scrap::ScrapModel;
+    use crate::settings::Conflict;
 
     fn scrap() -> ScrapModel {
         ScrapModel::new(Point::new(-100, 50), Size::new(300, 200))
@@ -667,7 +664,13 @@ mod tests {
         assert_eq!(bound(&shortcuts, "Left"), None);
         assert_eq!(shortcuts.chords("close"), vec![]);
         assert_eq!(shortcuts.chords("move_left"), vec![]);
-        assert_eq!(shortcuts.conflicts(), [chord("Left")]);
+        assert_eq!(
+            shortcuts.conflicts(),
+            [Conflict {
+                chord: chord("Left"),
+                owners: vec!["move_left", "close"],
+            }]
+        );
     }
 
     #[test]

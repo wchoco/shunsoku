@@ -30,6 +30,8 @@ mod save;
 #[cfg(windows)]
 mod scrap_window;
 #[cfg(windows)]
+mod settings_watch;
+#[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
 mod tray;
