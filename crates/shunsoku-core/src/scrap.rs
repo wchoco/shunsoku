@@ -515,7 +515,10 @@ pub struct Border {
 pub struct Appearance {
     /// 透明度（%）。100 で不透明。
     pub opacity: u8,
-    pub border: Option<Border>,
+    /// 枠の太さと色。枠を出さないときも持っておき、スクラップごとに枠を付けたときに使う。
+    pub border: Border,
+    /// 枠を出すか。
+    pub show_border: bool,
     pub shadow: bool,
 }
 
@@ -524,29 +527,39 @@ pub struct Appearance {
 pub struct AppearanceOverrides {
     /// 透明度（%）。
     pub opacity: Option<u8>,
-    /// 枠。`Some(None)` で枠なし、`Some(Some(color))` でその色（`0xRRGGBB`）の枠。太さは既定値の太さ（既定値が
-    /// 枠なしなら設定の既定の太さ）。
-    pub border: Option<Option<u32>>,
+    /// 枠。
+    pub border: Option<BorderOverride>,
     /// 影の有無。
     pub shadow: Option<bool>,
+}
+
+/// 枠のスクラップごとの上書き。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderOverride {
+    /// 枠を出さない。
+    Hidden,
+    /// その色（`0xRRGGBB`）の枠を出す。太さは既定値の太さ（既定値で枠を出さなくても設定の太さ）。
+    Color(u32),
 }
 
 impl AppearanceOverrides {
     /// `defaults` に重ねた見た目。
     fn apply(&self, defaults: &Appearance) -> Appearance {
-        let border = match self.border {
-            None => defaults.border,
-            Some(None) => None,
-            Some(Some(color)) => Some(Border {
-                width: defaults
-                    .border
-                    .map_or(crate::settings::Border::default().width, |b| b.width),
-                color,
-            }),
+        let (border, show_border) = match self.border {
+            None => (defaults.border, defaults.show_border),
+            Some(BorderOverride::Hidden) => (defaults.border, false),
+            Some(BorderOverride::Color(color)) => (
+                Border {
+                    color,
+                    ..defaults.border
+                },
+                true,
+            ),
         };
         Appearance {
             opacity: self.opacity.unwrap_or(defaults.opacity),
             border,
+            show_border,
             shadow: self.shadow.unwrap_or(defaults.shadow),
         }
     }
@@ -560,35 +573,42 @@ impl Default for Appearance {
     fn default() -> Appearance {
         Appearance {
             opacity: 100,
-            border: Some(Border {
+            border: Border {
                 width: 1,
                 color: 0x80_80_80,
-            }),
+            },
+            show_border: true,
             shadow: true,
         }
     }
 }
 
 impl Appearance {
+    /// 出す枠。枠を出さないなら None。
+    pub fn shown_border(&self) -> Option<Border> {
+        self.show_border.then_some(self.border)
+    }
+
     /// 画像の外側に足す幅（枠 + 影）。
     pub fn margin(&self) -> i32 {
-        let border = self.border.map_or(0, |b| b.width);
+        let border = self.shown_border().map_or(0, |b| b.width);
         let shadow = if self.shadow { SHADOW_WIDTH } else { 0 };
         (border + shadow) as i32
     }
 }
 
 impl From<ScrapAppearance> for Appearance {
-    /// 設定ファイルの `[scrap]` から作る。枠を出さない設定なら枠なし。
+    /// 設定ファイルの `[scrap]` から作る。枠を出さない設定でも、枠の太さと色は持っておく。
     fn from(settings: ScrapAppearance) -> Appearance {
         let border = settings.border;
         let (r, g, b) = (border.color.0, border.color.1, border.color.2);
         Appearance {
             opacity: settings.opacity,
-            border: border.visible.then_some(Border {
+            border: Border {
                 width: border.width,
                 color: u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
-            }),
+            },
+            show_border: border.visible,
             shadow: settings.shadow,
         }
     }
@@ -670,9 +690,9 @@ mod tests {
             Rect::new(-109, 41, 209, 259)
         );
         let plain = Appearance {
-            opacity: 100,
-            border: None,
+            show_border: false,
             shadow: false,
+            ..Appearance::default()
         };
         assert_eq!(scrap.window_rect(&plain), Rect::new(-100, 50, 200, 250));
     }
@@ -697,10 +717,11 @@ mod tests {
             Appearance::from(custom),
             Appearance {
                 opacity: 80,
-                border: Some(Border {
+                border: Border {
                     width: 3,
                     color: 0x12_34_56,
-                }),
+                },
+                show_border: true,
                 shadow: false,
             }
         );
@@ -711,7 +732,7 @@ mod tests {
             },
             ..ScrapAppearance::default()
         };
-        assert_eq!(Appearance::from(hidden).border, None);
+        assert_eq!(Appearance::from(hidden).shown_border(), None);
     }
 
     #[test]
@@ -719,10 +740,11 @@ mod tests {
         let scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
         let defaults = Appearance {
             opacity: 80,
-            border: Some(Border {
+            border: Border {
                 width: 3,
                 color: 0x12_34_56,
-            }),
+            },
+            show_border: true,
             shadow: false,
         };
         assert_eq!(scrap.appearance(&defaults), defaults);
@@ -742,15 +764,15 @@ mod tests {
         );
         // 枠の色だけを変えても、太さは既定値のまま
         let thick = Appearance {
-            border: Some(Border {
+            border: Border {
                 width: 4,
                 color: 0x80_80_80,
-            }),
+            },
             ..defaults
         };
-        scrap.appearance_overrides.border = Some(Some(0xFF_00_00));
+        scrap.appearance_overrides.border = Some(BorderOverride::Color(0xFF_00_00));
         assert_eq!(
-            scrap.appearance(&thick).border,
+            scrap.appearance(&thick).shown_border(),
             Some(Border {
                 width: 4,
                 color: 0xFF_00_00,
@@ -763,29 +785,37 @@ mod tests {
         let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
         scrap.appearance_overrides = AppearanceOverrides {
             opacity: Some(30),
-            border: Some(Some(0x00_00_FF)),
+            border: Some(BorderOverride::Color(0x00_00_FF)),
             shadow: Some(true),
         };
         let plain = Appearance {
             opacity: 100,
-            border: None,
+            border: Border {
+                width: 3,
+                color: 0x80_80_80,
+            },
+            show_border: false,
             shadow: false,
         };
-        // 既定値で枠がなければ、枠を付けたときの太さは設定の既定の太さ
+        // 既定値で枠を出さなくても、枠を付けたときの太さは設定の太さ
         assert_eq!(
             scrap.appearance(&plain),
             Appearance {
                 opacity: 30,
-                border: Some(Border {
-                    width: 1,
+                border: Border {
+                    width: 3,
                     color: 0x00_00_FF,
-                }),
+                },
+                show_border: true,
                 shadow: true,
             }
         );
-        scrap.appearance_overrides.border = Some(None);
+        scrap.appearance_overrides.border = Some(BorderOverride::Hidden);
         scrap.appearance_overrides.shadow = Some(false);
-        assert_eq!(scrap.appearance(&Appearance::default()).border, None);
+        assert_eq!(
+            scrap.appearance(&Appearance::default()).shown_border(),
+            None
+        );
         assert!(!scrap.appearance(&Appearance::default()).shadow);
     }
 
@@ -796,7 +826,7 @@ mod tests {
         assert_eq!(scrap.window_rect(&defaults), Rect::new(-109, 41, 209, 259));
         scrap.appearance_overrides.shadow = Some(false);
         assert_eq!(scrap.window_rect(&defaults), Rect::new(-101, 49, 201, 251));
-        scrap.appearance_overrides.border = Some(None);
+        scrap.appearance_overrides.border = Some(BorderOverride::Hidden);
         assert_eq!(scrap.window_rect(&defaults), Rect::new(-100, 50, 200, 250));
         // 透明度は大きさに関係しない
         scrap.appearance_overrides.opacity = Some(10);

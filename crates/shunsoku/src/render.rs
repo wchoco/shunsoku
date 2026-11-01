@@ -213,7 +213,7 @@ impl Renderer {
             // SAFETY: BeginDraw と EndDraw の間で呼ぶ
             unsafe {
                 let mut edge = image_rect;
-                if let Some(border) = appearance.border {
+                if let Some(border) = appearance.shown_border() {
                     let width = border.width as i32;
                     let color = rgb(border.color, 1.0);
                     let brush = target.CreateSolidColorBrush(&color, None)?;
