@@ -139,3 +139,32 @@ border_width = 1
 border_color = "#808080"
 # 影を出すかどうか（true / false）。
 shadow = true
+
+# 定型領域（毎回同じ場所を撮る範囲）。[[regions]] を 1 つ書くごとに 1 つ増えます。既定はなし。
+# トレイメニューの「定型領域」から、ここに書いた順に選んで撮れます。ホットキーでも撮れます。
+#   name                名前。必須で、ほかの定型領域と同じ名前にはできません
+#   hotkey              撮るホットキー。書き方は [hotkeys] と同じ。省略か "" で未設定
+#   monitor             撮るモニタの識別子。必須（登録の画面が書きます）。並びを変えても同じモニタを指します
+#   x / y               範囲の左上。モニタの左上からの物理ピクセル。必須で、0 以上
+#   width / height      範囲の幅と高さ（物理ピクセル）。必須で、1 以上
+#   save_dir            保存するフォルダ。省略すると [general] の save_dir。なければ作ります
+#   file_name_template  ファイル名。使える変数は [general] と同じ。既定は "{name}_{date}-{time}"
+#   save                保存するかどうか（true / false）。既定は true
+#   scrap               撮った範囲の真上にスクラップとして表示するかどうか。既定は false
+#                       （フォーカスは元のアプリに残ります。保存できなかったときも表示します）
+# save と scrap の両方を false にはできません（save を true として扱います）。
+# モニタがないときと、範囲がモニタからはみ出すときは、撮らずに通知で知らせます。
+#
+# 例:
+# [[regions]]
+# name = "ダッシュボード"
+# hotkey = "Ctrl+Alt+1"
+# monitor = '\\?\DISPLAY#GSM5B08#5&1a2b3c4d&0&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}'
+# x = 0
+# y = 0
+# width = 800
+# height = 600
+# save_dir = 'D:\shots\dashboard'
+# file_name_template = "{name}_{date}-{time}"
+# save = true
+# scrap = false

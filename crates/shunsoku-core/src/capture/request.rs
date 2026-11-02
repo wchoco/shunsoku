@@ -4,8 +4,12 @@
 //! Win32 層の `app` は依頼を受けて、待機（`delay`）→ 取得 → 範囲選択の画面 → 切り抜き → 出力 → 結果、
 //! の 1 本の流れで進める。発生源を足すときは `Source` に 1 つ足し、ここで対応する依頼を返す。
 //! M3 で CLI からの依頼を足すときは、`Source` と `CaptureRequest::reply` を足す（ADR-0003）。
+//! 定型領域（ホットキー・トレイ）は領域の設定で決まるので、`CaptureRequest::region` で作る。
 
+use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::settings::Region;
 
 /// 依頼の発生源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,11 +23,17 @@ pub enum Source {
 }
 
 /// どう撮るか。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureMethod {
     /// 範囲選択キャプチャ。範囲選択の画面でユーザーが範囲を選ぶ。
     Select,
+    /// 定型領域キャプチャ。撮るときに、その名前の定型領域を設定から引く。
+    Region(RegionId),
 }
+
+/// 定型領域を指すもの。名前（`settings::Region::name`。重ならない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionId(pub String);
 
 /// 撮ったものをどこへ出すか。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +53,12 @@ pub struct Outputs {
 pub enum SaveTarget {
     /// 全体設定の保存先とファイル名テンプレート。
     Default,
+    /// 定型領域の保存先とファイル名テンプレート。`dir` が None なら全体の保存先。`name` は `{name}` の値。
+    Region {
+        dir: Option<PathBuf>,
+        file_name_template: String,
+        name: String,
+    },
 }
 
 /// 保存に失敗したときにどうするか。
@@ -74,6 +90,27 @@ impl CaptureRequest {
         }
     }
 
+    /// 定型領域キャプチャ（ホットキー・トレイ）: 領域の設定に従って保存する・スクラップを出す。スクラップには
+    /// フォーカスを移さない（撮ったあとも元のアプリで作業を続けるため）。保存に失敗したらスクラップに逃がす。
+    pub fn region(region: &Region) -> CaptureRequest {
+        CaptureRequest {
+            method: CaptureMethod::Region(RegionId(region.name.clone())),
+            outputs: Outputs {
+                save: region.save.then(|| SaveTarget::Region {
+                    dir: region.save_dir.clone(),
+                    file_name_template: region.file_name_template.clone(),
+                    name: region.name.clone(),
+                }),
+                scrap: region.scrap,
+                copy: false,
+                focus_scrap: false,
+            },
+            on_save_failure: OnSaveFailure::FallbackToScrap,
+            delay: Duration::ZERO,
+            notify: true,
+        }
+    }
+
     /// 範囲選択キャプチャ: スクラップを出してフォーカスを移す。保存しない。
     fn select() -> CaptureRequest {
         CaptureRequest {
@@ -93,9 +130,11 @@ impl CaptureRequest {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use super::*;
+    use crate::geometry::Rect;
 
     /// 範囲選択キャプチャの依頼（spec #32）: スクラップを出す・フォーカスを移す・保存しない・通知する。
     fn select_capture() -> CaptureRequest {
@@ -129,5 +168,70 @@ mod tests {
     fn hotkey_requests_a_select_capture_shown_as_a_focused_scrap() {
         let request = CaptureRequest::from_source(Source::Hotkey);
         assert_eq!(request, select_capture());
+    }
+
+    fn region(save: bool, scrap: bool) -> Region {
+        Region {
+            name: "dash".to_owned(),
+            hotkey: None,
+            monitor: "M1".to_owned(),
+            rect: Rect::new(0, 0, 10, 10),
+            save_dir: Some(PathBuf::from(r"D:\dash")),
+            file_name_template: "{name}_{seq}".to_owned(),
+            save,
+            scrap,
+        }
+    }
+
+    fn region_save_target() -> SaveTarget {
+        SaveTarget::Region {
+            dir: Some(PathBuf::from(r"D:\dash")),
+            file_name_template: "{name}_{seq}".to_owned(),
+            name: "dash".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_region_by_default_is_only_saved_to_its_own_folder_and_notified() {
+        let request = CaptureRequest::region(&region(true, false));
+        assert_eq!(
+            request,
+            CaptureRequest {
+                method: CaptureMethod::Region(RegionId("dash".to_owned())),
+                outputs: Outputs {
+                    save: Some(region_save_target()),
+                    scrap: false,
+                    copy: false,
+                    focus_scrap: false,
+                },
+                on_save_failure: OnSaveFailure::FallbackToScrap,
+                delay: Duration::ZERO,
+                notify: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_region_shown_as_a_scrap_does_not_take_the_focus() {
+        let request = CaptureRequest::region(&region(false, true));
+        assert_eq!(
+            request.outputs,
+            Outputs {
+                save: None,
+                scrap: true,
+                copy: false,
+                focus_scrap: false,
+            }
+        );
+        let both = CaptureRequest::region(&region(true, true));
+        assert_eq!(both.outputs.save, Some(region_save_target()));
+        assert!(both.outputs.scrap && !both.outputs.focus_scrap);
+    }
+
+    #[test]
+    fn a_region_that_fails_to_save_falls_back_to_a_scrap_without_the_focus() {
+        let request = CaptureRequest::region(&region(true, false));
+        assert_eq!(request.on_save_failure, OnSaveFailure::FallbackToScrap);
+        assert!(!request.outputs.focus_scrap);
     }
 }

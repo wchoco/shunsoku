@@ -38,6 +38,19 @@
 //! border_width = 1                             # 1〜16（px）
 //! border_color = "#808080"
 //! shadow = true
+//!
+//! [[regions]]                                  # 定型領域。並び順がトレイのサブメニューの順
+//! name = "領域 1"                               # 必須。空と重複は不可（重複した後ろのものを捨てる）
+//! hotkey = "Ctrl+Alt+1"                        # 既定は空
+//! monitor = '\\?\DISPLAY#…'                    # 必須。monitor::MonitorInfo::id
+//! x = 0                                        # 必須。モニタ相対の物理ピクセル。x / y >= 0、
+//! y = 0                                        #   width / height >= 1
+//! width = 800
+//! height = 600
+//! save_dir = 'D:\shots'                        # 既定は全体の保存先
+//! file_name_template = "{name}_{date}-{time}"
+//! save = true                                  # save と scrap の両方 false は save を true に戻す
+//! scrap = false
 //! ```
 
 use std::collections::BTreeMap;
@@ -45,6 +58,7 @@ use std::path::PathBuf;
 
 use toml_edit::{DocumentMut, Item, TableLike};
 
+use crate::geometry::Rect;
 use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OperationDescriptor, Shortcuts};
 
@@ -76,6 +90,30 @@ pub struct Settings {
     pub scrap: ScrapAppearance,
     /// ログのレベル（隠し項目）。
     pub log_level: LogLevel,
+    /// 定型領域（`[[regions]]`）。ファイルの並び順。
+    pub regions: Vec<Region>,
+}
+
+/// 定型領域のファイル名テンプレートの既定値。
+pub const DEFAULT_REGION_FILE_NAME_TEMPLATE: &str = "{name}_{date}-{time}";
+
+/// 定型領域（`[[regions]]` の 1 つ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Region {
+    /// 名前。空でなく、ほかの定型領域と重ならない。
+    pub name: String,
+    pub hotkey: Option<Chord>,
+    /// モニタの識別子（`monitor::MonitorInfo::id`）。
+    pub monitor: String,
+    /// 範囲。モニタの左上を原点にした物理ピクセル。
+    pub rect: Rect,
+    /// 保存先。None なら全体の保存先。
+    pub save_dir: Option<PathBuf>,
+    pub file_name_template: String,
+    /// 撮ったら保存する。
+    pub save: bool,
+    /// 撮ったらスクラップとして表示する。`save` と両方 false にはならない（読み込みで `save` を true に戻す）。
+    pub scrap: bool,
 }
 
 /// 全体設定。
@@ -112,17 +150,29 @@ pub enum HotkeyAction {
     SelectCapture,
     /// 最後に閉じたスクラップをごみ箱から復元する。任意（空でも通知しない）。
     RestoreLast,
+    /// 定型領域キャプチャ。`Settings::regions` の中の位置。`[[regions]]` の `hotkey` に書く。
+    Region(usize),
 }
 
 impl HotkeyAction {
-    /// すべて。
+    /// `[hotkeys]` に書くもののすべて（定型領域は除く）。
     pub const ALL: [HotkeyAction; 2] = [HotkeyAction::SelectCapture, HotkeyAction::RestoreLast];
 
-    /// `[hotkeys]` の中のキー。
+    /// `[hotkeys]` の中のキー（定型領域では `[[regions]]` の中のキー）。
     pub fn key(self) -> &'static str {
         match self {
             HotkeyAction::SelectCapture => "select_capture",
             HotkeyAction::RestoreLast => "restore_last",
+            HotkeyAction::Region(_) => "hotkey",
+        }
+    }
+
+    /// 通知に出す項目名（`hotkeys.select_capture`、`regions[N].hotkey`）。N は `Settings::regions` の位置 + 1
+    /// （読み込みで捨てた定型領域があれば、ファイルの中の位置とずれる）。
+    pub fn item(self) -> String {
+        match self {
+            HotkeyAction::Region(i) => format!("regions[{}].{}", i + 1, self.key()),
+            _ => format!("hotkeys.{}", self.key()),
         }
     }
 }
@@ -140,6 +190,7 @@ impl Hotkeys {
         match action {
             HotkeyAction::SelectCapture => self.select_capture,
             HotkeyAction::RestoreLast => self.restore_last,
+            HotkeyAction::Region(_) => None,
         }
     }
 
@@ -152,10 +203,11 @@ impl Hotkeys {
         )
     }
 
-    fn get_mut(&mut self, action: HotkeyAction) -> &mut Option<Chord> {
+    fn get_mut(&mut self, action: HotkeyAction) -> Option<&mut Option<Chord>> {
         match action {
-            HotkeyAction::SelectCapture => &mut self.select_capture,
-            HotkeyAction::RestoreLast => &mut self.restore_last,
+            HotkeyAction::SelectCapture => Some(&mut self.select_capture),
+            HotkeyAction::RestoreLast => Some(&mut self.restore_last),
+            HotkeyAction::Region(_) => None,
         }
     }
 }
@@ -321,10 +373,20 @@ pub struct Keymap {
 /// - マウスの割り当て（`[mouse]`）も同じ規則で表に重ねる。表にない操作・引数のある操作への上書きと、
 ///   候補にない値（引数のない操作への左ドラッグ）は `Invalid`、重なりは `MouseConflict` にする。
 pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keymap {
-    let hotkeys = settings.hotkeys.assign();
+    let region_hotkeys = settings
+        .regions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, region)| Some((region.hotkey?, HotkeyAction::Region(i))));
+    let hotkeys = assign(
+        HotkeyAction::ALL
+            .into_iter()
+            .filter_map(|action| Some((settings.hotkeys.get(action)?, action)))
+            .chain(region_hotkeys),
+    );
     let shortcuts = Shortcuts::new(ops, &settings.shortcuts);
     let shortcut_item = |id: &str| format!("shortcuts.{id}");
-    let hotkey_item = |action: HotkeyAction| format!("hotkeys.{}", action.key());
+    let hotkey_item = |action: HotkeyAction| action.item();
 
     let mut issues: Vec<SettingsIssue> = shortcuts
         .ignored_overrides()
@@ -385,7 +447,7 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
 /// 読み込み直しで変わった部分（`diff`）。`app` はこれを見て、変わったものだけを反映し直す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SettingsChanges {
-    /// `[hotkeys]`。ホットキーを登録し直す。
+    /// `[hotkeys]` か、定型領域のホットキー（位置ごと）。ホットキーを登録し直す。
     pub hotkeys: bool,
     /// `[shortcuts]`。ショートカットの対応表とメニューを作り直す。
     pub shortcuts: bool,
@@ -413,7 +475,7 @@ impl SettingsChanges {
 /// `old` から `new` への変化。
 pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
     SettingsChanges {
-        hotkeys: old.hotkeys != new.hotkeys,
+        hotkeys: old.hotkeys != new.hotkeys || region_hotkeys(old) != region_hotkeys(new),
         shortcuts: old.shortcuts != new.shortcuts,
         mouse: old.mouse != new.mouse,
         save: old.general.save_dir != new.general.save_dir
@@ -423,6 +485,16 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
         appearance: old.scrap != new.scrap,
         log_level: old.log_level != new.log_level,
     }
+}
+
+/// 定型領域のホットキーを位置の順に並べたもの。`HotkeyAction::Region` は位置で持つので、位置とホットキーの
+/// 対応が変わったら登録し直す。
+fn region_hotkeys(settings: &Settings) -> Vec<Option<Chord>> {
+    settings
+        .regions
+        .iter()
+        .map(|region| region.hotkey)
+        .collect()
 }
 
 /// 設定ファイルの中身を読む。問題があっても、読めた項目と既定値で `Settings` を返す。
@@ -469,8 +541,10 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
 
     let hotkeys = r.table(root, "hotkeys");
     for action in HotkeyAction::ALL {
-        if let Some(chord) = r.value(hotkeys, "hotkeys", action.key(), optional_chord) {
-            *s.hotkeys.get_mut(action) = chord;
+        if let Some(chord) = r.value(hotkeys, "hotkeys", action.key(), optional_chord)
+            && let Some(slot) = s.hotkeys.get_mut(action)
+        {
+            *slot = chord;
         }
     }
 
@@ -509,7 +583,80 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
         s.scrap.shadow = on;
     }
 
+    s.regions = regions(root, &mut r);
+
     (s, r.issues)
+}
+
+/// `[[regions]]` を読む。名前・モニタ・範囲のどれかが読めない定型領域と、前の定型領域と名前が重なる定型領域は
+/// 捨てる（撮れないため）。ほかの項目は、その項目だけ既定値にする。項目名は `regions[N].key`（N は 1 から）。
+fn regions(root: &dyn TableLike, r: &mut Reader) -> Vec<Region> {
+    let Some(item) = root.get("regions") else {
+        return Vec::new();
+    };
+    let Some(tables) = item.as_array_of_tables() else {
+        r.invalid("regions");
+        return Vec::new();
+    };
+    let mut regions: Vec<Region> = Vec::new();
+    for (i, table) in tables.iter().enumerate() {
+        let path = format!("regions[{}]", i + 1);
+        let t: Option<&dyn TableLike> = Some(table);
+        let name = r.required(table, &path, "name", non_empty_str);
+        let monitor = r.required(table, &path, "monitor", non_empty_str);
+        let rect = region_rect(table, &path, r);
+        let hotkey = r.value(t, &path, "hotkey", optional_chord).flatten();
+        let save_dir = r.value(t, &path, "save_dir", save_dir);
+        let file_name_template = r
+            .value(t, &path, "file_name_template", non_empty_str)
+            .unwrap_or_else(|| DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned());
+        let mut save = r.value(t, &path, "save", Item::as_bool).unwrap_or(true);
+        let scrap = r.value(t, &path, "scrap", Item::as_bool).unwrap_or(false);
+        if !save && !scrap {
+            r.invalid(format!("{path}.save"));
+            save = true;
+        }
+        let (Some(name), Some(monitor), Some(rect)) = (name, monitor, rect) else {
+            continue;
+        };
+        if regions.iter().any(|region| region.name == name) {
+            r.invalid(format!("{path}.name"));
+            continue;
+        }
+        regions.push(Region {
+            name,
+            hotkey,
+            monitor,
+            rect,
+            save_dir,
+            file_name_template,
+            save,
+            scrap,
+        });
+    }
+    regions
+}
+
+/// 定型領域の範囲（`x` / `y` / `width` / `height`）。どれかが読めなければ None。
+fn region_rect(table: &toml_edit::Table, path: &str, r: &mut Reader) -> Option<Rect> {
+    let mut read = |key: &str, min: i64| {
+        r.required(table, path, key, |i| {
+            i.as_integer()
+                .filter(|&n| n >= min)
+                .and_then(|n| i32::try_from(n).ok())
+        })
+    };
+    let x = read("x", 0);
+    let y = read("y", 0);
+    let width = read("width", 1);
+    let height = read("height", 1);
+    let (x, y, width, height) = (x?, y?, width?, height?);
+    Some(Rect::new(
+        x,
+        y,
+        x.checked_add(width)?,
+        y.checked_add(height)?,
+    ))
 }
 
 /// 実行中に設定ファイルを読み込み直す。`src` は新しい中身（ファイルがなければ None で、既定値にする）。
@@ -548,6 +695,21 @@ impl Reader {
             self.invalid(name.to_owned());
         }
         table
+    }
+
+    /// 必須の項目を読む。ないときも、読めないときと同じく問題にして None。
+    fn required<T>(
+        &mut self,
+        table: &dyn TableLike,
+        path: &str,
+        key: &str,
+        parse: impl FnOnce(&Item) -> Option<T>,
+    ) -> Option<T> {
+        if table.get(key).is_none() {
+            self.invalid(format!("{path}.{key}"));
+            return None;
+        }
+        self.value(Some(table), path, key, parse)
     }
 
     /// 表 `table` の `key` を `parse` で読む。ないときは None（既定値のまま）。読めなければ問題にして None。
@@ -746,6 +908,7 @@ shadow = false
                     shadow: false,
                 },
                 log_level: LogLevel::Debug,
+                regions: Vec::new(),
             }
         );
     }
@@ -917,7 +1080,7 @@ future_option = true
 notifications = false
 language = "en"
 
-[regions]
+[future_table]
 foo = 1
 
 [[unknown_list]]
@@ -1117,6 +1280,213 @@ a = 1
                 ],
             }]
         );
+    }
+
+    #[test]
+    fn regions_are_read_in_file_order_with_their_defaults() {
+        let src = r#"
+version = 1
+
+[[regions]]
+name = "dashboard"
+hotkey = "Ctrl+Alt+1"
+monitor = '\\?\DISPLAY#GSM5B08#1'
+x = 10
+y = 20
+width = 640
+height = 480
+save_dir = 'D:\dash'
+file_name_template = "dash_{seq:3}"
+save = false
+scrap = true
+
+[[regions]]
+name = "game"
+monitor = '\\?\DISPLAY#DEL4321#2'
+x = 0
+y = 0
+width = 1
+height = 1
+"#;
+        let (settings, issues) = load(src);
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.regions,
+            vec![
+                Region {
+                    name: "dashboard".to_owned(),
+                    hotkey: Some(chord("Ctrl+Alt+1")),
+                    monitor: r"\\?\DISPLAY#GSM5B08#1".to_owned(),
+                    rect: Rect::new(10, 20, 650, 500),
+                    save_dir: Some(PathBuf::from(r"D:\dash")),
+                    file_name_template: "dash_{seq:3}".to_owned(),
+                    save: false,
+                    scrap: true,
+                },
+                Region {
+                    name: "game".to_owned(),
+                    hotkey: None,
+                    monitor: r"\\?\DISPLAY#DEL4321#2".to_owned(),
+                    rect: Rect::new(0, 0, 1, 1),
+                    save_dir: None,
+                    file_name_template: "{name}_{date}-{time}".to_owned(),
+                    save: true,
+                    scrap: false,
+                },
+            ]
+        );
+    }
+
+    /// `[[regions]]` の 1 つ。`extra` を足す。
+    fn region_src(name: &str, extra: &str) -> String {
+        format!(
+            "[[regions]]\nname = \"{name}\"\nmonitor = 'M1'\nx = 0\ny = 0\nwidth = 10\nheight = 10\n{extra}\n"
+        )
+    }
+
+    fn names(settings: &Settings) -> Vec<&str> {
+        settings.regions.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_region_whose_name_is_already_used_is_dropped_and_named() {
+        let src = format!(
+            "version = 1\n{}{}{}",
+            region_src("a", ""),
+            region_src("b", ""),
+            region_src("a", "save = false\nscrap = true")
+        );
+        let (settings, issues) = load(&src);
+        assert_eq!(issues, vec![invalid("regions[3].name")]);
+        assert_eq!(names(&settings), vec!["a", "b"]);
+        assert!(settings.regions[0].save);
+    }
+
+    #[test]
+    fn a_region_that_neither_saves_nor_shows_a_scrap_falls_back_to_saving() {
+        let src = format!("version = 1\n{}", region_src("a", "save = false"));
+        let (settings, issues) = load(&src);
+        assert_eq!(issues, vec![invalid("regions[1].save")]);
+        assert!(settings.regions[0].save);
+        assert!(!settings.regions[0].scrap);
+    }
+
+    #[test]
+    fn a_region_without_a_name_monitor_or_range_is_dropped_and_named() {
+        let src = r#"
+version = 1
+
+[[regions]]
+monitor = 'M1'
+x = 0
+y = 0
+width = 10
+height = 10
+
+[[regions]]
+name = ""
+monitor = 'M1'
+x = 0
+y = 0
+width = 10
+height = 10
+
+[[regions]]
+name = "no monitor"
+x = 0
+y = 0
+width = 10
+height = 10
+
+[[regions]]
+name = "empty range"
+monitor = 'M1'
+x = -1
+y = 0
+width = 0
+"#;
+        let (settings, issues) = load(src);
+        assert_eq!(
+            issues,
+            vec![
+                invalid("regions[1].name"),
+                invalid("regions[2].name"),
+                invalid("regions[3].monitor"),
+                invalid("regions[4].x"),
+                invalid("regions[4].width"),
+                invalid("regions[4].height"),
+            ]
+        );
+        assert!(settings.regions.is_empty());
+    }
+
+    #[test]
+    fn invalid_optional_region_items_fall_back_to_their_defaults() {
+        let src = format!(
+            "version = 1\n{}",
+            region_src(
+                "a",
+                "hotkey = \"Ctrl+Nope\"\nsave_dir = 'relative'\nfile_name_template = \"\"\nscrap = 1"
+            )
+        );
+        let (settings, issues) = load(&src);
+        assert_eq!(
+            issues,
+            vec![
+                invalid("regions[1].hotkey"),
+                invalid("regions[1].save_dir"),
+                invalid("regions[1].file_name_template"),
+                invalid("regions[1].scrap"),
+            ]
+        );
+        let region = &settings.regions[0];
+        assert_eq!(region.hotkey, None);
+        assert_eq!(region.save_dir, None);
+        assert_eq!(region.file_name_template, "{name}_{date}-{time}");
+        assert!(region.save && !region.scrap);
+    }
+
+    #[test]
+    fn regions_that_are_not_an_array_of_tables_are_named() {
+        let (settings, issues) = load("version = 1\nregions = 3\n");
+        assert_eq!(issues, vec![invalid("regions")]);
+        assert!(settings.regions.is_empty());
+    }
+
+    #[test]
+    fn region_hotkeys_are_assigned_with_the_other_hotkeys_and_overlaps_disable_both() {
+        let src = format!(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Alt+S\"\n{}{}{}",
+            region_src("a", "hotkey = \"Ctrl+Alt+1\""),
+            region_src("b", ""),
+            region_src("c", "hotkey = \"Ctrl+Alt+S\"")
+        );
+        let keymap = keymap_of(&src);
+        assert_eq!(
+            keymap.hotkeys.bound,
+            BTreeMap::from([(chord("Ctrl+Alt+1"), HotkeyAction::Region(0))])
+        );
+        assert_eq!(
+            keymap.issues,
+            vec![SettingsIssue::Conflict {
+                chord: chord("Ctrl+Alt+S"),
+                items: vec![
+                    "hotkeys.select_capture".to_owned(),
+                    "regions[3].hotkey".to_owned()
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_tells_that_hotkeys_changed_when_a_region_hotkey_changed() {
+        let (old, _) = load(&format!("version = 1\n{}", region_src("a", "")));
+        let mut new = old.clone();
+        new.regions[0].hotkey = Some(chord("Ctrl+Alt+1"));
+        assert!(diff(&old, &new).hotkeys);
+        let mut renamed = old.clone();
+        renamed.regions[0].name = "b".to_owned();
+        assert!(!diff(&old, &renamed).hotkeys);
     }
 
     fn keymap_of(src: &str) -> Keymap {
@@ -1326,6 +1696,7 @@ a = 1
         let uncommented: String = SAMPLE
             .lines()
             .map(|line| match line.strip_prefix("# ") {
+                Some(rest @ "[[regions]]") => rest,
                 Some(rest)
                     if rest.split_once(" = ").is_some_and(|(key, _)| {
                         key.bytes()
@@ -1353,5 +1724,7 @@ a = 1
                 ("close".to_owned(), None),
             ])
         );
+        assert_eq!(names(&settings), vec!["ダッシュボード"]);
+        assert_eq!(settings.regions[0].rect, Rect::new(0, 0, 800, 600));
     }
 }
