@@ -1225,7 +1225,8 @@ pub enum Pick {
 }
 
 /// 前の編集モードで選んだ道具・色・太さ。アプリが動いている間、すべてのスクラップで引き継ぐ（設定ファイルには
-/// 書き戻さない）。色と太さは選ぶまでは設定の既定値に従う（設定を変えればそれが効く）。
+/// 書き戻さない）。色と太さは選ぶまでは設定の既定値に従う。選んだあとでも、設定の既定値を変えればそれが効く
+/// （`Carryover::settings_changed`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Carryover {
     /// 最後に使った描く道具（選択は覚えない）。最初は矩形。
@@ -1254,6 +1255,20 @@ impl Carryover {
             ..font
         };
         state
+    }
+
+    /// 設定の `[annotation]` が `old` から `new` に変わった。既定値が変わった色・太さ・文字サイズは、前に選んだ
+    /// ものを忘れて新しい既定値に従う（変えた設定がすぐ効くように）。
+    pub fn settings_changed(&mut self, old: &AnnotationDefaults, new: &AnnotationDefaults) {
+        if old.color != new.color {
+            self.color = None;
+        }
+        if old.width != new.width {
+            self.width = None;
+        }
+        if old.font_size != new.font_size {
+            self.font_size = None;
+        }
     }
 
     /// 編集モードの出力のうち、選んだもの（`EditOutput::Picked`）を覚える。
@@ -2052,6 +2067,34 @@ mod tests {
         carryover.record(&state.input(key(V), &mut annotations));
         assert_eq!(state.tool, Tool::Select);
         assert_eq!(carryover.start(BLUE).tool, Tool::Line);
+    }
+
+    #[test]
+    fn a_changed_default_in_the_settings_wins_over_what_was_picked_before() {
+        let old = AnnotationDefaults::default();
+        let mut carryover = Carryover::default();
+        let mut state = carryover.start_with(Style::from(&old), Font::from(&old));
+        let mut annotations = Annotations::default();
+        carryover
+            .record(&state.input(EditInput::Pick(Pick::Color(Rgb(0, 0, 0))), &mut annotations));
+        carryover.record(&state.input(EditInput::Pick(Pick::Width(8)), &mut annotations));
+        carryover.record(&state.input(EditInput::Pick(Pick::FontSize(32)), &mut annotations));
+        // 色と文字サイズだけ設定で変えた
+        let new = AnnotationDefaults {
+            color: Rgb(0x00, 0xBC, 0xD4),
+            font_size: 24,
+            ..AnnotationDefaults::default()
+        };
+        carryover.settings_changed(&old, &new);
+        let state = carryover.start_with(Style::from(&new), Font::from(&new));
+        assert_eq!(
+            state.style,
+            Style {
+                color: Rgb(0x00, 0xBC, 0xD4),
+                width: 8,
+            }
+        );
+        assert_eq!(state.font.size, 24);
     }
 
     #[test]
