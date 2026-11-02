@@ -1,7 +1,5 @@
 //! `shunsoku-cli` の引数の解釈（ADR-0003）。`clap` は使わない。
 
-use std::path::Path;
-
 use crate::geometry::Rect;
 
 /// 解釈した結果。
@@ -223,12 +221,23 @@ fn parse_active(args: &[&str], output: &mut Output) -> Result<Target, ArgError> 
 
 /// 待つ秒数（0〜`MAX_DELAY` の整数）。
 fn parse_delay(value: &str) -> Result<u32, ArgError> {
-    match value.parse::<u32>() {
-        Ok(n) if n <= MAX_DELAY => Ok(n),
-        _ => Err(error(&format!(
-            "--delay は 0〜{MAX_DELAY} の整数（秒）で指定してください: {value}"
-        ))),
+    let n = value.parse::<u32>().map_err(|_| delay_error(value))?;
+    check_delay(n)?;
+    Ok(n)
+}
+
+/// 待つ秒数が 0〜`MAX_DELAY` か。
+fn check_delay(n: u32) -> Result<(), ArgError> {
+    if n > MAX_DELAY {
+        return Err(delay_error(&n.to_string()));
     }
+    Ok(())
+}
+
+fn delay_error(value: &str) -> ArgError {
+    error(&format!(
+        "--delay は 0〜{MAX_DELAY} の整数（秒）で指定してください: {value}"
+    ))
 }
 
 /// 対象が受け付けない引数。
@@ -275,15 +284,68 @@ fn parse_output_option(
 /// `--out` の値。拡張子は `.png`（大文字・小文字は問わない）だけ。
 fn parse_out(value: Option<&str>) -> Result<String, ArgError> {
     let path = value.ok_or_else(|| error("--out に保存先のファイルを指定してください"))?;
-    let is_png = Path::new(path)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+    check_png(path)?;
+    Ok(path.to_owned())
+}
+
+/// `--out` の拡張子が `.png`（大文字・小文字は問わない）か。区切りは `\` と `/` のどちらでも、ホストによらず同じに判定する。
+fn check_png(path: &str) -> Result<(), ArgError> {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let is_png = name
+        .rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && ext.eq_ignore_ascii_case("png"));
     if !is_png {
         return Err(error(&format!(
             "--out の拡張子は .png にしてください: {path}"
         )));
     }
-    Ok(path.to_owned())
+    Ok(())
+}
+
+/// 常駐本体に届いた `capture` の依頼を、CLI の引数と同じ規則で確かめ直す（パイプの相手を信じきらない）。
+/// `--out` は、CLI が絶対パスにしてから送るので、絶対パスであることも求める。
+pub fn check_capture(capture: &Capture) -> Result<(), ArgError> {
+    match &capture.target {
+        Target::Rect { monitor, rect } => {
+            if let Some(n) = monitor {
+                check_monitor(*n)?;
+            }
+            if rect.width() < 1 || rect.height() < 1 {
+                return Err(error(&format!(
+                    "範囲の幅と高さは 1 以上にしてください: {rect:?}"
+                )));
+            }
+        }
+        Target::Active { delay } => check_delay(*delay)?,
+        Target::Region { .. } | Target::Select => {}
+    }
+    check_output(&capture.output)?;
+    if let Save::To(path) = &capture.output.save {
+        if !is_absolute_file_path(path) {
+            return Err(error(&format!(
+                "--out は絶対パス（ドライブ名か \\\\<サーバー>\\<共有> から）にしてください: {path}"
+            )));
+        }
+        check_png(path)?;
+    }
+    Ok(())
+}
+
+/// Windows のファイルの絶対パスか（`C:\...` か `\\<サーバー>\<共有>\...`）。ホストによらず同じに判定する。
+/// デバイスの名前空間（`\\.\`・`\\?\`・`\??\`）は、ふつうのファイルではないので断る。
+fn is_absolute_file_path(path: &str) -> bool {
+    let separator = |c: char| c == '\\' || c == '/';
+    let mut chars = path.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(drive), Some(':'), Some(c)) if drive.is_ascii_alphabetic() && separator(c) => true,
+        (Some(a), Some(b), Some(_)) if separator(a) && separator(b) => {
+            let mut parts = path[2..].split(separator);
+            let server = parts.next().unwrap_or("");
+            let share = parts.next().unwrap_or("");
+            !server.is_empty() && !matches!(server, "." | "?") && !share.is_empty()
+        }
+        _ => false,
+    }
 }
 
 /// 出力のオプションの組み合わせを調べる。
@@ -298,12 +360,23 @@ fn check_output(output: &Output) -> Result<(), ArgError> {
 
 /// モニタの番号（1 から）。
 fn parse_monitor(value: &str) -> Result<u32, ArgError> {
-    match value.parse::<u32>() {
-        Ok(n) if n >= 1 => Ok(n),
-        _ => Err(error(&format!(
-            "モニタの番号は 1 以上の整数で指定してください: {value}"
-        ))),
+    let n = value.parse::<u32>().map_err(|_| monitor_error(value))?;
+    check_monitor(n)?;
+    Ok(n)
+}
+
+/// モニタの番号が 1 以上か。
+fn check_monitor(n: u32) -> Result<(), ArgError> {
+    if n < 1 {
+        return Err(monitor_error(&n.to_string()));
     }
+    Ok(())
+}
+
+fn monitor_error(value: &str) -> ArgError {
+    error(&format!(
+        "モニタの番号は 1 以上の整数で指定してください: {value}"
+    ))
 }
 
 /// `<x>,<y>,<w>,<h>`。x と y は負でもよい（モニタからはみ出すかは常駐本体が調べる）。幅と高さは 1 以上。

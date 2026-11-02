@@ -111,8 +111,8 @@ mod pipe {
 
     use shunsoku_core::protocol::{self, MAX_MESSAGE};
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PIPE_BUSY, GENERIC_READ,
-        GENERIC_WRITE, HANDLE,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PIPE_BUSY,
+        GENERIC_READ, GENERIC_WRITE, HANDLE,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile, SECURITY_IDENTIFICATION,
@@ -260,6 +260,11 @@ mod pipe {
                 }
                 // SAFETY: 名前は呼び出しの間生きている。空かずに時間が来たら false を返すだけ
                 let _ = unsafe { WaitNamedPipeW(name, left.as_millis() as u32) };
+            } else if e.code() == ERROR_ACCESS_DENIED.to_hresult() {
+                // 常駐本体のパイプは、本体より整合性レベルの低いプロセスには開けない（`pipe_server`）
+                return Err(Failure::unavailable(format!(
+                    "常駐本体に接続できません: {e}（常駐本体が管理者として動いているときは、管理者として動く shunsoku-cli からだけ依頼できます）"
+                )));
             } else {
                 return Err(Failure::unavailable(format!(
                     "常駐本体に接続できません: {e}"

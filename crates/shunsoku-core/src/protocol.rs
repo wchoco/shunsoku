@@ -1,6 +1,6 @@
 //! `shunsoku-cli` と常駐本体の間の、名前付きパイプでの依頼と応答の形式（ADR-0003）。
 
-use crate::cli_args::{Capture, Output, Save, Target};
+use crate::cli_args::{Capture, Output, Save, Target, check_capture};
 use crate::geometry::Rect;
 use crate::monitors::Monitor;
 use std::time::Duration;
@@ -136,7 +136,9 @@ pub fn decode_request(text: &str) -> Result<Request, DecodeError> {
                 copy: parse_flag(r.take("copy")?)?,
                 quiet: parse_flag(r.take("quiet")?)?,
             };
-            Request::Capture(Capture { target, output })
+            let capture = Capture { target, output };
+            check_capture(&capture).map_err(|e| DecodeError::Malformed(e.0))?;
+            Request::Capture(capture)
         }
         other => return Err(malformed(&format!("unknown command {other}"))),
     };
@@ -613,6 +615,97 @@ mod tests {
         ));
         let reply = Response::refused(&DecodeError::Malformed("x".to_owned()));
         assert_eq!(reply.exit_code(), 2);
+    }
+
+    /// `target` を撮って `output` に出す依頼を、書いて読み直す。
+    fn decode_capture(target: Target, output: Output) -> Result<Request, DecodeError> {
+        decode_request(&encode_request(&Request::Capture(Capture {
+            target,
+            output,
+        })))
+    }
+
+    /// `rect 0,0,1,1` を `out` に保存する依頼を、書いて読み直す。
+    fn decode_saving_to(out: &str) -> Result<Request, DecodeError> {
+        let target = Target::Rect {
+            monitor: None,
+            rect: Rect::new(0, 0, 1, 1),
+        };
+        let output = Output {
+            save: Save::To(out.to_owned()),
+            ..Output::default()
+        };
+        decode_capture(target, output)
+    }
+
+    #[test]
+    fn a_request_saving_to_a_relative_path_is_refused() {
+        for out in [r"shots\a.png", "a.png", r"\a.png", r"C:a.png"] {
+            assert!(
+                matches!(decode_saving_to(out), Err(DecodeError::Malformed(_))),
+                "{out} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_saving_into_a_device_namespace_is_refused() {
+        for out in [
+            r"\\.\C:\a.png",
+            r"\\?\C:\a.png",
+            r"\??\C:\a.png",
+            r"\\\a.png",
+        ] {
+            assert!(
+                matches!(decode_saving_to(out), Err(DecodeError::Malformed(_))),
+                "{out} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_saving_to_an_absolute_png_is_accepted() {
+        for out in [r"C:\shots\a.png", "d:/shots/A.PNG", r"\\server\share\a.Png"] {
+            assert!(decode_saving_to(out).is_ok(), "{out} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_request_saving_to_a_file_other_than_png_is_refused() {
+        for out in [r"C:\Windows\a.dll", r"C:\a", r"C:\a.png\", r"C:\a.png.exe"] {
+            assert!(
+                matches!(decode_saving_to(out), Err(DecodeError::Malformed(_))),
+                "{out} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_the_cli_would_not_have_accepted_is_refused() {
+        let rect = |monitor, rect| Target::Rect { monitor, rect };
+        let refused = [
+            (rect(None, Rect::new(0, 0, 0, 10)), Output::default()),
+            (rect(None, Rect::new(0, 0, 10, -1)), Output::default()),
+            (rect(Some(0), Rect::new(0, 0, 10, 10)), Output::default()),
+            (Target::Active { delay: 61 }, Output::default()),
+            (
+                Target::Select,
+                Output {
+                    save: Save::No,
+                    ..Output::default()
+                },
+            ),
+        ];
+        for (target, output) in refused {
+            let what = format!("{target:?} {output:?}");
+            assert!(
+                matches!(
+                    decode_capture(target, output),
+                    Err(DecodeError::Malformed(_))
+                ),
+                "{what} should be refused"
+            );
+        }
     }
 
     #[test]

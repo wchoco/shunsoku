@@ -10,12 +10,15 @@
 //! - パイプを開けるのは現在のユーザーとセッションだけにする:
 //!   - 名前にセッションの番号とユーザーの SID を入れる（`protocol::pipe_name`）。
 //!   - セキュリティ記述子の DACL は現在のユーザーだけに許し、ネットワークのログオンを拒む。継承はしない。
+//!     SACL に本体の整合性レベルの mandatory label（no-read-up / no-write-up）を付け、本体より整合性レベルの
+//!     低いプロセスには開けさせない（昇格した本体を、同じユーザーの昇格していないプロセスから使わせない）。
 //!   - `PIPE_REJECT_REMOTE_CLIENTS` で別のマシンからの接続を断る。
 //!   - 1 つ目のインスタンスを `FILE_FLAG_FIRST_PIPE_INSTANCE` で作り、先に同じ名前を作られていたら始めない。
 //!     インスタンスは常に 1 つ以上開いておき、名前が空く隙を作らない。
 //!   - 接続してきたクライアントのセッションを `GetNamedPipeClientSessionId` で確かめ、違えば何も読まずに切る
 //!     （同じユーザーの別のセッションは DACL では区別できないため）。念のためクライアントのプロセスのユーザーも
-//!     確かめる。
+//!     確かめる。クライアントのプロセスの整合性レベルも確かめ、本体より低ければ何も読まずに切る。
+//! - 届いた `capture` の依頼は、CLI の引数と同じ規則で確かめ直す（`protocol::decode_request`）。
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -120,6 +123,8 @@ struct Shared {
     session: u32,
     /// 現在のユーザーの SID。
     sid: String,
+    /// このプロセスの整合性レベル。これより低いクライアントは断る。
+    integrity: pipe_identity::Integrity,
     replier: Replier,
     requests: Mutex<mpsc::Sender<CaptureRequest>>,
     next_id: AtomicU64,
@@ -147,9 +152,14 @@ pub fn start(
 ) -> Result<(PipeServer, Replier)> {
     let session = pipe_identity::current_session()?;
     let sid = pipe_identity::current_user_sid()?;
+    let integrity = pipe_identity::current_integrity()?;
     let name = HSTRING::from(protocol::pipe_name(session, &sid));
-    // 保護された DACL: ネットワークのログオンを拒み、現在のユーザーだけに許す（継承しない）
-    let sddl = HSTRING::from(format!("D:P(D;;GA;;;NU)(A;;GA;;;{sid})"));
+    // 保護された DACL: ネットワークのログオンを拒み、現在のユーザーだけに許す（継承しない）。
+    // SACL: 本体より整合性レベルの低いプロセスには読み書きさせない
+    let sddl = HSTRING::from(format!(
+        "D:P(D;;GA;;;NU)(A;;GA;;;{sid}){}",
+        integrity.mandatory_label()
+    ));
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     // SAFETY: 文字列は呼び出しの間生きている。記述子はプロセスが終わるまで返さない
     unsafe {
@@ -168,6 +178,7 @@ pub fn start(
     let shared = Arc::new(Shared {
         session,
         sid,
+        integrity,
         replier: replier.clone(),
         requests: Mutex::new(sender),
         next_id: AtomicU64::new(1),
@@ -190,7 +201,7 @@ pub fn start(
             e.to_string(),
         ));
     }
-    log::info!("pipe server listening");
+    log::info!("pipe server listening (integrity {:#x})", integrity.0);
     Ok((PipeServer { requests }, replier))
 }
 
@@ -321,6 +332,21 @@ fn answer(pipe: HANDLE, shared: &Shared) -> Option<Response> {
         }
         Err(e) => {
             log::warn!("could not read the pipe client's user (pid {pid}): {e}");
+            return None;
+        }
+    }
+    match pipe_identity::process_integrity(pid) {
+        Ok(client) if shared.integrity.admits(client) => {}
+        Ok(client) => {
+            log::warn!(
+                "refused a pipe client below this process's integrity (pid {pid}, {:#x} < {:#x})",
+                client.0,
+                shared.integrity.0
+            );
+            return None;
+        }
+        Err(e) => {
+            log::warn!("could not read the pipe client's integrity (pid {pid}): {e}");
             return None;
         }
     }
