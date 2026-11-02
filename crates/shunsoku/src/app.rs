@@ -16,10 +16,12 @@
 //!   Explorer の再起動のあとにトレイを登録し直せるように、トレイだけ通常の（見えない）ウィンドウに持たせる。
 //!   ほかに、範囲選択の画面を開いている間だけ、モニタごとのウィンドウ（`overlay`）がある。
 //! - キャプチャは `capture::request` の依頼 1 本の流れで進める: 依頼 → 待機（`delay`）→ 取得（`grab`）→
-//!   範囲選択の画面（`overlay`）→ 切り抜き → 出力 → 結果。同時に進める依頼は 1 件だけ（`Capture`）。
+//!   範囲選択の画面（`overlay`）→ 切り出し → 出力 → 結果。同時に進める依頼は 1 件だけ（`Capture`）。
+//!   出力（コピー・スクラップ・保存）は撮り方によらず `output` で出す。CLI の依頼の受け取り・取りやめ・応答と
+//!   `capture rect` は子モジュールの `cli` にまとめる。
 //! - 定型領域キャプチャ（`CaptureMethod::Region`）は範囲選択の画面を出さず、1 つのメッセージの処理の中で
-//!   撮り終える（`capture_region`）: モニタの一覧（`monitor_ids`）→ core の `monitor::locate` → そのモニタだけ取得
-//!   （`Gpu::grab_monitor`）→ 切り抜き → 出力。依頼は `App::regions_waiting` に届いた順に待たせ、`WM_APP_REGION`
+//!   撮り終える（`capture_region`）: モニタの一覧（`monitor_list`）→ core の `monitors::locate_by_id` → そのモニタだけ取得
+//!   （`Gpu::grab_monitor`）→ 切り出し → 出力。依頼は `App::regions_waiting` に届いた順に待たせ、`WM_APP_REGION`
 //!   で 1 件ずつ撮る。範囲選択の画面を開いている間の依頼は無視する。shunsoku のメニューは閉じ、消えきるまで
 //!   待ってから撮る（`run_waiting_regions`）。保存に失敗したら、スクラップに逃がす（`App::save_fallbacks`）。
 //! - 範囲選択の入力（マウス・キー）は core の `selection::Input` にして `Selection::handle` に渡す。
@@ -65,7 +67,6 @@ use shunsoku_core::geometry::{Point, Rect};
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
-use shunsoku_core::monitor;
 use shunsoku_core::monitors::{self, LocateError};
 use shunsoku_core::perf::Mark;
 use shunsoku_core::protocol::{ErrorKind, Response};
@@ -109,10 +110,15 @@ use windows::core::{PCWSTR, Result, w};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
 use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
 
+mod cli;
+
 use crate::{
-    clipboard, grab, hotkey, logger, menu, monitor_ids, monitor_list, notify, overlay, panic_hook,
-    perf, pipe_server, render, save, scrap_window, settings_watch, single_instance, trash_store,
-    tray, window_list,
+    clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook, perf,
+    pipe_server, render, save, scrap_window, settings_watch, single_instance, trash_store, tray,
+    window_list,
+};
+use cli::{
+    REPLIER, capture_rect, on_pipe_requests, reply, reply_cancelled, reply_failed, waiting_reply,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
@@ -152,11 +158,16 @@ const CMD_REGION_FIRST: u32 = 1000;
 /// 依頼の `delay` を待つタイマーの番号（メッセージ専用ウィンドウの WM_TIMER）。
 const TIMER_CAPTURE_DELAY: usize = 1;
 /// shunsoku のメニューが消えきるのを待って定型領域キャプチャを進め直すタイマーの番号（メッセージ専用
-/// ウィンドウの WM_TIMER）と間隔。
+/// ウィンドウの WM_TIMER）。待っている依頼（`Capture::Waiting`）は `TIMER_CAPTURE_DELAY` で進め直す。
 const TIMER_REGION_RETRY: usize = 2;
-const REGION_RETRY_MS: u32 = 30;
+/// App を借りられずに進められなかった CLI の依頼を進め直すタイマーの番号（メッセージ専用ウィンドウの
+/// WM_TIMER）と間隔。
+const TIMER_PIPE_RETRY: usize = 3;
+const PIPE_RETRY_MS: u32 = 50;
+/// メニューが消えきったかを確かめ直す間隔。
+const MENU_RETRY_MS: u32 = 30;
 /// メニューが消えきるのを待つ回数の上限。超えたらそのまま撮る。
-const MAX_REGION_RETRIES: u32 = 30;
+const MAX_MENU_RETRIES: u32 = 30;
 /// メニューの項目をマウスで選んだときのフェード（SPI_GETSELECTIONFADE）を待つ時間。フェードのウィンドウは
 /// 列挙で見つからないことがあるので、メニューから選ばれた依頼は時間で待つ。
 const MENU_FADE_MS: u64 = 400;
@@ -176,9 +187,6 @@ static SECOND_INSTANCE: OnceLock<u32> = OnceLock::new();
 
 /// 埋め込みの文言（`locales/ja.toml`）。
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
-
-/// CLI の依頼に応答する口（`pipe_server`）。App を借りられないときにも応答できるよう、App の外に置く。
-static REPLIER: OnceLock<pipe_server::Replier> = OnceLock::new();
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -207,10 +215,10 @@ struct App {
     capture: Capture,
     /// 待っている定型領域キャプチャの依頼（届いた順）。`Capture` が `Idle` のときに 1 件ずつ撮る。
     regions_waiting: VecDeque<CaptureRequest>,
-    /// shunsoku のメニューが消えきるのを待った回数（`run_waiting_regions`）。
-    region_retries: u32,
-    /// これより前には定型領域キャプチャを撮らない（メニューで選んだ項目のフェードを待つ）。
-    region_not_before: Option<Instant>,
+    /// shunsoku のメニューが消えきるのを待った回数（`wait_for_menus`）。
+    menu_retries: u32,
+    /// これより前には撮らない（メニューで選んだ項目のフェードを待つ）。
+    menu_not_before: Option<Instant>,
     scraps: Vec<Scrap>,
     /// 閉じたスクラップ。drop で一時ファイルを消す。
     trash: trash_store::TrashStore,
@@ -503,7 +511,12 @@ pub fn run() -> i32 {
     let message_window = app.windows.message;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     // 依頼が届くのは App を置いてから
-    match pipe_server::start(message_window, WM_APP_PIPE, text("job.panicked").to_owned()) {
+    match pipe_server::start(
+        message_window,
+        WM_APP_PIPE,
+        text("job.panicked").to_owned(),
+        text("cli.timed_out").to_owned(),
+    ) {
         Ok((server, replier)) => {
             let _ = REPLIER.set(replier);
             with_app(|app| app.pipe = Some(server));
@@ -664,8 +677,8 @@ fn start(
         mouse: keymap.mouse,
         capture: Capture::Idle,
         regions_waiting: VecDeque::new(),
-        region_retries: 0,
-        region_not_before: None,
+        menu_retries: 0,
+        menu_not_before: None,
         scraps: Vec::new(),
         trash,
         saves: mpsc::channel(),
@@ -789,7 +802,15 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             Some(LRESULT(0))
         }
         WM_APP_PIPE => {
-            on_pipe_requests();
+            on_pipe_requests(hwnd);
+            Some(LRESULT(0))
+        }
+        WM_TIMER if wparam.0 == TIMER_PIPE_RETRY => {
+            // SAFETY: 自分のタイマーを止める
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_PIPE_RETRY);
+            }
+            on_pipe_requests(hwnd);
             Some(LRESULT(0))
         }
         WM_HOTKEY => {
@@ -965,8 +986,14 @@ fn on_tray(owner: HWND, event: tray::Event) {
 
 fn on_command(command: u32) {
     match command {
-        CMD_SELECT_CAPTURE => request_capture(Source::TrayMenu),
-        CMD_ADD_REGION => request_capture(Source::AddRegion),
+        CMD_SELECT_CAPTURE => {
+            chosen_from_menu();
+            request_capture(Source::TrayMenu);
+        }
+        CMD_ADD_REGION => {
+            chosen_from_menu();
+            request_capture(Source::AddRegion);
+        }
         CMD_CLOSE_ALL => close_all_scraps(),
         CMD_HIDE_ALL => set_scraps_visible(false),
         CMD_SHOW_ALL => set_scraps_visible(true),
@@ -1045,15 +1072,14 @@ fn on_overlay_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> O
             Some(LRESULT(0))
         }
         // 他のアプリに前面を取られるとキー入力が来なくなり、閉じられなくなるので閉じる
+        // （確定・取り消しで閉じた後にも届くので、そのときは何もしない）
         WM_ACTIVATEAPP if wparam.0 == 0 => {
-            log::info!("overlay lost the foreground; closing");
-            close_overlay();
+            close_overlay("the overlay lost the foreground");
             Some(LRESULT(0))
         }
         // モニタの構成が変わると、固定された画面は実際の画面と合わなくなる
         WM_DISPLAYCHANGE => {
-            log::info!("display changed while the overlay is open; closing");
-            close_overlay();
+            close_overlay("the display changed");
             Some(LRESULT(0))
         }
         // 背景は塗らない（描くのはスワップチェーンだけ）
@@ -1591,21 +1617,28 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
 
 /// `Effect::CopyToClipboard`: 画像をクリップボードに置く。失敗したらエラーの通知を出す。
 fn copy_to_clipboard(image: &Image) {
+    if let Err(reason) = copy_image(image) {
+        notify_user(notify::Level::Error, &reason);
+    }
+}
+
+/// 画像をクリップボードに置く。失敗したら通知に出す理由を返す（通知はしない）。
+fn copy_image(image: &Image) -> std::result::Result<(), String> {
     let Some(owner) = with_app(|app| app.windows.message) else {
-        return;
+        return Err(text("job.panicked").to_owned());
     };
     match clipboard::copy(owner, image) {
-        Ok(()) => log::info!(
-            "copied {}x{} to the clipboard",
-            image.width(),
-            image.height()
-        ),
+        Ok(()) => {
+            log::info!(
+                "copied {}x{} to the clipboard",
+                image.width(),
+                image.height()
+            );
+            Ok(())
+        }
         Err(e) => {
             log::error!("could not copy to the clipboard: {e}");
-            notify_user(
-                notify::Level::Error,
-                &format!("{}\n{e}", text("copy.failed")),
-            );
+            Err(format!("{}\n{e}", text("copy.failed")))
         }
     }
 }
@@ -1756,7 +1789,7 @@ fn start_save(
             save_failed(Some(&path), &e.to_string());
         }
         if let Some(fallback) = fallback {
-            float_scrap(fallback.at, fallback.image, false);
+            let _ = float_scrap(fallback.at, fallback.image, false);
         }
         reply_failed(reply, &e.to_string());
     }
@@ -1811,9 +1844,11 @@ fn on_saved() {
                 } else {
                     save_failed(Some(&saved.path), &e);
                 }
-                reply_failed(saved.reply, &e);
+                // CLI にはどこに書けなかったかも返す（--out の誤りに気づけるように）
+                let path = std::path::absolute(&saved.path).unwrap_or(saved.path);
+                reply_failed(saved.reply, &format!("{}: {e}", path.display()));
                 if let Some(fallback) = fallback {
-                    float_scrap(fallback.at, fallback.image, false);
+                    let _ = float_scrap(fallback.at, fallback.image, false);
                 }
             }
         }
@@ -2026,10 +2061,7 @@ fn on_selection_input(input: Input) {
     });
     match state {
         Some(State::Confirmed) => finish_selection(),
-        Some(State::Cancelled) => {
-            log::info!("overlay cancelled");
-            close_overlay();
-        }
+        Some(State::Cancelled) => close_overlay("cancelled"),
         _ => {}
     }
 }
@@ -2041,20 +2073,14 @@ fn finish_selection() {
             request,
             overlay,
             selection,
-        } => Some((
-            request,
-            overlay,
-            selection,
-            app.module,
-            Appearance::from(app.settings.scrap),
-        )),
+        } => Some((request, overlay, selection)),
         other => {
             app.capture = other;
             None
         }
     })
     .flatten();
-    let Some((request, overlay, selection, module, appearance)) = taken else {
+    let Some((request, overlay, selection)) = taken else {
         return;
     };
     if selection.is_registering() {
@@ -2104,40 +2130,10 @@ fn finish_selection() {
         fragments.len()
     );
 
-    if request.reply.is_some() {
-        // スクラップを前面にしてから範囲選択の画面を閉じる（前面にする権利を失わないように）
-        output_rect(request, rect, image);
-        drop(overlay);
-        end_capture();
-        log::info!("overlay closed");
-        return;
-    }
-    // ウィンドウを作るとメッセージが届くので、App を借りずに作る。前面にする権利を失わないよう、
-    // スクラップを前面にしてから範囲選択の画面を閉じる
-    let scrap = if request.outputs.scrap {
-        let focus = request.outputs.focus_scrap;
-        let model = ScrapModel::new(rect.origin(), image.size());
-        match open_scrap(module, model, image, &appearance, focus) {
-            Ok(scrap) => Some(scrap),
-            Err(e) => {
-                log::error!("could not open a scrap: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // スクラップを前面にしてから範囲選択の画面を閉じる（前面にする権利を失わないように）
+    output(request, rect, image);
     drop(overlay);
     end_capture();
-    if let Some(scrap) = scrap {
-        let rejected = with_app(|app| {
-            app.scraps.push(scrap);
-        });
-        if rejected.is_none() {
-            log::warn!("could not keep the scrap");
-        }
-        perf::mark(Mark::ScrapShown);
-    }
     log::info!("overlay closed");
 }
 
@@ -2228,13 +2224,46 @@ fn submit(request: CaptureRequest) {
     }
 }
 
-/// 待っている依頼を、撮り方に合わせて進める。
+/// 待っている依頼を、撮り方に合わせて進める。shunsoku のメニューが出ていれば閉じ、消えきってから撮る
+/// （写り込まないように）。
 fn take_capture() {
-    let method = with_app(|app| match &app.capture {
-        Capture::Waiting(request) => Some(request.method.clone()),
-        _ => None,
+    // SAFETY: このスレッドのメニューを閉じるだけ（出ていなければ何もしない）
+    unsafe {
+        let _ = EndMenu();
+    }
+    let next = with_app(|app| {
+        let Capture::Waiting(request) = &app.capture else {
+            return None;
+        };
+        let method = request.method.clone();
+        Some((wait_for_menus(app), method, app.windows.message))
     })
     .flatten();
+    let method = match next {
+        None => None,
+        Some((MenuWait::Clear { waited }, method, _)) => {
+            if waited {
+                flush_composition();
+            }
+            Some(method)
+        }
+        Some((MenuWait::Wait, method, message_window)) => {
+            // SAFETY: 自分のウィンドウのタイマー
+            if unsafe {
+                SetTimer(
+                    Some(message_window),
+                    TIMER_CAPTURE_DELAY,
+                    MENU_RETRY_MS,
+                    None,
+                )
+            } != 0
+            {
+                return;
+            }
+            log::warn!("could not start the menu retry timer; capturing now");
+            Some(method)
+        }
+    };
     match method {
         Some(request::CaptureMethod::Select | request::CaptureMethod::RegisterRegion) => {
             open_overlay()
@@ -2263,125 +2292,23 @@ fn take_capture() {
     }
 }
 
-/// `WM_APP_PIPE`: 届いている CLI の依頼を進める。範囲選択の画面を開いている間に届いたものは失敗として返し、
-/// `delay` を待っている間に届いたものは待たせる（終えたら `end_capture` が起こす）。
-fn on_pipe_requests() {
-    loop {
-        let next = with_app(|app| {
-            if matches!(app.capture, Capture::Waiting(_)) {
-                return None;
-            }
-            let selecting = matches!(app.capture, Capture::Selecting { .. });
-            app.pipe
-                .as_ref()?
-                .next()
-                .map(|request| (request, selecting))
-        })
-        .flatten();
-        let Some((request, selecting)) = next else {
-            return;
-        };
-        if selecting {
-            log::info!("CLI request while the overlay is open; rejected");
-            reply_failed(request.reply, text("cli.selecting"));
-        } else {
-            log::info!("capture requested from the CLI: {:?}", request.method);
-            submit(request);
-        }
-    }
-}
-
-/// `capture rect`: 範囲選択の画面を出さずに、決まった範囲を撮って出力する。
-fn capture_rect(monitor: Option<u32>, rect: Rect) {
-    let started = Instant::now();
-    let area = match monitors::locate(&monitor_list::list(), monitor, rect) {
-        Ok(area) => area,
-        Err(e) => {
-            log::warn!("could not locate {rect:?} on monitor {monitor:?}: {e:?}");
-            let reason = match e {
-                LocateError::NoSuchMonitor(n) => format!("{}{n}", text("cli.no_such_monitor")),
-                LocateError::NoMainMonitor => text("cli.no_main_monitor").to_owned(),
-                LocateError::OutOfMonitor => text("cli.out_of_monitor").to_owned(),
-            };
-            fail_capture(&reason);
-            return;
-        }
-    };
-    // 取得のスレッドは App に触らないので、借りたまま待ってよい
-    let Some(grabbed) = with_app(|app| {
-        let cursor = app.settings.general.capture_cursor;
-        app.gpu.grab(cursor)
-    }) else {
-        fail_capture(text("job.panicked"));
-        return;
-    };
-    let shots = match grabbed {
-        Ok(shots) => shots,
-        Err(e) => {
-            log::warn!("could not grab the screen: {e}");
-            let reason = match e {
-                grab::GrabError::Panicked => text("job.panicked").to_owned(),
-                e => e.to_string(),
-            };
-            fail_capture(&reason);
-            return;
-        }
-    };
-    let fragment = shots
-        .iter()
-        .find(|shot| {
-            let r = shot.rect;
-            Rect::new(r.left, r.top, r.right, r.bottom).intersect(&area) == Some(area)
-        })
-        .map(|shot| shot.read_back(area));
-    drop(shots);
-    let image = match fragment {
-        Some(Ok(Some(fragment))) if fragment.image.size() == area.size() => fragment.image,
-        Some(Err(e)) => {
-            log::warn!("could not read back {area:?}: {e}");
-            fail_capture(&e.to_string());
-            return;
-        }
-        _ => {
-            log::warn!("no readable shot covers {area:?}");
-            fail_capture(text("cli.unreadable_monitor"));
-            return;
-        }
-    };
-    let request = with_app(|app| match std::mem::take(&mut app.capture) {
-        Capture::Waiting(request) => Some(request),
-        other => {
-            app.capture = other;
-            None
-        }
-    })
-    .flatten();
-    end_capture();
-    let Some(request) = request else {
-        log::warn!("capture request vanished while capturing a rect");
-        return;
-    };
-    log::info!(
-        "captured {}x{} at ({}, {}) in {:.1} ms",
-        area.width(),
-        area.height(),
-        area.left,
-        area.top,
-        started.elapsed().as_secs_f64() * 1000.0
-    );
-    output_rect(request, area, image);
-}
-
-/// CLI の依頼で撮った画像（`area` はスクリーン座標の位置）を、依頼の出力（コピー → スクラップ → 保存の順）に出して CLI に応答する。
-/// どれかに失敗したら、その先は出さずにキャプチャの失敗として返す。保存に失敗してもスクラップには逃がさない。
-fn output_rect(request: CaptureRequest, area: Rect, image: Image) {
+/// 撮った画像（`area` はスクリーン座標の位置）を、依頼の出力（コピー → スクラップ → 保存の順）に出す。
+/// 撮り方（範囲選択・ウィンドウ・定型領域・`capture rect`）にかかわらず、ここで出す。
+///
+/// - 失敗として返す依頼（`OnSaveFailure::Fail`、CLI）は、どれかに失敗したらその先は出さず、失敗を通知して
+///   CLI に返す。保存に失敗してもスクラップには逃がさない。保存の結果は `on_saved` が返す。
+/// - そうでない依頼（ホットキー・トレイ）は、失敗を通知して残りを出す。保存に失敗したら、スクラップを
+///   出していなければスクラップに逃がす。
+fn output(request: CaptureRequest, area: Rect, image: Image) {
+    let strict = request.on_save_failure == OnSaveFailure::Fail;
     let CaptureRequest {
         outputs,
         notify,
         reply: reply_to,
         ..
     } = request;
-    let failed = |reason: &str| {
+    // 失敗として返す依頼の失敗
+    let fail = |reason: &str| {
         if notify {
             notify_user(
                 notify::Level::Error,
@@ -2390,127 +2317,60 @@ fn output_rect(request: CaptureRequest, area: Rect, image: Image) {
         }
         reply_failed(reply_to, reason);
     };
-    if outputs.copy {
-        let Some(owner) = with_app(|app| app.windows.message) else {
-            failed(text("job.panicked"));
-            return;
-        };
-        if let Err(e) = clipboard::copy(owner, &image) {
-            log::error!("could not copy to the clipboard: {e}");
-            failed(&format!("{}\n{e}", text("copy.failed")));
+    if outputs.copy
+        && let Err(reason) = copy_image(&image)
+    {
+        if strict {
+            fail(&reason);
             return;
         }
-        log::info!("copied {}x{} to the clipboard", area.width(), area.height());
+        if notify {
+            notify_user(notify::Level::Error, &reason);
+        }
     }
     if outputs.scrap {
-        let Some((module, appearance)) =
-            with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
-        else {
-            failed(text("job.panicked"));
-            return;
-        };
-        // ウィンドウを作るとメッセージが届くので、App を借りずに作る
-        let model = ScrapModel::new(area.origin(), image.size());
-        match open_scrap(
-            module,
-            model,
-            image.clone(),
-            &appearance,
-            outputs.focus_scrap,
-        ) {
-            Ok(scrap) => {
-                if with_app(|app| app.scraps.push(scrap)).is_none() {
-                    log::warn!("could not keep the scrap");
-                }
-            }
-            Err(e) => {
-                log::error!("could not open a scrap: {e}");
-                failed(&e.to_string());
+        match float_scrap(area.origin(), image.clone(), outputs.focus_scrap) {
+            Ok(()) => perf::mark(Mark::ScrapShown),
+            Err(reason) if strict => {
+                fail(&reason);
                 return;
             }
+            Err(_) => {}
         }
     }
-    let (path, overwrite) = match outputs.save {
-        None => {
-            if let Some(to) = reply_to {
-                reply(to, Response::Captured { path: None });
-            }
-            return;
+    let Some(target) = outputs.save else {
+        if let Some(to) = reply_to {
+            reply(to, Response::Captured { path: None });
         }
-        Some(request::SaveTarget::File(path)) => (path, save::Overwrite::Allow),
-        Some(target) => {
-            let resolved = match target {
-                request::SaveTarget::Region {
-                    dir,
-                    file_name_template,
-                    name,
-                } => resolve_destination(dir, &file_name_template, &name),
-                _ => resolve_default_destination(),
-            };
-            match resolved {
-                Ok(path) => (path, save::Overwrite::Deny),
-                Err((dir, reason)) => {
-                    let mut reason = reason;
-                    if let Some(dir) = dir {
-                        reason.push('\n');
-                        reason.push_str(&dir.display().to_string());
-                    }
-                    failed(&reason);
-                    return;
-                }
-            }
-        }
+        return;
     };
-    start_save(path, image, overwrite, None, reply_to, notify);
-}
-
-/// 待っている依頼の、結果を返す先（CLI の依頼だけ）。
-fn waiting_reply() -> Option<ReplyTo> {
-    with_app(|app| match &app.capture {
-        Capture::Waiting(request) => request.reply,
-        _ => None,
-    })
-    .flatten()
-}
-
-/// 待っている依頼を失敗で終える。CLI の依頼なら理由を返す。
-fn fail_capture(reason: &str) {
-    let (reply_to, notify) = with_app(|app| match std::mem::take(&mut app.capture) {
-        Capture::Waiting(request) => (request.reply, request.notify),
-        other => {
-            app.capture = other;
-            (None, true)
+    // 決まったファイル（CLI の --out）だけ上書きする
+    let overwrite = match target {
+        SaveTarget::File(_) => save::Overwrite::Allow,
+        _ => save::Overwrite::Deny,
+    };
+    let fallback = (!strict && !outputs.scrap).then(|| Fallback {
+        at: area.origin(),
+        image: image.clone(),
+    });
+    match resolve_save_target(target) {
+        Ok(path) => start_save(path, image, overwrite, fallback, reply_to, notify),
+        Err((dir, reason)) if strict => {
+            let mut reason = reason;
+            if let Some(dir) = dir {
+                reason.push('\n');
+                reason.push_str(&dir.display().to_string());
+            }
+            fail(&reason);
         }
-    })
-    .unwrap_or((None, true));
-    end_capture();
-    if notify {
-        notify_user(
-            notify::Level::Error,
-            &format!("{}\n{reason}", text("capture.failed")),
-        );
-    }
-    reply_failed(reply_to, reason);
-}
-
-/// CLI の依頼に応答する。
-fn reply(to: ReplyTo, response: Response) {
-    match REPLIER.get() {
-        Some(replier) => replier.reply(to, response),
-        None => log::warn!("no pipe server to reply to {}", to.0),
-    }
-}
-
-/// CLI の依頼なら、キャプチャの失敗（終了コード 1）として返す。
-fn reply_failed(to: Option<ReplyTo>, message: &str) {
-    if let Some(to) = to {
-        reply(
-            to,
-            Response::Failed {
-                kind: ErrorKind::CaptureFailed,
-                message: message.to_owned(),
-            },
-        );
+        Err((dir, reason)) => {
+            if notify {
+                save_failed(dir.as_deref(), &reason);
+            }
+            if let Some(fallback) = fallback {
+                let _ = float_scrap(fallback.at, fallback.image, false);
+            }
+        }
     }
 }
 
@@ -2523,21 +2383,19 @@ fn capture_active_window() {
 }
 
 /// 待っている依頼で `hwnd` のウィンドウを WGC で撮り、依頼の出力（スクラップ）を出す。
-/// `crop`（スクリーン座標）があれば、撮った画像からその部分（部品）を切り抜く。
+/// `crop`（スクリーン座標）があれば、撮った画像からその部分（部品）を切り出す。
 fn capture_window(hwnd: HWND, crop: Option<Rect>) {
     let started = Instant::now();
     let taken = with_app(|app| match &app.capture {
         Capture::Waiting(request) => Some((
             request.clone(),
             app.gpu.primary_device(),
-            app.module,
-            Appearance::from(app.settings.scrap),
             app.settings.general.capture_cursor,
         )),
         _ => None,
     })
     .flatten();
-    let Some((request, device, module, appearance, cursor)) = taken else {
+    let Some((request, device, cursor)) = taken else {
         return;
     };
     let grabbed = if hwnd.is_invalid() {
@@ -2571,7 +2429,7 @@ fn capture_window(hwnd: HWND, crop: Option<Rect>) {
     if partial && request.notify {
         notify_user(notify::Level::Warning, text("capture.window_partial"));
     }
-    // 部品は、撮ったウィンドウの画像から切り抜く（WGC は最上位のウィンドウしか撮れない）
+    // 部品は、撮ったウィンドウの画像から切り出す（WGC は最上位のウィンドウしか撮れない）
     let shot = match crop.map(|crop| crop.intersect(&shot.rect)) {
         None => shot,
         Some(Some(area)) => crate::window_grab::WindowShot {
@@ -2594,30 +2452,7 @@ fn capture_window(hwnd: HWND, crop: Option<Rect>) {
         started.elapsed().as_secs_f64() * 1000.0
     );
     end_capture();
-    if request.reply.is_some() {
-        output_rect(request, shot.rect, shot.image);
-        return;
-    }
-    if !request.outputs.scrap {
-        return;
-    }
-    // ウィンドウを作るとメッセージが届くので、App を借りずに作る
-    let model = ScrapModel::new(shot.rect.origin(), shot.image.size());
-    match open_scrap(
-        module,
-        model,
-        shot.image,
-        &appearance,
-        request.outputs.focus_scrap,
-    ) {
-        Ok(scrap) => {
-            if with_app(|app| app.scraps.push(scrap)).is_none() {
-                log::warn!("could not keep the scrap");
-            }
-            perf::mark(Mark::ScrapShown);
-        }
-        Err(e) => log::error!("could not open a scrap: {e}"),
-    }
+    output(request, shot.rect, shot.image);
 }
 
 /// WGC で撮れなかったウィンドウの、モニタに写っている部分を Desktop Duplication で撮る。撮れなければ None。
@@ -2740,7 +2575,8 @@ fn open_overlay() {
 }
 
 /// 範囲選択の画面を閉じ、依頼を終える。CLI の依頼なら、取り消し（終了コード 4）として返す。
-fn close_overlay() {
+/// 開いていなければ何もしない。`why` は閉じるわけ（ログに出す）。
+fn close_overlay(why: &str) {
     let taken = with_app(|app| match std::mem::take(&mut app.capture) {
         Capture::Selecting {
             overlay, request, ..
@@ -2758,20 +2594,7 @@ fn close_overlay() {
     drop(overlay);
     end_capture();
     reply_cancelled(reply_to);
-    log::info!("overlay closed");
-}
-
-/// CLI の依頼なら、ユーザーが取り消した（終了コード 4）として返す。
-fn reply_cancelled(to: Option<ReplyTo>) {
-    if let Some(to) = to {
-        reply(
-            to,
-            Response::Failed {
-                kind: ErrorKind::Cancelled,
-                message: text("cli.cancelled").to_owned(),
-            },
-        );
-    }
+    log::info!("overlay closed: {why}");
 }
 
 /// 依頼を終えて、取得に使った GPU のメモリを返す。待たせている CLI の依頼・定型領域キャプチャがあれば進める。
@@ -2824,15 +2647,14 @@ fn request_region(index: usize, from: &str) {
             .ok_or("the region is no longer in the settings")?;
         app.regions_waiting
             .push_back(CaptureRequest::region(region));
-        if from_menu && selection_fades() {
-            app.region_not_before =
-                Some(Instant::now() + std::time::Duration::from_millis(MENU_FADE_MS));
-        }
         Ok(app.windows.message)
     });
     match queued {
         Some(Ok(message_window)) => {
             log::info!("region capture {} requested from {from}", index + 1);
+            if from_menu {
+                chosen_from_menu();
+            }
             // SAFETY: このスレッドのメニューを閉じるだけ（出ていなければ何もしない）
             unsafe {
                 let _ = EndMenu();
@@ -2871,41 +2693,84 @@ fn run_waiting_regions() {
             if !matches!(app.capture, Capture::Idle) || app.regions_waiting.is_empty() {
                 return Ok(None);
             }
-            if app
-                .region_not_before
-                .is_some_and(|not_before| Instant::now() < not_before)
-            {
-                return Err(app.windows.message);
+            match wait_for_menus(app) {
+                MenuWait::Wait => Err(app.windows.message),
+                MenuWait::Clear { waited } => {
+                    Ok(app.regions_waiting.pop_front().map(|r| (r, waited)))
+                }
             }
-            app.region_not_before = None;
-            if app.region_retries < MAX_REGION_RETRIES && menus_visible() {
-                app.region_retries += 1;
-                return Err(app.windows.message);
-            }
-            app.region_retries = 0;
-            Ok(app.regions_waiting.pop_front())
         });
         match next {
-            Some(Ok(Some(request))) => capture_region(request),
+            Some(Ok(Some((request, waited)))) => {
+                if waited {
+                    flush_composition();
+                }
+                capture_region(request);
+            }
             Some(Err(message_window)) => {
                 // SAFETY: 自分のウィンドウのタイマー
                 if unsafe {
                     SetTimer(
                         Some(message_window),
                         TIMER_REGION_RETRY,
-                        REGION_RETRY_MS,
+                        MENU_RETRY_MS,
                         None,
                     )
                 } == 0
                 {
                     log::warn!("could not start the region retry timer; capturing now");
-                    with_app(|app| app.region_retries = MAX_REGION_RETRIES);
+                    with_app(|app| app.menu_retries = MAX_MENU_RETRIES);
                     continue;
                 }
                 return;
             }
             _ => return,
         }
+    }
+}
+
+/// shunsoku のメニューを撮る前に待つか。
+enum MenuWait {
+    /// まだ見えている（閉じる途中のフェードも）。少し待って確かめ直す。
+    Wait,
+    /// 見えていない。`waited` なら待った後（消えた画面がまだ画面に反映されていないかもしれない）。
+    Clear { waited: bool },
+}
+
+/// shunsoku のメニューが写り込まないよう、撮るのを待つか決める。待つなら回数を数え、上限を超えたらそのまま撮る。
+fn wait_for_menus(app: &mut App) -> MenuWait {
+    let fading = app.menu_not_before.take();
+    if let Some(not_before) = fading
+        && Instant::now() < not_before
+    {
+        app.menu_not_before = Some(not_before);
+        return MenuWait::Wait;
+    }
+    if app.menu_retries < MAX_MENU_RETRIES && menus_visible() {
+        app.menu_retries += 1;
+        return MenuWait::Wait;
+    }
+    let waited = fading.is_some() || app.menu_retries > 0;
+    app.menu_retries = 0;
+    MenuWait::Clear { waited }
+}
+
+/// メニューで項目を選んだ。選んだ項目のフェードが消えるまでは撮らない（フェードのウィンドウは列挙で
+/// 見つからないことがあるので、時間で待つ）。
+fn chosen_from_menu() {
+    if selection_fades() {
+        with_app(|app| {
+            app.menu_not_before =
+                Some(Instant::now() + std::time::Duration::from_millis(MENU_FADE_MS));
+        });
+    }
+}
+
+/// 隠したウィンドウが画面に反映されるのを待つ（DWM の次の合成まで）。
+fn flush_composition() {
+    // SAFETY: 引数なし
+    if let Err(e) = unsafe { DwmFlush() } {
+        log::warn!("DwmFlush failed: {e}");
     }
 }
 
@@ -2977,8 +2842,8 @@ fn capture_region(request: CaptureRequest) {
     };
     // CLI の依頼は、領域の保存先とファイル名テンプレートで保存する（領域の撮影後の動作は見ない）
     let request = request.clone().with_region_destination(&region);
-    let monitors = monitor_ids::list();
-    let located = match monitor::locate(&monitors, &region.monitor, region.rect) {
+    let monitors = monitor_list::list();
+    let located = match monitors::locate_by_id(&monitors, &region.monitor, region.rect) {
         Ok(located) => located,
         Err(e) => {
             log::warn!(
@@ -2987,8 +2852,10 @@ fn capture_region(request: CaptureRequest) {
                 monitors.iter().map(|m| &m.id).collect::<Vec<_>>()
             );
             let key = match e {
-                monitor::LocateError::MonitorNotFound => "region.monitor_not_found",
-                monitor::LocateError::OutOfBounds => "region.out_of_bounds",
+                LocateError::OutOfBounds => "region.out_of_bounds",
+                LocateError::MonitorNotFound
+                | LocateError::NoSuchMonitor(_)
+                | LocateError::NoMainMonitor => "region.monitor_not_found",
             };
             let message = format!("{}{name}", text(key));
             if request.notify {
@@ -3014,7 +2881,10 @@ fn capture_region(request: CaptureRequest) {
             .map_err(|e| e.to_string())
             .and_then(|shot| match shot.read_back(screen) {
                 Ok(Some(fragment)) => Ok(fragment),
-                Ok(None) => Err("the monitor cannot be captured (rotated or HDR)".to_owned()),
+                Ok(None) => {
+                    log::warn!("the monitor of region {name} cannot be read back");
+                    Err(text("cli.unreadable_monitor").to_owned())
+                }
                 Err(e) => Err(e.to_string()),
             });
         app.gpu.trim();
@@ -3047,46 +2917,14 @@ fn capture_region(request: CaptureRequest) {
         at.y
     );
 
-    if request.reply.is_some() {
-        output_rect(request, Rect::from_origin_size(at, image.size()), image);
-        return;
-    }
-    let outputs = &request.outputs;
-    if outputs.copy {
-        copy_to_clipboard(&image);
-    }
-    // スクラップを出すときは、保存に失敗してもスクラップが残るので、逃がすスクラップは要らない
-    let fallback = request.on_save_failure == OnSaveFailure::FallbackToScrap && !outputs.scrap;
-    if let Some(target) = &outputs.save {
-        match save_destination(target) {
-            Some(path) => {
-                let fallback = fallback.then(|| Fallback {
-                    at,
-                    image: image.clone(),
-                });
-                start_save(
-                    path,
-                    image.clone(),
-                    save::Overwrite::Deny,
-                    fallback,
-                    request.reply,
-                    request.notify,
-                );
-            }
-            None if fallback => float_scrap(at, image.clone(), false),
-            None => {}
-        }
-    }
-    if outputs.scrap {
-        float_scrap(at, image, outputs.focus_scrap);
-    }
+    output(request, Rect::from_origin_size(at, image.size()), image);
 }
 
 /// 範囲選択の画面で決めた範囲（スクリーン座標）を、定型領域として設定ファイルの `[[regions]]` に足す。
 /// 名前は重ならない「領域 N」、モニタは範囲の左上を含むモニタ。足せたら、トレイの「定型領域」サブメニュー
 /// （開くたびに `App::settings` から作る）に出て、すぐに撮れる。結果は通知で知らせる。
 fn register_region(rect: Rect) {
-    let monitors = monitor_ids::list();
+    let monitors = monitor_list::list();
     let Some(monitor) = monitors.iter().find(|m| m.rect.contains(rect.origin())) else {
         log::warn!("no monitor contains the region to register at {rect:?}");
         notify_user(notify::Level::Error, text("region.register_failed"));
@@ -3128,25 +2966,28 @@ fn register_region(rect: Rect) {
     }
 }
 
-/// 保存先: `target` の保存先に、`target` のファイル名テンプレートで付けた重ならない名前。
-fn save_destination(target: &SaveTarget) -> Option<PathBuf> {
+/// 保存先を決める: `target` の保存先に、`target` のファイル名テンプレートで付けた重ならない名前（決まった
+/// ファイルならそのまま）。決められなければ、（あれば）フォルダと理由を返す。通知はしない。
+fn resolve_save_target(
+    target: SaveTarget,
+) -> std::result::Result<PathBuf, (Option<PathBuf>, String)> {
     match target {
-        SaveTarget::Default => default_destination(),
-        SaveTarget::File(path) => Some(path.clone()),
+        SaveTarget::Default => resolve_default_destination(),
+        SaveTarget::File(path) => Ok(path),
         SaveTarget::Region {
             dir,
             file_name_template,
             name,
-        } => destination_in(dir.clone(), file_name_template, name),
+        } => resolve_destination(dir, &file_name_template, &name),
     }
 }
 
-/// 画像をスクラップとして `at`（スクリーン座標）に等倍で浮かべ、`App::scraps` に入れる。
-fn float_scrap(at: Point, image: Image, focus: bool) {
+/// 画像をスクラップとして `at`（スクリーン座標）に等倍で浮かべ、`App::scraps` に入れる。出せなければ理由を返す。
+fn float_scrap(at: Point, image: Image, focus: bool) -> std::result::Result<(), String> {
     let Some((module, appearance)) =
         with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
     else {
-        return;
+        return Err(text("job.panicked").to_owned());
     };
     // ウィンドウを作るとメッセージが届くので、App を借りずに作る
     let model = ScrapModel::new(at, image.size());
@@ -3155,8 +2996,12 @@ fn float_scrap(at: Point, image: Image, focus: bool) {
             if with_app(|app| app.scraps.push(scrap)).is_none() {
                 log::warn!("could not keep the scrap");
             }
+            Ok(())
         }
-        Err(e) => log::error!("could not open a scrap: {e}"),
+        Err(e) => {
+            log::error!("could not open a scrap: {e}");
+            Err(e.to_string())
+        }
     }
 }
 

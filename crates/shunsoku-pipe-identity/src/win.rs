@@ -1,8 +1,3 @@
-//! 名前付きパイプの相手を確かめるための、ユーザー（SID）とセッションの取得。
-//!
-//! 常駐本体（`pipe_server`）と `shunsoku-cli` の両方が使う。CLI は `#[path]` でこのファイルを取り込むので、
-//! `windows` クレートと `std` のほかには依存しない。
-
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};

@@ -1,0 +1,17 @@
+[package]
+name = "shunsoku-pipe-identity"
+description = "名前付きパイプの相手を確かめるためのユーザー（SID）とセッションの取得。常駐本体と CLI が使う"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Windows でだけ中身がある。Linux のホストでは空のクレートとして組む。
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+]

@@ -4,6 +4,9 @@
 //!   `CaptureRequest`（`reply` 付き）にして UI スレッドに渡し（`WM_APP_*` で起こす）、`Replier::reply` で
 //!   返ってきた応答を書いて切る。`monitors` は UI スレッドを通さずにその場で答える。
 //! - 仕事のスレッドのパニックは、その依頼の失敗（終了コード 1）として返す。
+//! - 応答を待つ間、CLI が切った（Ctrl+C など）か、待つ時間の上限（`protocol::reply_timeout`）を過ぎたら、
+//!   応答の行き先を消して UI スレッドを起こす。UI スレッドは行き先のない依頼を取りやめる
+//!   （`Replier::is_waiting`）。上限を過ぎたときは失敗として返す。
 //! - パイプを開けるのは現在のユーザーとセッションだけにする:
 //!   - 名前にセッションの番号とユーザーの SID を入れる（`protocol::pipe_name`）。
 //!   - セキュリティ記述子の DACL は現在のユーザーだけに許し、ネットワークのログオンを拒む。継承はしない。
@@ -18,7 +21,7 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use shunsoku_core::capture::request::{CaptureRequest, ReplyTo};
 use shunsoku_core::protocol::{self, DecodeError, ErrorKind, MAX_MESSAGE, Request, Response};
@@ -37,17 +40,19 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     GetNamedPipeClientSessionId, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_MESSAGE, PIPE_WAIT,
+    PIPE_TYPE_MESSAGE, PIPE_WAIT, PeekNamedPipe,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{HSTRING, Result};
 
-use crate::pipe_identity;
+use shunsoku_pipe_identity as pipe_identity;
 
 /// 同時に開いておく接続の上限。超えた CLI は空くまで待つ（`WaitNamedPipeW`）。
 const MAX_INSTANCES: u32 = 8;
 /// インスタンスを作れなかったときに作り直すまでの間隔。
 const RETRY: Duration = Duration::from_millis(200);
+/// 応答を待つ間に、CLI がまだつながっているか確かめる間隔。
+const CLIENT_CHECK: Duration = Duration::from_millis(500);
 
 /// UI スレッドが持つ受け口。
 pub struct PipeServer {
@@ -79,8 +84,25 @@ impl Replier {
             Some(sender) => {
                 let _ = sender.send(response);
             }
-            None => log::warn!("no pipe client is waiting for reply {}", to.0),
+            // 切った・待ちきれなかった依頼は行き先を先に消している（`forget`）。そのあとの応答なので普通に起きる
+            None => log::debug!("no pipe client is waiting for reply {}; dropped", to.0),
         }
+    }
+
+    /// `to` の依頼に、まだ応答を待っている CLI がいるか（切った・待ちきれなかった依頼は取りやめてよい）。
+    pub fn is_waiting(&self, to: ReplyTo) -> bool {
+        self.routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&to.0)
+    }
+
+    /// `id` の依頼の応答の行き先を消す。
+    fn forget(&self, id: u64) {
+        self.routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
     }
 
     fn register(&self, id: u64) -> mpsc::Receiver<Response> {
@@ -106,6 +128,8 @@ struct Shared {
     message: u32,
     /// 仕事のスレッドがパニックしたときの文言。
     panicked: String,
+    /// 応答を待ちきれなかったときの文言。
+    timed_out: String,
 }
 
 /// セキュリティ記述子。受付のスレッドが終わるまで（プロセスが終わるまで）持つ。
@@ -113,8 +137,14 @@ struct Security(PSECURITY_DESCRIPTOR);
 // SAFETY: LocalAlloc の領域を指すだけで、受付のスレッドだけが読む
 unsafe impl Send for Security {}
 
-/// パイプを作り、受付のスレッドを始める。依頼が届いたら `window` に `message` を送る。
-pub fn start(window: HWND, message: u32, panicked: String) -> Result<(PipeServer, Replier)> {
+/// パイプを作り、受付のスレッドを始める。依頼が届いたとき・依頼を取りやめるときに `window` に `message` を送る。
+/// `panicked` と `timed_out` は、仕事のスレッドがパニックしたとき・応答を待ちきれなかったときに返す文言。
+pub fn start(
+    window: HWND,
+    message: u32,
+    panicked: String,
+    timed_out: String,
+) -> Result<(PipeServer, Replier)> {
     let session = pipe_identity::current_session()?;
     let sid = pipe_identity::current_user_sid()?;
     let name = HSTRING::from(protocol::pipe_name(session, &sid));
@@ -144,6 +174,7 @@ pub fn start(window: HWND, message: u32, panicked: String) -> Result<(PipeServer
         window: window.0 as isize,
         message,
         panicked,
+        timed_out,
     });
     let pipe = first.0 as isize;
     let spawned = std::thread::Builder::new()
@@ -319,6 +350,7 @@ fn answer(pipe: HANDLE, shared: &Shared) -> Option<Response> {
     match request {
         Request::Monitors => Some(Response::Monitors(crate::monitor_list::list())),
         Request::Capture(capture) => {
+            let deadline = Instant::now() + protocol::reply_timeout(&capture);
             let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
             let replies = shared.replier.register(id);
             let request = CaptureRequest::from_cli(&capture, ReplyTo(id));
@@ -328,22 +360,94 @@ fn answer(pipe: HANDLE, shared: &Shared) -> Option<Response> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .send(request)
                 .is_ok();
-            // SAFETY: UI スレッドのメッセージ専用ウィンドウに送るだけ。もう壊れていれば失敗するだけ
-            let posted = sent
-                && unsafe {
-                    PostMessageW(
-                        Some(HWND(shared.window as *mut _)),
-                        shared.message,
-                        WPARAM(0),
-                        LPARAM(0),
-                    )
+            let response = if sent && wake(shared) {
+                match wait_reply(pipe, shared, id, &replies, deadline) {
+                    Waited::Reply(response) => Some(response),
+                    Waited::ClientGone => return None,
+                    Waited::TimedOut => {
+                        return Some(Response::Failed {
+                            kind: ErrorKind::CaptureFailed,
+                            message: shared.timed_out.clone(),
+                        });
+                    }
                 }
-                .is_ok();
-            let response = if posted { replies.recv().ok() } else { None };
+            } else {
+                shared.replier.forget(id);
+                None
+            };
             Some(response.unwrap_or_else(|| Response::Failed {
                 kind: ErrorKind::CaptureFailed,
                 message: shared.panicked.clone(),
             }))
         }
     }
+}
+
+/// UI スレッドを起こす（`WM_APP_PIPE`）。
+fn wake(shared: &Shared) -> bool {
+    // SAFETY: UI スレッドのメッセージ専用ウィンドウに送るだけ。もう壊れていれば失敗するだけ
+    unsafe {
+        PostMessageW(
+            Some(HWND(shared.window as *mut _)),
+            shared.message,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    }
+    .is_ok()
+}
+
+/// 応答を待った結果。
+enum Waited {
+    Reply(Response),
+    /// CLI が切った。
+    ClientGone,
+    /// 待つ時間の上限を過ぎた。
+    TimedOut,
+}
+
+/// `id` の依頼の応答を待つ。CLI が切ったか、`deadline` を過ぎたら、応答の行き先を消して UI スレッドに
+/// 取りやめさせる。UI スレッドがなくなったら（起こらないはず）パニックの文言で返す。
+fn wait_reply(
+    pipe: HANDLE,
+    shared: &Shared,
+    id: u64,
+    replies: &mpsc::Receiver<Response>,
+    deadline: Instant,
+) -> Waited {
+    loop {
+        match replies.recv_timeout(CLIENT_CHECK) {
+            Ok(response) => return Waited::Reply(response),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Waited::Reply(Response::Failed {
+                    kind: ErrorKind::CaptureFailed,
+                    message: shared.panicked.clone(),
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let gone = !client_connected(pipe);
+        if !gone && Instant::now() < deadline {
+            continue;
+        }
+        shared.replier.forget(id);
+        // 行き先を消す前に応答が届いていれば、それを返す
+        if let Ok(response) = replies.try_recv() {
+            return Waited::Reply(response);
+        }
+        wake(shared);
+        return if gone {
+            log::info!("the pipe client of request {id} has gone; abandoning it");
+            Waited::ClientGone
+        } else {
+            log::warn!("request {id} timed out; abandoning it");
+            Waited::TimedOut
+        };
+    }
+}
+
+/// CLI がまだつながっているか（切っていれば、のぞくと ERROR_BROKEN_PIPE などで失敗する）。
+fn client_connected(pipe: HANDLE) -> bool {
+    // SAFETY: 読まずに、つながりを確かめるだけ
+    unsafe { PeekNamedPipe(pipe, None, 0, None, None, None) }.is_ok()
 }

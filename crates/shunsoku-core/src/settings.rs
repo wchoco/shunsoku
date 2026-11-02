@@ -48,7 +48,7 @@
 //! [[regions]]                                  # 定型領域。並び順がトレイのサブメニューの順
 //! name = "領域 1"                               # 必須。空と重複は不可（重複した後ろのものを捨てる）
 //! hotkey = "Ctrl+Alt+1"                        # 既定は空
-//! monitor = '\\?\DISPLAY#…'                    # 必須。monitor::MonitorInfo::id
+//! monitor = '\\?\DISPLAY#…'                    # 必須。monitors::Monitor::id
 //! x = 0                                        # 必須。モニタ相対の物理ピクセル。x / y >= 0、
 //! y = 0                                        #   width / height >= 1
 //! width = 800
@@ -114,7 +114,7 @@ pub struct Region {
     /// 名前。空でなく、ほかの定型領域と重ならない。
     pub name: String,
     pub hotkey: Option<Chord>,
-    /// モニタの識別子（`monitor::MonitorInfo::id`）。
+    /// モニタの識別子（`monitors::Monitor::id`）。
     pub monitor: String,
     /// 範囲。モニタの左上を原点にした物理ピクセル。
     pub rect: Rect,
@@ -664,14 +664,11 @@ fn regions(root: &dyn TableLike, r: &mut Reader) -> Vec<Region> {
         return Vec::new();
     };
     read_regions(tables, r)
-        .into_iter()
-        .map(|(_, region)| region)
-        .collect()
 }
 
-/// `[[regions]]` の要素のうち読み込みで残る定型領域と、その要素の位置（0 から）。
-fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(usize, Region)> {
-    let mut regions: Vec<(usize, Region)> = Vec::new();
+/// `[[regions]]` の要素のうち読み込みで残る定型領域。
+fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<Region> {
+    let mut regions: Vec<Region> = Vec::new();
     for (i, table) in tables.iter().enumerate() {
         let path = format!("regions[{}]", i + 1);
         let t: Option<&dyn TableLike> = Some(table);
@@ -692,23 +689,20 @@ fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(usize
         let (Some(name), Some(monitor), Some(rect)) = (name, monitor, rect) else {
             continue;
         };
-        if regions.iter().any(|(_, region)| region.name == name) {
+        if regions.iter().any(|region| region.name == name) {
             r.invalid(format!("{path}.name"));
             continue;
         }
-        regions.push((
-            i,
-            Region {
-                name,
-                hotkey,
-                monitor,
-                rect,
-                save_dir,
-                file_name_template,
-                save,
-                scrap,
-            },
-        ));
+        regions.push(Region {
+            name,
+            hotkey,
+            monitor,
+            rect,
+            save_dir,
+            file_name_template,
+            save,
+            scrap,
+        });
     }
     regions
 }

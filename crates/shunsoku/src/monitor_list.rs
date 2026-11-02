@@ -1,6 +1,10 @@
 //! モニタの一覧を集める（core の `monitors::Monitor`）。番号付けと範囲の判定は core で行う。
+//! 撮るたびに集め直す（抜き差しや配置の変更を拾うため）。
 //!
-//! どのスレッドから呼んでもよい（DPI はプロセスの PMv2 の設定で読む）。
+//! - どのスレッドから呼んでもよい（DPI はプロセスの PMv2 の設定で読む）。
+//! - 識別子は、モニタのデバイスインターフェースのパス（`EnumDisplayDevicesW` に `EDD_GET_DEVICE_INTERFACE_NAME`）。
+//!   `\\.\DISPLAY1` のような GDI のデバイス名は並びを変えると入れ替わることがあるので使わない。パスが取れなければ
+//!   GDI のデバイス名で代える。
 
 use shunsoku_core::geometry::Rect;
 use shunsoku_core::monitors::Monitor;
@@ -12,13 +16,14 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::{ERROR_SUCCESS, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+    MONITORINFO, MONITORINFOEXW,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::core::BOOL;
-
-/// `MONITORINFO::dwFlags` のメインモニタの印。
-const MONITORINFOF_PRIMARY: u32 = 1;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY,
+};
+use windows::core::{BOOL, PCWSTR};
 
 /// いまのモニタの一覧（並びは `EnumDisplayMonitors` の順）。
 pub fn list() -> Vec<Monitor> {
@@ -48,6 +53,7 @@ pub fn list() -> Vec<Monitor> {
                 return None;
             }
             let device = from_wide(&info.szDevice);
+            let id = interface_path(&info.szDevice).unwrap_or_else(|| device.clone());
             let (mut dpi_x, mut dpi_y) = (96, 96);
             // SAFETY: 出力はこの関数の中で生きている。失敗したら 96 のまま
             let _ = unsafe { GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
@@ -64,6 +70,7 @@ pub fn list() -> Vec<Monitor> {
                 bottom,
             } = info.monitorInfo.rcMonitor;
             Some(Monitor {
+                id,
                 name,
                 rect: Rect::new(left, top, right, bottom),
                 dpi: dpi_x,
@@ -78,6 +85,27 @@ unsafe extern "system" fn collect(handle: HMONITOR, _: HDC, _: *mut RECT, data: 
     let handles = unsafe { &mut *(data.0 as *mut Vec<HMONITOR>) };
     handles.push(handle);
     true.into()
+}
+
+/// GDI のデバイス名 `device`（NUL で終わる）のモニタのデバイスインターフェースのパス。取れなければ None。
+fn interface_path(device: &[u16]) -> Option<String> {
+    let mut dd = DISPLAY_DEVICEW {
+        cb: size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: device は NUL で終わる。dd は呼び出しの間生きている
+    let found = unsafe {
+        EnumDisplayDevicesW(
+            PCWSTR(device.as_ptr()),
+            0,
+            &mut dd,
+            EDD_GET_DEVICE_INTERFACE_NAME,
+        )
+    }
+    .as_bool();
+    found
+        .then(|| from_wide(&dd.DeviceID))
+        .filter(|path| !path.is_empty())
 }
 
 /// GDI のデバイスの名前（`\\.\DISPLAY1`）と、モニタの製品名（EDID の名前）の組。取れなければ空。

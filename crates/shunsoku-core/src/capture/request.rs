@@ -1,7 +1,7 @@
 //! キャプチャの依頼の入口。
 //!
 //! 発生源（トレイ、ホットキー、M3 の CLI）ごとの違いは `CaptureRequest::from_source` の中だけで決める。
-//! Win32 層の `app` は依頼を受けて、待機（`delay`）→ 取得 → 範囲選択の画面 → 切り抜き → 出力 → 結果、
+//! Win32 層の `app` は依頼を受けて、待機（`delay`）→ 取得 → 範囲選択の画面 → 切り出し → 出力 → 結果、
 //! の 1 本の流れで進める。発生源を足すときは `Source` に 1 つ足し、ここで対応する依頼を返す。
 //! CLI からの依頼は `CaptureRequest::from_cli` で作り、結果を返す先（`reply`）を持たせる（ADR-0003）。
 //! 定型領域（ホットキー・トレイ）は領域の設定で決まるので、`CaptureRequest::region` で作る。
@@ -40,7 +40,7 @@ pub enum CaptureMethod {
     Rect {
         /// `monitors` の番号（1 から）。None ならメインモニタ。
         monitor: Option<u32>,
-        /// モニタ相対の物理ピクセル。モニタからはみ出すかは撮るときに `monitors::locate` で調べる。
+        /// モニタ相対の物理ピクセル。モニタからはみ出すかは撮るときに `monitors::locate_numbered` で調べる。
         rect: Rect,
     },
     /// 定型領域キャプチャ。撮るときに、その名前の定型領域を設定から引く。
@@ -58,7 +58,7 @@ pub enum CaptureMethod {
 pub struct WindowTarget {
     /// 撮る最上位のウィンドウ。
     pub window: WindowId,
-    /// 部品を選んだら、撮った画像から切り抜く範囲（スクリーン座標）。ウィンドウ全体なら None。
+    /// 部品を選んだら、撮った画像から切り出す範囲（スクリーン座標）。ウィンドウ全体なら None。
     pub crop: Option<Rect>,
 }
 
