@@ -7,7 +7,7 @@
 //! - キーの重なりは `keymap` で見つける。同じ範囲（ホットキー同士、ショートカット同士）の重なりは `assign` の
 //!   規則で両方を無効にし、ホットキーとショートカットの重なりは警告だけにする。
 //!
-//! M1 のスキーマ（書かなかった項目は既定値）:
+//! スキーマ（書かなかった項目は既定値）:
 //!
 //! ```toml
 //! version = 1                                  # 必須。1 だけ
@@ -17,12 +17,20 @@
 //! save_dir = 'D:\shots'                        # 既定: ピクチャ フォルダの下の shunsoku
 //! file_name_template = "shunsoku_{date}-{time}"
 //! notifications = true                         # false で止まるのは成功の通知だけ
+//! trash_limit = 10                             # ごみ箱の上限（0〜100 件）。0 なら閉じたらすぐに破棄
+//! dpi_scaling = "keep_pixels"                  # DPI の違うモニタへ動かしたとき: keep_pixels（画素を等倍に保つ）
+//!                                              #   / keep_apparent_size（見かけの大きさを保つ）
 //!
 //! [hotkeys]
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
+//! restore_last = "Ctrl+Shift+Z"                # 最後に閉じたものを復元。既定は空で、必須ではない
 //!
 //! [shortcuts]                                  # スクラップ操作の id ごとの上書き。"" は割り当てなし
 //! copy = "Ctrl+Shift+C"
+//!
+//! [mouse]                                      # スクラップ操作の id ごとのマウスの上書き。"" は割り当てなし
+//! close = "DoubleClick"                        # WheelUp / WheelDown / Ctrl+WheelUp / Ctrl+WheelDown /
+//! toggle_compact = "MiddleClick"               #   MiddleClick / DoubleClick
 //!
 //! [scrap]                                      # 見た目の既定値
 //! opacity = 100                                # 10〜100（%）
@@ -38,7 +46,7 @@ use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::keys::Chord;
-use crate::scrap::ops::{OperationDescriptor, Shortcuts};
+use crate::scrap::ops::{MouseBindings, MouseGesture, OperationDescriptor, Shortcuts};
 
 /// 対応している設定ファイルの形式の版。
 pub const VERSION: i64 = 1;
@@ -49,6 +57,12 @@ pub const DEFAULT_FILE_NAME_TEMPLATE: &str = "shunsoku_{date}-{time}";
 /// 透明度（%）として書ける範囲。
 pub const OPACITY_RANGE: std::ops::RangeInclusive<u8> = 10..=100;
 
+/// ごみ箱の上限（件）の既定値。
+pub const DEFAULT_TRASH_LIMIT: u8 = 10;
+
+/// ごみ箱の上限（件）として書ける範囲。
+pub const TRASH_LIMIT_RANGE: std::ops::RangeInclusive<u8> = 0..=100;
+
 /// 枠の太さ（px）として書ける範囲。
 pub const BORDER_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 1..=16;
 
@@ -58,6 +72,7 @@ pub struct Settings {
     pub general: General,
     pub hotkeys: Hotkeys,
     pub shortcuts: ShortcutOverrides,
+    pub mouse: MouseOverrides,
     pub scrap: ScrapAppearance,
     /// ログのレベル（隠し項目）。
     pub log_level: LogLevel,
@@ -72,6 +87,10 @@ pub struct General {
     pub file_name_template: String,
     /// 通知。オフで止めるのは成功の通知だけで、エラーと警告は常に出す（spec #32）。
     pub notifications: bool,
+    /// ごみ箱の上限（件）。0 なら閉じたらすぐに破棄する。
+    pub trash_limit: u8,
+    /// DPI の違うモニタへスクラップを動かしたときの見え方。
+    pub dpi_scaling: DpiScaling,
 }
 
 impl Default for General {
@@ -80,6 +99,8 @@ impl Default for General {
             save_dir: None,
             file_name_template: DEFAULT_FILE_NAME_TEMPLATE.to_owned(),
             notifications: true,
+            trash_limit: DEFAULT_TRASH_LIMIT,
+            dpi_scaling: DpiScaling::default(),
         }
     }
 }
@@ -89,16 +110,19 @@ impl Default for General {
 pub enum HotkeyAction {
     /// 範囲選択キャプチャ。必須（空なら未設定の通知を出す）。
     SelectCapture,
+    /// 最後に閉じたスクラップをごみ箱から復元する。任意（空でも通知しない）。
+    RestoreLast,
 }
 
 impl HotkeyAction {
     /// すべて。
-    pub const ALL: [HotkeyAction; 1] = [HotkeyAction::SelectCapture];
+    pub const ALL: [HotkeyAction; 2] = [HotkeyAction::SelectCapture, HotkeyAction::RestoreLast];
 
     /// `[hotkeys]` の中のキー。
     pub fn key(self) -> &'static str {
         match self {
             HotkeyAction::SelectCapture => "select_capture",
+            HotkeyAction::RestoreLast => "restore_last",
         }
     }
 }
@@ -107,6 +131,7 @@ impl HotkeyAction {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hotkeys {
     pub select_capture: Option<Chord>,
+    pub restore_last: Option<Chord>,
 }
 
 impl Hotkeys {
@@ -114,6 +139,7 @@ impl Hotkeys {
     pub fn get(&self, action: HotkeyAction) -> Option<Chord> {
         match action {
             HotkeyAction::SelectCapture => self.select_capture,
+            HotkeyAction::RestoreLast => self.restore_last,
         }
     }
 
@@ -129,6 +155,7 @@ impl Hotkeys {
     fn get_mut(&mut self, action: HotkeyAction) -> &mut Option<Chord> {
         match action {
             HotkeyAction::SelectCapture => &mut self.select_capture,
+            HotkeyAction::RestoreLast => &mut self.restore_last,
         }
     }
 }
@@ -138,6 +165,11 @@ impl Hotkeys {
 /// id が表にあるかどうかはここでは確かめない。表と重ねる `scrap::ops::Shortcuts::new` が、表にない id と
 /// 引数のある操作の id を無視して `Shortcuts::ignored_overrides` に載せる。
 pub type ShortcutOverrides = BTreeMap<String, Option<Chord>>;
+
+/// スクラップ操作のマウスの割り当ての上書き。キーはスクラップ操作の id（`scrap::ops` の表）。
+/// 値が None なら、その操作にマウスの操作を割り当てない。書かなかった操作は表の既定値のまま。
+/// id と値が表に合うかどうかはここでは確かめない。表と重ねる `scrap::ops::MouseBindings::new` が確かめる。
+pub type MouseOverrides = BTreeMap<String, Option<MouseGesture>>;
 
 /// スクラップの見た目の既定値。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +213,16 @@ impl Default for Border {
 /// 色。設定ファイルでは `#RRGGBB` で書く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
+
+/// DPI の違うモニタへスクラップを動かしたときの見え方（`[general] dpi_scaling`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DpiScaling {
+    /// 画素を等倍に保つ。表示の大きさ（物理ピクセル）は変えず、見かけの大きさが変わる。
+    #[default]
+    KeepPixels,
+    /// 見かけの大きさを保つ。移動先の DPI に合わせて表示の大きさを変え、倍率を画素基準で計算し直す。
+    KeepApparentSize,
+}
 
 /// ログのレベル。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -249,6 +291,12 @@ pub enum SettingsIssue {
         hotkey: String,
         shortcut: String,
     },
+    /// 2 つ以上の操作に付いたマウスの操作。どの操作にも付けない。`items` は重なった項目名
+    /// （`mouse.close` など。表の既定値から来たものも含む）。
+    MouseConflict {
+        gesture: MouseGesture,
+        items: Vec<String>,
+    },
 }
 
 /// 設定から作ったキーの割り当て（`keymap`）。
@@ -258,6 +306,8 @@ pub struct Keymap {
     pub hotkeys: Assigned<HotkeyAction>,
     /// スクラップ操作のショートカットの対応表。
     pub shortcuts: Shortcuts,
+    /// スクラップ操作のマウスの対応表。
+    pub mouse: MouseBindings,
     /// 重なりと、無視した上書き。`load` の問題と合わせて通知する。
     pub issues: Vec<SettingsIssue>,
 }
@@ -268,6 +318,8 @@ pub struct Keymap {
 /// - ショートカット同士・ホットキー同士の、同じ範囲での重なりは、両方を無効にして `Conflict` にする。
 /// - ホットキーとショートカットの重なりは、警告（`Overlap`）だけにする。
 /// - 表にない操作と、ショートカットを持てない操作への上書きは、無視して `Invalid` にする。
+/// - マウスの割り当て（`[mouse]`）も同じ規則で表に重ねる。表にない操作・引数のある操作への上書きと、
+///   候補にない値（引数のない操作への左ドラッグ）は `Invalid`、重なりは `MouseConflict` にする。
 pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keymap {
     let hotkeys = settings.hotkeys.assign();
     let shortcuts = Shortcuts::new(ops, &settings.shortcuts);
@@ -303,9 +355,29 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
             });
         }
     }
+    let mouse = MouseBindings::new(ops, &settings.mouse);
+    let mouse_item = |id: &str| format!("mouse.{id}");
+    issues.extend(
+        mouse
+            .ignored_overrides()
+            .iter()
+            .map(|id| SettingsIssue::Invalid {
+                item: mouse_item(id),
+            }),
+    );
+    issues.extend(
+        mouse
+            .conflicts()
+            .iter()
+            .map(|c| SettingsIssue::MouseConflict {
+                gesture: c.gesture,
+                items: c.owners.iter().map(|id| mouse_item(id)).collect(),
+            }),
+    );
     Keymap {
         hotkeys,
         shortcuts,
+        mouse,
         issues,
     }
 }
@@ -317,10 +389,14 @@ pub struct SettingsChanges {
     pub hotkeys: bool,
     /// `[shortcuts]`。ショートカットの対応表とメニューを作り直す。
     pub shortcuts: bool,
+    /// `[mouse]`。マウスの対応表を作り直す。
+    pub mouse: bool,
     /// 全体の保存先かファイル名テンプレート。次の保存から使う。
     pub save: bool,
     /// 通知のオン/オフ。
     pub notifications: bool,
+    /// ごみ箱の上限。下げたら超えた分を古いものから捨てる。
+    pub trash: bool,
     /// 見た目の既定値（`[scrap]`）。浮かべているスクラップを描き直す。
     pub appearance: bool,
     /// ログのレベル。
@@ -339,9 +415,11 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
     SettingsChanges {
         hotkeys: old.hotkeys != new.hotkeys,
         shortcuts: old.shortcuts != new.shortcuts,
+        mouse: old.mouse != new.mouse,
         save: old.general.save_dir != new.general.save_dir
             || old.general.file_name_template != new.general.file_name_template,
         notifications: old.general.notifications != new.general.notifications,
+        trash: old.general.trash_limit != new.general.trash_limit,
         appearance: old.scrap != new.scrap,
         log_level: old.log_level != new.log_level,
     }
@@ -380,6 +458,14 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     if let Some(on) = r.value(general, "general", "notifications", Item::as_bool) {
         s.general.notifications = on;
     }
+    if let Some(limit) = r.value(general, "general", "trash_limit", |i| {
+        in_range(i, TRASH_LIMIT_RANGE)
+    }) {
+        s.general.trash_limit = limit;
+    }
+    if let Some(scaling) = r.value(general, "general", "dpi_scaling", dpi_scaling) {
+        s.general.dpi_scaling = scaling;
+    }
 
     let hotkeys = r.table(root, "hotkeys");
     for action in HotkeyAction::ALL {
@@ -392,6 +478,14 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
         for (op, _) in shortcuts.iter() {
             if let Some(chord) = r.value(Some(shortcuts), "shortcuts", op, optional_chord) {
                 s.shortcuts.insert(op.to_owned(), chord);
+            }
+        }
+    }
+
+    if let Some(mouse) = r.table(root, "mouse") {
+        for (op, _) in mouse.iter() {
+            if let Some(gesture) = r.value(Some(mouse), "mouse", op, optional_gesture) {
+                s.mouse.insert(op.to_owned(), gesture);
             }
         }
     }
@@ -493,6 +587,15 @@ fn optional_chord(item: &Item) -> Option<Option<Chord>> {
     s.parse().ok().map(Some)
 }
 
+/// マウスの操作の名前（`MouseGesture` の `FromStr`）。空の文字列は「割り当てなし」（Some(None)）。
+fn optional_gesture(item: &Item) -> Option<Option<MouseGesture>> {
+    let s = item.as_str()?;
+    if s.trim().is_empty() {
+        return Some(None);
+    }
+    s.parse().ok().map(Some)
+}
+
 /// 保存先。Windows の絶対パス（`C:\…` か `\\server\share\…`）だけを受け付ける。
 fn save_dir(item: &Item) -> Option<PathBuf> {
     let s = item.as_str()?;
@@ -522,6 +625,14 @@ fn rgb(item: &Item) -> Option<Rgb> {
     }
     let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
     Some(Rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
+fn dpi_scaling(item: &Item) -> Option<DpiScaling> {
+    match item.as_str()? {
+        "keep_pixels" => Some(DpiScaling::KeepPixels),
+        "keep_apparent_size" => Some(DpiScaling::KeepApparentSize),
+        _ => None,
+    }
 }
 
 fn log_level(item: &Item) -> Option<LogLevel> {
@@ -583,13 +694,19 @@ log_level = "debug"
 save_dir = 'D:\shots'
 file_name_template = "cap_{datetime:yyyy}"
 notifications = false
+trash_limit = 3
+dpi_scaling = "keep_apparent_size"
 
 [hotkeys]
 select_capture = "Win+Shift+PrintScreen"
+restore_last = "Ctrl+Alt+Z"
 
 [shortcuts]
 copy = "Ctrl+Shift+C"
 close = ""
+
+[mouse]
+close = "DoubleClick"
 
 [scrap]
 opacity = 80
@@ -607,14 +724,18 @@ shadow = false
                     save_dir: Some(PathBuf::from(r"D:\shots")),
                     file_name_template: "cap_{datetime:yyyy}".to_owned(),
                     notifications: false,
+                    trash_limit: 3,
+                    dpi_scaling: DpiScaling::KeepApparentSize,
                 },
                 hotkeys: Hotkeys {
                     select_capture: Some(chord("Win+Shift+PrintScreen")),
+                    restore_last: Some(chord("Ctrl+Alt+Z")),
                 },
                 shortcuts: BTreeMap::from([
                     ("close".to_owned(), None),
                     ("copy".to_owned(), Some(chord("Ctrl+Shift+C"))),
                 ]),
+                mouse: BTreeMap::from([("close".to_owned(), Some(MouseGesture::DoubleClick))]),
                 scrap: ScrapAppearance {
                     opacity: 80,
                     border: Border {
@@ -718,6 +839,65 @@ shadow = 1
     }
 
     #[test]
+    fn an_opacity_outside_10_to_100_falls_back_to_the_default_and_is_named() {
+        for value in ["9", "101", "0", "-10"] {
+            let (settings, issues) = load(&format!("version = 1\n[scrap]\nopacity = {value}\n"));
+            assert_eq!(issues, vec![invalid("scrap.opacity")], "{value}");
+            assert_eq!(settings.scrap.opacity, 100, "{value}");
+        }
+        for (value, opacity) in [("10", 10), ("55", 55), ("100", 100)] {
+            let (settings, issues) = load(&format!("version = 1\n[scrap]\nopacity = {value}\n"));
+            assert_eq!(issues, vec![], "{value}");
+            assert_eq!(settings.scrap.opacity, opacity, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_trash_limit_defaults_to_10_and_out_of_range_values_fall_back_to_it() {
+        assert_eq!(load("version = 1\n").0.general.trash_limit, 10);
+        for (value, limit) in [("0", 0), ("2", 2), ("100", 100)] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[general]\ntrash_limit = {value}\n"));
+            assert_eq!(issues, vec![], "{value}");
+            assert_eq!(settings.general.trash_limit, limit, "{value}");
+        }
+        for value in ["101", "-1", "\"5\"", "2.5"] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[general]\ntrash_limit = {value}\n"));
+            assert_eq!(issues, vec![invalid("general.trash_limit")], "{value}");
+            assert_eq!(settings.general.trash_limit, 10, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_dpi_scaling_defaults_to_keeping_pixels_and_unknown_values_fall_back_to_it() {
+        assert_eq!(
+            load("version = 1\n").0.general.dpi_scaling,
+            DpiScaling::KeepPixels
+        );
+        for (value, scaling) in [
+            ("keep_pixels", DpiScaling::KeepPixels),
+            ("keep_apparent_size", DpiScaling::KeepApparentSize),
+        ] {
+            let (settings, issues) = load(&format!(
+                "version = 1\n[general]\ndpi_scaling = \"{value}\"\n"
+            ));
+            assert_eq!(issues, vec![], "{value}");
+            assert_eq!(settings.general.dpi_scaling, scaling, "{value}");
+        }
+        for value in ["\"keep_size\"", "\"\"", "true", "1"] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[general]\ndpi_scaling = {value}\n"));
+            assert_eq!(issues, vec![invalid("general.dpi_scaling")], "{value}");
+            assert_eq!(
+                settings.general.dpi_scaling,
+                DpiScaling::KeepPixels,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn unc_save_dir_is_accepted() {
         let (settings, issues) = load("version = 1\n[general]\nsave_dir = '\\\\nas\\shots'\n");
         assert_eq!(issues, vec![]);
@@ -798,6 +978,15 @@ a = 1
             }
         );
         assert_eq!(
+            changed(|s| {
+                s.mouse.insert("close".to_owned(), None);
+            }),
+            SettingsChanges {
+                mouse: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
             changed(|s| s.general.save_dir = Some(PathBuf::from(r"D:\shots"))),
             SettingsChanges {
                 save: true,
@@ -833,6 +1022,13 @@ a = 1
                 }
             );
         }
+        assert_eq!(
+            changed(|s| s.general.trash_limit = 2),
+            SettingsChanges {
+                trash: true,
+                ..SettingsChanges::default()
+            }
+        );
         assert_eq!(
             changed(|s| s.log_level = LogLevel::Trace),
             SettingsChanges {
@@ -874,6 +1070,7 @@ a = 1
         assert!(Hotkeys::default().assign().bound.is_empty());
         let hotkeys = Hotkeys {
             select_capture: Some(chord("Ctrl+Alt+S")),
+            restore_last: None,
         };
         let assigned = hotkeys.assign();
         assert_eq!(
@@ -881,6 +1078,45 @@ a = 1
             BTreeMap::from([(chord("Ctrl+Alt+S"), HotkeyAction::SelectCapture)])
         );
         assert!(assigned.conflicts.is_empty());
+    }
+
+    #[test]
+    fn restore_last_hotkey_is_unset_by_default() {
+        let (settings, issues) = load("version = 1\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.hotkeys.get(HotkeyAction::RestoreLast), None);
+    }
+
+    #[test]
+    fn restore_last_hotkey_is_read_and_assigned() {
+        let (settings, issues) = load("version = 1\n[hotkeys]\nrestore_last = \"Ctrl+Alt+Z\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.hotkeys.get(HotkeyAction::RestoreLast),
+            Some(chord("Ctrl+Alt+Z"))
+        );
+        assert_eq!(
+            settings.hotkeys.assign().bound,
+            BTreeMap::from([(chord("Ctrl+Alt+Z"), HotkeyAction::RestoreLast)])
+        );
+    }
+
+    #[test]
+    fn restore_last_hotkey_overlapping_another_hotkey_disables_both() {
+        let keymap = keymap_of(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Alt+S\"\nrestore_last = \"Ctrl+Alt+S\"\n",
+        );
+        assert!(keymap.hotkeys.bound.is_empty());
+        assert_eq!(
+            keymap.issues,
+            vec![SettingsIssue::Conflict {
+                chord: chord("Ctrl+Alt+S"),
+                items: vec![
+                    "hotkeys.select_capture".to_owned(),
+                    "hotkeys.restore_last".to_owned()
+                ],
+            }]
+        );
     }
 
     fn keymap_of(src: &str) -> Keymap {
@@ -961,6 +1197,66 @@ a = 1
             "{:?}",
             keymap.issues
         );
+    }
+
+    #[test]
+    fn mouse_overrides_are_read_by_gesture_name_and_empty_removes() {
+        let src = "version = 1\n[mouse]\nclose = \"DoubleClick\"\ntoggle_compact = \"MiddleClick\"\nzoom_in = \"Ctrl+WheelUp\"\nopacity_up = \"wheelup\"\nzoom_out = \"\"\n";
+        let (settings, issues) = load(src);
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.mouse,
+            MouseOverrides::from([
+                ("close".to_owned(), Some(MouseGesture::DoubleClick)),
+                ("opacity_up".to_owned(), Some(MouseGesture::WheelUp)),
+                ("toggle_compact".to_owned(), Some(MouseGesture::MiddleClick)),
+                ("zoom_in".to_owned(), Some(MouseGesture::CtrlWheelUp)),
+                ("zoom_out".to_owned(), None),
+            ])
+        );
+    }
+
+    #[test]
+    fn mouse_overrides_that_are_not_gesture_names_are_invalid_items() {
+        let src =
+            "version = 1\n[mouse]\nclose = \"RightClick\"\nzoom_in = 1\ncopy = \"DoubleClick\"\n";
+        let (settings, issues) = load(src);
+        assert_eq!(
+            issues,
+            vec![invalid("mouse.close"), invalid("mouse.zoom_in")]
+        );
+        assert_eq!(
+            settings.mouse,
+            MouseOverrides::from([("copy".to_owned(), Some(MouseGesture::DoubleClick))])
+        );
+        let (_, issues) = load("version = 1\nmouse = 3\n");
+        assert_eq!(issues, vec![invalid("mouse")]);
+    }
+
+    #[test]
+    fn keymap_names_ignored_and_overlapping_mouse_overrides() {
+        let keymap = keymap_of(
+            "version = 1\n[mouse]\nfly = \"WheelUp\"\nclose = \"LeftDrag\"\ncopy = \"DoubleClick\"\n",
+        );
+        assert_eq!(
+            keymap.issues,
+            vec![
+                invalid("mouse.close"),
+                invalid("mouse.fly"),
+                SettingsIssue::MouseConflict {
+                    gesture: MouseGesture::DoubleClick,
+                    items: vec!["mouse.copy".to_owned(), "mouse.toggle_compact".to_owned()],
+                },
+            ]
+        );
+        assert_eq!(
+            keymap
+                .mouse
+                .operation(MouseGesture::MiddleClick)
+                .map(|op| op.id),
+            Some("close")
+        );
+        assert!(keymap.mouse.operation(MouseGesture::DoubleClick).is_none());
     }
 
     #[test]

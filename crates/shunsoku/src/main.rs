@@ -34,6 +34,8 @@ mod settings_watch;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
+mod trash_store;
+#[cfg(windows)]
 mod tray;
 #[cfg(windows)]
 mod wide;

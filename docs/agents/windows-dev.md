@@ -39,7 +39,7 @@ scripts/win-build.sh [worktree-dir=.]   # env: PKG（既定 shunsoku）、PROFIL
 - **Desktop Duplication**: 出力はアダプタに属し、D3D11 デバイスはアダプタごとに作る（別アダプタのデバイスでは `DXGI_ERROR_UNSUPPORTED`）。`DuplicateOutput` 直後のフレームは `LastPresentTime == 0` で空のことがある。`DXGI_ERROR_ACCESS_LOST` は作り直し、セキュアデスクトップでの `E_ACCESSDENIED` は「いまは撮れない」として扱う。回転したモニタのテクスチャは回転前の向き。
 - **flip model のスワップチェーン**: `WS_EX_LAYERED` とは併用できない。Alt+Enter を止めるため `MakeWindowAssociation(DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES)`。
 - **レイヤードウィンドウ**: `UpdateLayeredWindow` には premultiplied alpha の 32bpp DIB を渡す。alpha 0 の画素はクリックが下に抜ける。
-- **DPI（PMv2）**: manifest で設定済み（`crates/shunsoku/build.rs`）。`SetProcessDpiAwarenessContext` のエラーは無視してよい。スクラップは `WM_DPICHANGED` で提案された矩形を当てない（画素を 1:1 に保つ）。
+- **DPI（PMv2）**: manifest で設定済み（`crates/shunsoku/build.rs`）。`SetProcessDpiAwarenessContext` のエラーは無視してよい。スクラップは `WM_DPICHANGED` で提案された矩形を当てず、新しい DPI を core の `ScrapModel::set_dpi` に渡す（大きさは設定の `dpi_scaling` で決まる）。`WM_DPICHANGED` はウィンドウを動かしている間（App を借りている間）に届くので、自分に `PostMessageW` で送り直してから扱う。
 - **タスクトレイ**: `HWND_MESSAGE` のウィンドウにはブロードキャストの `TaskbarCreated` が来ない。`TrackPopupMenu` の前に `SetForegroundWindow`、後に `PostMessageW(WM_NULL)`。
 - **クリップボード**: `SetClipboardData` が成功したら HGLOBAL はシステムのもの。失敗したら `GlobalFree`。`CF_DIBV5` は bottom-up で置く。
 - **設定ファイルの監視**: `ReadDirectoryChangesW` はディレクトリを見る。エディタの保存は一時ファイル + rename なので `FILE_NOTIFY_CHANGE_FILE_NAME` も要る。1 回の保存で何度も来るのでまとめる。

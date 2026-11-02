@@ -1,8 +1,9 @@
 //! スクラップのウィンドウ: 最前面のレイヤード ウィンドウ。中身は `UpdateLayeredWindow` で
 //! premultiplied BGRA の DIB（`render::Canvas` の DC）から出す。
 //!
-//! - 位置と大きさはスクリーン座標の物理ピクセル。画素を等倍で出すので、DPI が変わっても大きさを変えない
-//!   （ウィンドウ プロシージャは `app` が持ち、`WM_DPICHANGED` で 0 を返す）。
+//! - 位置と大きさはスクリーン座標の物理ピクセル。大きさは core の `ScrapModel::window_rect`（倍率を掛けた
+//!   表示の大きさ + 余白）で決まる。`WM_DPICHANGED` で提案された矩形は当てない（ウィンドウ プロシージャは
+//!   `app` が持ち、新しい DPI を core の `ScrapModel::set_dpi` に渡すだけにする）。
 //! - 透明度は `SourceConstantAlpha` で掛ける。
 //! - シェルの全画面の判定から外す（`NonRudeHWND`）。モニタ全体を覆うスクラップを最前面に出すと、
 //!   シェルが全画面のウィンドウとみなしてタスクバーを後ろに回し、動かすたびにモニタを覆う・覆わないが
@@ -12,11 +13,13 @@
 use shunsoku_core::geometry::Rect;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, IDC_ARROW, LoadCursorW, RegisterClassExW, RemovePropW, SW_SHOW,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetPropW,
-    SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_DBLCLKS, CreateWindowExW, DestroyWindow, IDC_ARROW, IsWindowVisible, LoadCursorW,
+    RegisterClassExW, RemovePropW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, ULW_ALPHA,
+    UpdateLayeredWindow, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -27,12 +30,14 @@ const CLASS_NAME: PCWSTR = w!("shunsoku.scrap");
 /// <https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist2-markfullscreenwindow>
 const NON_RUDE: PCWSTR = w!("NonRudeHWND");
 
-/// ウィンドウのクラスを登録する。`wndproc` は `app` のもの。
+/// ウィンドウのクラスを登録する。`wndproc` は `app` のもの。ダブルクリック（コンパクト表示の切り替え）を
+/// 受けるため `CS_DBLCLKS` を付ける。
 pub fn register_class(module: HINSTANCE, wndproc: WNDPROC) -> Result<()> {
     // SAFETY: 共有のカーソルなので壊さなくてよい
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW)? };
     let class = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
+        style: CS_DBLCLKS,
         lpfnWndProc: wndproc,
         hInstance: module,
         hCursor: cursor,
@@ -119,6 +124,15 @@ impl ScrapWindow {
         self.hwnd
     }
 
+    /// ウィンドウのあるモニタの DPI。取れなければ 96。
+    pub fn dpi(&self) -> u32 {
+        // SAFETY: 自分のウィンドウ
+        match unsafe { GetDpiForWindow(self.hwnd) } {
+            0 => 96,
+            dpi => dpi,
+        }
+    }
+
     /// 大きさを変えずに、左上を `rect` の左上に動かす（中身は描き直さない）。
     pub fn move_to(&self, rect: Rect) -> Result<()> {
         // SAFETY: 自分のウィンドウ
@@ -146,6 +160,18 @@ impl ScrapWindow {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
         }
+    }
+
+    /// 隠す（壊さない。`show` で出し直せる）。
+    pub fn hide(&self) {
+        // SAFETY: 自分のウィンドウ
+        let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+    }
+
+    /// 出ているか（`hide` で隠していないか）。
+    pub fn is_visible(&self) -> bool {
+        // SAFETY: 自分のウィンドウ
+        unsafe { IsWindowVisible(self.hwnd) }.as_bool()
     }
 }
 
