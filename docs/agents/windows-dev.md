@@ -24,7 +24,7 @@ scripts/win-build.sh [worktree-dir=.]   # env: PKG（既定 shunsoku）、PROFIL
 ```
 
 - WSL の cwd のまま `cargo.exe` で組める（rsync は要らない）。`CARGO_TARGET_DIR` は NTFS 上に worktree ごとに置く。初回は 1 分ほど、以降は差分だけ。
-- 動いている `shunsoku.exe` が出力をロックすると `LNK1104` で落ちる。スクリプトが先に `taskkill.exe` で止める。
+- 動いている exe が出力をロックすると `LNK1104` で落ちる。スクリプトは、上書きする 2 つのパス（target の exe と `shunsoku-build\<worktree 名>\` の exe）で動いているものだけを先に止める。ほかの場所で動く shunsoku（ユーザーの常駐、他の worktree の exe）は止めない。exe を名前で止める `taskkill /IM` は使わない。
 - ユーザーに起動してもらうとき: `cmd.exe /c start "" "<exe のパス>"`。`windows_subsystem = "windows"` なので標準出力は出ない。ログを見る。
 - `cargo.exe` は WSL の PATH にない。スクリプトの外で使うなら `%USERPROFILE%\.cargo\bin` を足す。
 - zsh では `time` が予約語で、`VAR=x time cmd` は構文エラーになる。先に `export` する。

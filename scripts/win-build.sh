@@ -10,7 +10,7 @@ PKG=${PKG:-shunsoku}
 PROFILE=${PROFILE:-release}
 
 winenv() { cmd.exe /c "echo %$1%" 2>/dev/null | tr -d '\r'; }
-export PATH="$PATH:/mnt/c/Windows/System32"
+export PATH="$PATH:/mnt/c/Windows/System32:/mnt/c/Windows/System32/WindowsPowerShell/v1.0"
 WIN_HOME=$(winenv USERPROFILE)
 WIN_LOCAL=$(winenv LOCALAPPDATA)
 export PATH="$PATH:$(wslpath "$WIN_HOME")/.cargo/bin"
@@ -20,11 +20,16 @@ export CARGO_TARGET_DIR="$WIN_LOCAL\\shunsoku-target\\$NAME"
 export WSLENV="${WSLENV:+$WSLENV:}CARGO_TARGET_DIR"
 cd "$WT"   # cargo.exe からは \\wsl.localhost\... に見えるが、そのままで組める。
 
-# 動いている exe は出力先をロックし、link が LNK1104 で落ちる。
-taskkill.exe /IM "$PKG.exe" /F >/dev/null 2>&1 || true
+SRC_WIN="$CARGO_TARGET_DIR\\$PROFILE\\$PKG.exe"
+DST_WIN="$WIN_HOME\\shunsoku-build\\$NAME\\$PKG.exe"
+
+# 動いている exe は自分のファイルをロックし、link（LNK1104）やコピーが落ちる。
+# このスクリプトが上書きする 2 つのパスで動いているものだけを止める。
+# 名前で止めると、常駐中の shunsoku や他の worktree の exe まで止まる。
+powershell.exe -NoProfile -Command "Get-Process -Name '$PKG' -ErrorAction SilentlyContinue | Where-Object { \$_.Path -in @('$SRC_WIN', '$DST_WIN') } | Stop-Process -Force" || true
 cargo.exe build --profile "$PROFILE" -p "$PKG" "$@"
 
-SRC="$(wslpath "$CARGO_TARGET_DIR")/$PROFILE/$PKG.exe"
+SRC="$(wslpath "$SRC_WIN")"
 DST_DIR="$(wslpath "$WIN_HOME")/shunsoku-build/$NAME"
 mkdir -p "$DST_DIR" && cp "$SRC" "$DST_DIR/"
 echo "built: $WIN_HOME\\shunsoku-build\\$NAME\\$PKG.exe"
