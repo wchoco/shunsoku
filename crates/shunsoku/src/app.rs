@@ -151,11 +151,12 @@ const CMD_REGION_FIRST: u32 = 1000;
 /// 依頼の `delay` を待つタイマーの番号（メッセージ専用ウィンドウの WM_TIMER）。
 const TIMER_CAPTURE_DELAY: usize = 1;
 /// shunsoku のメニューが消えきるのを待って定型領域キャプチャを進め直すタイマーの番号（メッセージ専用
-/// ウィンドウの WM_TIMER）と間隔。
+/// ウィンドウの WM_TIMER）。待っている依頼（`Capture::Waiting`）は `TIMER_CAPTURE_DELAY` で進め直す。
 const TIMER_REGION_RETRY: usize = 2;
-const REGION_RETRY_MS: u32 = 30;
+/// メニューが消えきったかを確かめ直す間隔。
+const MENU_RETRY_MS: u32 = 30;
 /// メニューが消えきるのを待つ回数の上限。超えたらそのまま撮る。
-const MAX_REGION_RETRIES: u32 = 30;
+const MAX_MENU_RETRIES: u32 = 30;
 /// メニューの項目をマウスで選んだときのフェード（SPI_GETSELECTIONFADE）を待つ時間。フェードのウィンドウは
 /// 列挙で見つからないことがあるので、メニューから選ばれた依頼は時間で待つ。
 const MENU_FADE_MS: u64 = 400;
@@ -206,10 +207,10 @@ struct App {
     capture: Capture,
     /// 待っている定型領域キャプチャの依頼（届いた順）。`Capture` が `Idle` のときに 1 件ずつ撮る。
     regions_waiting: VecDeque<CaptureRequest>,
-    /// shunsoku のメニューが消えきるのを待った回数（`run_waiting_regions`）。
-    region_retries: u32,
-    /// これより前には定型領域キャプチャを撮らない（メニューで選んだ項目のフェードを待つ）。
-    region_not_before: Option<Instant>,
+    /// shunsoku のメニューが消えきるのを待った回数（`wait_for_menus`）。
+    menu_retries: u32,
+    /// これより前には撮らない（メニューで選んだ項目のフェードを待つ）。
+    menu_not_before: Option<Instant>,
     scraps: Vec<Scrap>,
     /// 閉じたスクラップ。drop で一時ファイルを消す。
     trash: trash_store::TrashStore,
@@ -663,8 +664,8 @@ fn start(
         mouse: keymap.mouse,
         capture: Capture::Idle,
         regions_waiting: VecDeque::new(),
-        region_retries: 0,
-        region_not_before: None,
+        menu_retries: 0,
+        menu_not_before: None,
         scraps: Vec::new(),
         trash,
         saves: mpsc::channel(),
@@ -964,8 +965,14 @@ fn on_tray(owner: HWND, event: tray::Event) {
 
 fn on_command(command: u32) {
     match command {
-        CMD_SELECT_CAPTURE => request_capture(Source::TrayMenu),
-        CMD_ADD_REGION => request_capture(Source::AddRegion),
+        CMD_SELECT_CAPTURE => {
+            chosen_from_menu();
+            request_capture(Source::TrayMenu);
+        }
+        CMD_ADD_REGION => {
+            chosen_from_menu();
+            request_capture(Source::AddRegion);
+        }
         CMD_CLOSE_ALL => close_all_scraps(),
         CMD_HIDE_ALL => set_scraps_visible(false),
         CMD_SHOW_ALL => set_scraps_visible(true),
@@ -2225,13 +2232,46 @@ fn submit(request: CaptureRequest) {
     }
 }
 
-/// 待っている依頼を、撮り方に合わせて進める。
+/// 待っている依頼を、撮り方に合わせて進める。shunsoku のメニューが出ていれば閉じ、消えきってから撮る
+/// （写り込まないように）。
 fn take_capture() {
-    let method = with_app(|app| match &app.capture {
-        Capture::Waiting(request) => Some(request.method.clone()),
-        _ => None,
+    // SAFETY: このスレッドのメニューを閉じるだけ（出ていなければ何もしない）
+    unsafe {
+        let _ = EndMenu();
+    }
+    let next = with_app(|app| {
+        let Capture::Waiting(request) = &app.capture else {
+            return None;
+        };
+        let method = request.method.clone();
+        Some((wait_for_menus(app), method, app.windows.message))
     })
     .flatten();
+    let method = match next {
+        None => None,
+        Some((MenuWait::Clear { waited }, method, _)) => {
+            if waited {
+                flush_composition();
+            }
+            Some(method)
+        }
+        Some((MenuWait::Wait, method, message_window)) => {
+            // SAFETY: 自分のウィンドウのタイマー
+            if unsafe {
+                SetTimer(
+                    Some(message_window),
+                    TIMER_CAPTURE_DELAY,
+                    MENU_RETRY_MS,
+                    None,
+                )
+            } != 0
+            {
+                return;
+            }
+            log::warn!("could not start the menu retry timer; capturing now");
+            Some(method)
+        }
+    };
     match method {
         Some(request::CaptureMethod::Select | request::CaptureMethod::RegisterRegion) => {
             open_overlay()
@@ -2824,15 +2864,14 @@ fn request_region(index: usize, from: &str) {
             .ok_or("the region is no longer in the settings")?;
         app.regions_waiting
             .push_back(CaptureRequest::region(region));
-        if from_menu && selection_fades() {
-            app.region_not_before =
-                Some(Instant::now() + std::time::Duration::from_millis(MENU_FADE_MS));
-        }
         Ok(app.windows.message)
     });
     match queued {
         Some(Ok(message_window)) => {
             log::info!("region capture {} requested from {from}", index + 1);
+            if from_menu {
+                chosen_from_menu();
+            }
             // SAFETY: このスレッドのメニューを閉じるだけ（出ていなければ何もしない）
             unsafe {
                 let _ = EndMenu();
@@ -2871,41 +2910,84 @@ fn run_waiting_regions() {
             if !matches!(app.capture, Capture::Idle) || app.regions_waiting.is_empty() {
                 return Ok(None);
             }
-            if app
-                .region_not_before
-                .is_some_and(|not_before| Instant::now() < not_before)
-            {
-                return Err(app.windows.message);
+            match wait_for_menus(app) {
+                MenuWait::Wait => Err(app.windows.message),
+                MenuWait::Clear { waited } => {
+                    Ok(app.regions_waiting.pop_front().map(|r| (r, waited)))
+                }
             }
-            app.region_not_before = None;
-            if app.region_retries < MAX_REGION_RETRIES && menus_visible() {
-                app.region_retries += 1;
-                return Err(app.windows.message);
-            }
-            app.region_retries = 0;
-            Ok(app.regions_waiting.pop_front())
         });
         match next {
-            Some(Ok(Some(request))) => capture_region(request),
+            Some(Ok(Some((request, waited)))) => {
+                if waited {
+                    flush_composition();
+                }
+                capture_region(request);
+            }
             Some(Err(message_window)) => {
                 // SAFETY: 自分のウィンドウのタイマー
                 if unsafe {
                     SetTimer(
                         Some(message_window),
                         TIMER_REGION_RETRY,
-                        REGION_RETRY_MS,
+                        MENU_RETRY_MS,
                         None,
                     )
                 } == 0
                 {
                     log::warn!("could not start the region retry timer; capturing now");
-                    with_app(|app| app.region_retries = MAX_REGION_RETRIES);
+                    with_app(|app| app.menu_retries = MAX_MENU_RETRIES);
                     continue;
                 }
                 return;
             }
             _ => return,
         }
+    }
+}
+
+/// shunsoku のメニューを撮る前に待つか。
+enum MenuWait {
+    /// まだ見えている（閉じる途中のフェードも）。少し待って確かめ直す。
+    Wait,
+    /// 見えていない。`waited` なら待った後（消えた画面がまだ画面に反映されていないかもしれない）。
+    Clear { waited: bool },
+}
+
+/// shunsoku のメニューが写り込まないよう、撮るのを待つか決める。待つなら回数を数え、上限を超えたらそのまま撮る。
+fn wait_for_menus(app: &mut App) -> MenuWait {
+    let fading = app.menu_not_before.take();
+    if let Some(not_before) = fading
+        && Instant::now() < not_before
+    {
+        app.menu_not_before = Some(not_before);
+        return MenuWait::Wait;
+    }
+    if app.menu_retries < MAX_MENU_RETRIES && menus_visible() {
+        app.menu_retries += 1;
+        return MenuWait::Wait;
+    }
+    let waited = fading.is_some() || app.menu_retries > 0;
+    app.menu_retries = 0;
+    MenuWait::Clear { waited }
+}
+
+/// メニューで項目を選んだ。選んだ項目のフェードが消えるまでは撮らない（フェードのウィンドウは列挙で
+/// 見つからないことがあるので、時間で待つ）。
+fn chosen_from_menu() {
+    if selection_fades() {
+        with_app(|app| {
+            app.menu_not_before =
+                Some(Instant::now() + std::time::Duration::from_millis(MENU_FADE_MS));
+        });
+    }
+}
+
+/// 隠したウィンドウが画面に反映されるのを待つ（DWM の次の合成まで）。
+fn flush_composition() {
+    // SAFETY: 引数なし
+    if let Err(e) = unsafe { DwmFlush() } {
+        log::warn!("DwmFlush failed: {e}");
     }
 }
 
