@@ -13,6 +13,8 @@
 //! 道具は今のところ矩形（`Tool::Rect`）だけ。道具を足すときは `Tool` と `Shape` に行を足し、`Draft` から
 //! 図形を作るところ（`Draft::shape`）を足す。
 
+pub mod toolbar;
+
 use crate::geometry::Point;
 use crate::keys::{Chord, Key};
 use crate::settings::{AnnotationDefaults, Rgb};
@@ -146,6 +148,10 @@ impl EditState {
                 _ => vec![],
             },
             EditInput::Release => self.commit(annotations),
+            EditInput::Pick(pick) => {
+                self.pick(pick);
+                vec![EditOutput::Picked(pick)]
+            }
             EditInput::Key(chord) if chord == ESCAPE => {
                 let mut outputs = self.commit(annotations);
                 outputs.push(EditOutput::Left);
@@ -157,6 +163,15 @@ impl EditState {
                 outputs.push(EditOutput::Left);
                 outputs
             }
+        }
+    }
+
+    /// ツールバーで選んだものを、これから描くものにする。
+    fn pick(&mut self, pick: Pick) {
+        match pick {
+            Pick::Tool(tool) => self.tool = tool,
+            Pick::Color(color) => self.style.color = color,
+            Pick::Width(width) => self.style.width = width,
         }
     }
 
@@ -191,6 +206,8 @@ pub enum EditInput {
     Release,
     /// キーを押した。`Esc` で抜ける。ほかのキーは受けない（何も返さない）。
     Key(Chord),
+    /// ツールバー（か道具の切り替えのキー）で道具・色・太さを選んだ。
+    Pick(Pick),
     /// 抜ける（メニューの「書き込み」、ほかのウィンドウへのフォーカスの移動、スクラップを閉じる前）。
     Leave,
 }
@@ -213,6 +230,50 @@ pub enum EditOutput {
     Redraw,
     /// 編集モードを抜けた。
     Left,
+    /// 道具・色・太さを選んだ。ツールバーを描き直し、`Carryover::record` で次の編集モードに引き継ぐ。
+    Picked(Pick),
+}
+
+/// 編集モードで選べる、これから描くものの道具・色・太さ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    Tool(Tool),
+    Color(Rgb),
+    Width(u32),
+}
+
+/// 前の編集モードで選んだ道具・色・太さ。アプリが動いている間、すべてのスクラップで引き継ぐ（設定ファイルには
+/// 書き戻さない）。色と太さは選ぶまでは設定の既定値に従う（設定を変えればそれが効く）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Carryover {
+    /// 最後に使った描く道具。最初は矩形。
+    tool: Tool,
+    color: Option<Rgb>,
+    width: Option<u32>,
+}
+
+impl Carryover {
+    /// 編集モードの始まりの状態。`defaults` は設定の `[annotation]`。
+    pub fn start(&self, defaults: Style) -> EditState {
+        let mut state = EditState::new(Style {
+            color: self.color.unwrap_or(defaults.color),
+            width: self.width.unwrap_or(defaults.width),
+        });
+        state.tool = self.tool;
+        state
+    }
+
+    /// 編集モードの出力のうち、選んだもの（`EditOutput::Picked`）を覚える。
+    pub fn record(&mut self, outputs: &[EditOutput]) {
+        for output in outputs {
+            match *output {
+                EditOutput::Picked(Pick::Tool(tool)) => self.tool = tool,
+                EditOutput::Picked(Pick::Color(color)) => self.color = Some(color),
+                EditOutput::Picked(Pick::Width(width)) => self.width = Some(width),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// 書き込みを描く先への変換。元の画像の画素 `p` の中心を、描く先の `((p.x - left + 0.5) * scale_x,

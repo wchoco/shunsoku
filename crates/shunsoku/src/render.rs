@@ -10,26 +10,31 @@
 //!   描く（`draw_annotations`）。座標の換算は core の `annotate::View` で、表示なら `ScrapModel::annotation_view`、
 //!   保存とコピーなら `ScrapModel::output_view` を渡す。画像は補間せずに描くが、書き込みはアンチエイリアスする。
 //! - 透明度はここでは掛けない（レイヤード ウィンドウの `SourceConstantAlpha` で掛ける）。
+//! - 書き込みの編集モードのツールバー（`toolbar_window`）も、ここで `paint_toolbar` で描く。並びは core の
+//!   `annotate::toolbar::Layout`。アイコンは Direct2D の線と図形で描く（字形のフォントに頼らない）。
 //! - コピーと保存の画像は、`render_image` で画像と書き込みを画像の大きさに描いてから作る（表示と同じ描き方に
 //!   するため。ADR-0006）。
 
 use std::ffi::c_void;
 
-use shunsoku_core::annotate::{Annotation, Shape, View};
+use shunsoku_core::annotate::toolbar::{Button, Layout, ToolSlot};
+use shunsoku_core::annotate::{Annotation, EditState, Shape, View};
 use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::image::Image;
 use shunsoku_core::scrap::{Appearance, SHADOW_WIDTH};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_HOLLOW,
+    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
-    ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget,
+    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Brush, ID2D1DCRenderTarget,
+    ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -183,7 +188,7 @@ impl Drop for Canvas {
 
 /// Canvas に描く Direct2D の DC レンダー ターゲット。
 pub struct Renderer {
-    _factory: ID2D1Factory,
+    factory: ID2D1Factory,
     target: ID2D1DCRenderTarget,
     /// 倍率の表示を書く DirectWrite。初めて表示するときに作る。
     dwrite: Option<IDWriteFactory>,
@@ -207,7 +212,7 @@ impl Renderer {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let target = factory.CreateDCRenderTarget(&props)?;
             Ok(Renderer {
-                _factory: factory,
+                factory,
                 target,
                 dwrite: None,
             })
@@ -275,6 +280,21 @@ impl Renderer {
                 (Some(label), Some(dwrite)) => draw_zoom_label(target, &dwrite, image_rect, label),
                 _ => Ok(()),
             }
+        })
+    }
+
+    /// 書き込みのツールバーを描く。`canvas` は `layout` の大きさ。`state` の道具・色・太さのボタンを選んだ
+    /// 見た目にする。`scale` はスクラップのモニタの DPI / 96。
+    pub fn paint_toolbar(
+        &self,
+        canvas: &Canvas,
+        layout: &Layout,
+        state: &EditState,
+        scale: f32,
+    ) -> Result<()> {
+        let factory = &self.factory;
+        self.paint(canvas, |target| {
+            draw_toolbar(target, factory, layout, state, scale)
         })
     }
 
@@ -514,6 +534,234 @@ fn draw_zoom_label(
             D2D1_DRAW_TEXT_OPTIONS_NONE,
             DWRITE_MEASURING_MODE_NATURAL,
         );
+    }
+    Ok(())
+}
+
+/// ツールバーの色。
+const TOOLBAR_BACK: u32 = 0xF7_F7_F7;
+const TOOLBAR_EDGE: u32 = 0xBD_BD_BD;
+const TOOLBAR_ICON: u32 = 0x33_33_33;
+const TOOLBAR_DISABLED: u32 = 0xB4_B4_B4;
+const TOOLBAR_CURRENT_BACK: u32 = 0xD6_E8_FA;
+const TOOLBAR_CURRENT_EDGE: u32 = 0x1E_88_E5;
+const TOOLBAR_DONE: u32 = 0x002E_7D32;
+const TOOLBAR_SWATCH_EDGE: u32 = 0x80_80_80;
+
+/// ツールバーの背景とボタンを描く。
+fn draw_toolbar(
+    target: &ID2D1RenderTarget,
+    factory: &ID2D1Factory,
+    layout: &Layout,
+    state: &EditState,
+    scale: f32,
+) -> Result<()> {
+    let whole = Rect::from_origin_size(Point::default(), layout.size());
+    // SAFETY: BeginDraw と EndDraw の間で呼ぶ
+    unsafe {
+        let brush = target.CreateSolidColorBrush(&rgb(TOOLBAR_BACK, 1.0), None)?;
+        target.FillRectangle(&to_rect_f(whole), &brush);
+        brush.SetColor(&rgb(TOOLBAR_EDGE, 1.0));
+        for strip in ring(whole, whole.inflate(-1)) {
+            target.FillRectangle(&to_rect_f(strip), &brush);
+        }
+        for &(button, rect) in layout.buttons() {
+            if button.is_current(state) {
+                brush.SetColor(&rgb(TOOLBAR_CURRENT_BACK, 1.0));
+                target.FillRectangle(&to_rect_f(rect), &brush);
+                brush.SetColor(&rgb(TOOLBAR_CURRENT_EDGE, 1.0));
+                for strip in ring(rect, rect.inflate(-1)) {
+                    target.FillRectangle(&to_rect_f(strip), &brush);
+                }
+            }
+        }
+        target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        let drawn = (|| {
+            for &(button, rect) in layout.buttons() {
+                let icon = if button.is_enabled() {
+                    TOOLBAR_ICON
+                } else {
+                    TOOLBAR_DISABLED
+                };
+                brush.SetColor(&rgb(icon, 1.0));
+                draw_toolbar_button(target, factory, &brush, button, rect, scale)?;
+            }
+            Ok(())
+        })();
+        target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+        drawn
+    }
+}
+
+/// ボタン 1 つのアイコンを `brush` の色で描く（完了・色・つまみは自分の色）。
+fn draw_toolbar_button(
+    target: &ID2D1RenderTarget,
+    factory: &ID2D1Factory,
+    brush: &ID2D1SolidColorBrush,
+    button: Button,
+    rect: Rect,
+    scale: f32,
+) -> Result<()> {
+    // アイコンを描く枠（ボタンの内側）の中の (0..1, 0..1) の点
+    let inset = 7.0 * scale;
+    let (left, top) = (rect.left as f32 + inset, rect.top as f32 + inset);
+    let width = rect.width() as f32 - inset * 2.0;
+    let height = rect.height() as f32 - inset * 2.0;
+    let at = |u: f32, v: f32| windows_numerics::Vector2 {
+        X: left + u * width,
+        Y: top + v * height,
+    };
+    let stroke = 1.5 * scale;
+    let lines = |points: &[(f32, f32)], closed: bool, brush: &ID2D1Brush, stroke: f32| {
+        let points: Vec<_> = points.iter().map(|&(u, v)| at(u, v)).collect();
+        polyline(target, factory, &points, closed, brush, stroke)
+    };
+    let plain: &ID2D1Brush = brush;
+    // SAFETY: BeginDraw と EndDraw の間で呼ぶ
+    unsafe {
+        match button {
+            Button::Tool(ToolSlot::Select) => lines(
+                &[
+                    (0.22, 0.02),
+                    (0.22, 0.86),
+                    (0.42, 0.68),
+                    (0.56, 0.98),
+                    (0.70, 0.92),
+                    (0.56, 0.62),
+                    (0.82, 0.62),
+                ],
+                true,
+                plain,
+                stroke,
+            )?,
+            Button::Tool(ToolSlot::Rect) => {
+                let r = D2D_RECT_F {
+                    left,
+                    top: at(0.0, 0.18).Y,
+                    right: left + width,
+                    bottom: at(0.0, 0.82).Y,
+                };
+                target.DrawRectangle(&r, brush, stroke, None);
+            }
+            Button::Tool(ToolSlot::Ellipse) => {
+                let ellipse = D2D1_ELLIPSE {
+                    point: at(0.5, 0.5),
+                    radiusX: width * 0.5,
+                    radiusY: height * 0.36,
+                };
+                target.DrawEllipse(&ellipse, brush, stroke, None);
+            }
+            Button::Tool(ToolSlot::Arrow) => {
+                lines(&[(0.05, 0.95), (0.95, 0.05)], false, plain, stroke)?;
+                lines(
+                    &[(0.45, 0.05), (0.95, 0.05), (0.95, 0.55)],
+                    false,
+                    plain,
+                    stroke,
+                )?;
+            }
+            Button::Tool(ToolSlot::Line) => {
+                lines(&[(0.05, 0.95), (0.95, 0.05)], false, plain, stroke)?;
+            }
+            Button::Tool(ToolSlot::Text) => {
+                let thick = 2.0 * scale;
+                lines(&[(0.1, 0.08), (0.9, 0.08)], false, plain, thick)?;
+                lines(&[(0.5, 0.08), (0.5, 0.95)], false, plain, thick)?;
+            }
+            Button::Tool(ToolSlot::Freehand) => lines(
+                &[
+                    (0.0, 0.75),
+                    (0.15, 0.35),
+                    (0.3, 0.25),
+                    (0.42, 0.55),
+                    (0.55, 0.8),
+                    (0.7, 0.72),
+                    (0.82, 0.38),
+                    (1.0, 0.22),
+                ],
+                false,
+                plain,
+                stroke,
+            )?,
+            Button::Color(shunsoku_core::settings::Rgb(r, g, b)) => {
+                let swatch = to_rect_f(rect.inflate(-(6.0 * scale).round() as i32));
+                let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+                let fill = target.CreateSolidColorBrush(&rgb(color, 1.0), None)?;
+                target.FillRectangle(&swatch, &fill);
+                // 白でも見えるように縁を引く
+                fill.SetColor(&rgb(TOOLBAR_SWATCH_EDGE, 1.0));
+                target.DrawRectangle(&swatch, &fill, 1.0, None);
+            }
+            Button::Width(w) => {
+                // 太さはスクラップの画素なので、DPI の倍率だけを掛けた太さの線で見せる
+                let thick = (w as f32 * scale).min(height);
+                let y = top + height / 2.0;
+                let from = windows_numerics::Vector2 { X: left, Y: y };
+                let to = windows_numerics::Vector2 {
+                    X: left + width,
+                    Y: y,
+                };
+                target.DrawLine(from, to, brush, thick, None);
+            }
+            Button::Done => {
+                let done = target.CreateSolidColorBrush(&rgb(TOOLBAR_DONE, 1.0), None)?;
+                let done: &ID2D1Brush = &done;
+                lines(
+                    &[(0.05, 0.55), (0.38, 0.85), (0.95, 0.15)],
+                    false,
+                    done,
+                    2.2 * scale,
+                )?;
+            }
+            Button::Grip => {
+                let dot = target.CreateSolidColorBrush(&rgb(TOOLBAR_DISABLED, 1.0), None)?;
+                let cx = rect.left as f32 + rect.width() as f32 / 2.0;
+                let cy = rect.top as f32 + rect.height() as f32 / 2.0;
+                let step = 4.5 * scale;
+                for dx in [-0.5, 0.5] {
+                    for dy in [-1.0, 0.0, 1.0] {
+                        let ellipse = D2D1_ELLIPSE {
+                            point: windows_numerics::Vector2 {
+                                X: cx + dx * step,
+                                Y: cy + dy * step,
+                            },
+                            radiusX: 1.4 * scale,
+                            radiusY: 1.4 * scale,
+                        };
+                        target.FillEllipse(&ellipse, &dot);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 点を順に結んだ線を引く。`closed` なら最後の点から最初の点へも結ぶ。
+fn polyline(
+    target: &ID2D1RenderTarget,
+    factory: &ID2D1Factory,
+    points: &[windows_numerics::Vector2],
+    closed: bool,
+    brush: &ID2D1Brush,
+    stroke: f32,
+) -> Result<()> {
+    let Some((&first, rest)) = points.split_first() else {
+        return Ok(());
+    };
+    // SAFETY: BeginDraw と EndDraw の間で呼ぶ。シンクは Close してから描く
+    unsafe {
+        let path = factory.CreatePathGeometry()?;
+        let sink = path.Open()?;
+        sink.BeginFigure(first, D2D1_FIGURE_BEGIN_HOLLOW);
+        sink.AddLines(rest);
+        sink.EndFigure(if closed {
+            D2D1_FIGURE_END_CLOSED
+        } else {
+            D2D1_FIGURE_END_OPEN
+        });
+        sink.Close()?;
+        target.DrawGeometry(&path, brush, stroke, None);
     }
     Ok(())
 }

@@ -53,6 +53,11 @@
 //! - 書き込みの編集モードの間（`Effect::EnterEditMode` から）は、左ボタン・カーソルの移動・キーを core の
 //!   `ScrapModel::edit_input` に渡し、描き直す（`on_edit_input`）。ショートカットとマウスの割り当て（ホイール・
 //!   中クリック・ダブルクリックも）は効かない。ほかのウィンドウにフォーカスが移ったら（`WM_ACTIVATE`）抜ける。
+//! - 編集モードの間は、スクラップの直下にツールバー（`toolbar_window`、`Scrap::toolbar`）を出す。押してもスクラップの
+//!   フォーカスは動かない。道具・色・太さを選ぶ（`EditInput::Pick`）、完了（`EditInput::Leave`）、つまみのドラッグで
+//!   スクラップごと動かす（`on_toolbar_drag`）。置き場所は core の `annotate::toolbar::place` で、スクラップを描き直す・
+//!   動かすたび（`Scrap::paint` / `Scrap::redraw`）についていく。選んだものは `App::carryover` に覚え、次の編集モードに
+//!   引き継ぐ。
 //!   書き込みは表示にも保存とコピーにも `render` の同じ関数で描く（ADR-0006）。
 
 use std::cell::RefCell;
@@ -64,7 +69,8 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
-use shunsoku_core::annotate::{EditInput, EditOutput, Style};
+use shunsoku_core::annotate::toolbar::{self, Button as ToolbarButton, Layout as ToolbarLayout};
+use shunsoku_core::annotate::{Carryover, EditInput, EditOutput, Style};
 use shunsoku_core::capture::request::{
     self, CaptureMethod, CaptureRequest, OnSaveFailure, ReplyTo, SaveTarget, Source,
 };
@@ -83,7 +89,7 @@ use shunsoku_core::scrap::{
     Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
 use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
-use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
+use shunsoku_core::settings::{self, LogLevel, Rgb, Settings, SettingsChanges, SettingsIssue};
 use shunsoku_core::trash::TrashId;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
@@ -114,13 +120,20 @@ use windows::core::{PCWSTR, Result, w};
 // 精密モード（#66）で足したもの
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
 use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
+// 書き込みのツールバー（#84）で足したもの
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, IDC_SIZEALL, LoadCursorW, MA_NOACTIVATE, SetCursor, WM_MOUSEACTIVATE,
+};
 
 mod cli;
 
 use crate::{
     clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook, perf,
-    pipe_server, render, save, scrap_window, settings_watch, single_instance, trash_store, tray,
-    window_list,
+    pipe_server, render, save, scrap_window, settings_watch, single_instance, toolbar_window,
+    trash_store, tray, window_list,
 };
 use cli::{
     REPLIER, capture_rect, on_pipe_requests, reply, reply_cancelled, reply_failed, waiting_reply,
@@ -182,6 +195,9 @@ const ZOOM_LABEL_MS: u32 = 1000;
 /// スクラップのウィンドウのモニタの DPI が変わった（wparam が新しい DPI）。`WM_DPICHANGED` はウィンドウを
 /// 動かしている間（App を借りている間）に届くので、自分に送り直して借りられるときに core へ渡す。
 const WM_APP_SCRAP_DPI: u32 = WM_APP + 0x100;
+/// スクラップが非アクティブになった（`WM_ACTIVATE` の `WA_INACTIVE`）。隠す・壊すなど App を借りている間にも届くので、
+/// 自分に送り直して借りられるときに編集モードを抜ける。
+const WM_APP_SCRAP_INACTIVE: u32 = WM_APP + 0x101;
 
 /// UI スレッドのパニックで終わったときの終了コード（Rust の既定と同じ）。
 const EXIT_PANIC: i32 = 101;
@@ -239,6 +255,8 @@ struct App {
     save_fallbacks: Vec<(PathBuf, Fallback)>,
     /// スクラップの中身を描く Direct2D の描き手。描き直しのたびに作らないよう使い回す（`paint_scrap`）。
     renderer: Option<render::Renderer>,
+    /// 書き込みの編集モードで最後に選んだ道具・色・太さ。アプリが動いている間、次の編集モードに引き継ぐ。
+    carryover: Carryover,
     /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
     notice_folder: Option<PathBuf>,
     gpu: grab::Gpu,
@@ -283,6 +301,8 @@ struct Fallback {
 
 /// 浮かべているスクラップ 1 枚。
 struct Scrap {
+    /// 書き込みの編集モードの間だけ出すツールバー。持ち主のウィンドウより先に壊すよう、`window` より前に置く。
+    toolbar: Option<Toolbar>,
     /// drop でウィンドウを壊す。
     window: scrap_window::ScrapWindow,
     model: ScrapModel,
@@ -298,7 +318,92 @@ struct Scrap {
     zoom_label: bool,
 }
 
+/// 書き込みの編集モードのツールバー。
+struct Toolbar {
+    /// drop でウィンドウを壊す。
+    window: toolbar_window::ToolbarWindow,
+    /// 並べる色（`toolbar::palette`）。入ったときの設定の既定色で決める。
+    colours: Vec<Rgb>,
+    /// 最後に出した並びと矩形（スクリーン座標）。まだ出していなければ None。当たり判定に使う。
+    placed: std::cell::RefCell<Option<(ToolbarLayout, Rect)>>,
+    /// つまみのドラッグ。
+    drag: Drag,
+}
+
+impl Toolbar {
+    /// スクリーン座標の点 `at` にあるボタン。
+    fn hit(&self, at: Point) -> Option<ToolbarButton> {
+        let placed = self.placed.borrow();
+        let (layout, rect) = placed.as_ref()?;
+        layout.hit(Point::new(at.x - rect.left, at.y - rect.top))
+    }
+}
+
+/// ツールバーとスクラップの画像の間（DPI 96 のときの物理ピクセル。枠と影の外に足す）。
+const TOOLBAR_GAP: f64 = 4.0;
+
+/// `hwnd` のあるモニタの作業領域（タスクバーを除く。スクリーン座標）。
+fn work_area(hwnd: HWND) -> Option<Rect> {
+    // SAFETY: 引数は生きているウィンドウと、この関数の中の構造体
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(monitor, &mut info).as_bool().then(|| {
+            let r = info.rcWork;
+            Rect::new(r.left, r.top, r.right, r.bottom)
+        })
+    }
+}
+
 impl Scrap {
+    /// 書き込みのツールバーを、スクラップの画像の直下（`toolbar::place`）に出す。`repaint` か、DPI が変わって並びが
+    /// 変わったときだけ描き直し、そうでなければ動かすだけにする。ツールバーがなければ何もしない。
+    fn sync_toolbar(
+        &self,
+        appearance: &Appearance,
+        renderer: &mut Option<render::Renderer>,
+        repaint: bool,
+    ) {
+        let (Some(toolbar), Some(state)) = (&self.toolbar, self.model.edit_state()) else {
+            return;
+        };
+        let scale = f64::from(self.window.dpi()) / 96.0;
+        let layout = ToolbarLayout::new(&toolbar.colours, scale);
+        let size = layout.size();
+        let image = self.model.image_rect();
+        let work = work_area(self.window.hwnd()).unwrap_or(image);
+        let gap = self.model.appearance(appearance).margin() + (TOOLBAR_GAP * scale).round() as i32;
+        let rect = Rect::from_origin_size(toolbar::place(image, size, work, gap), size);
+        let mut placed = toolbar.placed.borrow_mut();
+        let first = placed.is_none();
+        let same = placed.as_ref().is_some_and(|(l, _)| *l == layout);
+        let shown = if same && !repaint {
+            toolbar.window.move_to(rect)
+        } else {
+            (|| {
+                let canvas = render::Canvas::new(size)?;
+                let painter = match renderer.take() {
+                    Some(painter) => painter,
+                    None => render::Renderer::new()?,
+                };
+                painter.paint_toolbar(&canvas, &layout, state, scale as f32)?;
+                *renderer = Some(painter);
+                toolbar.window.present(canvas.dc(), rect)
+            })()
+        };
+        if let Err(e) = shown {
+            log::warn!("could not show the annotation toolbar: {e}");
+            return;
+        }
+        *placed = Some((layout, rect));
+        if first {
+            toolbar.window.show();
+        }
+    }
+
     /// 表示する画像（保存・コピーの対象）。トリムしていればトリム後。
     fn shown(&self) -> &Image {
         self.shown.as_ref().unwrap_or(&self.image)
@@ -321,7 +426,9 @@ impl Scrap {
         repaint: bool,
     ) -> Result<()> {
         if self.model.same_content(before) && !repaint {
-            self.window.move_to(self.model.window_rect(appearance))
+            self.window.move_to(self.model.window_rect(appearance))?;
+            self.sync_toolbar(appearance, renderer, false);
+            Ok(())
         } else {
             self.paint(appearance, renderer)
         }
@@ -367,7 +474,9 @@ impl Scrap {
             &self.model,
             appearance,
             label,
-        )
+        )?;
+        self.sync_toolbar(appearance, renderer, true);
+        Ok(())
     }
 }
 
@@ -602,6 +711,7 @@ fn start(
 
     overlay::register_class(module, Some(overlay_wndproc))?;
     scrap_window::register_class(module, Some(scrap_wndproc))?;
+    toolbar_window::register_class(module, Some(toolbar_wndproc))?;
 
     // SAFETY: 名前は 'static
     let _ = TASKBAR_CREATED.set(unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
@@ -700,6 +810,7 @@ fn start(
         pending_saves: Vec::new(),
         save_fallbacks: Vec::new(),
         renderer: None,
+        carryover: Carryover::default(),
         notice_folder: None,
         gpu: grab::Gpu::default(),
         hotkeys,
@@ -768,6 +879,17 @@ unsafe extern "system" fn scrap_wndproc(
 ) -> LRESULT {
     // SAFETY: 受け取った引数をそのまま渡す
     unsafe { dispatch(on_scrap_message, hwnd, msg, wparam, lparam) }
+}
+
+/// 書き込みのツールバーのウィンドウのプロシージャ。
+unsafe extern "system" fn toolbar_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: 受け取った引数をそのまま渡す
+    unsafe { dispatch(on_toolbar_message, hwnd, msg, wparam, lparam) }
 }
 
 /// `handler` をパニックから守って呼ぶ。`handler` が None を返したら DefWindowProcW に任せる。
@@ -1189,9 +1311,23 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             Some(LRESULT(0))
         }
         // ほかのウィンドウにフォーカスが移ったら、書き込みの編集モードを抜ける。既定の処理にも回す
+        // （隠す・壊すときなど App を借りている間にも届くので、送り直してから抜ける）
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
-            on_edit_input(hwnd, EditInput::Leave);
+            // SAFETY: 自分のウィンドウに送る
+            if let Err(e) =
+                unsafe { PostMessageW(Some(hwnd), WM_APP_SCRAP_INACTIVE, WPARAM(0), LPARAM(0)) }
+            {
+                log::warn!("could not post the deactivation of a scrap: {e}");
+            }
             None
+        }
+        // 送り直すまでの間にもう一度アクティブになっていれば（ツールバーは押してもアクティブにならない）抜けない
+        WM_APP_SCRAP_INACTIVE => {
+            // SAFETY: 引数なし
+            if unsafe { GetForegroundWindow() } != hwnd {
+                on_edit_input(hwnd, EditInput::Leave);
+            }
+            Some(LRESULT(0))
         }
         // Alt+F4 など。ウィンドウだけ壊されて App に残らないように、閉じるのと同じにする
         WM_CLOSE => {
@@ -1293,6 +1429,120 @@ fn on_scrap_drag(hwnd: HWND, wparam: WPARAM, at: Point) {
     }
 }
 
+/// 書き込みのツールバーのウィンドウへのメッセージ。押してもアクティブにならない（スクラップのフォーカスを奪わない）。
+fn on_toolbar_message(hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+    match msg {
+        WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
+        WM_LBUTTONDOWN => {
+            on_toolbar_press(hwnd, message_screen_point());
+            Some(LRESULT(0))
+        }
+        WM_MOUSEMOVE => {
+            on_toolbar_drag(hwnd, wparam, message_screen_point());
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONUP => {
+            // ドラッグは WM_CAPTURECHANGED で終える。App を借りる前に放す（そのメッセージが届くため）
+            // SAFETY: UI スレッドで呼ぶ
+            let _ = unsafe { ReleaseCapture() };
+            Some(LRESULT(0))
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                if let Some(toolbar) = app.toolbar_mut(hwnd) {
+                    toolbar.drag.end();
+                }
+            });
+            Some(LRESULT(0))
+        }
+        // つまみの上では移動のカーソルにする
+        WM_SETCURSOR => {
+            let on_grip = with_app(|app| {
+                app.toolbar_mut(hwnd)
+                    .and_then(|t| t.hit(message_screen_point()))
+                    == Some(ToolbarButton::Grip)
+            })
+            .unwrap_or(false);
+            if !on_grip {
+                return None;
+            }
+            // SAFETY: 共有のカーソルなので壊さなくてよい
+            if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_SIZEALL) } {
+                // SAFETY: UI スレッドで呼ぶ
+                unsafe { SetCursor(Some(cursor)) };
+            }
+            Some(LRESULT(1))
+        }
+        // 大きさはスクラップのモニタの DPI で決める（`Scrap::sync_toolbar`）
+        WM_DPICHANGED => Some(LRESULT(0)),
+        _ => None,
+    }
+}
+
+impl App {
+    /// ツールバーのウィンドウ `hwnd` を持つスクラップ。
+    fn scrap_of_toolbar(&mut self, hwnd: HWND) -> Option<&mut Scrap> {
+        self.scraps
+            .iter_mut()
+            .find(|s| s.toolbar.as_ref().is_some_and(|t| t.window.hwnd() == hwnd))
+    }
+
+    fn toolbar_mut(&mut self, hwnd: HWND) -> Option<&mut Toolbar> {
+        self.scrap_of_toolbar(hwnd)?.toolbar.as_mut()
+    }
+}
+
+/// ツールバーのボタンを押した: 道具・色・太さを選ぶ、完了で抜ける、つまみならドラッグを始める。
+fn on_toolbar_press(hwnd: HWND, at: Point) {
+    let Some((scrap, button)) = with_app(|app| {
+        let scrap = app.scrap_of_toolbar(hwnd)?;
+        let button = scrap.toolbar.as_ref()?.hit(at)?;
+        Some((scrap.window.hwnd(), button))
+    })
+    .flatten() else {
+        return;
+    };
+    match button {
+        ToolbarButton::Grip => {
+            // 速く動かしても追えるようにマウスを捕まえる。キー入力とアクティブはスクラップのまま
+            // SAFETY: 自分のウィンドウ
+            unsafe { SetCapture(hwnd) };
+            with_app(|app| {
+                if let Some(toolbar) = app.toolbar_mut(hwnd) {
+                    toolbar.drag.start(at);
+                }
+            });
+        }
+        ToolbarButton::Done => {
+            on_edit_input(scrap, EditInput::Leave);
+        }
+        button => {
+            if let Some(pick) = button.pick() {
+                on_edit_input(scrap, EditInput::Pick(pick));
+            }
+        }
+    }
+}
+
+/// つまみのドラッグの間のカーソルの移動で、スクラップごと動かす（ツールバーはついてくる）。編集モードの間に
+/// スクラップを動かせるのはここだけ。
+fn on_toolbar_drag(hwnd: HWND, wparam: WPARAM, at: Point) {
+    let pointer = pointer_on_move(hwnd, wparam);
+    with_app(|app| {
+        let scrap = app.scrap_of_toolbar(hwnd)?;
+        let delta = scrap.toolbar.as_mut()?.drag.move_to(at, pointer)?;
+        let scrap_hwnd = scrap.window.hwnd();
+        let (scrap, appearance, renderer) = app.scrap_to_draw(scrap_hwnd)?;
+        let before = scrap.model.clone();
+        let p = scrap.model.position;
+        scrap.model.position = Point::new(p.x.saturating_add(delta.x), p.y.saturating_add(delta.y));
+        // 動かすときに届くメッセージでは App を借りないので、借りたまま動かす
+        scrap.redraw_or_revert(&before, &appearance, renderer, false, "toolbar grip");
+        Some(())
+    });
+    release_stray_capture(pointer);
+}
+
 /// 書き込みの編集モードにいるか。
 fn is_editing(hwnd: HWND) -> bool {
     with_app(|app| {
@@ -1328,6 +1578,13 @@ fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
                 "edit mode left ({} annotations)",
                 scrap.model.annotations().items().len()
             );
+            // ツールバーのウィンドウを壊すときに届くメッセージでは App を借りない
+            scrap.toolbar = None;
+        }
+        for output in &outputs {
+            if let EditOutput::Picked(pick) = output {
+                log::info!("edit pick {pick:?}");
+            }
         }
         if !outputs.is_empty() {
             // 描くだけで App を借りるメッセージは届かないので、借りたまま描く
@@ -1335,6 +1592,7 @@ fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
                 log::warn!("could not draw the annotations: {e}");
             }
         }
+        app.carryover.record(&outputs);
         Some(outputs)
     })
     .flatten()
@@ -1635,12 +1893,15 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
 fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
     let deferred = with_app(|app| {
         let annotation = Style::from(app.settings.annotation);
+        let carryover = app.carryover;
+        let module = app.module;
         let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
         let before = scrap.model.clone();
         let mut deferred = Vec::new();
         let context = OpContext {
             appearance,
             annotation,
+            carryover,
             ..context
         };
         let effects = ops::execute(op, &mut scrap.model, &context);
@@ -1670,6 +1931,23 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                 Effect::EnterEditMode | Effect::LeaveEditMode => {
                     let entered = effect == Effect::EnterEditMode;
                     log::info!("edit mode {}", if entered { "entered" } else { "left" });
+                    // ツールバーのウィンドウを作る・壊すときに届くメッセージでは App を借りない
+                    scrap.toolbar = if entered {
+                        match toolbar_window::ToolbarWindow::create(module, hwnd) {
+                            Ok(window) => Some(Toolbar {
+                                window,
+                                colours: toolbar::palette(annotation.color),
+                                placed: Default::default(),
+                                drag: Drag::default(),
+                            }),
+                            Err(e) => {
+                                log::warn!("could not create the annotation toolbar: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     if let Err(e) = scrap.paint(&appearance, renderer) {
                         log::warn!("could not show the edit mode: {e}");
                     }
@@ -1971,6 +2249,7 @@ fn close_scrap(hwnd: HWND) {
     let removed = with_app(|app| {
         let index = app.scraps.iter().position(|s| s.window.hwnd() == hwnd)?;
         let Scrap {
+            toolbar,
             window,
             mut model,
             image,
@@ -1980,11 +2259,12 @@ fn close_scrap(hwnd: HWND) {
         model.settle();
         // 一時ファイルは裏のスレッドで書くので、借りたままでよい
         app.trash.push(model, image, save::now());
-        Some(window)
+        Some((toolbar, window))
     })
     .flatten();
-    // ウィンドウを壊すとメッセージが届くので、App を借りずに壊す
-    if let Some(window) = removed {
+    // ウィンドウを壊すとメッセージが届くので、App を借りずに壊す（ツールバーが先）
+    if let Some((toolbar, window)) = removed {
+        drop(toolbar);
         drop(window);
         log::info!("scrap closed");
     }
@@ -2013,9 +2293,12 @@ fn close_all_scraps() {
 fn set_scraps_visible(visible: bool) {
     with_app(|app| {
         for scrap in &app.scraps {
+            let toolbar = scrap.toolbar.as_ref().map(|t| &t.window);
             if visible {
                 scrap.window.show(false);
+                toolbar.inspect(|t| t.show());
             } else {
+                toolbar.inspect(|t| t.hide());
                 scrap.window.hide();
             }
         }
@@ -2275,6 +2558,7 @@ fn open_scrap(
     painted?;
     window.show(focus);
     Ok(Scrap {
+        toolbar: None,
         window,
         model,
         image,
