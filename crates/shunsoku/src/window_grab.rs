@@ -192,7 +192,7 @@ fn read_frame(
 }
 
 /// ウィンドウの見えている枠（見えないリサイズの縁を除く）。WGC が撮る範囲と同じ。
-fn window_bounds(hwnd: HWND) -> Rect {
+pub fn window_bounds(hwnd: HWND) -> Rect {
     let mut r = RECT::default();
     // SAFETY: RECT の大きさを渡して読むだけ
     let dwm = unsafe {

@@ -51,6 +51,8 @@ mod tray;
 mod wide;
 #[cfg(windows)]
 mod window_grab;
+#[cfg(windows)]
+mod window_list;
 
 #[cfg(windows)]
 fn main() {

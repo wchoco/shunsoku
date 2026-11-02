@@ -100,7 +100,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterWindowMessageW, SPI_GETSELECTIONFADE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     SetCursorPos, SetTimer, SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE,
     WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
     WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
@@ -112,7 +112,7 @@ use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
 use crate::{
     clipboard, grab, hotkey, logger, menu, monitor_ids, monitor_list, notify, overlay, panic_hook,
     perf, pipe_server, render, save, scrap_window, settings_watch, single_instance, trash_store,
-    tray,
+    tray, window_list,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
@@ -245,7 +245,8 @@ enum Capture {
     Selecting {
         request: CaptureRequest,
         overlay: overlay::Overlay,
-        selection: Selection,
+        /// ウィンドウの一覧を持って大きいので Box にする。
+        selection: Box<Selection>,
     },
 }
 
@@ -1030,6 +1031,12 @@ fn on_overlay_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> O
         }
         WM_KEYDOWN => {
             if let Some(input) = selection_key(wparam, lparam) {
+                on_selection_input(input);
+            }
+            Some(LRESULT(0))
+        }
+        WM_KEYUP => {
+            if let Some(input) = selection_modifiers(wparam) {
                 on_selection_input(input);
             }
             Some(LRESULT(0))
@@ -1928,6 +1935,21 @@ fn restore_from_trash(
     }
 }
 
+/// Shift か Ctrl の `WM_KEYDOWN` / `WM_KEYUP` なら、押し下げの状態（ハイライトの切り替え）の入力にする。
+fn selection_modifiers(wparam: WPARAM) -> Option<Input> {
+    matches!(VIRTUAL_KEY(wparam.0 as u16), VK_SHIFT | VK_CONTROL).then(held_selection_modifiers)
+}
+
+/// いま押している Shift と Ctrl。`GetKeyState` は処理中のメッセージまでを反映する。
+fn held_selection_modifiers() -> Input {
+    // SAFETY: GetKeyState は引数のキーの状態を読むだけ
+    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
+    Input::Modifiers {
+        shift: down(VK_SHIFT),
+        ctrl: down(VK_CONTROL),
+    }
+}
+
 /// 範囲選択の画面での `WM_KEYDOWN` を入力にする。対象でないキーは None。
 fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
     // SAFETY: GetKeyState は引数のキーの状態を読むだけ
@@ -1944,6 +1966,9 @@ fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
             Input::Arrow { direction, shift }
         })
     };
+    if let Some(input) = selection_modifiers(wparam) {
+        return Some(input);
+    }
     match VIRTUAL_KEY(wparam.0 as u16) {
         VK_ESCAPE => Some(Input::Escape),
         VK_TAB if !repeat => Some(Input::ToggleMode),
@@ -2029,6 +2054,16 @@ fn finish_selection() {
     let Some((request, overlay, selection, module, appearance)) = taken else {
         return;
     };
+    if let Some(chosen) = selection.chosen_window() {
+        // ハイライトから選んだウィンドウは、範囲選択の画面を閉じてから WGC で撮る
+        log::info!("window chosen on the overlay");
+        let request = request.for_window(chosen);
+        drop(overlay);
+        log::info!("overlay closed");
+        with_app(|app| app.capture = Capture::Waiting(request));
+        take_capture();
+        return;
+    }
     let Some(rect) = selection.rect() else {
         drop(overlay);
         end_capture();
@@ -2182,6 +2217,9 @@ fn take_capture() {
     match method {
         Some(request::CaptureMethod::Select) => open_overlay(),
         Some(request::CaptureMethod::ActiveWindow) => capture_active_window(),
+        Some(request::CaptureMethod::Window(target)) => {
+            capture_window(window_list::hwnd(target.window), target.crop);
+        }
         Some(request::CaptureMethod::Rect { monitor, rect }) => capture_rect(monitor, rect),
         Some(request::CaptureMethod::Region(_)) => {
             // 定型領域はふだん `request_region` の待ち行列から撮る。ここに来たら同じ流れで撮る
@@ -2446,10 +2484,16 @@ fn reply_failed(to: Option<ReplyTo>, message: &str) {
 
 /// 待っている依頼で、いまアクティブなウィンドウを WGC で撮り、依頼の出力（スクラップ）を出す。
 fn capture_active_window() {
-    let started = Instant::now();
     // 撮る前にアクティブなウィンドウを決める（スクラップを出すとフォーカスが移る）
     // SAFETY: 引数なし
     let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    capture_window(hwnd, None);
+}
+
+/// 待っている依頼で `hwnd` のウィンドウを WGC で撮り、依頼の出力（スクラップ）を出す。
+/// `crop`（スクリーン座標）があれば、撮った画像からその部分（部品）を切り抜く。
+fn capture_window(hwnd: HWND, crop: Option<Rect>) {
+    let started = Instant::now();
     let taken = with_app(|app| match &app.capture {
         Capture::Waiting(request) => Some((
             request.clone(),
@@ -2474,7 +2518,7 @@ fn capture_active_window() {
     let (shot, partial) = match grabbed {
         Ok(shot) => (shot, false),
         Err(e) => {
-            log::warn!("could not capture the active window: {e}");
+            log::warn!("could not capture the window: {e}");
             // UAC で昇格したウィンドウなど、WGC で撮れないときは見えている部分だけを撮る（#64）
             match (!hwnd.is_invalid())
                 .then(|| grab_visible_part(hwnd, cursor))
@@ -2492,6 +2536,20 @@ fn capture_active_window() {
     if partial {
         notify_user(notify::Level::Warning, text("capture.window_partial"));
     }
+    // 部品は、撮ったウィンドウの画像から切り抜く（WGC は最上位のウィンドウしか撮れない）
+    let shot = match crop.map(|crop| crop.intersect(&shot.rect)) {
+        None => shot,
+        Some(Some(area)) => crate::window_grab::WindowShot {
+            rect: area,
+            image: shot
+                .image
+                .crop(area.offset(-shot.rect.left, -shot.rect.top)),
+        },
+        Some(None) => {
+            log::warn!("the chosen part is outside the captured window");
+            shot
+        }
+    };
     log::info!(
         "captured window {}x{} at ({}, {}) in {:.1} ms",
         shot.rect.width(),
@@ -2588,7 +2646,14 @@ fn open_overlay() {
             return;
         }
     };
-    let selection = overlay.new_selection();
+    let mut selection = overlay.new_selection();
+    // ハイライトの対象。画面を出してから集める（出すまでの時間を延ばさないため）。
+    // 画面に覆われたあとも、下のウィンドウの位置は開いた時点のまま
+    let windows_started = Instant::now();
+    selection.set_windows(window_list::collect());
+    let windows_ms = windows_started.elapsed().as_secs_f64() * 1000.0;
+    // 開く前から Shift を押していれば、すぐにハイライトする
+    selection.handle(held_selection_modifiers());
     let rejected = with_app(|app| match std::mem::take(&mut app.capture) {
         Capture::Waiting(request) => {
             // 開くたびに設定の既定のモードから始める（Tab の切り替えはその回だけ）
@@ -2596,14 +2661,15 @@ fn open_overlay() {
                 .with_mode(app.settings.selection.mode)
                 .with_crosshair(app.settings.selection.crosshair);
             let mut overlay = overlay;
-            if selection.view().crosshair.is_some() {
+            let view = selection.view();
+            if view.crosshair.is_some() || view.highlight.is_some() {
                 // 描くだけでウィンドウは作らないので、借りたまま描いてよい
                 overlay.redraw(&selection);
             }
             app.capture = Capture::Selecting {
                 request,
                 overlay,
-                selection,
+                selection: Box::new(selection),
             };
             None
         }
@@ -2620,7 +2686,7 @@ fn open_overlay() {
         return;
     }
     log::info!(
-        "overlay opened on {monitors} monitor(s): grab {grab_ms:.1} ms, total {:.1} ms",
+        "overlay opened on {monitors} monitor(s): grab {grab_ms:.1} ms, windows {windows_ms:.1} ms, total {:.1} ms",
         started.elapsed().as_secs_f64() * 1000.0
     );
 }

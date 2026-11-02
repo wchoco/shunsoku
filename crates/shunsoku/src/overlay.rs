@@ -8,9 +8,10 @@
 //! - ウィンドウ プロシージャは `app` が持つ（Win32 層のモジュールは `app` を通してつながる）。
 //! - 画面は暗くしない。範囲を選んでいる間は、固定された画面をバックバッファに写したうえに Direct2D で
 //!   範囲のすぐ外側に細い枠（内側が白、外側が黒の 1 物理ピクセルずつ。どんな背景でも見えるように）を描き、
-//!   範囲の左上の外側にサイズを出す。Direct2D の資源は初めて範囲を描くときに作る（開くまでの時間を
-//!   延ばさないため）。Direct2D の座標は 1 DIP = 1 物理ピクセル。
-//! - 描くもの（範囲、つまみ、十字線、カーソルの横の座標）は core の `Selection::view` が決める。
+//!   範囲の左上の外側にサイズを出す。ウィンドウをハイライトしている間は、範囲の代わりにその矩形を
+//!   半透明の青で塗って内側に枠を描き、名前とサイズを出す。Direct2D の資源は初めて範囲を描くときに
+//!   作る（開くまでの時間を延ばさないため）。Direct2D の座標は 1 DIP = 1 物理ピクセル。
+//! - 描くもの（範囲、ハイライト、つまみ、十字線、カーソルの横の座標）は core の `Selection::view` が決める。
 //!   十字線はカーソルのあるモニタにだけ、そのモニタいっぱいに引く。
 //! - drop で Direct2D の描画先、スワップチェーンの順に解放してからウィンドウを壊す。そのあと
 //!   `grab::Gpu::trim` を呼ぶ。
@@ -87,6 +88,22 @@ const LABEL_TEXT: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 1.0,
 };
+/// ハイライトの枠の色（Windows の既定のアクセントに近い青）。
+const HIGHLIGHT_FRAME: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.0,
+    g: 0.47,
+    b: 0.84,
+    a: 1.0,
+};
+/// ハイライトの中に重ねる色。
+const HIGHLIGHT_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.0,
+    g: 0.47,
+    b: 0.84,
+    a: 0.15,
+};
+/// ハイライトの枠の太さ（DPI 100% のときの物理ピクセル。DPI に合わせて太くする）。
+const HIGHLIGHT_WIDTH: f32 = 3.0;
 /// サイズの表示の文字の大きさ・余白・範囲との間（DPI 100% のときの物理ピクセル。DPI に合わせて大きくする）。
 const LABEL_FONT_SIZE: f32 = 12.0;
 const LABEL_PADDING_X: f32 = 6.0;
@@ -153,6 +170,8 @@ struct D2dTarget {
     frame_outer: ID2D1SolidColorBrush,
     label_back: ID2D1SolidColorBrush,
     label_text: ID2D1SolidColorBrush,
+    highlight_frame: ID2D1SolidColorBrush,
+    highlight_fill: ID2D1SolidColorBrush,
     crosshair: ID2D1SolidColorBrush,
     _target: ID2D1Bitmap1,
     context: ID2D1DeviceContext,
@@ -174,11 +193,16 @@ struct Scene {
     handles: Vec<Rect>,
     crosshair: Option<Point>,
     cursor_label: Option<Label>,
+    /// ハイライトしているウィンドウの矩形。名前とサイズは `size_label` に入れる。
+    highlight: Option<Rect>,
 }
 
 impl Scene {
     fn is_empty(&self) -> bool {
-        self.rect.is_none() && self.crosshair.is_none() && self.cursor_label.is_none()
+        self.rect.is_none()
+            && self.crosshair.is_none()
+            && self.cursor_label.is_none()
+            && self.highlight.is_none()
     }
 }
 
@@ -256,12 +280,21 @@ impl Overlay {
     /// そのまま出し、あれば範囲の枠とサイズ、つまみ、十字線、カーソルの横の座標を出す。
     pub fn redraw(&mut self, selection: &Selection) {
         let view = selection.view();
-        let size_label = match (view.rect, &view.size_label) {
-            (Some(rect), Some(text)) => self.label(selection, rect, text).unwrap_or_else(|e| {
+        // ハイライトしていれば、範囲のサイズの代わりにウィンドウの名前とサイズを出す
+        let text = match (&view.highlight, view.rect, &view.size_label) {
+            (Some(highlight), _, _) => Some((
+                highlight_label_at(selection, highlight.rect),
+                highlight.label(),
+            )),
+            (None, Some(rect), Some(text)) => Some((rect, text.clone())),
+            _ => None,
+        };
+        let size_label = match text {
+            Some((at, text)) => self.label(selection, at, &text).unwrap_or_else(|e| {
                 log::warn!("could not lay out the size label: {e}");
                 None
             }),
-            _ => None,
+            None => None,
         };
         let cursor_label = match &view.cursor_label {
             Some((at, text)) => self.cursor_label(selection, *at, text).unwrap_or_else(|e| {
@@ -276,6 +309,7 @@ impl Overlay {
             handles: view.handles,
             crosshair: view.crosshair,
             cursor_label,
+            highlight: view.highlight.map(|h| h.rect),
         };
         let factory = if scene.is_empty() {
             None
@@ -304,13 +338,18 @@ impl Overlay {
     }
 
     /// サイズの表示を、範囲の左上があるモニタの DPI の大きさで、範囲の左上の外側に置く。
-    /// そのモニタの上にはみ出すなら、範囲の内側の左上に置く。
+    /// そのモニタの上にはみ出すなら、範囲の内側の左上に置く。右にはみ出すなら、モニタの右端に寄せる。
     fn label(&mut self, selection: &Selection, rect: Rect, text: &str) -> Result<Option<Label>> {
         let monitor = monitor_at(selection, rect.origin());
         let dpi = monitor.map_or(96, |m| m.dpi);
         let gap = LABEL_GAP * dpi as f32 / 96.0;
         let (text, format, width, height) = self.measure(text, dpi)?;
-        let left = rect.left as f32;
+        let mut left = rect.left as f32;
+        if let Some(m) = monitor {
+            left = left
+                .min(m.rect.right as f32 - width)
+                .max(m.rect.left as f32);
+        }
         let mut top = rect.top as f32 - gap - height;
         if monitor.is_some_and(|m| top < m.rect.top as f32) {
             top = rect.top as f32 + gap;
@@ -507,10 +546,13 @@ impl MonitorView {
         }
     }
 
-    /// 十字線、範囲の枠、つまみ、サイズ、カーソルの横の座標を出す。スクリーン座標からこのウィンドウの
+    /// 十字線、ハイライト、範囲の枠、つまみ、サイズ（ハイライトなら名前とサイズ）、カーソルの横の座標を出す。スクリーン座標からこのウィンドウの
     /// 座標に直して描く。
     fn draw_selection(&mut self, factory: &ID2D1Factory1, scene: &Scene) -> Result<()> {
         let monitor = to_rect(self.shot.rect);
+        let highlight_width = (HIGHLIGHT_WIDTH * self.shot.dpi as f32 / 96.0)
+            .round()
+            .max(1.0) as i32;
         let Some(surface) = &mut self.surface else {
             return Ok(());
         };
@@ -575,6 +617,18 @@ impl MonitorView {
                 Rect::new(at.x, monitor.top, at.x + 1, monitor.bottom),
                 &d2d.crosshair,
             );
+        }
+        // ハイライトは中を薄く塗り、枠を内側に描く（最大化したウィンドウでもモニタの端で見えるように）
+        if let Some(rect) = scene.highlight {
+            fill(rect, &d2d.highlight_fill);
+            let inner = rect.inflate(-highlight_width);
+            if inner.is_empty() {
+                fill(rect, &d2d.highlight_frame);
+            } else {
+                for band in ring(rect, inner) {
+                    fill(band, &d2d.highlight_frame);
+                }
+            }
         }
         for (outer, inner, brush) in lines.into_iter().flatten() {
             for band in ring(outer, inner) {
@@ -694,12 +748,25 @@ impl D2dTarget {
                 frame_outer: context.CreateSolidColorBrush(&FRAME_OUTER, None)?,
                 label_back: context.CreateSolidColorBrush(&LABEL_BACK, None)?,
                 label_text: context.CreateSolidColorBrush(&LABEL_TEXT, None)?,
+                highlight_frame: context.CreateSolidColorBrush(&HIGHLIGHT_FRAME, None)?,
+                highlight_fill: context.CreateSolidColorBrush(&HIGHLIGHT_FILL, None)?,
                 crosshair: context.CreateSolidColorBrush(&CROSSHAIR, None)?,
                 _target: target,
                 context,
             })
         }
     }
+}
+
+/// ハイライトの名前とサイズを置く基準の矩形。ハイライトのうちカーソルのあるモニタに見えている部分
+/// （モニタをまたぐウィンドウや、画面の外にはみ出したウィンドウでも見えるように）。
+fn highlight_label_at(selection: &Selection, rect: Rect) -> Rect {
+    selection
+        .monitors()
+        .iter()
+        .find(|m| m.rect.contains(selection.cursor()))
+        .and_then(|m| m.rect.intersect(&rect))
+        .unwrap_or(rect)
 }
 
 /// `outer` から `inner`（`outer` の内側）を除いた輪を、上・下・左・右の 4 つの帯で返す。
