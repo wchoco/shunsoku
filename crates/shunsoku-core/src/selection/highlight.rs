@@ -349,4 +349,27 @@ mod tests {
         });
         assert_eq!(s.highlight(), None);
     }
+
+    #[test]
+    fn the_view_shows_the_highlight_instead_of_the_range() {
+        let mut s = window_with_parts(p(500, 400));
+        s.handle(shift());
+        s.handle(press(p(500, 400)));
+        let view = s.view();
+        assert_eq!(view.highlight.map(|h| h.window), Some(WindowId(1)));
+        assert_eq!((view.rect, view.size_label), (None, None));
+    }
+
+    #[test]
+    fn shift_enter_while_adjusting_confirms_the_range_not_a_window() {
+        let mut s = window_with_parts(p(500, 400)).with_mode(Mode::Precise);
+        s.handle(press(p(500, 400)));
+        s.handle(Input::Move { at: p(599, 449) });
+        assert_eq!(s.handle(release(p(599, 449))), State::Adjusting);
+        s.handle(shift());
+        assert_eq!(s.highlight(), None);
+        assert_eq!(s.handle(Input::Enter), State::Confirmed);
+        assert_eq!(s.chosen_window(), None);
+        assert_eq!(s.rect(), Some(Rect::new(500, 400, 600, 450)));
+    }
 }

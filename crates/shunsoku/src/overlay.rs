@@ -9,14 +9,16 @@
 //! - 画面は暗くしない。範囲を選んでいる間は、固定された画面をバックバッファに写したうえに Direct2D で
 //!   範囲のすぐ外側に細い枠（内側が白、外側が黒の 1 物理ピクセルずつ。どんな背景でも見えるように）を描き、
 //!   範囲の左上の外側にサイズを出す。ウィンドウをハイライトしている間は、範囲の代わりにその矩形を
-//!   半透明の青で塗って内側に枠を描き、名前とサイズを出す。Direct2D の資源は初めて範囲を描くときに作る（開くまでの時間を
-//!   延ばさないため）。Direct2D の座標は 1 DIP = 1 物理ピクセル。
+//!   半透明の青で塗って内側に枠を描き、名前とサイズを出す。Direct2D の資源は初めて範囲を描くときに
+//!   作る（開くまでの時間を延ばさないため）。Direct2D の座標は 1 DIP = 1 物理ピクセル。
+//! - 描くもの（範囲、ハイライト、つまみ、十字線、カーソルの横の座標）は core の `Selection::view` が決める。
+//!   十字線はカーソルのあるモニタにだけ、そのモニタいっぱいに引く。
 //! - drop で Direct2D の描画先、スワップチェーンの順に解放してからウィンドウを壊す。そのあと
 //!   `grab::Gpu::trim` を呼ぶ。
 
 use shunsoku_core::geometry::{Point, Rect};
 use shunsoku_core::image::Fragment;
-use shunsoku_core::selection::{MonitorInfo, Part, Selection};
+use shunsoku_core::selection::{CursorShape, MonitorInfo, Part, Selection};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
@@ -46,9 +48,10 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetCursorPos, IDC_CROSS, LoadCursorW, RegisterClassExW,
-    SW_SHOW, SetCursor, SetForegroundWindow, ShowWindow, WNDCLASSEXW, WNDPROC,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_DBLCLKS, CreateWindowExW, DestroyWindow, GetCursorPos, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, LoadCursorW, RegisterClassExW, SW_SHOW, SetCursor,
+    SetForegroundWindow, ShowWindow, WNDCLASSEXW, WNDPROC, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Interface, PCWSTR, Result, w};
 
@@ -106,6 +109,16 @@ const LABEL_FONT_SIZE: f32 = 12.0;
 const LABEL_PADDING_X: f32 = 6.0;
 const LABEL_PADDING_Y: f32 = 3.0;
 const LABEL_GAP: f32 = 4.0;
+/// カーソルの横の座標の表示を、カーソルの画素から右下へずらす量（DPI 100% のときの物理ピクセル）。
+/// 十字のカーソルに重ならないように。
+const CURSOR_LABEL_OFFSET: f32 = 20.0;
+/// 十字線の色。どんな背景でも見えるよう、半透明のマゼンタにする。
+const CROSSHAIR: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 0.0,
+    b: 1.0,
+    a: 0.7,
+};
 
 /// ウィンドウのクラスを登録する。`wndproc` は `app` のもの。
 pub fn register_class(module: HINSTANCE, wndproc: WNDPROC) -> Result<()> {
@@ -117,6 +130,8 @@ pub fn register_class(module: HINSTANCE, wndproc: WNDPROC) -> Result<()> {
         hInstance: module,
         hCursor: cursor,
         lpszClassName: CLASS_NAME,
+        // 精密モードの調整の状態でダブルクリックを受ける
+        style: CS_DBLCLKS,
         // 背景は塗らない（GDI では描かない）
         ..Default::default()
     };
@@ -157,6 +172,7 @@ struct D2dTarget {
     label_text: ID2D1SolidColorBrush,
     highlight_frame: ID2D1SolidColorBrush,
     highlight_fill: ID2D1SolidColorBrush,
+    crosshair: ID2D1SolidColorBrush,
     _target: ID2D1Bitmap1,
     context: ID2D1DeviceContext,
 }
@@ -169,7 +185,28 @@ struct Painter {
     format: Option<(u32, IDWriteTextFormat)>,
 }
 
-/// サイズの表示。座標はスクリーン座標。
+/// 1 回に描くもの。座標はスクリーン座標。
+#[derive(Default)]
+struct Scene {
+    rect: Option<Rect>,
+    size_label: Option<Label>,
+    handles: Vec<Rect>,
+    crosshair: Option<Point>,
+    cursor_label: Option<Label>,
+    /// ハイライトしているウィンドウの矩形。名前とサイズは `size_label` に入れる。
+    highlight: Option<Rect>,
+}
+
+impl Scene {
+    fn is_empty(&self) -> bool {
+        self.rect.is_none()
+            && self.crosshair.is_none()
+            && self.cursor_label.is_none()
+            && self.highlight.is_none()
+    }
+}
+
+/// サイズや座標の表示。座標はスクリーン座標。
 struct Label {
     text: Vec<u16>,
     format: IDWriteTextFormat,
@@ -209,7 +246,7 @@ impl Overlay {
         }
         // まだ範囲はないので Direct2D は作らない
         for view in &mut overlay.monitors {
-            if let Err(e) = view.draw(None, None, None, None) {
+            if let Err(e) = view.draw(None, &Scene::default()) {
                 log::warn!("could not draw the overlay: {e}");
             }
         }
@@ -239,44 +276,54 @@ impl Overlay {
         Selection::new(monitors, Point::new(cursor.x, cursor.y))
     }
 
-    /// 全モニタのウィンドウを描き直す。範囲がなければ固定された画面をそのまま出し、
-    /// 範囲があればその枠とサイズを出す。
+    /// 全モニタのウィンドウを描き直す。描くもの（`Selection::view`）がなければ固定された画面を
+    /// そのまま出し、あれば範囲の枠とサイズ、つまみ、十字線、カーソルの横の座標を出す。
     pub fn redraw(&mut self, selection: &Selection) {
-        // ハイライトしていれば、範囲の代わりにハイライトの枠と名前とサイズを出す
-        let highlight = selection.highlight();
-        let rect = if highlight.is_some() {
-            None
-        } else {
-            selection.rect()
-        };
-        let text = match (&highlight, rect) {
-            (Some(highlight), _) => Some((
-                highlight.label(),
+        let view = selection.view();
+        // ハイライトしていれば、範囲のサイズの代わりにウィンドウの名前とサイズを出す
+        let text = match (&view.highlight, view.rect, &view.size_label) {
+            (Some(highlight), _, _) => Some((
                 highlight_label_at(selection, highlight.rect),
+                highlight.label(),
             )),
-            (None, Some(rect)) => selection.size_label().map(|text| (text, rect)),
-            (None, None) => None,
+            (None, Some(rect), Some(text)) => Some((rect, text.clone())),
+            _ => None,
         };
-        let label = match text {
-            Some((text, at)) => self.label(selection, text, at).unwrap_or_else(|e| {
+        let size_label = match text {
+            Some((at, text)) => self.label(selection, at, &text).unwrap_or_else(|e| {
                 log::warn!("could not lay out the size label: {e}");
                 None
             }),
             None => None,
         };
-        let highlight = highlight.map(|h| h.rect);
-        let factory = match rect.or(highlight) {
-            Some(_) => match self.painter() {
+        let cursor_label = match &view.cursor_label {
+            Some((at, text)) => self.cursor_label(selection, *at, text).unwrap_or_else(|e| {
+                log::warn!("could not lay out the cursor label: {e}");
+                None
+            }),
+            None => None,
+        };
+        let scene = Scene {
+            rect: view.rect,
+            size_label,
+            handles: view.handles,
+            crosshair: view.crosshair,
+            cursor_label,
+            highlight: view.highlight.map(|h| h.rect),
+        };
+        let factory = if scene.is_empty() {
+            None
+        } else {
+            match self.painter() {
                 Ok(painter) => Some(painter.factory.clone()),
                 Err(e) => {
                     log::warn!("could not create Direct2D: {e}");
                     None
                 }
-            },
-            None => None,
+            }
         };
         for view in &mut self.monitors {
-            if let Err(e) = view.draw(factory.as_ref(), rect, highlight, label.as_ref()) {
+            if let Err(e) = view.draw(factory.as_ref(), &scene) {
                 log::warn!("could not draw the overlay: {e}");
             }
         }
@@ -290,15 +337,57 @@ impl Overlay {
         }
     }
 
-    /// サイズの表示（`text`）を、範囲の左上があるモニタの DPI の大きさで、範囲の左上の外側に置く。
+    /// サイズの表示を、範囲の左上があるモニタの DPI の大きさで、範囲の左上の外側に置く。
     /// そのモニタの上にはみ出すなら、範囲の内側の左上に置く。右にはみ出すなら、モニタの右端に寄せる。
-    fn label(&mut self, selection: &Selection, text: String, rect: Rect) -> Result<Option<Label>> {
-        let monitor = selection
-            .monitors()
-            .iter()
-            .find(|m| m.rect.contains(rect.origin()))
-            .copied();
+    fn label(&mut self, selection: &Selection, rect: Rect, text: &str) -> Result<Option<Label>> {
+        let monitor = monitor_at(selection, rect.origin());
         let dpi = monitor.map_or(96, |m| m.dpi);
+        let gap = LABEL_GAP * dpi as f32 / 96.0;
+        let (text, format, width, height) = self.measure(text, dpi)?;
+        let mut left = rect.left as f32;
+        if let Some(m) = monitor {
+            left = left
+                .min(m.rect.right as f32 - width)
+                .max(m.rect.left as f32);
+        }
+        let mut top = rect.top as f32 - gap - height;
+        if monitor.is_some_and(|m| top < m.rect.top as f32) {
+            top = rect.top as f32 + gap;
+        }
+        Ok(Some(Label::new(
+            text, format, left, top, width, height, dpi,
+        )))
+    }
+
+    /// カーソルの横の座標の表示を、カーソルのあるモニタの DPI の大きさで、カーソルの右下に置く。
+    /// そのモニタの右や下にはみ出すなら、カーソルの左や上に回す。
+    fn cursor_label(
+        &mut self,
+        selection: &Selection,
+        at: Point,
+        text: &str,
+    ) -> Result<Option<Label>> {
+        let monitor = monitor_at(selection, at);
+        let dpi = monitor.map_or(96, |m| m.dpi);
+        let offset = CURSOR_LABEL_OFFSET * dpi as f32 / 96.0;
+        let (text, format, width, height) = self.measure(text, dpi)?;
+        let mut left = at.x as f32 + offset;
+        let mut top = at.y as f32 + offset;
+        if let Some(m) = monitor {
+            if left + width > m.rect.right as f32 {
+                left = at.x as f32 - offset - width;
+            }
+            if top + height > m.rect.bottom as f32 {
+                top = at.y as f32 - offset - height;
+            }
+        }
+        Ok(Some(Label::new(
+            text, format, left, top, width, height, dpi,
+        )))
+    }
+
+    /// `text` を `dpi` のモニタの大きさで測る。返すのは UTF-16 の文字列、書式、余白を含む幅と高さ。
+    fn measure(&mut self, text: &str, dpi: u32) -> Result<(Vec<u16>, IDWriteTextFormat, f32, f32)> {
         let scale = dpi as f32 / 96.0;
         let painter = self.painter()?;
         let format = painter.format(dpi)?;
@@ -312,39 +401,9 @@ impl Overlay {
             layout.GetMetrics(&mut metrics)?;
             metrics
         };
-        let pad_x = LABEL_PADDING_X * scale;
-        let pad_y = LABEL_PADDING_Y * scale;
-        let gap = LABEL_GAP * scale;
-        let width = metrics.width.ceil() + pad_x * 2.0;
-        let height = metrics.height.ceil() + pad_y * 2.0;
-        let mut left = rect.left as f32;
-        if let Some(m) = monitor {
-            left = left
-                .min(m.rect.right as f32 - width)
-                .max(m.rect.left as f32);
-        }
-        let mut top = rect.top as f32 - gap - height;
-        if monitor.is_some_and(|m| top < m.rect.top as f32) {
-            top = rect.top as f32 + gap;
-        }
-        let back = D2D_RECT_F {
-            left,
-            top,
-            right: left + width,
-            bottom: top + height,
-        };
-        let text_rect = D2D_RECT_F {
-            left: back.left + pad_x,
-            top: back.top + pad_y,
-            right: back.right - pad_x,
-            bottom: back.bottom - pad_y,
-        };
-        Ok(Some(Label {
-            text,
-            format,
-            back,
-            text_rect,
-        }))
+        let width = metrics.width.ceil() + LABEL_PADDING_X * scale * 2.0;
+        let height = metrics.height.ceil() + LABEL_PADDING_Y * scale * 2.0;
+        Ok((text, format, width, height))
     }
 
     fn painter(&mut self) -> Result<&mut Painter> {
@@ -379,6 +438,65 @@ impl Overlay {
     }
 }
 
+impl Label {
+    /// 背景の左上と大きさ（余白を含む）から作る。
+    fn new(
+        text: Vec<u16>,
+        format: IDWriteTextFormat,
+        left: f32,
+        top: f32,
+        width: f32,
+        height: f32,
+        dpi: u32,
+    ) -> Label {
+        let scale = dpi as f32 / 96.0;
+        let back = D2D_RECT_F {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        };
+        let text_rect = D2D_RECT_F {
+            left: back.left + LABEL_PADDING_X * scale,
+            top: back.top + LABEL_PADDING_Y * scale,
+            right: back.right - LABEL_PADDING_X * scale,
+            bottom: back.bottom - LABEL_PADDING_Y * scale,
+        };
+        Label {
+            text,
+            format,
+            back,
+            text_rect,
+        }
+    }
+}
+
+/// `at` の画素を含むモニタ。
+fn monitor_at(selection: &Selection, at: Point) -> Option<MonitorInfo> {
+    selection
+        .monitors()
+        .iter()
+        .find(|m| m.rect.contains(at))
+        .copied()
+}
+
+/// カーソルの形を当てる。
+pub fn set_cursor(shape: CursorShape) {
+    let id = match shape {
+        CursorShape::Cross => IDC_CROSS,
+        CursorShape::Move => IDC_SIZEALL,
+        CursorShape::ResizeNwse => IDC_SIZENWSE,
+        CursorShape::ResizeNesw => IDC_SIZENESW,
+        CursorShape::ResizeNs => IDC_SIZENS,
+        CursorShape::ResizeWe => IDC_SIZEWE,
+    };
+    // SAFETY: 共有のカーソルなので壊さなくてよい
+    if let Ok(cursor) = unsafe { LoadCursorW(None, id) } {
+        // SAFETY: UI スレッドで呼ぶ
+        unsafe { SetCursor(Some(cursor)) };
+    }
+}
+
 impl Painter {
     /// `dpi` のモニタ用のサイズの表示の書式。DPI が変わらなければ作り直さない。
     fn format(&mut self, dpi: u32) -> Result<IDWriteTextFormat> {
@@ -408,23 +526,13 @@ impl Painter {
 }
 
 impl MonitorView {
-    /// 固定された画面を写し、範囲（`rect`）があれば範囲の枠とサイズを出す。
-    /// `factory` がなければ範囲は描かない。
-    /// `highlight` があれば、範囲の代わりにハイライトの枠を出す。
-    fn draw(
-        &mut self,
-        factory: Option<&ID2D1Factory1>,
-        rect: Option<Rect>,
-        highlight: Option<Rect>,
-        label: Option<&Label>,
-    ) -> Result<()> {
+    /// 固定された画面を写し、その上に `scene` を描く。`factory` がなければ `scene` は描かない。
+    fn draw(&mut self, factory: Option<&ID2D1Factory1>, scene: &Scene) -> Result<()> {
         self.copy_shot()?;
-        let drawn = match (factory, rect, highlight) {
-            (Some(factory), _, Some(highlight)) => self.draw_highlight(factory, highlight, label),
-            (Some(factory), Some(rect), None) => self.draw_selection(factory, rect, label),
-            _ => Ok(()),
-        };
-        if let Err(e) = drawn {
+        if let Some(factory) = factory
+            && !scene.is_empty()
+            && let Err(e) = self.draw_selection(factory, scene)
+        {
             // 描画先を作り直せば直ることがある（D2DERR_RECREATE_TARGET など）。次に描くときに作り直す
             log::warn!("could not draw the selection: {e}");
             if let Some(surface) = &mut self.surface {
@@ -438,78 +546,11 @@ impl MonitorView {
         }
     }
 
-    /// 範囲の枠とサイズを出す。スクリーン座標からこのウィンドウの座標に直して描く。
-    fn draw_selection(
-        &mut self,
-        factory: &ID2D1Factory1,
-        rect: Rect,
-        label: Option<&Label>,
-    ) -> Result<()> {
+    /// 十字線、ハイライト、範囲の枠、つまみ、サイズ（ハイライトなら名前とサイズ）、カーソルの横の座標を出す。スクリーン座標からこのウィンドウの
+    /// 座標に直して描く。
+    fn draw_selection(&mut self, factory: &ID2D1Factory1, scene: &Scene) -> Result<()> {
         let monitor = to_rect(self.shot.rect);
-        let Some(surface) = &mut self.surface else {
-            return Ok(());
-        };
-        if surface.d2d.is_none() {
-            surface.d2d = Some(D2dTarget::new(
-                factory,
-                &self.shot.device,
-                &surface.swap_chain,
-            )?);
-        }
-        let Some(d2d) = &surface.d2d else {
-            return Ok(());
-        };
-        let (ox, oy) = (monitor.left as f32, monitor.top as f32);
-        let local = |r: &D2D_RECT_F| D2D_RECT_F {
-            left: r.left - ox,
-            top: r.top - oy,
-            right: r.right - ox,
-            bottom: r.bottom - oy,
-        };
-        // 枠は範囲の外側に 1 画素ずつ、内側の白と外側の黒の 2 本（範囲の画素には重ねない）
-        let lines = [
-            (rect.inflate(1), rect, &d2d.frame_inner),
-            (rect.inflate(2), rect.inflate(1), &d2d.frame_outer),
-        ];
-        let context = &d2d.context;
-        // SAFETY: このモニタのバックバッファに描く。UI スレッドで呼ぶ
-        unsafe {
-            context.BeginDraw();
-            context.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-            for (outer, inner, brush) in lines {
-                // このモニタに重なる部分だけ塗る
-                for band in ring(outer, inner)
-                    .iter()
-                    .filter_map(|b| b.intersect(&monitor))
-                {
-                    context.FillRectangle(&local(&to_rect_f(band)), brush);
-                }
-            }
-            if let Some(label) = label {
-                context.FillRectangle(&local(&label.back), &d2d.label_back);
-                context.DrawText(
-                    &label.text,
-                    &label.format,
-                    &local(&label.text_rect),
-                    &d2d.label_text,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-            }
-            context.EndDraw(None, None)
-        }
-    }
-
-    /// ハイライトの枠と、名前とサイズを出す。枠はハイライトの内側に描く（最大化したウィンドウでも
-    /// モニタの端で見えるように）。中は薄く色を付ける。
-    fn draw_highlight(
-        &mut self,
-        factory: &ID2D1Factory1,
-        rect: Rect,
-        label: Option<&Label>,
-    ) -> Result<()> {
-        let monitor = to_rect(self.shot.rect);
-        let width = (HIGHLIGHT_WIDTH * self.shot.dpi as f32 / 96.0)
+        let highlight_width = (HIGHLIGHT_WIDTH * self.shot.dpi as f32 / 96.0)
             .round()
             .max(1.0) as i32;
         let Some(surface) = &mut self.surface else {
@@ -532,24 +573,24 @@ impl MonitorView {
             right: r.right - ox,
             bottom: r.bottom - oy,
         };
-        let inner = rect.inflate(-width);
+        // 枠は範囲の外側に 1 画素ずつ、内側の白と外側の黒の 2 本（範囲の画素には重ねない）
+        let lines = scene.rect.map(|rect| {
+            [
+                (rect.inflate(1), rect, &d2d.frame_inner),
+                (rect.inflate(2), rect.inflate(1), &d2d.frame_outer),
+            ]
+        });
         let context = &d2d.context;
-        // SAFETY: このモニタのバックバッファに描く。UI スレッドで呼ぶ
-        unsafe {
-            context.BeginDraw();
-            context.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-            if let Some(fill) = rect.intersect(&monitor) {
-                context.FillRectangle(&local(&to_rect_f(fill)), &d2d.highlight_fill);
+        // このモニタに重なる部分だけ塗る
+        let fill = |r: Rect, brush: &ID2D1SolidColorBrush| {
+            if let Some(r) = r.intersect(&monitor) {
+                // SAFETY: BeginDraw と EndDraw の間で呼ぶ
+                unsafe { context.FillRectangle(&local(&to_rect_f(r)), brush) };
             }
-            let bands = if inner.is_empty() {
-                vec![rect]
-            } else {
-                ring(rect, inner).to_vec()
-            };
-            for band in bands.iter().filter_map(|b| b.intersect(&monitor)) {
-                context.FillRectangle(&local(&to_rect_f(band)), &d2d.highlight_frame);
-            }
-            if let Some(label) = label {
+        };
+        let text = |label: &Label| {
+            // SAFETY: BeginDraw と EndDraw の間で呼ぶ
+            unsafe {
                 context.FillRectangle(&local(&label.back), &d2d.label_back);
                 context.DrawText(
                     &label.text,
@@ -560,8 +601,53 @@ impl MonitorView {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
-            context.EndDraw(None, None)
+        };
+        // SAFETY: このモニタのバックバッファに描く。UI スレッドで呼ぶ
+        unsafe {
+            context.BeginDraw();
+            context.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
         }
+        // 十字線はカーソルのあるモニタにだけ、そのモニタいっぱいに引く
+        if let Some(at) = scene.crosshair.filter(|&at| monitor.contains(at)) {
+            fill(
+                Rect::new(monitor.left, at.y, monitor.right, at.y + 1),
+                &d2d.crosshair,
+            );
+            fill(
+                Rect::new(at.x, monitor.top, at.x + 1, monitor.bottom),
+                &d2d.crosshair,
+            );
+        }
+        // ハイライトは中を薄く塗り、枠を内側に描く（最大化したウィンドウでもモニタの端で見えるように）
+        if let Some(rect) = scene.highlight {
+            fill(rect, &d2d.highlight_fill);
+            let inner = rect.inflate(-highlight_width);
+            if inner.is_empty() {
+                fill(rect, &d2d.highlight_frame);
+            } else {
+                for band in ring(rect, inner) {
+                    fill(band, &d2d.highlight_frame);
+                }
+            }
+        }
+        for (outer, inner, brush) in lines.into_iter().flatten() {
+            for band in ring(outer, inner) {
+                fill(band, brush);
+            }
+        }
+        // つまみは黒で縁取った白い四角
+        for &handle in &scene.handles {
+            fill(handle.inflate(1), &d2d.frame_outer);
+            fill(handle, &d2d.frame_inner);
+        }
+        if let Some(label) = &scene.size_label {
+            text(label);
+        }
+        if let Some(label) = &scene.cursor_label {
+            text(label);
+        }
+        // SAFETY: BeginDraw と対
+        unsafe { context.EndDraw(None, None) }
     }
 
     /// 固定された画面をバックバッファに写す。
@@ -664,6 +750,7 @@ impl D2dTarget {
                 label_text: context.CreateSolidColorBrush(&LABEL_TEXT, None)?,
                 highlight_frame: context.CreateSolidColorBrush(&HIGHLIGHT_FRAME, None)?,
                 highlight_fill: context.CreateSolidColorBrush(&HIGHLIGHT_FILL, None)?,
+                crosshair: context.CreateSolidColorBrush(&CROSSHAIR, None)?,
                 _target: target,
                 context,
             })
