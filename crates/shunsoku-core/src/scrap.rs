@@ -1704,7 +1704,10 @@ mod tests {
         assert!(scrap.is_editing());
         scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
         assert_eq!(
-            scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21))),
+            scrap.edit_input(EditInput::Move {
+                at: Point::new(o.x + 41, o.y + 21),
+                shift: false
+            }),
             vec![EditOutput::Redraw]
         );
         // 描きかけも描く
@@ -1728,7 +1731,10 @@ mod tests {
         assert_eq!(scrap.annotations_to_draw(), scrap.annotations().items());
         // 画像の外へはみ出したドラッグは画像の端の画素で止まる
         scrap.edit_input(EditInput::Press(Point::new(o.x - 50, o.y - 50)));
-        scrap.edit_input(EditInput::Move(Point::new(o.x + 1000, o.y + 1000)));
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 1000, o.y + 1000),
+            shift: false,
+        });
         scrap.edit_input(EditInput::Release);
         assert_eq!(
             scrap.annotations().items()[1].shape,
@@ -1744,18 +1750,30 @@ mod tests {
         scrap.start_editing(Style::default());
         scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 8)));
         // 200% なので 1px 動いても同じ画素
-        scrap.edit_input(EditInput::Move(Point::new(o.x + 9, o.y + 9)));
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 9, o.y + 9),
+            shift: false,
+        });
         assert_eq!(scrap.annotations_to_draw(), vec![]);
         assert_eq!(scrap.edit_input(EditInput::Release), vec![]);
         // 離れてから戻ってきても同じ
         scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 8)));
-        scrap.edit_input(EditInput::Move(Point::new(o.x + 30, o.y + 30)));
-        scrap.edit_input(EditInput::Move(Point::new(o.x + 8, o.y + 8)));
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 30, o.y + 30),
+            shift: false,
+        });
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 8, o.y + 8),
+            shift: false,
+        });
         scrap.edit_input(EditInput::Release);
         assert!(scrap.annotations().is_empty());
         // 押していないホバーでは何も描かない
         assert_eq!(
-            scrap.edit_input(EditInput::Move(Point::new(o.x + 30, o.y + 30))),
+            scrap.edit_input(EditInput::Move {
+                at: Point::new(o.x + 30, o.y + 30),
+                shift: false
+            }),
             vec![]
         );
         assert!(scrap.annotations_to_draw().is_empty());
@@ -1767,7 +1785,10 @@ mod tests {
         let o = scrap.image_rect().origin();
         scrap.start_editing(Style::default());
         scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
-        scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21)));
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 41, o.y + 21),
+            shift: false,
+        });
         scrap.edit_input(EditInput::Release);
         let drawn = scrap.annotations().clone();
         // 200% でトリムの左上が (10, 20) なので、画素 (14, 23) の中心は画像の左上から (9, 7)
@@ -1807,7 +1828,10 @@ mod tests {
         scrap.start_editing(Style::default());
         // 押したまま Esc でも、描きかけを残して抜ける
         scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
-        scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21)));
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 41, o.y + 21),
+            shift: false,
+        });
         let outputs = scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x1B))));
         assert!(outputs.contains(&EditOutput::Left));
         assert_eq!(scrap.mode, Mode::Normal);
@@ -1833,7 +1857,10 @@ mod tests {
         let o = scrap.image_rect().origin();
         scrap.start_editing(Style::default());
         scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
-        scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21)));
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 41, o.y + 21),
+            shift: false,
+        });
         scrap.settle();
         assert_eq!(scrap.mode, Mode::Normal);
         assert_eq!(scrap.annotations().items().len(), 1);
@@ -1862,7 +1889,10 @@ mod tests {
         scrap.start_editing(Style::default());
         let before = scrap.clone();
         scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
-        scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21)));
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 41, o.y + 21),
+            shift: false,
+        });
         assert!(!scrap.same_content(&before));
         scrap.settle();
         let mut drawn_in_normal = before.clone();

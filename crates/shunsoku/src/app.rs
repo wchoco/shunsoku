@@ -1307,7 +1307,11 @@ fn is_editing(hwnd: HWND) -> bool {
 fn on_edit_move(hwnd: HWND, wparam: WPARAM, at: Point) {
     let pointer = pointer_on_move(hwnd, wparam);
     let input = if pointer.holding() {
-        EditInput::Move(at)
+        // Shift を押していれば図形に制約をかける（正方形・円・45° 刻み）。wparam の MK_SHIFT は
+        // Win32_System_SystemServices を足さないよう値で持つ
+        const MK_SHIFT: usize = 0x0004;
+        let shift = wparam.0 & MK_SHIFT != 0;
+        EditInput::Move { at, shift }
     } else {
         EditInput::Release
     };
