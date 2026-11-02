@@ -4,6 +4,7 @@ members = [
     "crates/shunsoku-core",
     "crates/shunsoku",
     "crates/shunsoku-cli",
+    "crates/shunsoku-pipe-identity",
     "tools/perf-harness",
 ]
 

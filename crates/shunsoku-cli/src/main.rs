@@ -103,10 +103,6 @@ impl Failure {
 }
 
 #[cfg(windows)]
-#[path = "../../shunsoku/src/pipe_identity.rs"]
-mod pipe_identity;
-
-#[cfg(windows)]
 mod pipe {
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
@@ -131,7 +127,9 @@ mod pipe {
     use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
     use windows::core::{HSTRING, PWSTR};
 
-    use super::{Failure, pipe_identity};
+    use shunsoku_pipe_identity as pipe_identity;
+
+    use super::Failure;
 
     /// 常駐本体を起動してからパイプができるまで待つ時間の上限。
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);

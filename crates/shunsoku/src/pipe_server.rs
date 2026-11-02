@@ -42,7 +42,7 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{HSTRING, Result};
 
-use crate::pipe_identity;
+use shunsoku_pipe_identity as pipe_identity;
 
 /// 同時に開いておく接続の上限。超えた CLI は空くまで待つ（`WaitNamedPipeW`）。
 const MAX_INSTANCES: u32 = 8;

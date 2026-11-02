@@ -168,6 +168,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "shunsoku-core",
+ "shunsoku-pipe-identity",
  "windows",
 ]
 
@@ -176,6 +177,7 @@ name = "shunsoku-cli"
 version = "0.1.0"
 dependencies = [
  "shunsoku-core",
+ "shunsoku-pipe-identity",
  "windows",
 ]
 
@@ -185,6 +187,13 @@ version = "0.1.0"
 dependencies = [
  "png",
  "toml_edit",
+]
+
+[[package]]
+name = "shunsoku-pipe-identity"
+version = "0.1.0"
+dependencies = [
+ "windows",
 ]
 
 [[package]]

@@ -28,8 +28,6 @@ mod panic_hook;
 #[cfg(windows)]
 mod perf;
 #[cfg(windows)]
-mod pipe_identity;
-#[cfg(windows)]
 mod pipe_server;
 #[cfg(windows)]
 mod render;
