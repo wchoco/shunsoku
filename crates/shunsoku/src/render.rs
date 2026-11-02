@@ -9,6 +9,9 @@
 //! - 書き込み（`annotate::Annotation`）は画像の上、トリムの範囲の上の重ねものの下に、画像の矩形の中だけに
 //!   描く（`draw_annotations`）。座標の換算は core の `annotate::View` で、表示なら `ScrapModel::annotation_view`、
 //!   保存とコピーなら `ScrapModel::output_view` を渡す。画像は補間せずに描くが、書き込みはアンチエイリアスする。
+//! - 文字の書き込み（`Shape::Text`）は DirectWrite で、左上を書き込みの点の画素の左上に合わせ、行の高さを core の
+//!   見積もり（`annotate::LINE_HEIGHT`）に揃えて描く。打っている文字（`TypingLayer`）は、IME で変換中の文字に
+//!   下線を引いてつなげ、キャレットを描く（その矩形を IME の窓の位置に使う）。
 //! - 透明度はここでは掛けない（レイヤード ウィンドウの `SourceConstantAlpha` で掛ける）。
 //! - 書き込みの編集モードのツールバー（`toolbar_window`）も、ここで `paint_toolbar` で描く。並びは core の
 //!   `annotate::toolbar::Layout`。アイコンは Direct2D の線と図形で描く（字形のフォントに頼らない）。
@@ -18,7 +21,9 @@
 use std::ffi::c_void;
 
 use shunsoku_core::annotate::toolbar::{Button, Layout, ToolSlot};
-use shunsoku_core::annotate::{Annotation, Annotations, EditState, Shape, View, arrow_head};
+use shunsoku_core::annotate::{
+    Annotation, Annotations, EditState, Font, LINE_HEIGHT, Shape, View, arrow_head,
+};
 use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::image::Image;
 use shunsoku_core::scrap::{Appearance, SHADOW_WIDTH};
@@ -39,8 +44,10 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_METRICS,
-    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
+    DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory,
+    IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -83,6 +90,19 @@ pub struct AnnotationLayer<'a> {
     /// 選んでいる書き込みの外接矩形（元の画像の画素、`Annotation::bounds`）。あれば選択の印を描く。
     /// 保存とコピーには描かない（None）。
     pub selected: Option<Rect>,
+    /// 打っている文字。保存とコピーには描かない（None）。
+    pub typing: Option<TypingLayer<'a>>,
+}
+
+/// 打っている文字と、IME で変換中の文字。
+#[derive(Debug, Clone, Copy)]
+pub struct TypingLayer<'a> {
+    /// 打っている文字の書き込み（`Shape::Text`。`EditState::typing`）。
+    pub annotation: &'a Annotation,
+    /// 変換中の文字（打っている文字の後ろにつなげて、下線を引いて描く）。
+    pub composition: &'a str,
+    /// 変換中の文字の中のキャレットの位置（UTF-16 の単位）。
+    pub cursor: usize,
 }
 
 /// スクラップの画像に重ねるもの。下から書き込み・トリムの範囲・倍率の順に描く。
@@ -226,7 +246,7 @@ impl Renderer {
 
     /// スクラップのウィンドウの中身を描く。`canvas` はウィンドウの大きさ（`ScrapModel::window_rect`）で、
     /// 画像は余白（`Appearance::margin`）の内側に `display`（`ScrapModel::display_size`）の大きさで置く。
-    /// 画像の上に `overlays` を重ねる。
+    /// 画像の上に `overlays` を重ねる。文字を打っていれば、キャレットの矩形（ウィンドウの中の座標）を返す。
     pub fn paint_scrap(
         &mut self,
         canvas: &Canvas,
@@ -234,7 +254,7 @@ impl Renderer {
         display: Size,
         appearance: &Appearance,
         overlays: Overlays,
-    ) -> Result<()> {
+    ) -> Result<Option<Rect>> {
         let Overlays {
             annotations,
             label,
@@ -246,6 +266,7 @@ impl Renderer {
             Some(_) => Some(self.dwrite()?),
             None => None,
         };
+        let mut caret = None;
         self.paint(canvas, |target| {
             // SAFETY: BeginDraw と EndDraw の間で呼ぶ
             unsafe {
@@ -277,7 +298,7 @@ impl Renderer {
                 }
             }
             draw_image(target, image, image_rect)?;
-            draw_annotations(target, annotations, image_rect)?;
+            caret = draw_annotations(target, annotations, image_rect)?;
             if let Some(trim) = trim {
                 draw_trim_overlay(target, image_rect, trim)?;
             }
@@ -285,7 +306,8 @@ impl Renderer {
                 (Some(label), Some(dwrite)) => draw_zoom_label(target, &dwrite, image_rect, label),
                 _ => Ok(()),
             }
-        })
+        })?;
+        Ok(caret)
     }
 
     /// 書き込みのツールバーを描く。`canvas` は `layout` の大きさ。`state` の道具・色・太さのボタンを選んだ
@@ -324,7 +346,7 @@ impl Renderer {
         let rect = Rect::from_origin_size(Point::default(), image.size());
         self.paint(canvas, |target| {
             draw_image(target, image, rect)?;
-            draw_annotations(target, annotations, rect)
+            draw_annotations(target, annotations, rect).map(|_| ())
         })
     }
 
@@ -408,13 +430,14 @@ fn draw_image(target: &ID2D1RenderTarget, image: &Image, dest: Rect) -> Result<(
 /// 書き込みを、`image_rect` の左上を原点に `layer.view` で置いて描く。画像の矩形の外（トリムで隠した部分など）は
 /// 描かない。線は画素の中心を通るので、奇数の太さを等倍で描くと画素に揃う。線・矢印・フリーハンドの端と
 /// 折れ目は丸める。矢印の頭（core の `arrow_head`）は塗りつぶした三角形で、軸は頭の底辺まで引く。
+/// 打っている文字（`layer.typing`）は書き込みの上に描き、そのキャレットの矩形（描く先の座標）を返す。
 fn draw_annotations(
     target: &ID2D1RenderTarget,
     layer: AnnotationLayer,
     image_rect: Rect,
-) -> Result<()> {
-    if layer.annotations.is_empty() || image_rect.is_empty() {
-        return Ok(());
+) -> Result<Option<Rect>> {
+    if (layer.annotations.is_empty() && layer.typing.is_none()) || image_rect.is_empty() {
+        return Ok(None);
     }
     let (dx, dy) = (f64::from(image_rect.left), f64::from(image_rect.top));
     let at = |p: Point| {
@@ -439,30 +462,48 @@ fn draw_annotations(
                 None,
             )?;
             let brush = target.CreateSolidColorBrush(&rgb(0, 1.0), None)?;
+            // 文字があるときだけ DirectWrite を使う（共有のファクトリなので、作るのは 1 度だけ）
+            let has_text = layer.typing.is_some()
+                || layer
+                    .annotations
+                    .iter()
+                    .any(|a| matches!(a.shape, Shape::Text { .. }));
+            let dwrite: Option<IDWriteFactory> = if has_text {
+                // レイヤード ウィンドウは画素ごとのアルファを持つので、ClearType ではなくグレースケールで描く
+                target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                Some(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?)
+            } else {
+                None
+            };
             let pen = Pen {
                 target,
                 factory: &factory,
+                dwrite: dwrite.as_ref(),
                 brush: &brush,
                 round: &round,
+                view: layer.view,
+                origin: (dx, dy),
             };
             for annotation in layer.annotations {
-                let shunsoku_core::settings::Rgb(r, g, b) = annotation.style.color;
-                brush.SetColor(&rgb(
-                    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
-                    1.0,
-                ));
+                brush.SetColor(&color_of(annotation));
                 let width = layer.view.width(annotation.style.width);
                 pen.draw(&annotation.shape, &at, width)?;
             }
-            Ok(())
+            match layer.typing {
+                Some(typing) => {
+                    brush.SetColor(&color_of(typing.annotation));
+                    pen.draw_typing(typing)
+                }
+                None => Ok(None),
+            }
         })();
         target.PopAxisAlignedClip();
         // 選択の印は画像の端の書き込みでも見えるよう、画像の矩形で切らない
         let marked = match (drawn, layer.selected) {
-            (Ok(()), Some(bounds)) => {
+            (Ok(caret), Some(bounds)) => {
                 let (x0, y0) = at(Point::new(bounds.left, bounds.top));
                 let (x1, y1) = at(Point::new(bounds.right, bounds.bottom));
-                draw_selection_mark(target, (x0, y0, x1, y1))
+                draw_selection_mark(target, (x0, y0, x1, y1)).map(|()| caret)
             }
             (drawn, _) => drawn,
         };
@@ -516,13 +557,30 @@ fn draw_selection_mark(
     Ok(())
 }
 
+/// 書き込みの色（不透明）。
+fn color_of(annotation: &Annotation) -> D2D1_COLOR_F {
+    let shunsoku_core::settings::Rgb(r, g, b) = annotation.style.color;
+    rgb(
+        (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
+        1.0,
+    )
+}
+
+/// 打っている文字のキャレットの太さ（描く先の物理ピクセル）。
+const CARET_WIDTH: f32 = 2.0;
+
 /// 書き込みを 1 つずつ描く道具一式。BeginDraw と EndDraw の間だけ使う。
 struct Pen<'a> {
     target: &'a ID2D1RenderTarget,
     factory: &'a ID2D1Factory,
+    /// 文字を描く DirectWrite。文字の書き込みがなければ None。
+    dwrite: Option<&'a IDWriteFactory>,
     brush: &'a ID2D1SolidColorBrush,
     /// 端と折れ目を丸める線の形。
     round: &'a ID2D1StrokeStyle,
+    /// 元の画像の画素から、画像の左上を原点とした座標への変換と、描く先での画像の左上。
+    view: View,
+    origin: (f64, f64),
 }
 
 impl Pen<'_> {
@@ -582,9 +640,98 @@ impl Pen<'_> {
                     sink.Close()?;
                     target.DrawGeometry(&path, brush, stroke, self.round);
                 }
+                Shape::Text { at, text, font } => {
+                    if let Some((layout, origin)) = self.text_layout(*at, text, font)? {
+                        target.DrawTextLayout(origin, &layout, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// `text` を `font` で `at` の画素の左上から描く並び（DirectWrite）と、描く先での左上。DirectWrite が
+    /// なければ None。大きさは表示の倍率に合わせて伸び縮みさせる。
+    fn text_layout(
+        &self,
+        at: Point,
+        text: &str,
+        font: &Font,
+    ) -> Result<Option<(IDWriteTextLayout, Vector2)>> {
+        let Some(dwrite) = self.dwrite else {
+            return Ok(None);
+        };
+        let size = self.view.width(font.size).max(1.0) as f32;
+        let family: Vec<u16> = font.family.encode_utf16().chain([0]).collect();
+        let text: Vec<u16> = text.encode_utf16().collect();
+        let (x, y) = self.view.point(at);
+        let origin = Vector2 {
+            X: (x - self.view.scale_x / 2.0 + self.origin.0) as f32,
+            Y: (y - self.view.scale_y / 2.0 + self.origin.1) as f32,
+        };
+        // SAFETY: 文字列はこの関数の中で生きている（family は 0 で終わる）
+        unsafe {
+            let format = dwrite.CreateTextFormat(
+                windows::core::PCWSTR(family.as_ptr()),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                size,
+                w!(""),
+            )?;
+            format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            // 行の高さを core の見積もり（当たり判定の矩形）に揃える。ベースラインは行の高さの 8 割
+            let line = size * LINE_HEIGHT as f32;
+            format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line, line * 0.8)?;
+            let layout = dwrite.CreateTextLayout(&text, &format, 1.0e6, 1.0e6)?;
+            Ok(Some((layout, origin)))
+        }
+    }
+
+    /// 打っている文字を、変換中の文字に下線を引いてつなげて描き、キャレットを描く。キャレットの矩形
+    /// （描く先の座標）を返す。
+    fn draw_typing(&self, typing: TypingLayer) -> Result<Option<Rect>> {
+        let Shape::Text { at, text, font } = &typing.annotation.shape else {
+            return Ok(None);
+        };
+        let typed = text.encode_utf16().count();
+        let composed = typing.composition.encode_utf16().count();
+        let whole = format!("{text}{}", typing.composition);
+        let Some((layout, origin)) = self.text_layout(*at, &whole, font)? else {
+            return Ok(None);
+        };
+        let caret_at = typed + typing.cursor.min(composed);
+        let (mut x, mut y) = (0.0f32, 0.0f32);
+        let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+        // SAFETY: Pen は BeginDraw と EndDraw の間だけ作られる（draw_annotations）
+        unsafe {
+            if composed > 0 {
+                layout.SetUnderline(
+                    true,
+                    DWRITE_TEXT_RANGE {
+                        startPosition: typed as u32,
+                        length: composed as u32,
+                    },
+                )?;
+            }
+            layout.HitTestTextPosition(caret_at as u32, false, &mut x, &mut y, &mut metrics)?;
+            self.target
+                .DrawTextLayout(origin, &layout, self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            let caret = D2D_RECT_F {
+                left: origin.X + x,
+                top: origin.Y + y,
+                right: origin.X + x + CARET_WIDTH,
+                bottom: origin.Y + y + metrics.height.max(1.0),
+            };
+            self.target.FillRectangle(&caret, self.brush);
+            Ok(Some(Rect::new(
+                caret.left.floor() as i32,
+                caret.top.floor() as i32,
+                caret.right.ceil() as i32,
+                caret.bottom.ceil() as i32,
+            )))
+        }
     }
 }
 
@@ -850,6 +997,26 @@ fn draw_toolbar_button(
                     Y: y,
                 };
                 target.DrawLine(from, to, brush, thick, None);
+            }
+            Button::FontSize(size) => {
+                // 文字の大きさは「A」の高さで見せる（いちばん大きい 32 で枠いっぱい。小さくても読める高さは残す）
+                let h = (size as f32 / 32.0).clamp(0.3, 1.0);
+                let (bottom, top) = (0.5 + h / 2.0, 0.5 - h / 2.0);
+                let half = h * 0.4;
+                lines(
+                    &[(0.5 - half, bottom), (0.5, top), (0.5 + half, bottom)],
+                    false,
+                    plain,
+                    stroke,
+                )?;
+                let bar = bottom - h * 0.38;
+                let bar_half = half * 0.62;
+                lines(
+                    &[(0.5 - bar_half, bar), (0.5 + bar_half, bar)],
+                    false,
+                    plain,
+                    stroke,
+                )?;
             }
             Button::Undo | Button::Redo => {
                 // 曲がった矢印: 元に戻すは左へ、やり直すは右へ戻ってくる（左右を映した形）

@@ -10,8 +10,8 @@
 //!
 //! 表示と保存・コピーは、どちらも `View`（元の画像の画素 → 描く先の座標）を通して同じ描画処理で描く。
 //!
-//! 道具は矩形・楕円・矢印・線・フリーハンド（`Tool`）で、編集モードの間は数字キーで選ぶ（`Tool::from_key`。
-//! 5 は文字のために空けてある）。`Shift` を押しながら描くと、矩形は正方形、楕円は円、線と矢印は 45° 刻みに
+//! 道具は矩形・楕円・矢印・線・文字・フリーハンド（`Tool`）で、編集モードの間は数字キーで選ぶ
+//! （`Tool::from_key`）。`Shift` を押しながら描くと、矩形は正方形、楕円は円、線と矢印は 45° 刻みに
 //! なる（`Draft::end`）。道具を足すときは `Tool` と `Shape` に行を足し、`Draft::shape` と番号の表を足す。
 //!
 //! 選択の道具（`Tool::Select`、`V`）では、クリックでいちばん上の書き込みを 1 つ選ぶ（`Annotation::hits`。
@@ -22,6 +22,14 @@
 //! 履歴（元に戻す / やり直す）は `Annotations` が書き込みと一緒に持つ（`mode` の外なので、モードを抜けても、
 //! ごみ箱から戻しても残る）。編集モードの間、`Ctrl+Z` で元に戻し、`Ctrl+Y` か `Ctrl+Shift+Z` でやり直す。
 //! 元に戻す・やり直すと選択は外れる。新しい変更を積むと、やり直しの履歴は消える。
+//!
+//! 文字の道具（`Tool::Text`）では、クリックした画素を左上にして文字を打つ（`Typing`）。打っている間の文字は
+//! `EditInput::Char` で 1 文字ずつ受け（日本語入力の確定した文字も `app` がここに渡す。変換中の文字は `app` が
+//! 持って描くだけ）、`Enter` で改行、`Backspace` で 1 文字消す。打っている所の外のクリック、`Esc`、道具の
+//! 切り替え、モードを抜けるときに確定して書き込みにする（空なら何も残さない）。描いた文字はダブルクリック
+//! （`EditInput::DoubleClick`）で打ち直せる。足すのも打ち直すのも、確定したときに履歴の 1 件になる。
+//! 文字は書いたときの書体と大きさ（`Font`）を持つ。文字の大きさと当たり判定の矩形は書体を知らずに見積もる
+//! （`text_bounds`）ので、実際に描いた文字の大きさとは少しずれる。
 
 pub mod toolbar;
 
@@ -37,8 +45,8 @@ pub struct Style {
     pub width: u32,
 }
 
-impl From<AnnotationDefaults> for Style {
-    fn from(defaults: AnnotationDefaults) -> Style {
+impl From<&AnnotationDefaults> for Style {
+    fn from(defaults: &AnnotationDefaults) -> Style {
         Style {
             color: defaults.color,
             width: defaults.width,
@@ -48,7 +56,31 @@ impl From<AnnotationDefaults> for Style {
 
 impl Default for Style {
     fn default() -> Style {
-        Style::from(AnnotationDefaults::default())
+        Style::from(&AnnotationDefaults::default())
+    }
+}
+
+/// 文字の書き込みの書体と大きさ。書き込みは書いたときのものを持つ（設定を変えても変わらない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Font {
+    /// 書体の名前。入っていなければ、描くときに DirectWrite が代わりの書体で描く。
+    pub family: String,
+    /// 大きさ（元の画像の画素）。拡大縮小すると表示も一緒に大きく・小さくなる。
+    pub size: u32,
+}
+
+impl From<&AnnotationDefaults> for Font {
+    fn from(defaults: &AnnotationDefaults) -> Font {
+        Font {
+            family: defaults.font.clone(),
+            size: defaults.font_size,
+        }
+    }
+}
+
+impl Default for Font {
+    fn default() -> Font {
+        Font::from(&AnnotationDefaults::default())
     }
 }
 
@@ -65,6 +97,9 @@ pub enum Shape {
     Line { from: Point, to: Point },
     /// フリーハンド。通った点（2 つ以上）を順に線で結ぶ。滑らかにはせず、点を間引くだけ（`FREEHAND_STEP`）。
     Freehand { points: Vec<Point> },
+    /// 文字。`at` の画素の左上を文字の左上にして、`text`（`\n` で改行）を背景なし・折り返しなしで書く。
+    /// 色は `Style::color` で、太さは使わない。
+    Text { at: Point, text: String, font: Font },
 }
 
 impl Shape {
@@ -80,8 +115,57 @@ impl Shape {
                 shift(to);
             }
             Shape::Freehand { points } => points.iter_mut().for_each(shift),
+            Shape::Text { at, .. } => shift(at),
         }
     }
+}
+
+/// 文字が占める矩形の見積もり（元の画像の画素）。左上は `at` で、幅は最も長い行（全角の文字は大きさと同じ、
+/// ほかは `NARROW_CHAR` 倍）、高さは行の数 × `LINE_HEIGHT` 倍。空の文字でも 1 行分の高さと少しの幅を持つ。
+pub fn text_bounds(at: Point, text: &str, size: u32) -> Rect {
+    let size = f64::from(size);
+    let width = text
+        .split('\n')
+        .map(|line| {
+            line.chars()
+                .map(|c| if is_wide(c) { size } else { size * NARROW_CHAR })
+                .sum::<f64>()
+        })
+        .fold(size / 2.0, f64::max);
+    let lines = text.split('\n').count() as f64;
+    Rect::new(
+        at.x,
+        at.y,
+        at.x.saturating_add(width.ceil() as i32),
+        at.y.saturating_add((lines * size * LINE_HEIGHT).ceil() as i32),
+    )
+}
+
+/// 半角の文字の幅（文字の大きさに対する割合）の見積もり。
+const NARROW_CHAR: f64 = 0.55;
+
+/// 行の高さ（文字の大きさに対する割合）の見積もり。
+pub const LINE_HEIGHT: f64 = 1.35;
+
+/// 全角（東アジアの幅が広い文字）か。CJK・かな・ハングル・全角形・絵文字のおおよその範囲。
+fn is_wide(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x3FFFD
+    )
 }
 
 /// 1 つの書き込み。
@@ -93,8 +177,13 @@ pub struct Annotation {
 
 impl Annotation {
     /// 元の画像の画素 `at` が、この書き込みの線の上（太さの半分と `slop` 画素の内）にあるか。矩形と楕円は
-    /// 縁だけで、中は当たらない（囲んだものの上の書き込みを選べるように）。
+    /// 縁だけで、中は当たらない（囲んだものの上の書き込みを選べるように）。文字は線ではないので、見積もった
+    /// 矩形（`bounds`）を `slop` 広げた中ならどこでも当たる。
     pub fn hits(&self, at: Point, slop: u32) -> bool {
+        if let Shape::Text { .. } = self.shape {
+            let slop = i32::try_from(slop).unwrap_or(i32::MAX);
+            return self.bounds().inflate(slop).contains(at);
+        }
         let reach = f64::from(self.style.width) / 2.0 + f64::from(slop);
         let at = (f64::from(at.x), f64::from(at.y));
         let near = |points: &[(f64, f64)], closed: bool| {
@@ -132,6 +221,8 @@ impl Annotation {
                 let points: Vec<_> = points.iter().map(|&p| xy(p)).collect();
                 near(&points, false)
             }
+            // 文字は上で見た
+            Shape::Text { .. } => false,
         }
     }
 }
@@ -150,7 +241,7 @@ fn in_triangle(p: (f64, f64), t: [(f64, f64); 3]) -> bool {
 
 impl Annotation {
     /// 外接矩形（元の画像の画素。選択の印を描く場所）。辺は端の画素の中心から太さの半分（切り上げ）だけ外で、
-    /// 矢印は頭の三角形も含む。
+    /// 矢印は頭の三角形も含む。文字は見積もった矩形（`text_bounds`）。
     pub fn bounds(&self) -> Rect {
         let half = self.style.width.div_ceil(2) as i32;
         let points: Vec<Point> = match &self.shape {
@@ -159,6 +250,7 @@ impl Annotation {
             | Shape::Arrow { from, to }
             | Shape::Line { from, to } => vec![*from, *to],
             Shape::Freehand { points } => points.clone(),
+            Shape::Text { at, text, font } => return text_bounds(*at, text, font.size),
         };
         let mut bounds = Rect::new(i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         let mut cover = |x: f64, y: f64, pad: i32| {
@@ -383,6 +475,8 @@ pub enum Tool {
     Ellipse,
     Arrow,
     Line,
+    /// 文字。クリックした所から文字を打つ。
+    Text,
     Freehand,
 }
 
@@ -404,7 +498,7 @@ impl Tool {
             2 => Some(Tool::Ellipse),
             3 => Some(Tool::Arrow),
             4 => Some(Tool::Line),
-            // 5 は文字（#87）
+            5 => Some(Tool::Text),
             6 => Some(Tool::Freehand),
             _ => None,
         }
@@ -462,7 +556,7 @@ impl Draft {
             Tool::Ellipse => Some(Shape::Ellipse { from, to }),
             Tool::Arrow => Some(Shape::Arrow { from, to }),
             Tool::Line => Some(Shape::Line { from, to }),
-            Tool::Select | Tool::Freehand => None,
+            Tool::Select | Tool::Text | Tool::Freehand => None,
         }
     }
 
@@ -478,7 +572,7 @@ impl Draft {
                 let side = dx.abs().max(dy.abs());
                 Point::new(self.from.x + side * sign(dx), self.from.y + side * sign(dy))
             }
-            Tool::Select | Tool::Freehand => self.to,
+            Tool::Select | Tool::Text | Tool::Freehand => self.to,
             Tool::Arrow | Tool::Line => {
                 let (ax, ay) = (f64::from(dx.abs()), f64::from(dy.abs()));
                 let (dx, dy) = if ay < ax * TAN_22_5 {
@@ -519,8 +613,38 @@ pub struct EditState {
     grab: Option<Grab>,
     /// 当たり判定を線の太さの外に広げる画素数（`Annotation::hits` の `slop`）。
     hit_slop: u32,
+    /// これから打つ文字の書体と大きさ。入ったときは設定の `[annotation]` の値。
+    pub font: Font,
+    /// 打っている文字（文字の道具でクリックしてから確定するまで）。
+    typing: Option<Typing>,
     /// 見えている範囲（元の画像の画素）。外にある書き込みは選ばない。None なら絞らない。
     visible: Option<Rect>,
+}
+
+/// 打っている文字。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Typing {
+    /// 文字の左上の画素。
+    at: Point,
+    /// 打った文字（確定したもの。日本語入力の変換中の文字は含まない）。
+    text: String,
+    font: Font,
+    style: Style,
+    /// 打ち直している書き込みの位置。新しく打つなら None。
+    retyping: Option<usize>,
+}
+
+impl Typing {
+    fn annotation(&self) -> Annotation {
+        Annotation {
+            shape: Shape::Text {
+                at: self.at,
+                text: self.text.clone(),
+                font: self.font.clone(),
+            },
+            style: self.style,
+        }
+    }
 }
 
 /// 選んだ書き込みのドラッグ。
@@ -541,8 +665,25 @@ impl EditState {
             selected: None,
             grab: None,
             hit_slop: 0,
+            font: Font::default(),
+            typing: None,
             visible: None,
         }
+    }
+
+    /// 文字を打っている間か。
+    pub fn is_typing(&self) -> bool {
+        self.typing.is_some()
+    }
+
+    /// 打っている文字（打った分だけ。空のこともある）。描くのと、日本語入力の窓の場所を決めるのに使う。
+    pub fn typing(&self) -> Option<Annotation> {
+        self.typing.as_ref().map(Typing::annotation)
+    }
+
+    /// 打ち直している書き込みの位置（`Annotations::items` の添え字）。打ち終えるまで、元のものは描かない。
+    pub fn retyping(&self) -> Option<usize> {
+        self.typing.as_ref()?.retyping
     }
 
     /// 当たり判定の広さ（元の画像の画素）。`ScrapModel` が表示の倍率から決める（画面での広さを揃えるため）。
@@ -588,7 +729,13 @@ impl EditState {
 
     /// 入力を受けて、`annotations` を変える。座標は元の画像の画素（`ScrapModel::edit_input` が直したもの）。
     pub fn input(&mut self, input: EditInput, annotations: &mut Annotations) -> Vec<EditOutput> {
+        if self.typing.is_some()
+            && let Some(outputs) = self.type_input(input, annotations)
+        {
+            return outputs;
+        }
         match input {
+            EditInput::Press(at) if self.tool == Tool::Text => self.start_typing(at, None),
             EditInput::Press(at) if self.tool == Tool::Select => self.select_at(at, annotations),
             EditInput::Press(at) => {
                 self.draft = Some(Draft::new(at));
@@ -609,6 +756,11 @@ impl EditState {
                 self.commit(annotations)
             }
             EditInput::Pick(pick) => self.pick(pick, annotations),
+            EditInput::Char(_) => vec![],
+            EditInput::DoubleClick(at) => match self.text_at(at, annotations) {
+                Some(index) => self.retype(index, annotations),
+                None => self.input(EditInput::Press(at), annotations),
+            },
             EditInput::Key(chord) if chord == ESCAPE => {
                 let mut outputs = self.commit(annotations);
                 outputs.push(EditOutput::Left);
@@ -643,6 +795,141 @@ impl EditState {
         }
     }
 
+    /// 文字を打っている間の入力。打つ文字への入力ならその結果を、ほかの入力と同じに扱うなら None を返す
+    /// （打っている文字は先に確定してある）。
+    fn type_input(
+        &mut self,
+        input: EditInput,
+        annotations: &mut Annotations,
+    ) -> Option<Vec<EditOutput>> {
+        let typing = self.typing.as_mut()?;
+        let inside = |at: Point, slop: u32| typing.annotation().hits(at, slop);
+        let outputs = match input {
+            EditInput::Char(c) if c.is_control() => vec![],
+            EditInput::Char(c) => {
+                typing.text.push(c);
+                vec![EditOutput::Redraw]
+            }
+            EditInput::Key(chord) if chord == ESCAPE => self.finish_typing(annotations),
+            EditInput::Key(chord) if ENTER.contains(&chord) => {
+                typing.text.push('\n');
+                vec![EditOutput::Redraw]
+            }
+            EditInput::Key(chord) if chord == BACKSPACE => match typing.text.pop() {
+                Some(_) => vec![EditOutput::Redraw],
+                None => vec![],
+            },
+            // 元に戻す・やり直すは、確定してから（描きかけと同じ）
+            EditInput::Key(chord) if chord == UNDO || REDO.contains(&chord) => return None,
+            // ほかのキー（数字キーの道具、矢印、Delete など）は、打つ間は受けない
+            EditInput::Key(_) => vec![],
+            EditInput::Press(at) if inside(at, self.hit_slop) => vec![],
+            // 打った文字の上のダブルクリックは、単語を選んだりせず何もしない
+            EditInput::DoubleClick(at) if !typing.text.is_empty() && inside(at, self.hit_slop) => {
+                vec![]
+            }
+            // 外のクリックは確定だけ（そこから描いたり選んだりはしない）
+            EditInput::Press(_) => self.finish_typing(annotations),
+            EditInput::Pick(Pick::Color(color)) => {
+                typing.style.color = color;
+                self.style.color = color;
+                vec![EditOutput::Redraw, EditOutput::Picked(Pick::Color(color))]
+            }
+            EditInput::Pick(Pick::FontSize(size)) => {
+                typing.font.size = size;
+                self.font.size = size;
+                vec![EditOutput::Redraw, EditOutput::Picked(Pick::FontSize(size))]
+            }
+            EditInput::Move { .. } | EditInput::Release | EditInput::Pick(Pick::Width(_)) => {
+                return None;
+            }
+            EditInput::DoubleClick(_)
+            | EditInput::Pick(Pick::Tool(_))
+            | EditInput::Delete
+            | EditInput::Undo
+            | EditInput::Redo
+            | EditInput::Leave => {
+                let mut outputs = self.finish_typing(annotations);
+                outputs.extend(self.input(input, annotations));
+                outputs
+            }
+        };
+        Some(outputs)
+    }
+
+    /// `at` から文字を打ち始める。打ち直すなら `retyping` に元の書き込みの位置とその書き込みを渡す。
+    fn start_typing(
+        &mut self,
+        at: Point,
+        retyping: Option<(usize, &Annotation)>,
+    ) -> Vec<EditOutput> {
+        self.draft = None;
+        self.grab = None;
+        self.selected = None;
+        self.typing = Some(match retyping {
+            Some((
+                index,
+                Annotation {
+                    shape: Shape::Text { at, text, font },
+                    style,
+                },
+            )) => Typing {
+                at: *at,
+                text: text.clone(),
+                font: font.clone(),
+                style: *style,
+                retyping: Some(index),
+            },
+            _ => Typing {
+                at,
+                text: String::new(),
+                font: self.font.clone(),
+                style: self.style,
+                retyping: None,
+            },
+        });
+        vec![EditOutput::TypingStarted, EditOutput::Redraw]
+    }
+
+    /// `index` の文字の書き込みを打ち直す。描きかけは先に書き込みにする。
+    fn retype(&mut self, index: usize, annotations: &mut Annotations) -> Vec<EditOutput> {
+        self.commit(annotations);
+        let Some(annotation) = annotations.items().get(index) else {
+            return vec![];
+        };
+        let at = match &annotation.shape {
+            Shape::Text { at, .. } => *at,
+            _ => return vec![],
+        };
+        self.start_typing(at, Some((index, annotation)))
+    }
+
+    /// `at` にある文字の書き込みのうち、いちばん上のもの。
+    fn text_at(&self, at: Point, annotations: &Annotations) -> Option<usize> {
+        annotations.items().iter().rposition(|a| {
+            matches!(a.shape, Shape::Text { .. }) && self.is_visible(a) && a.hits(at, self.hit_slop)
+        })
+    }
+
+    /// 打っている文字を確定する。空（空白だけ）なら何も残さず、打ち直していたなら元のものを消す。
+    fn finish_typing(&mut self, annotations: &mut Annotations) -> Vec<EditOutput> {
+        let Some(typing) = self.typing.take() else {
+            return vec![];
+        };
+        let empty = typing.text.trim().is_empty();
+        match (typing.retyping, empty) {
+            (None, true) => {}
+            (None, false) => annotations.push(typing.annotation()),
+            (Some(index), true) => {
+                annotations.remove(index);
+            }
+            (Some(index), false) => {
+                annotations.replace(index, typing.annotation());
+            }
+        }
+        vec![EditOutput::Redraw, EditOutput::TypingEnded]
+    }
+
     /// 道具・色・太さを選ぶ。道具を替えるときは、描きかけがあれば前の道具のまま書き込みにしてから替える。
     fn pick(&mut self, pick: Pick, annotations: &mut Annotations) -> Vec<EditOutput> {
         let mut outputs = vec![];
@@ -664,11 +951,46 @@ impl EditState {
             }
             Pick::Width(width) => {
                 self.style.width = width;
-                outputs = self.restyle_selected(annotations, |style| style.width = width);
+                // 文字は太さを使わないので、選んだ文字の書き込みは変えない（履歴も積まない）
+                if !self.selected_is_text(annotations) {
+                    outputs = self.restyle_selected(annotations, |style| style.width = width);
+                }
+            }
+            Pick::FontSize(size) => {
+                self.font.size = size;
+                outputs = self.resize_selected_text(size, annotations);
             }
         }
         outputs.push(EditOutput::Picked(pick));
         outputs
+    }
+
+    fn selected_is_text(&self, annotations: &Annotations) -> bool {
+        self.selected
+            .and_then(|index| annotations.items().get(index))
+            .is_some_and(|a| matches!(a.shape, Shape::Text { .. }))
+    }
+
+    /// 選んだ文字の書き込みの大きさを `size` にする。選んでいないか、文字でないか、もう同じなら何もしない。
+    fn resize_selected_text(
+        &mut self,
+        size: u32,
+        annotations: &mut Annotations,
+    ) -> Vec<EditOutput> {
+        let Some(index) = self.selected else {
+            return vec![];
+        };
+        let Some(mut after) = annotations.items().get(index).cloned() else {
+            return vec![];
+        };
+        let Shape::Text { font, .. } = &mut after.shape else {
+            return vec![];
+        };
+        font.size = size;
+        if !annotations.replace(index, after) {
+            return vec![];
+        }
+        vec![EditOutput::Redraw]
     }
 
     /// `at` にある書き込みのうち、いちばん上のものを選ぶ。何もなければ選択を外す。
@@ -823,15 +1145,24 @@ const REDO: [Chord; 2] = [
     Chord::plain(Key::known(0x5A)).ctrl().shift(),
 ];
 
-/// `Esc`。編集モードを抜ける。
+/// `Esc`。編集モードを抜ける（文字を打っている間は確定するだけ）。
 const ESCAPE: Chord = Chord::plain(Key::known(0x1B));
+
+/// `Enter` と `Shift+Enter`。文字を打っている間は改行する。
+const ENTER: [Chord; 2] = [
+    Chord::plain(Key::known(0x0D)),
+    Chord::plain(Key::known(0x0D)).shift(),
+];
 
 /// 書き込みの編集モードへの入力。座標は、`ScrapModel::edit_input` に渡すときはスクリーン座標（物理ピクセル）、
 /// `EditState::input` が受けるときは元の画像の画素。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditInput {
-    /// 左ボタンを押した（ダブルクリックの 2 回目も）。
+    /// 左ボタンを押した。
     Press(Point),
+    /// ダブルクリックした（2 回目の押下。1 回目は `Press`）。文字の書き込みの上なら打ち直し、ほかは `Press`
+    /// と同じ。
+    DoubleClick(Point),
     /// カーソルが動いた。押している間だけ描きかけを変える。`shift` は `Shift` を押しているか（図形の制約）。
     Move { at: Point, shift: bool },
     /// 左ボタンを離した、またはマウスを捕まえていられなくなった。描きかけを書き込みにする。
@@ -841,6 +1172,8 @@ pub enum EditInput {
     Key(Chord),
     /// ツールバーで道具・色・太さを選んだ（数字キーで道具を選ぶのは `Key`）。
     Pick(Pick),
+    /// 文字を打った（`WM_CHAR` と、日本語入力で確定した文字）。打っている間だけ受け、制御文字は捨てる。
+    Char(char),
     /// ツールバーの削除を押した（`Delete` と `Backspace` は `Key`）。選んだ書き込みを消す。
     Delete,
     /// ツールバーの元に戻すを押した（`Ctrl+Z` は `Key`）。
@@ -856,6 +1189,7 @@ impl EditInput {
     pub fn map_point(self, f: impl FnOnce(Point) -> Point) -> EditInput {
         match self {
             EditInput::Press(at) => EditInput::Press(f(at)),
+            EditInput::DoubleClick(at) => EditInput::DoubleClick(f(at)),
             EditInput::Move { at, shift } => EditInput::Move { at: f(at), shift },
             other => other,
         }
@@ -871,6 +1205,10 @@ pub enum EditOutput {
     ToolChanged,
     /// 編集モードを抜けた。
     Left,
+    /// 文字を打ち始めた（日本語入力を使えるようにする）。
+    TypingStarted,
+    /// 文字を打ち終えた（日本語入力を止め、変換中の文字は捨てる）。
+    TypingEnded,
     /// 道具・色・太さを（ツールバーか数字キーで）選んだ。ツールバーを描き直し、`Carryover::record` で次の
     /// 編集モードに引き継ぐ。
     Picked(Pick),
@@ -882,6 +1220,8 @@ pub enum Pick {
     Tool(Tool),
     Color(Rgb),
     Width(u32),
+    /// 文字の大きさ（元の画像の画素）。
+    FontSize(u32),
 }
 
 /// 前の編集モードで選んだ道具・色・太さ。アプリが動いている間、すべてのスクラップで引き継ぐ（設定ファイルには
@@ -892,16 +1232,27 @@ pub struct Carryover {
     tool: Tool,
     color: Option<Rgb>,
     width: Option<u32>,
+    font_size: Option<u32>,
 }
 
 impl Carryover {
-    /// 編集モードの始まりの状態。`defaults` は設定の `[annotation]`。
+    /// 編集モードの始まりの状態。`defaults` は設定の `[annotation]`（文字は既定の書体）。
     pub fn start(&self, defaults: Style) -> EditState {
+        self.start_with(defaults, Font::default())
+    }
+
+    /// 編集モードの始まりの状態。`defaults` と `font` は設定の `[annotation]`。書体は引き継がず、いつも設定の
+    /// もの（ツールバーで選べるのは大きさだけ）。
+    pub fn start_with(&self, defaults: Style, font: Font) -> EditState {
         let mut state = EditState::new(Style {
             color: self.color.unwrap_or(defaults.color),
             width: self.width.unwrap_or(defaults.width),
         });
         state.tool = self.tool;
+        state.font = Font {
+            size: self.font_size.unwrap_or(font.size),
+            ..font
+        };
         state
     }
 
@@ -914,6 +1265,7 @@ impl Carryover {
                 EditOutput::Picked(Pick::Tool(tool)) => self.tool = tool,
                 EditOutput::Picked(Pick::Color(color)) => self.color = Some(color),
                 EditOutput::Picked(Pick::Width(width)) => self.width = Some(width),
+                EditOutput::Picked(Pick::FontSize(size)) => self.font_size = Some(size),
                 _ => {}
             }
         }
@@ -1195,11 +1547,10 @@ mod tests {
     }
 
     #[test]
-    fn the_fifth_number_key_is_kept_for_text_and_other_keys_are_not_taken() {
+    fn number_keys_past_six_and_modified_number_keys_are_not_taken() {
         let mut state = EditState::new(BLUE);
         let mut annotations = Annotations::default();
         state.input(digit(3), &mut annotations);
-        assert_eq!(state.input(digit(5), &mut annotations), vec![]);
         assert_eq!(state.input(digit(7), &mut annotations), vec![]);
         // 修飾キーつきの数字は道具を選ばない
         let ctrl_1 = EditInput::Key(Chord::plain(Key::known(0x31)).ctrl());
@@ -1981,5 +2332,321 @@ mod tests {
             vec![EditOutput::Redraw]
         );
         assert_eq!(annotations.items().len(), 1);
+    }
+
+    fn chars(state: &mut EditState, annotations: &mut Annotations, text: &str) {
+        for c in text.chars() {
+            state.input(EditInput::Char(c), annotations);
+        }
+    }
+
+    fn text(at: Point, text: &str, size: u32) -> Shape {
+        Shape::Text {
+            at,
+            text: text.to_owned(),
+            font: Font {
+                family: "Yu Gothic UI".to_owned(),
+                size,
+            },
+        }
+    }
+
+    const ENTER: u16 = 0x0D;
+    const ESC: u16 = 0x1B;
+
+    #[test]
+    fn the_fifth_number_key_picks_text_and_a_click_types_from_that_pixel_until_a_click_outside() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        assert_eq!(state.tool, Tool::Text);
+        assert_eq!(
+            click(&mut state, &mut annotations, p(10, 20)),
+            vec![EditOutput::TypingStarted, EditOutput::Redraw]
+        );
+        assert!(state.is_typing());
+        assert_eq!(
+            state.input(EditInput::Char('a'), &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        chars(&mut state, &mut annotations, "あい");
+        // 打っている間は書き込みにならず、打っているものとして描く
+        assert!(annotations.is_empty());
+        assert_eq!(
+            state.typing().map(|a| a.shape),
+            Some(text(p(10, 20), "aあい", 16))
+        );
+        // 打っている所の中のクリックでは確定しない
+        assert_eq!(click(&mut state, &mut annotations, p(12, 25)), vec![]);
+        assert_eq!(
+            click(&mut state, &mut annotations, p(300, 300)),
+            vec![EditOutput::Redraw, EditOutput::TypingEnded]
+        );
+        assert!(!state.is_typing());
+        assert_eq!(
+            annotations.items(),
+            &[Annotation {
+                shape: text(p(10, 20), "aあい", 16),
+                style: BLUE,
+            }]
+        );
+        // 足したのは履歴の 1 件
+        state.input(undo(), &mut annotations);
+        assert!(annotations.is_empty());
+        assert!(!annotations.can_undo());
+    }
+
+    #[test]
+    fn enter_breaks_the_line_backspace_takes_back_a_char_and_control_chars_are_ignored() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(0, 0));
+        chars(&mut state, &mut annotations, "ab");
+        assert_eq!(
+            state.input(key(ENTER), &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        // Enter と Backspace の WM_CHAR（\r と \x08）は文字にしない
+        chars(&mut state, &mut annotations, "\r\x08\tcd");
+        assert_eq!(
+            state.input(key(0x08), &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(
+            state.typing().map(|a| a.shape),
+            Some(text(p(0, 0), "ab\nc", 16))
+        );
+        // 打つ間は数字キーや V で道具を替えず、Delete や矢印も受けない
+        for vk in [0x31, 0x56, 0x2E, 0x25] {
+            assert_eq!(state.input(key(vk), &mut annotations), vec![], "{vk:#x}");
+        }
+        assert_eq!(state.tool, Tool::Text);
+        assert!(state.is_typing());
+    }
+
+    #[test]
+    fn esc_while_typing_only_finishes_the_text_and_the_next_esc_leaves() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(5, 5));
+        chars(&mut state, &mut annotations, "x");
+        assert_eq!(
+            state.input(key(ESC), &mut annotations),
+            vec![EditOutput::Redraw, EditOutput::TypingEnded]
+        );
+        assert_eq!(annotations.items().len(), 1);
+        assert_eq!(
+            state.input(key(ESC), &mut annotations),
+            vec![EditOutput::Left]
+        );
+    }
+
+    #[test]
+    fn a_text_with_nothing_but_spaces_leaves_nothing() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(5, 5));
+        click(&mut state, &mut annotations, p(300, 300));
+        click(&mut state, &mut annotations, p(5, 5));
+        chars(&mut state, &mut annotations, " ");
+        state.input(key(ENTER), &mut annotations);
+        state.input(key(ESC), &mut annotations);
+        assert!(annotations.is_empty());
+        assert!(!annotations.can_undo());
+    }
+
+    #[test]
+    fn leaving_or_picking_a_tool_while_typing_keeps_the_text() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(5, 5));
+        chars(&mut state, &mut annotations, "a");
+        assert_eq!(
+            state.input(EditInput::Pick(Pick::Tool(Tool::Rect)), &mut annotations),
+            vec![
+                EditOutput::Redraw,
+                EditOutput::TypingEnded,
+                EditOutput::ToolChanged,
+                EditOutput::Picked(Pick::Tool(Tool::Rect))
+            ]
+        );
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(50, 50));
+        chars(&mut state, &mut annotations, "b");
+        assert_eq!(
+            state.input(EditInput::Leave, &mut annotations),
+            vec![
+                EditOutput::Redraw,
+                EditOutput::TypingEnded,
+                EditOutput::Left
+            ]
+        );
+        assert_eq!(
+            shapes(&annotations),
+            vec![text(p(5, 5), "a", 16), text(p(50, 50), "b", 16)]
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_a_text_types_it_again_and_the_change_is_one_entry() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(10, 10));
+        chars(&mut state, &mut annotations, "abc");
+        state.input(key(ESC), &mut annotations);
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(0, 100),
+            p(50, 100),
+        );
+        state.input(key(V), &mut annotations);
+        // ダブルクリックの 1 回目で選び、2 回目で打ち直しになる
+        click(&mut state, &mut annotations, p(12, 15));
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(
+            state.input(EditInput::DoubleClick(p(12, 15)), &mut annotations),
+            vec![EditOutput::TypingStarted, EditOutput::Redraw]
+        );
+        assert_eq!(state.selected(), None);
+        // 打ち直している書き込みは、打っているものとして描く（元のものは描かない）
+        assert_eq!(state.retyping(), Some(0));
+        chars(&mut state, &mut annotations, "d");
+        assert_eq!(
+            state.typing().map(|a| a.shape),
+            Some(text(p(10, 10), "abcd", 16))
+        );
+        state.input(EditInput::Release, &mut annotations);
+        state.input(key(ESC), &mut annotations);
+        assert_eq!(state.retyping(), None);
+        assert_eq!(
+            shapes(&annotations),
+            vec![
+                text(p(10, 10), "abcd", 16),
+                Shape::Line {
+                    from: p(0, 100),
+                    to: p(50, 100),
+                },
+            ]
+        );
+        state.input(undo(), &mut annotations);
+        assert_eq!(annotations.items()[0].shape, text(p(10, 10), "abc", 16));
+        // 線の上のダブルクリックは打ち直しにならない（選択の道具のクリックと同じ）
+        state.input(EditInput::DoubleClick(p(25, 100)), &mut annotations);
+        assert!(!state.is_typing());
+        assert_eq!(state.selected(), Some(1));
+    }
+
+    #[test]
+    fn a_text_typed_again_down_to_nothing_is_removed_and_comes_back_with_ctrl_z() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(10, 10));
+        chars(&mut state, &mut annotations, "ab");
+        state.input(key(ESC), &mut annotations);
+        // 文字の道具のままでも、ダブルクリックで打ち直せる（1 回目のクリックの空の文字は残らない）
+        click(&mut state, &mut annotations, p(11, 12));
+        state.input(EditInput::DoubleClick(p(11, 12)), &mut annotations);
+        assert_eq!(state.retyping(), Some(0));
+        state.input(key(0x08), &mut annotations);
+        state.input(key(0x08), &mut annotations);
+        click(&mut state, &mut annotations, p(300, 300));
+        assert!(annotations.is_empty());
+        state.input(undo(), &mut annotations);
+        assert_eq!(shapes(&annotations), vec![text(p(10, 10), "ab", 16)]);
+        state.input(undo(), &mut annotations);
+        assert!(annotations.is_empty());
+    }
+
+    #[test]
+    fn the_font_size_applies_to_the_text_being_typed_or_selected_and_keeps_the_text_as_drawn() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(10, 10));
+        chars(&mut state, &mut annotations, "a");
+        assert_eq!(
+            state.input(EditInput::Pick(Pick::FontSize(32)), &mut annotations),
+            vec![EditOutput::Redraw, EditOutput::Picked(Pick::FontSize(32))]
+        );
+        state.input(EditInput::Pick(Pick::Color(Rgb(0, 0, 0))), &mut annotations);
+        state.input(key(ESC), &mut annotations);
+        assert_eq!(state.font.size, 32);
+        assert_eq!(
+            annotations.items(),
+            &[Annotation {
+                shape: text(p(10, 10), "a", 32),
+                style: Style {
+                    color: Rgb(0, 0, 0),
+                    width: BLUE.width,
+                },
+            }]
+        );
+        // 選んだ文字の大きさを変えるのは履歴の 1 件。太さは文字には効かない
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(12, 12));
+        assert_eq!(state.selected(), Some(0));
+        state.input(EditInput::Pick(Pick::FontSize(12)), &mut annotations);
+        assert_eq!(annotations.items()[0].shape, text(p(10, 10), "a", 12));
+        assert_eq!(
+            state.input(EditInput::Pick(Pick::Width(8)), &mut annotations),
+            vec![EditOutput::Picked(Pick::Width(8))]
+        );
+        state.input(undo(), &mut annotations);
+        assert_eq!(annotations.items()[0].shape, text(p(10, 10), "a", 32));
+    }
+
+    #[test]
+    fn a_text_is_hit_anywhere_in_its_box_which_grows_with_lines_and_the_size() {
+        let a = Annotation {
+            shape: text(p(10, 20), "ab\nあいう", 20),
+            style: BLUE,
+        };
+        // 全角は大きさと同じ幅、半角はその半分ほど。行の高さは大きさより少し高い
+        let bounds = a.bounds();
+        assert_eq!((bounds.left, bounds.top, bounds.right), (10, 20, 70));
+        assert!(
+            (20 + 2 * 20..=20 + 2 * 30).contains(&bounds.bottom),
+            "{bounds:?}"
+        );
+        assert!(a.hits(p(11, 21), 0));
+        assert!(a.hits(p(65, bounds.bottom - 1), 0));
+        assert!(!a.hits(p(71, 25), 0));
+        assert!(a.hits(p(71, 25), 2));
+        assert!(!a.hits(p(10, 19), 0));
+    }
+
+    #[test]
+    fn the_next_edit_mode_starts_with_the_last_font_size_and_the_font_from_the_settings() {
+        let mut carryover = Carryover::default();
+        let font = Font {
+            family: "Meiryo".to_owned(),
+            size: 16,
+        };
+        let mut state = carryover.start_with(BLUE, font.clone());
+        assert_eq!(state.font, font);
+        let mut annotations = Annotations::default();
+        carryover.record(&state.input(EditInput::Pick(Pick::FontSize(24)), &mut annotations));
+        let next = carryover.start_with(
+            BLUE,
+            Font {
+                family: "Yu Mincho".to_owned(),
+                size: 16,
+            },
+        );
+        assert_eq!(
+            next.font,
+            Font {
+                family: "Yu Mincho".to_owned(),
+                size: 24,
+            }
+        );
     }
 }

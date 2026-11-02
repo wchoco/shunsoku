@@ -14,6 +14,8 @@ mod hdr;
 #[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
+mod ime;
+#[cfg(windows)]
 mod logger;
 #[cfg(windows)]
 mod menu;
