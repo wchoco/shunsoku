@@ -2024,6 +2024,7 @@ fn finish_selection() {
     let Some(rect) = selection.rect() else {
         drop(overlay);
         end_capture();
+        reply_cancelled(request.reply);
         return;
     };
     let fragments: Vec<Fragment> = selection
@@ -2048,6 +2049,13 @@ fn finish_selection() {
         fragments.len()
     );
 
+    if request.reply.is_some() {
+        output_cli(request, image);
+        drop(overlay);
+        end_capture();
+        log::info!("overlay closed");
+        return;
+    }
     // ウィンドウを作るとメッセージが届くので、App を借りずに作る。前面にする権利を失わないよう、
     // スクラップを前面にしてから範囲選択の画面を閉じる
     let scrap = if request.outputs.scrap {
@@ -2300,14 +2308,27 @@ fn capture_rect(monitor: Option<u32>, rect: Rect) {
         area.top,
         started.elapsed().as_secs_f64() * 1000.0
     );
-    // `from_cli` の依頼は保存だけ。スクラップ・コピーなどほかの出力は #74 で足す
-    if request.outputs.save.is_none() {
-        if let Some(to) = request.reply {
-            reply(to, Response::Captured { path: None });
+    output_cli(request, image);
+}
+
+/// CLI の依頼で撮った画像を出力して、CLI に応答する。保存の結果は `on_saved` が返す。
+/// `from_cli` の依頼は保存だけ。スクラップ・コピーなどほかの出力は #74 で足す。
+fn output_cli(request: CaptureRequest, image: Image) {
+    let resolved = match &request.outputs.save {
+        None => {
+            if let Some(to) = request.reply {
+                reply(to, Response::Captured { path: None });
+            }
+            return;
         }
-        return;
-    }
-    match resolve_default_destination() {
+        Some(SaveTarget::Default) => resolve_default_destination(),
+        Some(SaveTarget::Region {
+            dir,
+            file_name_template,
+            name,
+        }) => resolve_destination(dir.clone(), file_name_template, name),
+    };
+    match resolved {
         Ok(path) => start_save(path, image, save::Overwrite::Deny, None, request.reply),
         Err((dir, reason)) => {
             let mut body = format!("{}\n{reason}", text("capture.failed"));
@@ -2319,6 +2340,15 @@ fn capture_rect(monitor: Option<u32>, rect: Rect) {
             reply_failed(request.reply, &reason);
         }
     }
+}
+
+/// 待っている依頼の、結果を返す先（CLI の依頼だけ）。
+fn waiting_reply() -> Option<ReplyTo> {
+    with_app(|app| match &app.capture {
+        Capture::Waiting(request) => request.reply,
+        _ => None,
+    })
+    .flatten()
 }
 
 /// 待っている依頼を失敗で終える。CLI の依頼なら理由を返す。
@@ -2381,7 +2411,7 @@ fn capture_active_window() {
         return;
     };
     let grabbed = if hwnd.is_invalid() {
-        Err("no active window".to_owned())
+        Err(text("cli.no_active_window").to_owned())
     } else {
         device.map_err(|e| e.to_string()).and_then(|device| {
             crate::window_grab::grab_window(&device, hwnd, cursor).map_err(|e| e.to_string())
@@ -2393,6 +2423,7 @@ fn capture_active_window() {
             log::warn!("could not capture the active window: {e}");
             end_capture();
             notify_user(notify::Level::Error, text("capture.failed"));
+            reply_failed(request.reply, &e);
             return;
         }
     };
@@ -2405,6 +2436,10 @@ fn capture_active_window() {
         started.elapsed().as_secs_f64() * 1000.0
     );
     end_capture();
+    if request.reply.is_some() {
+        output_cli(request, shot.image);
+        return;
+    }
     if !request.outputs.scrap {
         return;
     }
@@ -2445,7 +2480,9 @@ fn open_overlay() {
         Ok(shots) => shots,
         Err(e) => {
             log::warn!("could not grab the screen: {e}");
+            let reply_to = waiting_reply();
             end_capture();
+            reply_failed(reply_to, &e.to_string());
             // 取得のスレッドのパニックはその仕事の失敗として通知する。ほかの撮れないときの通知は M3
             if matches!(e, grab::GrabError::Panicked) {
                 notify_user(
@@ -2468,7 +2505,9 @@ fn open_overlay() {
         }
         Err(e) => {
             log::error!("could not open the overlay: {e}");
+            let reply_to = waiting_reply();
             end_capture();
+            reply_failed(reply_to, &e.to_string());
             return;
         }
     };
@@ -2509,23 +2548,39 @@ fn open_overlay() {
     );
 }
 
-/// 範囲選択の画面を閉じ、依頼を終える。
+/// 範囲選択の画面を閉じ、依頼を終える。CLI の依頼なら、取り消し（終了コード 4）として返す。
 fn close_overlay() {
-    let overlay = with_app(|app| match std::mem::take(&mut app.capture) {
-        Capture::Selecting { overlay, .. } => Some(overlay),
+    let taken = with_app(|app| match std::mem::take(&mut app.capture) {
+        Capture::Selecting {
+            overlay, request, ..
+        } => Some((overlay, request.reply)),
         other => {
             app.capture = other;
             None
         }
     })
     .flatten();
-    let Some(overlay) = overlay else {
+    let Some((overlay, reply_to)) = taken else {
         return;
     };
     // ウィンドウを壊すとメッセージが届くので、App を借りずに閉じる
     drop(overlay);
     end_capture();
+    reply_cancelled(reply_to);
     log::info!("overlay closed");
+}
+
+/// CLI の依頼なら、ユーザーが取り消した（終了コード 4）として返す。
+fn reply_cancelled(to: Option<ReplyTo>) {
+    if let Some(to) = to {
+        reply(
+            to,
+            Response::Failed {
+                kind: ErrorKind::Cancelled,
+                message: text("cli.cancelled").to_owned(),
+            },
+        );
+    }
 }
 
 /// 依頼を終えて、取得に使った GPU のメモリを返す。待たせている CLI の依頼・定型領域キャプチャがあれば進める。
@@ -2722,12 +2777,13 @@ fn capture_region(request: CaptureRequest) {
     .flatten();
     let Some(region) = region else {
         log::warn!("region {name} is no longer in the settings");
-        notify_user(
-            notify::Level::Error,
-            &format!("{}{name}", text("region.gone")),
-        );
+        let message = format!("{}{name}", text("region.gone"));
+        notify_user(notify::Level::Error, &message);
+        reply_failed(request.reply, &message);
         return;
     };
+    // CLI の依頼は、領域の保存先とファイル名テンプレートで保存する（領域の撮影後の動作は見ない）
+    let request = request.clone().with_region_destination(&region);
     let monitors = monitor_ids::list();
     let located = match monitor::locate(&monitors, &region.monitor, region.rect) {
         Ok(located) => located,
@@ -2741,7 +2797,9 @@ fn capture_region(request: CaptureRequest) {
                 monitor::LocateError::MonitorNotFound => "region.monitor_not_found",
                 monitor::LocateError::OutOfBounds => "region.out_of_bounds",
             };
-            notify_user(notify::Level::Error, &format!("{}{name}", text(key)));
+            let message = format!("{}{name}", text(key));
+            notify_user(notify::Level::Error, &message);
+            reply_failed(request.reply, &message);
             return;
         }
     };
@@ -2775,9 +2833,13 @@ fn capture_region(request: CaptureRequest) {
                 notify::Level::Error,
                 &format!("{}\n{name}\n{e}", text("capture.failed")),
             );
+            reply_failed(request.reply, &e);
             return;
         }
-        None => return,
+        None => {
+            reply_failed(request.reply, text("job.panicked"));
+            return;
+        }
     };
     let (at, image) = (fragment.at, fragment.image);
     log::info!(
@@ -2788,6 +2850,10 @@ fn capture_region(request: CaptureRequest) {
         at.y
     );
 
+    if request.reply.is_some() {
+        output_cli(request, image);
+        return;
+    }
     let outputs = &request.outputs;
     if outputs.copy {
         copy_to_clipboard(&image);

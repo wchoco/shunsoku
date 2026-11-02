@@ -5,7 +5,7 @@ use crate::geometry::Rect;
 use crate::monitors::Monitor;
 
 /// プロトコルのバージョン。形式を変えたら上げる。互換性は保たず、違えば断る。
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// 1 通の依頼・応答の大きさの上限（バイト）。これより大きいものは読まずに断る。
 pub const MAX_MESSAGE: usize = 64 * 1024;
@@ -50,6 +50,15 @@ pub fn encode_request(request: &Request) -> String {
                     }
                     w.field("rect", &rect_value(rect));
                 }
+                Target::Region { name } => {
+                    w.field("target", "region");
+                    w.field("name", name);
+                }
+                Target::Select => w.field("target", "select"),
+                Target::Active { delay } => {
+                    w.field("target", "active");
+                    w.field("delay", &delay.to_string());
+                }
             }
         }
     }
@@ -68,6 +77,13 @@ pub fn decode_request(text: &str) -> Result<Request, DecodeError> {
                     let rect = parse_rect(r.take("rect")?)?;
                     Target::Rect { monitor, rect }
                 }
+                "region" => Target::Region {
+                    name: r.take("name")?.to_owned(),
+                },
+                "select" => Target::Select,
+                "active" => Target::Active {
+                    delay: parse_number(r.take("delay")?)?,
+                },
                 other => return Err(malformed(&format!("unknown target {other}"))),
             };
             Request::Capture(Capture { target })
@@ -369,6 +385,23 @@ mod tests {
     }
 
     #[test]
+    fn region_select_and_active_requests_survive_a_round_trip() {
+        let targets = [
+            Target::Region {
+                name: "領域 1\\a\nb".to_owned(),
+            },
+            Target::Select,
+            Target::Active { delay: 0 },
+            Target::Active { delay: 60 },
+        ];
+        for target in targets {
+            let request = Request::Capture(Capture { target });
+            let wire = encode_request(&request);
+            assert_eq!(decode_request(&wire), Ok(request));
+        }
+    }
+
+    #[test]
     fn responses_survive_a_round_trip_including_awkward_text() {
         let responses = [
             Response::Captured {
@@ -438,7 +471,7 @@ mod tests {
     #[test]
     fn a_malformed_request_is_refused_as_an_argument_error() {
         assert!(matches!(
-            decode_request("shunsoku 1\ncommand dance\n"),
+            decode_request(&format!("shunsoku {VERSION}\ncommand dance\n")),
             Err(DecodeError::Malformed(_))
         ));
         let reply = Response::refused(&DecodeError::Malformed("x".to_owned()));
