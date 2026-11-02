@@ -1,7 +1,7 @@
 //! 書き込みの編集モードのツールバーの、Win32 に依らない部分: 並び（`Layout`）、当たり判定、色の並び
 //! （`palette`）、置き場所（`place`）。
 
-use super::{Annotations, EditState, Pick, Tool};
+use super::{Annotations, EditState, Pick, Shape, Tool};
 use crate::geometry::{Point, Rect, Size};
 use crate::settings::Rgb;
 
@@ -49,7 +49,10 @@ pub fn place(anchor: Rect, size: Size, work: Rect, gap: i32) -> Point {
 /// 太さの選択肢（元の画像の画素）。
 pub const WIDTHS: [u32; 4] = [2, 3, 5, 8];
 
-/// ツールバーの道具の欄。選択と 6 種の道具を、まだ描けないものも含めて並べる（描けないものは押せない）。
+/// 文字の大きさの選択肢（元の画像の画素）。文字の道具の間（と打っている間）は、太さの欄がこれになる。
+pub const FONT_SIZES: [u32; 4] = [12, 16, 24, 32];
+
+/// ツールバーの道具の欄。選択と 6 種の道具を並べる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSlot {
     Select,
@@ -81,8 +84,7 @@ impl ToolSlot {
             ToolSlot::Line => Some(Tool::Line),
             ToolSlot::Freehand => Some(Tool::Freehand),
             ToolSlot::Select => Some(Tool::Select),
-            // 文字（#87）
-            ToolSlot::Text => None,
+            ToolSlot::Text => Some(Tool::Text),
         }
     }
 }
@@ -93,6 +95,8 @@ pub enum Button {
     Tool(ToolSlot),
     Color(Rgb),
     Width(u32),
+    /// 文字の大きさ。
+    FontSize(u32),
     /// 元に戻す。
     Undo,
     /// やり直す。
@@ -112,6 +116,7 @@ impl Button {
             Button::Tool(slot) => slot.tool().map(Pick::Tool),
             Button::Color(color) => Some(Pick::Color(color)),
             Button::Width(width) => Some(Pick::Width(width)),
+            Button::FontSize(size) => Some(Pick::FontSize(size)),
             Button::Undo | Button::Redo | Button::Delete | Button::Done | Button::Grip => None,
         }
     }
@@ -128,12 +133,20 @@ impl Button {
         }
     }
 
-    /// いま選ばれているか（`state` の道具・色・太さと同じ）。
+    /// いま選ばれているか（`state` の道具・色・太さ・文字の大きさと同じ）。文字を打っている間の色と大きさは、
+    /// 打っている文字のもの（打ち直しなら、その文字の）。
     pub fn is_current(self, state: &EditState) -> bool {
+        let typing = state.typing();
+        let color = typing.as_ref().map_or(state.style.color, |a| a.style.color);
+        let size = match typing.map(|a| a.shape) {
+            Some(Shape::Text { font, .. }) => font.size,
+            _ => state.font.size,
+        };
         match self.pick() {
             Some(Pick::Tool(tool)) => state.tool == tool,
-            Some(Pick::Color(color)) => state.style.color == color,
+            Some(Pick::Color(c)) => color == c,
             Some(Pick::Width(width)) => state.style.width == width,
+            Some(Pick::FontSize(s)) => size == s,
             None => false,
         }
     }
@@ -146,7 +159,8 @@ const SPACING: f64 = 2.0;
 const GROUP_SPACING: f64 = 10.0;
 const GRIP_WIDTH: f64 = 14.0;
 
-/// ツールバーの並び: 左から道具、色、太さ、元に戻す・やり直す・削除・完了、端に移動用のつまみ。座標はツールバーの左上が原点。
+/// ツールバーの並び: 左から道具、色、太さ（文字の道具では文字の大きさ）、元に戻す・やり直す・削除・完了、端に
+/// 移動用のつまみ。座標はツールバーの左上が原点。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     size: Size,
@@ -154,15 +168,34 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// `colours`（`palette`）を並べた並び。`scale` はスクラップのモニタの DPI / 96。
+    /// `colours`（`palette`）を並べた、太さを選ぶ並び。`scale` はスクラップのモニタの DPI / 96。
     pub fn new(colours: &[Rgb], scale: f64) -> Layout {
+        Layout::with_sizes(colours, scale, false)
+    }
+
+    /// `state` に合わせた並び。文字の道具を選んでいるか文字を打っている間は、太さの代わりに文字の大きさを
+    /// 同じ場所に並べる。
+    pub fn for_state(colours: &[Rgb], scale: f64, state: &EditState) -> Layout {
+        Layout::with_sizes(
+            colours,
+            scale,
+            state.tool == Tool::Text || state.is_typing(),
+        )
+    }
+
+    fn with_sizes(colours: &[Rgb], scale: f64, font_sizes: bool) -> Layout {
+        let sizes: Vec<Button> = if font_sizes {
+            FONT_SIZES.iter().map(|&s| Button::FontSize(s)).collect()
+        } else {
+            WIDTHS.iter().map(|&w| Button::Width(w)).collect()
+        };
         let px = |v: f64| (v * scale).round() as i32;
         let (padding, button, spacing, group) =
             (px(PADDING), px(BUTTON), px(SPACING), px(GROUP_SPACING));
         let groups: [Vec<Button>; 4] = [
             ToolSlot::ALL.iter().map(|&s| Button::Tool(s)).collect(),
             colours.iter().map(|&c| Button::Color(c)).collect(),
-            WIDTHS.iter().map(|&w| Button::Width(w)).collect(),
+            sizes,
             vec![Button::Undo, Button::Redo, Button::Delete, Button::Done],
         ];
         let mut buttons = Vec::new();
@@ -330,8 +363,11 @@ mod tests {
             Some(Pick::Tool(Tool::Freehand))
         );
         assert!(!Button::Tool(ToolSlot::Ellipse).is_current(&state));
-        // 文字（#87）はまだない
-        assert!(!Button::Tool(ToolSlot::Text).is_enabled(&state, &annotations));
+        assert_eq!(
+            Button::Tool(ToolSlot::Text).pick(),
+            Some(Pick::Tool(Tool::Text))
+        );
+        assert!(Button::Tool(ToolSlot::Text).is_enabled(&state, &annotations));
         assert!(Button::Tool(ToolSlot::Arrow).is_enabled(&state, &annotations));
         assert_eq!(Button::Done.pick(), None);
         assert_eq!(Button::Grip.pick(), None);
@@ -394,5 +430,40 @@ mod tests {
         assert_eq!(enabled(&state, &annotations), (false, true));
         assert_eq!(Button::Undo.pick(), None);
         assert!(!Button::Undo.is_current(&state));
+    }
+
+    #[test]
+    fn with_the_text_tool_the_widths_turn_into_font_sizes_in_the_same_place() {
+        use crate::annotate::{Annotations, EditInput};
+        let mut state = EditState::new(crate::annotate::Style::default());
+        let mut annotations = Annotations::default();
+        let drawing = Layout::for_state(&PALETTE, 1.0, &state);
+        assert_eq!(drawing, Layout::new(&PALETTE, 1.0));
+        state.input(EditInput::Pick(Pick::Tool(Tool::Text)), &mut annotations);
+        let text = Layout::for_state(&PALETTE, 1.0, &state);
+        assert_eq!(text.size(), drawing.size());
+        let swapped: Vec<_> = drawing
+            .buttons()
+            .iter()
+            .zip(text.buttons())
+            .filter(|(a, b)| a != b)
+            .map(|(&(a, ar), &(b, br))| (a, b, ar == br))
+            .collect();
+        assert_eq!(
+            swapped,
+            WIDTHS
+                .iter()
+                .zip(FONT_SIZES)
+                .map(|(&w, s)| (Button::Width(w), Button::FontSize(s), true))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(Button::FontSize(24).pick(), Some(Pick::FontSize(24)));
+        assert!(Button::FontSize(16).is_current(&state));
+        state.input(EditInput::Pick(Pick::FontSize(24)), &mut annotations);
+        assert!(Button::FontSize(24).is_current(&state));
+        assert!(!Button::FontSize(16).is_current(&state));
+        // 描く道具に戻せば太さに戻る
+        state.input(EditInput::Pick(Pick::Tool(Tool::Rect)), &mut annotations);
+        assert_eq!(Layout::for_state(&PALETTE, 1.0, &state), drawing);
     }
 }

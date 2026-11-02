@@ -59,6 +59,10 @@
 //!   動かすたび（`Scrap::paint` / `Scrap::redraw`）についていく。選んだものは `App::carryover` に覚え、次の編集モードに
 //!   引き継ぐ。
 //!   書き込みは表示にも保存とコピーにも `render` の同じ関数で描く（ADR-0006）。
+//! - 文字の道具で打つ間（`EditOutput::TypingStarted` から `TypingEnded` まで）だけ、スクラップで IME を使う
+//!   （`ime`、`sync_ime`）。`WM_CHAR` と IME の確定した文字を `EditInput::Char` にし、変換中の文字は `Scrap::composition`
+//!   に持って打っている文字の続きに描く。変換中にクリックやツールバーなどで打ち終えるときは、変換中の文字も
+//!   確定したことにしてから渡す（`commit_composition`）。編集モードのダブルクリックは `EditInput::DoubleClick`。
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -120,6 +124,12 @@ use windows::core::{PCWSTR, Result, w};
 // 精密モード（#66）で足したもの
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
 use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
+// 文字の書き込み（#87）で足したもの
+use crate::ime;
+use shunsoku_core::annotate::{EditState, Font};
+use windows::Win32::UI::WindowsAndMessaging::{
+    WM_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+};
 // 書き込みのツールバー（#84）で足したもの
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
@@ -316,6 +326,14 @@ struct Scrap {
     wheel: Wheel,
     /// 倍率を出しているか（`Effect::ShowZoom` から `TIMER_ZOOM_LABEL` が鳴るまで）。
     zoom_label: bool,
+    /// 文字を打つ間の IME の変換中の文字。
+    composition: Option<ime::Composition>,
+    /// IME を使えるようにしているか（`sync_ime`）。
+    ime_on: bool,
+    /// 最後に描いたキャレットの矩形（ウィンドウの中の座標）。打っていなければ None。
+    caret: std::cell::Cell<Option<Rect>>,
+    /// `WM_CHAR` で来たサロゲート ペアの前半。
+    high_surrogate: Option<u16>,
 }
 
 /// 書き込みの編集モードのツールバー。
@@ -371,7 +389,7 @@ impl Scrap {
             return;
         };
         let scale = f64::from(self.window.dpi()) / 96.0;
-        let layout = ToolbarLayout::new(&toolbar.colours, scale);
+        let layout = ToolbarLayout::for_state(&toolbar.colours, scale, state);
         let size = layout.size();
         let image = self.model.image_rect();
         let work = work_area(self.window.hwnd()).unwrap_or(image);
@@ -473,14 +491,16 @@ impl Scrap {
             percent: self.model.zoom(),
             scale: self.window.dpi() as f32 / 96.0,
         });
-        paint_scrap(
+        let caret = paint_scrap(
             renderer,
             &self.window,
             self.shown(),
             &self.model,
             appearance,
             label,
+            self.composition.as_ref(),
         )?;
+        self.caret.set(caret);
         self.sync_toolbar(appearance, renderer, true);
         Ok(())
     }
@@ -492,6 +512,7 @@ impl Scrap {
 ///
 /// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
 /// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
+/// 文字を打っていれば、IME の変換中の文字 `composition` をつなげて描き、キャレットの矩形（ウィンドウの中の座標）を返す。
 fn paint_scrap(
     renderer: &mut Option<render::Renderer>,
     window: &scrap_window::ScrapWindow,
@@ -499,7 +520,8 @@ fn paint_scrap(
     model: &ScrapModel,
     appearance: &Appearance,
     label: Option<render::ZoomLabel>,
-) -> Result<()> {
+    composition: Option<&ime::Composition>,
+) -> Result<Option<Rect>> {
     let rect = model.window_rect(appearance);
     let appearance = &model.appearance(appearance);
     let canvas = render::Canvas::new(rect.size())?;
@@ -524,19 +546,26 @@ fn paint_scrap(
         }),
     });
     let annotations = model.annotations_to_draw();
+    let typing = model.typing_annotation();
     let overlays = render::Overlays {
         annotations: render::AnnotationLayer {
             annotations: &annotations,
             view: model.annotation_view(),
             selected: model.selected_annotation().map(|a| a.bounds()),
+            typing: typing.as_ref().map(|annotation| render::TypingLayer {
+                annotation,
+                composition: composition.map_or("", |c| c.text.as_str()),
+                cursor: composition.map_or(0, |c| c.cursor),
+            }),
         },
         label,
         trim,
     };
-    painter.paint_scrap(&canvas, image, display, appearance, overlays)?;
+    let caret = painter.paint_scrap(&canvas, image, display, appearance, overlays)?;
     *renderer = Some(painter);
     // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
-    window.present(canvas.dc(), rect, appearance.opacity)
+    window.present(canvas.dc(), rect, appearance.opacity)?;
+    Ok(caret)
 }
 
 struct Windows {
@@ -1281,13 +1310,13 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             Some(LRESULT(0))
         }
         // 2 回目の押下は WM_LBUTTONDOWN の代わりにこれで来る（CS_DBLCLKS）。トリムの最中は確定にする
-        // 書き込みの編集モードでは、ふつうの押下と同じに描き始める
+        // 書き込みの編集モードでは core に渡す（文字の上なら打ち直し、ほかはふつうの押下と同じに描き始める）
         WM_LBUTTONDBLCLK => {
             let at = message_screen_point();
             if is_editing(hwnd) {
                 // SAFETY: 自分のウィンドウ
                 unsafe { SetCapture(hwnd) };
-                on_edit_input(hwnd, EditInput::Press(at));
+                on_edit_input(hwnd, EditInput::DoubleClick(at));
                 return Some(LRESULT(0));
             }
             if on_trim_input(hwnd, TrimInput::Confirm) {
@@ -1312,6 +1341,24 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
         }
         // Alt との組み合わせは WM_SYSKEYDOWN で来る。対応表にないキーは DefWindowProcW に任せる
         WM_KEYDOWN | WM_SYSKEYDOWN => on_scrap_key(hwnd, wparam).then_some(LRESULT(0)),
+        // 文字を打っている間の文字（TranslateMessage が作る）
+        WM_CHAR => on_scrap_char(hwnd, wparam).then_some(LRESULT(0)),
+        // 変換中の文字は IME の窓に出さず、スクラップに描く。App は借りない（IME の呼び出しの中でも届く）
+        WM_IME_SETCONTEXT => {
+            // SAFETY: 受け取った引数を（印を 1 つ落として）そのまま渡す
+            Some(unsafe {
+                DefWindowProcW(hwnd, msg, wparam, ime::without_composition_window(lparam))
+            })
+        }
+        WM_IME_STARTCOMPOSITION if is_typing(hwnd) => Some(LRESULT(0)),
+        WM_IME_COMPOSITION if is_typing(hwnd) => {
+            on_ime_composition(hwnd, lparam);
+            Some(LRESULT(0))
+        }
+        WM_IME_ENDCOMPOSITION if is_typing(hwnd) => {
+            set_composition(hwnd, None);
+            Some(LRESULT(0))
+        }
         // 右クリック（DefWindowProcW が WM_RBUTTONUP から作る）と Shift+F10・アプリケーション キー
         WM_CONTEXTMENU => {
             show_scrap_menu(hwnd, lparam);
@@ -1586,7 +1633,130 @@ fn on_edit_move(hwnd: HWND, wparam: WPARAM, at: Point) {
 }
 
 /// 書き込みの編集モードに入力を渡し、変わったら描き直す。編集モードでなければ何もせず None。
+/// 文字を打っている間にクリックなどで打ち終えるときのために、文字とカーソルの移動のほかは、先に変換中の文字を
+/// 確定したことにする（`commit_composition`）。打ち始めたら・打ち終えたら IME を使う・使わないを切り替える。
 fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
+    if !matches!(
+        input,
+        EditInput::Char(_) | EditInput::Move { .. } | EditInput::Release
+    ) {
+        commit_composition(hwnd);
+    }
+    let outputs = edit_input(hwnd, input);
+    if outputs.as_ref().is_some_and(|o| !o.is_empty()) {
+        sync_ime(hwnd);
+    }
+    outputs
+}
+
+/// 文字を打っているか。
+fn is_typing(hwnd: HWND) -> bool {
+    with_app(|app| {
+        app.scraps.iter().any(|s| {
+            s.window.hwnd() == hwnd && s.model.edit_state().is_some_and(EditState::is_typing)
+        })
+    })
+    .unwrap_or(false)
+}
+
+/// `WM_CHAR`: 文字を打っている間の文字を渡す。サロゲート ペアは 2 つ揃ってから渡す。受けなければ false。
+fn on_scrap_char(hwnd: HWND, wparam: WPARAM) -> bool {
+    let unit = wparam.0 as u16;
+    let c = match unit {
+        0xD800..=0xDBFF => {
+            return with_app(|app| {
+                let scrap = app.scrap_mut(hwnd)?;
+                scrap.high_surrogate = Some(unit);
+                Some(scrap.model.edit_state().is_some_and(EditState::is_typing))
+            })
+            .flatten()
+            .unwrap_or(false);
+        }
+        0xDC00..=0xDFFF => {
+            let high = with_app(|app| app.scrap_mut(hwnd)?.high_surrogate.take()).flatten();
+            let Some(high) = high else {
+                return false;
+            };
+            char::decode_utf16([high, unit]).next().and_then(|c| c.ok())
+        }
+        _ => char::from_u32(u32::from(unit)),
+    };
+    let Some(c) = c else {
+        return false;
+    };
+    on_edit_input(hwnd, EditInput::Char(c)).is_some_and(|o| !o.is_empty())
+}
+
+/// `WM_IME_COMPOSITION`: 確定した文字を渡し、変換中の文字を描き直す。
+fn on_ime_composition(hwnd: HWND, lparam: LPARAM) {
+    let update = ime::read_composition(hwnd, lparam);
+    // 確定した文字は変換中の文字に入っていたので、先に変換中の文字を新しいものにしてから渡す
+    with_app(|app| {
+        if let Some(scrap) = app.scrap_mut(hwnd) {
+            scrap.composition = update.composition.clone();
+        }
+    });
+    for c in update.result.chars() {
+        edit_input(hwnd, EditInput::Char(c));
+    }
+    set_composition(hwnd, update.composition);
+}
+
+/// 変換中の文字を `composition` にして描き直し、IME の窓をキャレットに合わせる。
+fn set_composition(hwnd: HWND, composition: Option<ime::Composition>) {
+    with_app(|app| {
+        let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
+        scrap.composition = composition;
+        // 描くだけで App を借りるメッセージは届かないので、借りたまま描く
+        if let Err(e) = scrap.paint(&appearance, renderer) {
+            log::warn!("could not draw the text being typed: {e}");
+        }
+        Some(())
+    });
+    sync_ime(hwnd);
+}
+
+/// 変換中の文字があれば、確定したことにして渡し、IME の側の変換中の文字を捨てる。
+fn commit_composition(hwnd: HWND) {
+    let Some(composition) = with_app(|app| app.scrap_mut(hwnd)?.composition.take()).flatten()
+    else {
+        return;
+    };
+    for c in composition.text.chars() {
+        edit_input(hwnd, EditInput::Char(c));
+    }
+    ime::cancel(hwnd);
+}
+
+/// 文字を打ち始めたら IME を使えるようにし、打ち終えたら使えないようにする。打っている間は、変換中の文字と
+/// 候補の窓をキャレットに合わせる。IME を呼ぶのは App を返してから。
+fn sync_ime(hwnd: HWND) {
+    let Some((typing, was_on, caret)) = with_app(|app| {
+        let (scrap, appearance, _) = app.scrap_to_draw(hwnd)?;
+        let typing = scrap.model.edit_state().is_some_and(EditState::is_typing);
+        let was_on = std::mem::replace(&mut scrap.ime_on, typing);
+        if !typing {
+            scrap.composition = None;
+        }
+        let origin = scrap.model.window_rect(&appearance).origin();
+        let caret = scrap.caret.get().map(|r| r.offset(origin.x, origin.y));
+        Some((typing, was_on, caret))
+    })
+    .flatten() else {
+        return;
+    };
+    match (was_on, typing) {
+        (false, true) => ime::enable(hwnd),
+        (true, false) => ime::disable(hwnd),
+        _ => {}
+    }
+    if let (true, Some(caret)) = (typing, caret) {
+        ime::place(hwnd, caret);
+    }
+}
+
+/// 書き込みの編集モードに入力を渡し、変わったら描き直す（`on_edit_input` の中身）。
+fn edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
     with_app(|app| {
         let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
         if !scrap.model.is_editing() {
@@ -1689,7 +1859,7 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
         ..OpContext::default()
     };
     for _ in 0..notches.unsigned_abs() {
-        run_mouse_operation(hwnd, gesture, context);
+        run_mouse_operation(hwnd, gesture, context.clone());
     }
     true
 }
@@ -1900,6 +2070,7 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
         annotations: scrap.model.annotations().items(),
         view: scrap.model.output_view(),
         selected: None,
+        typing: None,
     };
     match render::render_image(scrap.shown(), layer) {
         Ok(image) => job(image),
@@ -1912,8 +2083,11 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
 
 /// スクラップ操作を実行し、返った `Effect` を実行する。スクラップのキー・マウス・メニューはすべてここを通る。
 fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
+    // 打っている間にメニューから編集モードを抜けるときは、変換中の文字も書き込みにする
+    commit_composition(hwnd);
     let deferred = with_app(|app| {
-        let annotation = Style::from(app.settings.annotation);
+        let annotation = Style::from(&app.settings.annotation);
+        let font = Font::from(&app.settings.annotation);
         let carryover = app.carryover;
         let module = app.module;
         let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
@@ -1922,6 +2096,7 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
         let context = OpContext {
             appearance,
             annotation,
+            font,
             carryover,
             ..context
         };
@@ -1997,6 +2172,8 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
     })
     .flatten()
     .unwrap_or_default();
+    // 編集モードを抜けたら IME を使えないようにする
+    sync_ime(hwnd);
     // クリップボード・通知・ウィンドウを壊すのはメッセージが届くことがあるので、App を借りずに行う
     for action in deferred {
         match action {
@@ -2557,6 +2734,8 @@ fn open_scrap(
 ) -> Result<Scrap> {
     let rect = model.window_rect(appearance);
     let window = scrap_window::ScrapWindow::create(module, rect)?;
+    // 文字を打つ間のほかは IME を使わない（IME がオンでもショートカットのキーが届くように）
+    ime::disable(window.hwnd());
     // 開いたモニタの DPI を覚える。ごみ箱から戻したものは、閉じたときと DPI が違えば設定に従って大きさを変える
     let mut model = model;
     let scaling = with_app(|app| app.settings.general.dpi_scaling).unwrap_or_default();
@@ -2573,9 +2752,10 @@ fn open_scrap(
             &model,
             appearance,
             None,
+            None,
         )
     })
-    .unwrap_or_else(|| paint_scrap(&mut None, &window, visible, &model, appearance, None));
+    .unwrap_or_else(|| paint_scrap(&mut None, &window, visible, &model, appearance, None, None));
     painted?;
     window.show(focus);
     Ok(Scrap {
@@ -2587,6 +2767,10 @@ fn open_scrap(
         drag: Drag::default(),
         wheel: Wheel::default(),
         zoom_label: false,
+        composition: None,
+        ime_on: false,
+        caret: Default::default(),
+        high_surrogate: None,
     })
 }
 

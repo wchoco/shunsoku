@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::annotate::{Carryover, EditInput, Style};
+use crate::annotate::{Carryover, EditInput, Font, Style};
 use crate::geometry::Point;
 use crate::keys::{Chord, Key, Modifiers};
 use crate::scrap::{Appearance, BorderOverride, Mode, ScrapModel, ZoomAnchor};
@@ -203,7 +203,7 @@ pub enum ChoiceLabel {
 }
 
 /// 操作を呼び出したときの引数。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OpContext {
     /// 全体の見た目の既定値（設定ファイルの `[scrap]`）。見た目を変える操作が、いまの見た目を知るのに使う。
     pub appearance: Appearance,
@@ -218,6 +218,8 @@ pub struct OpContext {
     pub annotation: Style,
     /// 前の編集モードで選んだ道具・色・太さ（アプリが動いている間だけ、すべてのスクラップで引き継ぐ）。
     pub carryover: Carryover,
+    /// 文字の書き込みの書体と大きさの既定値（設定ファイルの `[annotation]`）。
+    pub font: Font,
 }
 
 /// 操作の結果、Win32 層がすること。
@@ -538,7 +540,11 @@ fn annotate(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     if model.is_editing() {
         model.edit_input(EditInput::Leave);
         vec![Effect::LeaveEditMode]
-    } else if model.start_editing_with(context.carryover.start(context.annotation)) {
+    } else if model.start_editing_with(
+        context
+            .carryover
+            .start_with(context.annotation, context.font.clone()),
+    ) {
         vec![Effect::EnterEditMode]
     } else {
         Vec::new()
@@ -1164,7 +1170,7 @@ pub fn menu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotate::{Carryover, EditOutput, Pick, Style, Tool};
+    use crate::annotate::{Carryover, EditOutput, Font, Pick, Style, Tool};
     use crate::geometry::{Point, Rect, Size};
     use crate::image::Image;
     use crate::scrap::{
@@ -1356,7 +1362,7 @@ mod tests {
         let mut first = scrap();
         let context = OpContext {
             carryover,
-            ..defaults
+            ..defaults.clone()
         };
         execute(op("annotate"), &mut first, &context);
         let blue = Rgb(0x1E, 0x88, 0xE5);
@@ -1377,10 +1383,25 @@ mod tests {
         let mut second = scrap();
         let context = OpContext {
             carryover,
-            ..defaults
+            ..defaults.clone()
         };
         execute(op("annotate"), &mut second, &context);
         assert_eq!(second.edit_state().map(|s| s.style), Some(chosen));
+    }
+
+    #[test]
+    fn edit_mode_types_text_in_the_configured_font() {
+        let mut model = scrap();
+        let font = Font {
+            family: "Meiryo".to_owned(),
+            size: 24,
+        };
+        let context = OpContext {
+            font: font.clone(),
+            ..editing_context()
+        };
+        execute(op("annotate"), &mut model, &context);
+        assert_eq!(model.edit_state().map(|s| s.font.clone()), Some(font));
     }
 
     #[test]
@@ -1390,7 +1411,7 @@ mod tests {
         let mut first = scrap();
         let context = OpContext {
             carryover,
-            ..defaults
+            ..defaults.clone()
         };
         execute(op("annotate"), &mut first, &context);
         assert_eq!(first.edit_state().map(|s| s.tool), Some(Tool::Rect));
@@ -1403,7 +1424,7 @@ mod tests {
         let mut second = scrap();
         let context = OpContext {
             carryover,
-            ..defaults
+            ..defaults.clone()
         };
         execute(op("annotate"), &mut second, &context);
         assert_eq!(second.edit_state().map(|s| s.tool), Some(Tool::Line));

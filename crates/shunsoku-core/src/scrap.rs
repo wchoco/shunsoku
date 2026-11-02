@@ -572,13 +572,29 @@ impl ScrapModel {
         &self.annotations
     }
 
-    /// 描く書き込み。描き終えたものの上に、編集モードの描きかけを重ねる。
+    /// 描く書き込み。描き終えたものの上に、編集モードの描きかけを重ねる。打ち直している文字の元のものは
+    /// 描かない（打っている文字は `typing_annotation` で別に描く）。
     pub fn annotations_to_draw(&self) -> Vec<Annotation> {
-        let mut drawn = self.annotations.items().to_vec();
-        if let Mode::Editing(state) = &self.mode {
-            drawn.extend(state.draft());
-        }
+        let Mode::Editing(state) = &self.mode else {
+            return self.annotations.items().to_vec();
+        };
+        let retyping = state.retyping();
+        let mut drawn: Vec<Annotation> = self
+            .annotations
+            .items()
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| Some(i) != retyping)
+            .map(|(_, a)| a.clone())
+            .collect();
+        drawn.extend(state.draft());
         drawn
+    }
+
+    /// 編集モードで打っている文字（打った分だけ。空のこともある）。日本語入力の変換中の文字とカーソルは
+    /// `app` がこの後ろに描く。
+    pub fn typing_annotation(&self) -> Option<Annotation> {
+        self.edit_state()?.typing()
     }
 
     /// 画面に書き込みを描く変換。描く先の原点は画像を出す矩形（`image_rect`）の左上で、倍率とトリムと
@@ -1775,6 +1791,44 @@ mod tests {
             rect((10, 20), (59, 59))
         );
         assert!(scrap.is_editing());
+    }
+
+    #[test]
+    fn a_double_click_on_a_text_types_it_again_in_place_of_the_original() {
+        use crate::annotate::Font;
+        let mut scrap = trimmed_and_zoomed();
+        let o = scrap.image_rect().origin();
+        let at = Point::new(o.x + 8, o.y + 7);
+        scrap.start_editing(Style::default());
+        scrap.edit_input(EditInput::Pick(Pick::Tool(Tool::Text)));
+        assert_eq!(
+            scrap.edit_input(EditInput::Press(at)),
+            vec![EditOutput::TypingStarted, EditOutput::Redraw]
+        );
+        scrap.edit_input(EditInput::Char('a'));
+        let typed = |text: &str| Shape::Text {
+            at: Point::new(14, 23),
+            text: text.to_owned(),
+            font: Font::default(),
+        };
+        // 打っている文字は描きかけと別に描く（日本語入力の変換中の文字と一緒に）
+        assert_eq!(scrap.typing_annotation().map(|a| a.shape), Some(typed("a")));
+        assert_eq!(scrap.annotations_to_draw(), vec![]);
+        scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x1B))));
+        assert!(scrap.is_editing());
+        assert_eq!(scrap.typing_annotation(), None);
+        assert_eq!(scrap.annotations_to_draw().len(), 1);
+        // 打ち直す間は、元の書き込みを描かない
+        scrap.edit_input(EditInput::DoubleClick(Point::new(o.x + 10, o.y + 9)));
+        assert_eq!(scrap.annotations_to_draw(), vec![]);
+        scrap.edit_input(EditInput::Char('b'));
+        assert_eq!(
+            scrap.typing_annotation().map(|a| a.shape),
+            Some(typed("ab"))
+        );
+        scrap.edit_input(EditInput::Leave);
+        assert!(!scrap.is_editing());
+        assert_eq!(scrap.annotations_to_draw()[0].shape, typed("ab"));
     }
 
     #[test]
