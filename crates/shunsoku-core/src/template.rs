@@ -263,6 +263,39 @@ mod tests {
         );
     }
 
+    fn region_name(region: &str, template: &str, existing: &[&str]) -> String {
+        let context = Context {
+            name: region,
+            now: NOW,
+        };
+        let existing: Vec<String> = existing.iter().map(|s| (*s).to_owned()).collect();
+        file_name(template, &context, &existing, "png")
+    }
+
+    #[test]
+    fn the_region_default_template_names_the_file_by_region_name_date_and_time() {
+        assert_eq!(
+            region_name("領域 1", "{name}_{date}-{time}", &[]),
+            "領域 1_20260307-090504.png"
+        );
+        // 名前の中のファイル名に使えない文字も _ にする
+        assert_eq!(
+            region_name("a/b:c", "{name}_{date}-{time}", &[]),
+            "a_b_c_20260307-090504.png"
+        );
+    }
+
+    #[test]
+    fn seq_after_the_region_name_counts_only_files_of_that_region() {
+        let existing = ["dash_1.png", "dash_2.png", "game_9.png"];
+        assert_eq!(region_name("dash", "{name}_{seq}", &existing), "dash_3.png");
+        assert_eq!(
+            region_name("game", "{name}_{seq}", &existing),
+            "game_10.png"
+        );
+        assert_eq!(region_name("new", "{name}_{seq}", &existing), "new_1.png");
+    }
+
     #[test]
     fn unknown_variables_and_unclosed_braces_are_kept() {
         assert_eq!(name("a{foo}b{", &[]), "a{foo}b{.png");

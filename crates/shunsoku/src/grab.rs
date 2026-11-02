@@ -1,9 +1,12 @@
-//! 取得: Desktop Duplication で全モニタの画面を並列に取り、GPU 上の自前のテクスチャに写す（ADR-0002）。
+//! 取得: Desktop Duplication で全モニタ（定型領域キャプチャでは 1 モニタ）の画面を並列に取り、GPU 上の自前のテクスチャに写す（ADR-0002）。
 //!
 //! - モニタ（DXGI の出力）はアダプタに属する。D3D11 のデバイスはアダプタごとに 1 つ作り、`Gpu` に
 //!   持ち続ける（作り直すと範囲選択の画面が出るまでが遅くなるため）。閉じたあとは `Gpu::trim` で返す。
 //! - 取得はモニタごとに `std::thread::scope` のスレッドで行い、UI スレッドはその場で全部を待つ。
 //!   スレッドのパニックは `join` の `Err` になり、その取得の失敗として返す（常駐は続く）。
+//! - カーソルを写すときは、フレームと一緒に返るカーソルの形と位置を、自前のテクスチャに重ねる
+//!   （`draw_cursor`）。切り抜く前の画面の画像に重ねるので、範囲選択・定型領域・CLI のどれにも効き、
+//!   範囲選択の画面にも止まったカーソルとして出る。
 //! - Duplication はフレームを自前のテクスチャへ写したらすぐ閉じる。開いたままにすると常駐時の
 //!   メモリが増える（ADR-0002）。
 
@@ -11,16 +14,17 @@ use std::ffi::c_void;
 use std::fmt;
 use std::thread;
 
-use shunsoku_core::geometry::{Point, Rect};
+use shunsoku_core::cursor::{Cursor, Shape, ShapeKind};
+use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::image::{Fragment, Image};
 
 use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, LUID, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
-    ID3D11Texture2D,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_MAP_READ, D3D11_MAP_READ_WRITE, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY,
@@ -28,6 +32,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
     IDXGIAdapter1, IDXGIDevice3, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource,
 };
@@ -182,8 +188,31 @@ struct Raw(*mut c_void);
 unsafe impl Send for Raw {}
 
 impl Gpu {
-    /// 全モニタの画面を並列に取得する。
-    pub fn grab(&mut self) -> std::result::Result<Vec<Shot>, GrabError> {
+    /// 全モニタの画面を並列に取得する。`cursor` なら、マウスカーソルを画面の画像に重ねる。
+    pub fn grab(&mut self, cursor: bool) -> std::result::Result<Vec<Shot>, GrabError> {
+        self.grab_outputs(|_| true, cursor)
+    }
+
+    /// `monitor`（スクリーン座標でのモニタの位置と大きさ）のモニタだけを取得する（定型領域キャプチャ）。
+    /// そのモニタが DXGI の出力に見つからなければ `GrabError::NoOutputs`。`cursor` は `grab` と同じ。
+    pub fn grab_monitor(
+        &mut self,
+        monitor: Rect,
+        cursor: bool,
+    ) -> std::result::Result<Shot, GrabError> {
+        let mut shots = self.grab_outputs(
+            |r| Rect::new(r.left, r.top, r.right, r.bottom) == monitor,
+            cursor,
+        )?;
+        shots.pop().ok_or(GrabError::NoOutputs)
+    }
+
+    /// `wanted`（出力のスクリーン座標での位置と大きさ）が真の出力の画面を並列に取得する。
+    fn grab_outputs(
+        &mut self,
+        wanted: impl Fn(&RECT) -> bool,
+        cursor: bool,
+    ) -> std::result::Result<Vec<Shot>, GrabError> {
         // 抜き差しや配置の変更を拾うため、ファクトリは毎回作り直す（ファクトリは作った時点の一覧を持つ）
         // SAFETY: 引数なしの生成
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
@@ -192,7 +221,8 @@ impl Gpu {
         // SAFETY: 列挙は Err（DXGI_ERROR_NOT_FOUND）で終わる
         while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
             index += 1;
-            let outputs = attached_outputs(&adapter)?;
+            let mut outputs = attached_outputs(&adapter)?;
+            outputs.retain(|(_, rect, _)| wanted(rect));
             if outputs.is_empty() {
                 continue;
             }
@@ -227,7 +257,7 @@ impl Gpu {
                             let (Some(device), Some(output)) = (device, output) else {
                                 return Err(GrabError::NoOutputs);
                             };
-                            grab_output(device, output).map(|g| g.into_raw())
+                            grab_output(device, output, cursor).map(|g| g.into_raw())
                         })
                 })
                 .collect();
@@ -400,10 +430,11 @@ impl RawGrabbed {
 fn grab_output(
     device: &ID3D11Device,
     output: &IDXGIOutput1,
+    cursor: bool,
 ) -> std::result::Result<Grabbed, GrabError> {
     let mut reopened = 0;
     loop {
-        match grab_once(device, output) {
+        match grab_once(device, output, cursor) {
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST && reopened < MAX_REOPEN => {
                 reopened += 1;
                 log::info!("desktop duplication access lost; reopening ({reopened})");
@@ -413,16 +444,19 @@ fn grab_output(
     }
 }
 
-fn grab_once(device: &ID3D11Device, output: &IDXGIOutput1) -> Result<Grabbed> {
+fn grab_once(device: &ID3D11Device, output: &IDXGIOutput1, cursor: bool) -> Result<Grabbed> {
     // SAFETY: device はこの出力が属するアダプタのもの。フレームは ReleaseFrame まで使う
     unsafe {
         let duplication = output.DuplicateOutput(device)?;
         let rotation = duplication.GetDesc().Rotation;
-        let frame = acquire_frame(&duplication)?;
+        let (frame, pointer) = acquire_frame(&duplication, cursor)?;
         let result = copy_frame(device, &frame);
         drop(frame);
         let _ = duplication.ReleaseFrame();
         let texture = result?;
+        if let Some(pointer) = pointer {
+            draw_cursor(device, &texture, &pointer)?;
+        }
 
         // 回転したモニタの画像は回転前の向きで来る。M1 では回して出さない（下で None にする）
         let upright =
@@ -441,8 +475,15 @@ fn grab_once(device: &ID3D11Device, output: &IDXGIOutput1) -> Result<Grabbed> {
 }
 
 /// 画面の画像が届いたフレームを取る。返したフレームは呼び出し側が ReleaseFrame する。
-fn acquire_frame(duplication: &IDXGIOutputDuplication) -> Result<ID3D11Texture2D> {
+/// `cursor` なら、このモニタに出ているカーソル（出ていなければ None）も返す（位置はモニタの左上から）。
+fn acquire_frame(
+    duplication: &IDXGIOutputDuplication,
+    cursor: bool,
+) -> Result<(ID3D11Texture2D, Option<Cursor>)> {
     let mut last = None;
+    // カーソルの形と位置は、変わったフレームにだけ載る。開いた直後の空のフレームに載ることもあるので、
+    // 捨てるフレームのものも覚えておく
+    let mut pointer = Pointer::default();
     for _ in 0..MAX_ACQUIRE_TRIES {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
@@ -453,6 +494,9 @@ fn acquire_frame(duplication: &IDXGIOutputDuplication) -> Result<ID3D11Texture2D
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
             Err(e) => return Err(e),
         }
+        if cursor {
+            pointer.update(duplication, &info);
+        }
         let Some(resource) = resource else {
             // SAFETY: 取れたフレームを返す
             let _ = unsafe { duplication.ReleaseFrame() };
@@ -460,7 +504,7 @@ fn acquire_frame(duplication: &IDXGIOutputDuplication) -> Result<ID3D11Texture2D
         };
         // 開いた直後のフレームは画面の画像がまだ来ていない（空）。次のフレームを待つ
         if info.LastPresentTime != 0 {
-            return resource.cast();
+            return Ok((resource.cast()?, pointer.into_cursor()));
         }
         last = Some(info.LastPresentTime);
         drop(resource);
@@ -500,4 +544,137 @@ fn texture_format(texture: &ID3D11Texture2D) -> DXGI_FORMAT {
     // SAFETY: 説明を読むだけ
     unsafe { texture.GetDesc(&mut desc) };
     desc.Format
+}
+
+/// フレームから集めたカーソルの状態。
+#[derive(Default)]
+struct Pointer {
+    /// 形の左上（モニタの左上から）。None はこのモニタに出ていない。
+    at: Option<Point>,
+    shape: Option<Shape>,
+}
+
+impl Pointer {
+    /// フレームに載っていたカーソルの位置と形で更新する。ReleaseFrame の前に呼ぶ。
+    fn update(&mut self, duplication: &IDXGIOutputDuplication, info: &DXGI_OUTDUPL_FRAME_INFO) {
+        if info.LastMouseUpdateTime != 0 {
+            let p = info.PointerPosition;
+            self.at = p
+                .Visible
+                .as_bool()
+                .then(|| Point::new(p.Position.x, p.Position.y));
+        }
+        if info.PointerShapeBufferSize == 0 {
+            return;
+        }
+        match pointer_shape(duplication, info.PointerShapeBufferSize) {
+            Ok(shape) => self.shape = shape,
+            Err(e) => log::warn!("could not read the pointer shape: {e}"),
+        }
+    }
+
+    fn into_cursor(self) -> Option<Cursor> {
+        Some(Cursor {
+            shape: self.shape?,
+            at: self.at?,
+        })
+    }
+}
+
+/// いまのフレームのカーソルの形。知らない種類なら None。
+fn pointer_shape(duplication: &IDXGIOutputDuplication, size: u32) -> Result<Option<Shape>> {
+    let mut data = vec![0u8; size as usize];
+    let mut required = 0;
+    let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+    // SAFETY: data は size バイト。フレームは ReleaseFrame 前
+    unsafe {
+        duplication.GetFramePointerShape(
+            size,
+            data.as_mut_ptr().cast(),
+            &mut required,
+            &mut info,
+        )?;
+    }
+    let kind = match info.Type as i32 {
+        t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 => ShapeKind::Monochrome,
+        t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 => ShapeKind::Color,
+        t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 => ShapeKind::MaskedColor,
+        t => {
+            log::warn!("unknown pointer shape type {t}; the cursor is not drawn");
+            return Ok(None);
+        }
+    };
+    Ok(Some(Shape {
+        kind,
+        width: info.Width,
+        height: info.Height,
+        pitch: info.Pitch as usize,
+        data,
+    }))
+}
+
+/// カーソルを画面の画像に重ねる。重なる部分だけを staging に写し、CPU で重ねて書き戻す。
+/// 8bit BGRA でない画像（HDR のモニタ）には重ねない。
+fn draw_cursor(device: &ID3D11Device, texture: &ID3D11Texture2D, cursor: &Cursor) -> Result<()> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    // SAFETY: 説明を読むだけ
+    unsafe { texture.GetDesc(&mut desc) };
+    if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+        log::warn!(
+            "output format is {:?}, not 8-bit BGRA; the cursor is not drawn",
+            desc.Format
+        );
+        return Ok(());
+    }
+    let screen = Rect::from_origin_size(Point::new(0, 0), Size::new(desc.Width, desc.Height));
+    let Some(area) = cursor.bounds().intersect(&screen) else {
+        return Ok(());
+    };
+    let size = area.size();
+    let staging_desc = D3D11_TEXTURE2D_DESC {
+        Width: size.width,
+        Height: size.height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: (D3D11_CPU_ACCESS_READ.0 | D3D11_CPU_ACCESS_WRITE.0) as u32,
+        MiscFlags: 0,
+        ..desc
+    };
+    let source = D3D11_BOX {
+        left: area.left as u32,
+        top: area.top as u32,
+        front: 0,
+        right: area.right as u32,
+        bottom: area.bottom as u32,
+        back: 1,
+    };
+    // SAFETY: 同じデバイスのテクスチャ同士で写す。Map した範囲（RowPitch * 高さ）の中だけを書き、
+    // Unmap してから書き戻す。コンテキストは SetMultithreadProtected 済み
+    unsafe {
+        let mut staging = None;
+        device.CreateTexture2D(&staging_desc, None, Some(&mut staging))?;
+        let staging = staging.ok_or(windows::Win32::Foundation::E_POINTER)?;
+        let context = device.GetImmediateContext()?;
+        context.CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, 0, Some(&source));
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context.Map(&staging, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))?;
+        let stride = mapped.RowPitch as usize;
+        let len = stride * (size.height as usize - 1) + size.width as usize * 4;
+        let pixels = std::slice::from_raw_parts_mut(mapped.pData as *mut u8, len);
+        cursor.draw(area.origin(), size, stride, pixels);
+        context.Unmap(&staging, 0);
+        context.CopySubresourceRegion(
+            texture,
+            0,
+            area.left as u32,
+            area.top as u32,
+            0,
+            &staging,
+            0,
+            None,
+        );
+    }
+    Ok(())
 }

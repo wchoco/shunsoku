@@ -135,6 +135,14 @@ fn write_general(t: &mut dyn TableLike, g: &General) {
         &g.dpi_scaling,
         |&v| Some(dpi_scaling_name(v).into()),
     );
+    put(
+        t,
+        "capture_cursor",
+        Item::as_bool,
+        Some(d.capture_cursor),
+        &g.capture_cursor,
+        |&v| Some(v.into()),
+    );
 }
 
 /// 空のホットキーは項目を消さずに `""` と書く（行と行末のコメントを残すため）。
@@ -342,6 +350,7 @@ notifications = false
         s.general.notifications = false;
         s.general.trash_limit = 0;
         s.general.dpi_scaling = DpiScaling::KeepApparentSize;
+        s.general.capture_cursor = true;
         s.hotkeys.select_capture = chord("Ctrl+Shift+A");
         s.hotkeys.restore_last = chord("Win+Alt+Z");
         s.shortcuts.insert("copy".to_owned(), chord("Ctrl+Shift+C"));
