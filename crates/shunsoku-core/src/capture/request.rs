@@ -158,8 +158,18 @@ impl CaptureRequest {
     /// スクラップにフォーカスを移す。保存に失敗したら、`--scrap` の有無にかかわらずスクラップに逃がさず失敗として返す。
     /// `--quiet` ならトレイ通知を出さない。
     pub fn from_cli(capture: &cli_args::Capture, reply: ReplyTo) -> CaptureRequest {
-        let method = match capture.target {
-            cli_args::Target::Rect { monitor, rect } => CaptureMethod::Rect { monitor, rect },
+        let method = match &capture.target {
+            cli_args::Target::Rect { monitor, rect } => CaptureMethod::Rect {
+                monitor: *monitor,
+                rect: *rect,
+            },
+            cli_args::Target::Region { name } => CaptureMethod::Region(RegionId(name.clone())),
+            cli_args::Target::Select => CaptureMethod::Select,
+            cli_args::Target::Active { .. } => CaptureMethod::ActiveWindow,
+        };
+        let delay = match capture.target {
+            cli_args::Target::Active { delay } => Duration::from_secs(u64::from(delay)),
+            _ => Duration::ZERO,
         };
         let output = &capture.output;
         let save = match &output.save {
@@ -176,7 +186,7 @@ impl CaptureRequest {
                 focus_scrap: output.scrap,
             },
             on_save_failure: OnSaveFailure::Fail,
-            delay: Duration::ZERO,
+            delay,
             notify: !output.quiet,
             reply: Some(reply),
         }
@@ -188,11 +198,7 @@ impl CaptureRequest {
         CaptureRequest {
             method: CaptureMethod::Region(RegionId(region.name.clone())),
             outputs: Outputs {
-                save: region.save.then(|| SaveTarget::Region {
-                    dir: region.save_dir.clone(),
-                    file_name_template: region.file_name_template.clone(),
-                    name: region.name.clone(),
-                }),
+                save: region.save.then(|| region_save_target(region)),
                 scrap: region.scrap,
                 copy: false,
                 focus_scrap: false,
@@ -202,6 +208,18 @@ impl CaptureRequest {
             notify: true,
             reply: None,
         }
+    }
+
+    /// 撮る定型領域が決まったときに、全体の保存先（`SaveTarget::Default`）への保存を、その領域の保存先と
+    /// ファイル名テンプレートへの保存に変える。CLI の `capture region` の依頼に使う。出力（保存する・スクラップを
+    /// 出す）は変えない（領域の撮影後の動作は見ない）。定型領域の依頼でなければ、そのまま返す。
+    pub fn with_region_destination(mut self, region: &Region) -> CaptureRequest {
+        if matches!(self.method, CaptureMethod::Region(_))
+            && self.outputs.save == Some(SaveTarget::Default)
+        {
+            self.outputs.save = Some(region_save_target(region));
+        }
+        self
     }
 
     /// 範囲選択・ウィンドウのキャプチャ: スクラップを出してフォーカスを移す。保存しない。
@@ -219,6 +237,15 @@ impl CaptureRequest {
             notify: true,
             reply: None,
         }
+    }
+}
+
+/// 定型領域の保存先とファイル名テンプレートへの保存。
+fn region_save_target(region: &Region) -> SaveTarget {
+    SaveTarget::Region {
+        dir: region.save_dir.clone(),
+        file_name_template: region.file_name_template.clone(),
+        name: region.name.clone(),
     }
 }
 
@@ -534,6 +561,110 @@ mod tests {
         let both = CaptureRequest::region(&region(true, true));
         assert_eq!(both.outputs.save, Some(region_save_target()));
         assert!(both.outputs.scrap && !both.outputs.focus_scrap);
+    }
+
+    fn cli(target: cli_args::Target) -> CaptureRequest {
+        CaptureRequest::from_cli(
+            &cli_args::Capture {
+                target,
+                output: cli_args::Output::default(),
+            },
+            ReplyTo(3),
+        )
+    }
+
+    /// CLI の既定の出力: 保存だけ・保存に失敗したら失敗として返す。
+    fn cli_saving(method: CaptureMethod, save: SaveTarget, delay: Duration) -> CaptureRequest {
+        CaptureRequest {
+            method,
+            outputs: Outputs {
+                save: Some(save),
+                scrap: false,
+                copy: false,
+                focus_scrap: false,
+            },
+            on_save_failure: OnSaveFailure::Fail,
+            delay,
+            notify: true,
+            reply: Some(ReplyTo(3)),
+        }
+    }
+
+    #[test]
+    fn a_cli_active_capture_waits_the_delay_then_only_saves() {
+        assert_eq!(
+            cli(cli_args::Target::Active { delay: 3 }),
+            cli_saving(
+                CaptureMethod::ActiveWindow,
+                SaveTarget::Default,
+                Duration::from_secs(3)
+            )
+        );
+    }
+
+    #[test]
+    fn a_cli_select_capture_only_saves() {
+        assert_eq!(
+            cli(cli_args::Target::Select),
+            cli_saving(CaptureMethod::Select, SaveTarget::Default, Duration::ZERO)
+        );
+    }
+
+    /// spec #34: CLI で定型領域を撮るときは、領域の撮影後の動作は見ず、保存先とファイル名テンプレートは領域のもの。
+    #[test]
+    fn a_cli_region_capture_saves_with_the_regions_destination_ignoring_its_outputs() {
+        let request = cli(cli_args::Target::Region {
+            name: "dash".to_owned(),
+        });
+        // 領域の撮影後の動作は「スクラップだけ」だが、CLI の既定（保存だけ）に従う
+        let request = request.with_region_destination(&region(false, true));
+        assert_eq!(
+            request,
+            cli_saving(
+                CaptureMethod::Region(RegionId("dash".to_owned())),
+                region_save_target(),
+                Duration::ZERO
+            )
+        );
+    }
+
+    #[test]
+    fn a_cli_region_capture_keeps_an_explicit_out_or_no_save() {
+        for save in [
+            cli_args::Save::To("C:\\a.png".to_owned()),
+            cli_args::Save::No,
+        ] {
+            let request = CaptureRequest::from_cli(
+                &cli_args::Capture {
+                    target: cli_args::Target::Region {
+                        name: "dash".to_owned(),
+                    },
+                    output: cli_args::Output {
+                        save,
+                        scrap: true,
+                        ..cli_args::Output::default()
+                    },
+                },
+                ReplyTo(3),
+            );
+            assert_eq!(
+                request
+                    .clone()
+                    .with_region_destination(&region(true, false)),
+                request
+            );
+        }
+    }
+
+    #[test]
+    fn the_region_destination_leaves_a_hotkey_region_request_as_it_is() {
+        let request = CaptureRequest::region(&region(true, true));
+        assert_eq!(
+            request
+                .clone()
+                .with_region_destination(&region(false, false)),
+            request
+        );
     }
 
     #[test]
