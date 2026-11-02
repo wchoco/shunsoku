@@ -1118,7 +1118,10 @@ a = 1
     fn active_window_capture_hotkey_is_unset_by_default() {
         let (settings, issues) = load("version = 1\n");
         assert_eq!(issues, vec![]);
-        assert_eq!(settings.hotkeys.get(HotkeyAction::ActiveWindowCapture), None);
+        assert_eq!(
+            settings.hotkeys.get(HotkeyAction::ActiveWindowCapture),
+            None
+        );
     }
 
     #[test]

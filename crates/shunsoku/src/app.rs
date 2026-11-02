@@ -51,7 +51,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
-use shunsoku_core::capture::request::{CaptureRequest, Source};
+use shunsoku_core::capture::request::{self, CaptureRequest, Source};
 use shunsoku_core::geometry::Point;
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
@@ -718,7 +718,7 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_CAPTURE_DELAY);
             }
-            open_overlay();
+            take_capture();
             Some(LRESULT(0))
         }
         WM_CLOSE => {
@@ -1920,14 +1920,94 @@ fn request_capture(source: Source) {
     };
     log::info!("capture requested from {source:?}");
     if delay.is_zero() {
-        open_overlay();
+        take_capture();
         return;
     }
     let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
     // SAFETY: 自分のウィンドウのタイマー
     if unsafe { SetTimer(Some(message_window), TIMER_CAPTURE_DELAY, ms, None) } == 0 {
         log::warn!("could not start the capture delay timer; capturing now");
-        open_overlay();
+        take_capture();
+    }
+}
+
+/// 待っている依頼を、撮り方に合わせて進める。
+fn take_capture() {
+    let method = with_app(|app| match &app.capture {
+        Capture::Waiting(request) => Some(request.method),
+        _ => None,
+    })
+    .flatten();
+    match method {
+        Some(request::CaptureMethod::Select) => open_overlay(),
+        Some(request::CaptureMethod::ActiveWindow) => capture_active_window(),
+        None => {}
+    }
+}
+
+/// 待っている依頼で、いまアクティブなウィンドウを WGC で撮り、依頼の出力（スクラップ）を出す。
+fn capture_active_window() {
+    let started = Instant::now();
+    // 撮る前にアクティブなウィンドウを決める（スクラップを出すとフォーカスが移る）
+    // SAFETY: 引数なし
+    let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    let taken = with_app(|app| match &app.capture {
+        Capture::Waiting(request) => Some((
+            request.clone(),
+            app.gpu.primary_device(),
+            app.module,
+            Appearance::from(app.settings.scrap),
+        )),
+        _ => None,
+    })
+    .flatten();
+    let Some((request, device, module, appearance)) = taken else {
+        return;
+    };
+    let grabbed = if hwnd.is_invalid() {
+        Err("no active window".to_owned())
+    } else {
+        device.map_err(|e| e.to_string()).and_then(|device| {
+            crate::window_grab::grab_window(&device, hwnd, false).map_err(|e| e.to_string())
+        })
+    };
+    let shot = match grabbed {
+        Ok(shot) => shot,
+        Err(e) => {
+            log::warn!("could not capture the active window: {e}");
+            end_capture();
+            notify_user(notify::Level::Error, text("capture.failed"));
+            return;
+        }
+    };
+    log::info!(
+        "captured window {}x{} at ({}, {}) in {:.1} ms",
+        shot.rect.width(),
+        shot.rect.height(),
+        shot.rect.left,
+        shot.rect.top,
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    end_capture();
+    if !request.outputs.scrap {
+        return;
+    }
+    // ウィンドウを作るとメッセージが届くので、App を借りずに作る
+    let model = ScrapModel::new(shot.rect.origin(), shot.image.size());
+    match open_scrap(
+        module,
+        model,
+        shot.image,
+        &appearance,
+        request.outputs.focus_scrap,
+    ) {
+        Ok(scrap) => {
+            if with_app(|app| app.scraps.push(scrap)).is_none() {
+                log::warn!("could not keep the scrap");
+            }
+            perf::mark(Mark::ScrapShown);
+        }
+        Err(e) => log::error!("could not open a scrap: {e}"),
     }
 }
 
@@ -2035,6 +2115,9 @@ fn on_hotkey(wparam: WPARAM) {
     match action {
         Some(settings::HotkeyAction::SelectCapture) => request_capture(Source::Hotkey),
         Some(settings::HotkeyAction::RestoreLast) => restore_last_scrap(),
+        Some(settings::HotkeyAction::ActiveWindowCapture) => {
+            request_capture(Source::ActiveWindowHotkey)
+        }
         None => log::warn!("unknown hotkey id {}", wparam.0),
     }
 }
