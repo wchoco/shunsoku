@@ -10,6 +10,12 @@ pub const VERSION: u32 = 1;
 /// 1 通の依頼・応答の大きさの上限（バイト）。これより大きいものは読まずに断る。
 pub const MAX_MESSAGE: usize = 64 * 1024;
 
+/// 名前付きパイプの名前。セッションの番号とユーザーの SID（文字列）を含め、別のセッション・別のユーザーの
+/// 常駐本体とは別のパイプにする。開けるのを現在のユーザーに限るのはセキュリティ記述子の役目（`pipe_server`）。
+pub fn pipe_name(session: u32, user_sid: &str) -> String {
+    format!(r"\\.\pipe\shunsoku-{session}-{user_sid}")
+}
+
 /// 依頼。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -410,6 +416,16 @@ mod tests {
             decode_request("hello\n"),
             Err(DecodeError::VersionMismatch(None))
         );
+    }
+
+    #[test]
+    fn the_pipe_name_is_per_session_and_per_user() {
+        assert_eq!(
+            pipe_name(2, "S-1-5-21-1-2-3-1001"),
+            r"\\.\pipe\shunsoku-2-S-1-5-21-1-2-3-1001"
+        );
+        assert_ne!(pipe_name(1, "S-1-5-21-1"), pipe_name(2, "S-1-5-21-1"));
+        assert_ne!(pipe_name(1, "S-1-5-21-1"), pipe_name(1, "S-1-5-21-2"));
     }
 
     #[test]
