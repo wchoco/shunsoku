@@ -10,11 +10,15 @@ mod clipboard;
 #[cfg(windows)]
 mod grab;
 #[cfg(windows)]
+mod hdr;
+#[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
 mod logger;
 #[cfg(windows)]
 mod menu;
+#[cfg(windows)]
+mod monitor_list;
 #[cfg(windows)]
 mod notify;
 #[cfg(windows)]
@@ -23,6 +27,8 @@ mod overlay;
 mod panic_hook;
 #[cfg(windows)]
 mod perf;
+#[cfg(windows)]
+mod pipe_server;
 #[cfg(windows)]
 mod render;
 #[cfg(windows)]
@@ -39,6 +45,10 @@ mod trash_store;
 mod tray;
 #[cfg(windows)]
 mod wide;
+#[cfg(windows)]
+mod window_grab;
+#[cfg(windows)]
+mod window_list;
 
 #[cfg(windows)]
 fn main() {

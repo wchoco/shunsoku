@@ -43,11 +43,9 @@ impl Registered {
         self.unregister_all();
         let mut failed = Vec::new();
         for (&chord, &action) in hotkeys {
-            // id は HotkeyAction::ALL の中の位置 + 1（0 は使わない。範囲は 0x0000〜0xBFFF）
-            let Some(i) = HotkeyAction::ALL.iter().position(|&a| a == action) else {
+            let Some(id) = id(action) else {
                 continue;
             };
-            let id = i as i32 + 1;
             // SAFETY: 自分のスレッドのウィンドウに登録する
             let result = unsafe {
                 RegisterHotKey(
@@ -91,6 +89,17 @@ impl Drop for Registered {
     fn drop(&mut self) {
         self.unregister_all();
     }
+}
+
+/// 登録に使う id（範囲は 0x0000〜0xBFFF。0 は使わない）。全体のホットキーは `HotkeyAction::ALL` の中の位置 + 1、
+/// 定型領域のホットキーは 0x100 + 領域の位置。
+fn id(action: HotkeyAction) -> Option<i32> {
+    const REGION_BASE: usize = 0x100;
+    let i = match action {
+        HotkeyAction::Region(i) => REGION_BASE.checked_add(i)?,
+        _ => HotkeyAction::ALL.iter().position(|&a| a == action)? + 1,
+    };
+    i32::try_from(i).ok().filter(|&id| id <= 0xBFFF)
 }
 
 /// 押しっぱなしで繰り返し届かないように `MOD_NOREPEAT` を付ける。

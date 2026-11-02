@@ -7,6 +7,9 @@ tooltip = "shunsoku"
 
 [tray.menu]
 select_capture = "範囲選択キャプチャ"
+regions = "定型領域"
+regions_empty = "（なし）"
+add_region = "定型領域を追加…"
 trash = "ごみ箱"
 trash_empty = "（空）"
 close_all = "すべてのスクラップを閉じる"
@@ -84,6 +87,33 @@ panicked = "予期しないエラーが起きました。詳しくはログを�
 
 [capture]
 failed = "画面を撮れませんでした。"
+# ウィンドウを WGC で撮れず（UAC で昇格したウィンドウなど）、見えている部分だけを撮ったとき
+window_partial = "隠れた部分は撮れませんでした。"
+
+# 定型領域キャプチャの失敗。後ろに定型領域の名前を付けて出す
+[region]
+monitor_not_found = "定型領域のモニタが見つからないため、撮れませんでした: "
+out_of_bounds = "定型領域の範囲がモニタからはみ出すため、撮れませんでした: "
+gone = "その名前の定型領域が設定にないため、撮れませんでした: "
+# 定型領域の登録。登録した名前は「領域 1」「領域 2」…（この後ろに番号を付ける）
+default_name = "領域"
+registered = "定型領域を登録しました: "
+register_failed = "定型領域を登録できませんでした。"
+# 範囲選択の画面
+[selection]
+# 定型領域の登録のとき、画面の上端に出す
+register_banner = "定型領域の登録"
+
+# CLI（shunsoku-cli）に返す失敗の理由。標準エラーに出る
+[cli]
+selecting = "範囲選択の画面を開いているため、撮れません。"
+no_such_monitor = "その番号のモニタはありません（番号は shunsoku-cli monitors で調べられます）: "
+no_main_monitor = "メインモニタが見つかりません。"
+out_of_monitor = "範囲がモニタからはみ出しています。"
+unreadable_monitor = "このモニタの画面はそのまま出せません（回転したモニタなど）。"
+cancelled = "範囲選択が取り消されました。"
+timed_out = "時間内に撮り終えられなかったため、依頼を取りやめました。"
+no_active_window = "撮れるアクティブウィンドウがありません（デスクトップとタスクバーは撮りません）。"
 
 [copy]
 failed = "クリップボードにコピーできませんでした。"
