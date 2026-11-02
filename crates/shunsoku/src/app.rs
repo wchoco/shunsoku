@@ -60,9 +60,11 @@
 //!   引き継ぐ。
 //!   書き込みは表示にも保存とコピーにも `render` の同じ関数で描く（ADR-0006）。
 //! - 文字の道具で打つ間（`EditOutput::TypingStarted` から `TypingEnded` まで）だけ、スクラップで IME を使う
-//!   （`ime`、`sync_ime`）。`WM_CHAR` と IME の確定した文字を `EditInput::Char` にし、変換中の文字は `Scrap::composition`
-//!   に持って打っている文字の続きに描く。変換中にクリックやツールバーなどで打ち終えるときは、変換中の文字も
-//!   確定したことにしてから渡す（`commit_composition`）。編集モードのダブルクリックは `EditInput::DoubleClick`。
+//!   （`ime`、`sync_ime`）。`WM_CHAR` は `EditInput::Utf16`、IME の確定した文字と変換中の文字は
+//!   `EditInput::Composition` にして渡す。変換中の文字は core（`EditState::composition`）が持ち、打っている文字の
+//!   続きに描く。変換中にクリックやツールバーなどで打ち終えるときに変換中の文字を確定したことにするのも core で、
+//!   そのとき（`EditOutput::CompositionTaken`）は IME の側の変換中の文字を捨てる。編集モードのダブルクリックは
+//!   `EditInput::DoubleClick`。
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -326,14 +328,8 @@ struct Scrap {
     wheel: Wheel,
     /// 倍率を出しているか（`Effect::ShowZoom` から `TIMER_ZOOM_LABEL` が鳴るまで）。
     zoom_label: bool,
-    /// 文字を打つ間の IME の変換中の文字。
-    composition: Option<ime::Composition>,
-    /// IME を使えるようにしているか（`sync_ime`）。
-    ime_on: bool,
     /// 最後に描いたキャレットの矩形（ウィンドウの中の座標）。打っていなければ None。
     caret: std::cell::Cell<Option<Rect>>,
-    /// `WM_CHAR` で来たサロゲート ペアの前半。
-    high_surrogate: Option<u16>,
 }
 
 /// 書き込みの編集モードのツールバー。
@@ -498,7 +494,6 @@ impl Scrap {
             &self.model,
             appearance,
             label,
-            self.composition.as_ref(),
         )?;
         self.caret.set(caret);
         self.sync_toolbar(appearance, renderer, true);
@@ -512,7 +507,8 @@ impl Scrap {
 ///
 /// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
 /// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
-/// 文字を打っていれば、IME の変換中の文字 `composition` をつなげて描き、キャレットの矩形（ウィンドウの中の座標）を返す。
+/// 文字を打っていれば、IME の変換中の文字（`EditState::composition`）をつなげて描き、キャレットの矩形（ウィンドウの
+/// 中の座標）を返す。
 fn paint_scrap(
     renderer: &mut Option<render::Renderer>,
     window: &scrap_window::ScrapWindow,
@@ -520,7 +516,6 @@ fn paint_scrap(
     model: &ScrapModel,
     appearance: &Appearance,
     label: Option<render::ZoomLabel>,
-    composition: Option<&ime::Composition>,
 ) -> Result<Option<Rect>> {
     let rect = model.window_rect(appearance);
     let appearance = &model.appearance(appearance);
@@ -547,6 +542,7 @@ fn paint_scrap(
     });
     let annotations = model.annotations_to_draw();
     let typing = model.typing_annotation();
+    let composition = model.edit_state().and_then(EditState::composition);
     let overlays = render::Overlays {
         annotations: render::AnnotationLayer {
             annotations: &annotations,
@@ -557,6 +553,7 @@ fn paint_scrap(
                 composition: composition.map_or("", |c| c.text.as_str()),
                 cursor: composition.map_or(0, |c| c.cursor),
             }),
+            scale: window.dpi() as f32 / 96.0,
         },
         label,
         trim,
@@ -1356,7 +1353,13 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             Some(LRESULT(0))
         }
         WM_IME_ENDCOMPOSITION if is_typing(hwnd) => {
-            set_composition(hwnd, None);
+            on_edit_input(
+                hwnd,
+                EditInput::Composition {
+                    result: String::new(),
+                    composing: None,
+                },
+            );
             Some(LRESULT(0))
         }
         // 右クリック（DefWindowProcW が WM_RBUTTONUP から作る）と Shift+F10・アプリケーション キー
@@ -1420,6 +1423,10 @@ fn message_screen_point() -> Point {
 }
 
 impl App {
+    fn scrap(&self, hwnd: HWND) -> Option<&Scrap> {
+        self.scraps.iter().find(|s| s.window.hwnd() == hwnd)
+    }
+
     fn scrap_mut(&mut self, hwnd: HWND) -> Option<&mut Scrap> {
         self.scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)
     }
@@ -1633,18 +1640,20 @@ fn on_edit_move(hwnd: HWND, wparam: WPARAM, at: Point) {
 }
 
 /// 書き込みの編集モードに入力を渡し、変わったら描き直す。編集モードでなければ何もせず None。
-/// 文字を打っている間にクリックなどで打ち終えるときのために、文字とカーソルの移動のほかは、先に変換中の文字を
-/// 確定したことにする（`commit_composition`）。打ち始めたら・打ち終えたら IME を使う・使わないを切り替える。
+/// 変換中の文字を確定したことにしたら（`EditOutput::CompositionTaken`）IME の側の変換中の文字を捨て、打ち始めたら・
+/// 打ち終えたら IME を使う・使わないを切り替える。
 fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
-    if !matches!(
-        input,
-        EditInput::Char(_) | EditInput::Move { .. } | EditInput::Release
-    ) {
-        commit_composition(hwnd);
-    }
     let outputs = edit_input(hwnd, input);
-    if outputs.as_ref().is_some_and(|o| !o.is_empty()) {
-        sync_ime(hwnd);
+    if let Some(outputs) = &outputs {
+        if outputs.contains(&EditOutput::CompositionTaken) {
+            ime::cancel(hwnd);
+        }
+        if !outputs.is_empty() {
+            let switch = outputs
+                .iter()
+                .any(|o| matches!(o, EditOutput::TypingStarted | EditOutput::TypingEnded));
+            sync_ime(hwnd, switch);
+        }
     }
     outputs
 }
@@ -1652,103 +1661,47 @@ fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
 /// 文字を打っているか。
 fn is_typing(hwnd: HWND) -> bool {
     with_app(|app| {
-        app.scraps.iter().any(|s| {
-            s.window.hwnd() == hwnd && s.model.edit_state().is_some_and(EditState::is_typing)
-        })
+        app.scrap(hwnd)
+            .is_some_and(|s| s.model.edit_state().is_some_and(EditState::is_typing))
     })
     .unwrap_or(false)
 }
 
-/// `WM_CHAR`: 文字を打っている間の文字を渡す。サロゲート ペアは 2 つ揃ってから渡す。受けなければ false。
+/// `WM_CHAR`: 文字を打っている間の文字を渡す（サロゲート ペアは core が組み立てる）。受けなければ false。
 fn on_scrap_char(hwnd: HWND, wparam: WPARAM) -> bool {
-    let unit = wparam.0 as u16;
-    let c = match unit {
-        0xD800..=0xDBFF => {
-            return with_app(|app| {
-                let scrap = app.scrap_mut(hwnd)?;
-                scrap.high_surrogate = Some(unit);
-                Some(scrap.model.edit_state().is_some_and(EditState::is_typing))
-            })
-            .flatten()
-            .unwrap_or(false);
-        }
-        0xDC00..=0xDFFF => {
-            let high = with_app(|app| app.scrap_mut(hwnd)?.high_surrogate.take()).flatten();
-            let Some(high) = high else {
-                return false;
-            };
-            char::decode_utf16([high, unit]).next().and_then(|c| c.ok())
-        }
-        _ => char::from_u32(u32::from(unit)),
-    };
-    let Some(c) = c else {
-        return false;
-    };
-    on_edit_input(hwnd, EditInput::Char(c)).is_some_and(|o| !o.is_empty())
+    on_edit_input(hwnd, EditInput::Utf16(wparam.0 as u16)).is_some_and(|o| !o.is_empty())
 }
 
-/// `WM_IME_COMPOSITION`: 確定した文字を渡し、変換中の文字を描き直す。
+/// `WM_IME_COMPOSITION`: 確定した文字と変換中の文字を渡す。
 fn on_ime_composition(hwnd: HWND, lparam: LPARAM) {
     let update = ime::read_composition(hwnd, lparam);
-    // 確定した文字は変換中の文字に入っていたので、先に変換中の文字を新しいものにしてから渡す
-    with_app(|app| {
-        if let Some(scrap) = app.scrap_mut(hwnd) {
-            scrap.composition = update.composition.clone();
-        }
-    });
-    for c in update.result.chars() {
-        edit_input(hwnd, EditInput::Char(c));
-    }
-    set_composition(hwnd, update.composition);
+    on_edit_input(
+        hwnd,
+        EditInput::Composition {
+            result: update.result,
+            composing: update.composition,
+        },
+    );
 }
 
-/// 変換中の文字を `composition` にして描き直し、IME の窓をキャレットに合わせる。
-fn set_composition(hwnd: HWND, composition: Option<ime::Composition>) {
-    with_app(|app| {
-        let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
-        scrap.composition = composition;
-        // 描くだけで App を借りるメッセージは届かないので、借りたまま描く
-        if let Err(e) = scrap.paint(&appearance, renderer) {
-            log::warn!("could not draw the text being typed: {e}");
-        }
-        Some(())
-    });
-    sync_ime(hwnd);
-}
-
-/// 変換中の文字があれば、確定したことにして渡し、IME の側の変換中の文字を捨てる。
-fn commit_composition(hwnd: HWND) {
-    let Some(composition) = with_app(|app| app.scrap_mut(hwnd)?.composition.take()).flatten()
-    else {
-        return;
-    };
-    for c in composition.text.chars() {
-        edit_input(hwnd, EditInput::Char(c));
-    }
-    ime::cancel(hwnd);
-}
-
-/// 文字を打ち始めたら IME を使えるようにし、打ち終えたら使えないようにする。打っている間は、変換中の文字と
-/// 候補の窓をキャレットに合わせる。IME を呼ぶのは App を返してから。
-fn sync_ime(hwnd: HWND) {
-    let Some((typing, was_on, caret)) = with_app(|app| {
-        let (scrap, appearance, _) = app.scrap_to_draw(hwnd)?;
+/// 打っている間は、変換中の文字と候補の窓をキャレットに合わせる。`switch`（打ち始めた・打ち終えた）なら、
+/// 打っていれば IME を使えるようにし、打っていなければ使えないようにする。IME を呼ぶのは App を返してから。
+fn sync_ime(hwnd: HWND, switch: bool) {
+    let Some((typing, caret)) = with_app(|app| {
+        let appearance = Appearance::from(app.settings.scrap);
+        let scrap = app.scrap(hwnd)?;
         let typing = scrap.model.edit_state().is_some_and(EditState::is_typing);
-        let was_on = std::mem::replace(&mut scrap.ime_on, typing);
-        if !typing {
-            scrap.composition = None;
-        }
         let origin = scrap.model.window_rect(&appearance).origin();
         let caret = scrap.caret.get().map(|r| r.offset(origin.x, origin.y));
-        Some((typing, was_on, caret))
+        Some((typing, caret))
     })
     .flatten() else {
         return;
     };
-    match (was_on, typing) {
-        (false, true) => ime::enable(hwnd),
+    match (switch, typing) {
+        (true, true) => ime::enable(hwnd),
         (true, false) => ime::disable(hwnd),
-        _ => {}
+        (false, _) => {}
     }
     if let (true, Some(caret)) = (typing, caret) {
         ime::place(hwnd, caret);
@@ -1790,12 +1743,7 @@ fn edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
 
 /// トリムの範囲を選んでいるか。
 fn is_trimming(hwnd: HWND) -> bool {
-    with_app(|app| {
-        app.scraps
-            .iter()
-            .any(|s| s.window.hwnd() == hwnd && s.model.is_trimming())
-    })
-    .unwrap_or(false)
+    with_app(|app| app.scrap(hwnd).is_some_and(|s| s.model.is_trimming())).unwrap_or(false)
 }
 
 /// トリムの最中のカーソルの移動。押したままでなければ（離したことを取りこぼしたなど）押していないことにする
@@ -1936,8 +1884,9 @@ fn on_scrap_key(hwnd: HWND, wparam: WPARAM) -> bool {
         key,
     };
     // 書き込みの編集モードではショートカットは効かない。受けなかったキー（Alt+F4 など）は DefWindowProcW に任せる
+    // 変換中の文字を確定しただけ（`CompositionTaken`）なら受けていない
     if let Some(outputs) = on_edit_input(hwnd, EditInput::Key(chord)) {
-        return !outputs.is_empty();
+        return outputs.iter().any(|o| *o != EditOutput::CompositionTaken);
     }
     let Some(op) = with_app(|app| app.shortcuts.operation(chord)).flatten() else {
         return false;
@@ -2071,6 +2020,8 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
         view: scrap.model.output_view(),
         selected: None,
         typing: None,
+        // 選択の印もキャレットも描かない
+        scale: 1.0,
     };
     match render::render_image(scrap.shown(), layer) {
         Ok(image) => job(image),
@@ -2083,8 +2034,6 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
 
 /// スクラップ操作を実行し、返った `Effect` を実行する。スクラップのキー・マウス・メニューはすべてここを通る。
 fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
-    // 打っている間にメニューから編集モードを抜けるときは、変換中の文字も書き込みにする
-    commit_composition(hwnd);
     let deferred = with_app(|app| {
         let annotation = Style::from(&app.settings.annotation);
         let font = Font::from(&app.settings.annotation);
@@ -2172,8 +2121,8 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
     })
     .flatten()
     .unwrap_or_default();
-    // 編集モードを抜けたら IME を使えないようにする
-    sync_ime(hwnd);
+    // 編集モードを抜けたら IME を使えないようにする（core が変換中の文字も書き込みにしてある）
+    sync_ime(hwnd, true);
     // クリップボード・通知・ウィンドウを壊すのはメッセージが届くことがあるので、App を借りずに行う
     for action in deferred {
         match action {
@@ -2752,10 +2701,9 @@ fn open_scrap(
             &model,
             appearance,
             None,
-            None,
         )
     })
-    .unwrap_or_else(|| paint_scrap(&mut None, &window, visible, &model, appearance, None, None));
+    .unwrap_or_else(|| paint_scrap(&mut None, &window, visible, &model, appearance, None));
     painted?;
     window.show(focus);
     Ok(Scrap {
@@ -2767,10 +2715,7 @@ fn open_scrap(
         drag: Drag::default(),
         wheel: Wheel::default(),
         zoom_label: false,
-        composition: None,
-        ime_on: false,
         caret: Default::default(),
-        high_surrogate: None,
     })
 }
 

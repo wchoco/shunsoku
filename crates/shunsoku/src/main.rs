@@ -16,6 +16,8 @@ mod hotkey;
 #[cfg(windows)]
 mod ime;
 #[cfg(windows)]
+mod layered;
+#[cfg(windows)]
 mod logger;
 #[cfg(windows)]
 mod menu;

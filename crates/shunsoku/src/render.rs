@@ -92,6 +92,9 @@ pub struct AnnotationLayer<'a> {
     pub selected: Option<Rect>,
     /// 打っている文字。保存とコピーには描かない（None）。
     pub typing: Option<TypingLayer<'a>>,
+    /// 選択の印とキャレットの大きさの倍率（ウィンドウのあるモニタの DPI / 96）。書き込みそのものは画像の画素で
+    /// 描くので、これを掛けない。
+    pub scale: f32,
 }
 
 /// 打っている文字と、IME で変換中の文字。
@@ -492,7 +495,7 @@ fn draw_annotations(
             match layer.typing {
                 Some(typing) => {
                     brush.SetColor(&color_of(typing.annotation));
-                    pen.draw_typing(typing)
+                    pen.draw_typing(typing, layer.scale)
                 }
                 None => Ok(None),
             }
@@ -503,7 +506,7 @@ fn draw_annotations(
             (Ok(caret), Some(bounds)) => {
                 let (x0, y0) = at(Point::new(bounds.left, bounds.top));
                 let (x1, y1) = at(Point::new(bounds.right, bounds.bottom));
-                draw_selection_mark(target, (x0, y0, x1, y1)).map(|()| caret)
+                draw_selection_mark(target, (x0, y0, x1, y1), layer.scale).map(|()| caret)
             }
             (drawn, _) => drawn,
         };
@@ -512,30 +515,37 @@ fn draw_annotations(
     }
 }
 
-/// 選択の印の色と、外接矩形から外へ空ける幅・角の四角の大きさ（物理ピクセル）。
+/// 選択の印の色と、外接矩形から外へ空ける幅・角の四角の大きさ・白い縁と青い枠の太さ（96 DPI での画素。モニタの
+/// DPI で換算する）。
 const SELECTION_COLOR: u32 = 0x1E_88_E5;
-const SELECTION_PAD: f64 = 3.0;
-const SELECTION_HANDLE: f64 = 5.0;
+const SELECTION_PAD: f32 = 3.0;
+const SELECTION_HANDLE: f32 = 5.0;
+const SELECTION_HALO: f32 = 3.0;
+const SELECTION_LINE: f32 = 1.0;
 
 /// 選んでいる書き込みの印: 外接矩形（描く先の座標 `(left, top, right, bottom)`）を少し広げた青い枠と、
-/// 角の白い四角。どんな色の上でも見えるように、枠は白い縁の上に引く。
+/// 角の白い四角。どんな色の上でも見えるように、枠は白い縁の上に引く。大きさは `scale`（DPI / 96）倍にする。
 fn draw_selection_mark(
     target: &ID2D1RenderTarget,
     (left, top, right, bottom): (f64, f64, f64, f64),
+    scale: f32,
 ) -> Result<()> {
+    let scale = scale.max(1.0);
+    let pad = SELECTION_PAD * scale;
+    let line = SELECTION_LINE * scale;
     let frame = D2D_RECT_F {
-        left: (left.min(right) - SELECTION_PAD) as f32,
-        top: (top.min(bottom) - SELECTION_PAD) as f32,
-        right: (left.max(right) + SELECTION_PAD) as f32,
-        bottom: (top.max(bottom) + SELECTION_PAD) as f32,
+        left: left.min(right) as f32 - pad,
+        top: top.min(bottom) as f32 - pad,
+        right: left.max(right) as f32 + pad,
+        bottom: top.max(bottom) as f32 + pad,
     };
-    let half = (SELECTION_HANDLE / 2.0) as f32;
+    let half = SELECTION_HANDLE * scale / 2.0;
     // SAFETY: BeginDraw と EndDraw の間で呼ぶ（draw_annotations）
     unsafe {
         let brush = &target.CreateSolidColorBrush(&rgb(0xFF_FF_FF, 1.0), None)?;
-        target.DrawRectangle(&frame, brush, 3.0, None);
+        target.DrawRectangle(&frame, brush, SELECTION_HALO * scale, None);
         brush.SetColor(&rgb(SELECTION_COLOR, 1.0));
-        target.DrawRectangle(&frame, brush, 1.0, None);
+        target.DrawRectangle(&frame, brush, line, None);
         for (x, y) in [
             (frame.left, frame.top),
             (frame.right, frame.top),
@@ -551,7 +561,7 @@ fn draw_selection_mark(
             brush.SetColor(&rgb(0xFF_FF_FF, 1.0));
             target.FillRectangle(&handle, brush);
             brush.SetColor(&rgb(SELECTION_COLOR, 1.0));
-            target.DrawRectangle(&handle, brush, 1.0, None);
+            target.DrawRectangle(&handle, brush, line, None);
         }
     }
     Ok(())
@@ -566,7 +576,7 @@ fn color_of(annotation: &Annotation) -> D2D1_COLOR_F {
     )
 }
 
-/// 打っている文字のキャレットの太さ（描く先の物理ピクセル）。
+/// 打っている文字のキャレットの太さ（96 DPI での画素。`AnnotationLayer::scale` で換算する）。
 const CARET_WIDTH: f32 = 2.0;
 
 /// 書き込みを 1 つずつ描く道具一式。BeginDraw と EndDraw の間だけ使う。
@@ -689,9 +699,9 @@ impl Pen<'_> {
         }
     }
 
-    /// 打っている文字を、変換中の文字に下線を引いてつなげて描き、キャレットを描く。キャレットの矩形
-    /// （描く先の座標）を返す。
-    fn draw_typing(&self, typing: TypingLayer) -> Result<Option<Rect>> {
+    /// 打っている文字を、変換中の文字に下線を引いてつなげて描き、キャレットを描く（太さは `scale` 倍）。
+    /// キャレットの矩形（描く先の座標）を返す。
+    fn draw_typing(&self, typing: TypingLayer, scale: f32) -> Result<Option<Rect>> {
         let Shape::Text { at, text, font } = &typing.annotation.shape else {
             return Ok(None);
         };
@@ -721,7 +731,7 @@ impl Pen<'_> {
             let caret = D2D_RECT_F {
                 left: origin.X + x,
                 top: origin.Y + y,
-                right: origin.X + x + CARET_WIDTH,
+                right: origin.X + x + CARET_WIDTH * scale.max(1.0),
                 bottom: origin.Y + y + metrics.height.max(1.0),
             };
             self.target.FillRectangle(&caret, self.brush);
