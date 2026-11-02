@@ -20,6 +20,10 @@
 //! トリム（`trim`）は範囲の選択を始めるだけで、選んでいる間（`Mode::Trimming`）の入力は表を通さず
 //! `ScrapModel::trim_input` が受ける。その間はどの操作の `can_execute` も false にする。
 //!
+//! 書き込み（`annotate`）は書き込みの編集モード（`Mode::Editing`）に入る。もう一度選ぶと抜ける。編集モードの
+//! 間は「書き込み」のほかの操作の `can_execute` を false にし、メニューでは「書き込み」にチェックを付ける
+//! （`OperationDescriptor::checked`）。編集モードの間の入力は表を通さず `ScrapModel::edit_input` が受ける。
+//!
 //! 見た目（透明度・枠・影）は、一覧を `choices` に持つ `opacity` / `border` / `shadow` と、`Ctrl+ホイール` の
 //! `opacity_up` / `opacity_down` に分ける。どれもスクラップごとの上書き（`ScrapModel::appearance_overrides`）を
 //! 変える。いまの見た目は全体の既定値に上書きを重ねて決まるので、既定値を `OpContext::appearance` と `menu` の
@@ -27,9 +31,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::annotate::{EditInput, Style};
 use crate::geometry::Point;
 use crate::keys::{Chord, Key, Modifiers};
-use crate::scrap::{Appearance, BorderOverride, ScrapModel, ZoomAnchor};
+use crate::scrap::{Appearance, BorderOverride, Mode, ScrapModel, ZoomAnchor};
 use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
@@ -55,6 +60,8 @@ pub struct OperationDescriptor {
     pub in_menu: bool,
     /// いま実行できるか。できない操作はメニューでグレー表示にし、ショートカットでも実行しない。
     pub can_execute: fn(&ScrapModel) -> bool,
+    /// メニューの項目にチェックを付けるか（いまその状態にいる。書き込みの編集モードなど）。None なら付けない。
+    pub checked: Option<fn(&ScrapModel) -> bool>,
     /// 引数の選択肢（倍率の一覧など）。Some の操作はショートカットを持たず、メニューでは子メニューになる。
     /// 選ばれた選択肢の `Choice::value` は `OpContext::choice` で `run` に渡る。
     /// 引数は全体の見た目の既定値（チェックをいまの見た目に付けるため）。
@@ -207,6 +214,8 @@ pub struct OpContext {
     /// マウスで呼んだときのカーソルの位置（スクリーン座標）。ホイールの拡大縮小の基準点になる。
     /// キーやメニューから呼んだときは None（スクラップの中心が基準）。
     pub cursor: Option<Point>,
+    /// 書き込みの色と太さの既定値（設定ファイルの `[annotation]`）。書き込みの編集モードに入るときに使う。
+    pub annotation: Style,
 }
 
 /// 操作の結果、Win32 層がすること。
@@ -227,6 +236,10 @@ pub enum Effect {
     ShowSaveDialog,
     /// トリムの範囲の選択を始めた（`Mode::Trimming`）。キーとマウスを `ScrapModel::trim_input` に渡し、範囲を描く。
     EnterTrimMode,
+    /// 書き込みの編集モードに入った（`Mode::Editing`）。キーとマウスを `ScrapModel::edit_input` に渡す。
+    EnterEditMode,
+    /// 書き込みの編集モードを抜けた。
+    LeaveEditMode,
 }
 
 const ESC: Chord = Chord::plain(Key::known(0x1B));
@@ -244,10 +257,12 @@ const CTRL_NUMPAD_SUBTRACT: Chord = Chord::plain(Key::known(0x6D)).ctrl();
 const CTRL_0: Chord = Chord::plain(Key::known(0x30)).ctrl();
 const CTRL_SHIFT_S: Chord = CTRL_S.shift();
 const CTRL_T: Chord = Chord::plain(Key::known(0x54)).ctrl();
+const E: Chord = Chord::plain(Key::known(0x45));
 
-/// トリムの範囲を選んでいる間（`Mode::Trimming`）のほかは、いつでも実行できる。
-const fn not_trimming(model: &ScrapModel) -> bool {
-    !model.is_trimming()
+/// ふつうのモード（`Mode::Normal`）なら、いつでも実行できる。トリムの範囲を選んでいる間と書き込みの
+/// 編集モードの間は実行できない。
+const fn normal(model: &ScrapModel) -> bool {
+    matches!(model.mode, Mode::Normal)
 }
 
 /// トリムしていて、畳んでいなければ実行できる（トリムの範囲を選んでいる間は除く）。
@@ -258,7 +273,7 @@ fn trimmed(model: &ScrapModel) -> bool {
 /// コンパクト表示に畳んでいないときだけ実行できる。畳んでいる間に実行できるのは移動・閉じる・コピーと、
 /// 広げる操作だけにする（spec #33）。
 fn not_compact(model: &ScrapModel) -> bool {
-    not_trimming(model) && !model.is_compact()
+    normal(model) && !model.is_compact()
 }
 
 /// `(dx, dy)` だけ動かす操作の `run`。
@@ -507,6 +522,27 @@ fn trim(model: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     }
 }
 
+/// 書き込みの編集モードの間と、ふつうのモードで畳んでいないときに実行できる（入るか抜けるか）。
+fn can_annotate(model: &ScrapModel) -> bool {
+    model.is_editing() || not_compact(model)
+}
+
+fn editing(model: &ScrapModel) -> bool {
+    model.is_editing()
+}
+
+/// 書き込みの編集モードに入る。入っていれば抜ける（描きかけは書き込みにする）。
+fn annotate(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    if model.is_editing() {
+        model.edit_input(EditInput::Leave);
+        vec![Effect::LeaveEditMode]
+    } else if model.start_editing(context.annotation) {
+        vec![Effect::EnterEditMode]
+    } else {
+        Vec::new()
+    }
+}
+
 fn untrim(model: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     if model.untrim() {
         vec![Effect::Redraw]
@@ -532,7 +568,8 @@ const fn keyboard_move(
         order,
         drag_only: false,
         in_menu: false,
-        can_execute: not_trimming,
+        can_execute: normal,
+        checked: None,
         choices: None,
         run,
     }
@@ -549,7 +586,8 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: not_trimming,
+        can_execute: normal,
+        checked: None,
         choices: None,
         run: copy,
     },
@@ -563,6 +601,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: true,
         can_execute: not_compact,
+        checked: None,
         choices: None,
         run: save_default,
     },
@@ -576,6 +615,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: true,
         can_execute: not_compact,
+        checked: None,
         choices: None,
         run: save_as,
     },
@@ -589,6 +629,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: true,
         can_execute: not_compact,
+        checked: None,
         choices: None,
         run: trim,
     },
@@ -602,8 +643,23 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: true,
         can_execute: trimmed,
+        checked: None,
         choices: None,
         run: untrim,
+    },
+    OperationDescriptor {
+        id: "annotate",
+        label_key: "scrap.op.annotate",
+        default_shortcut: &[E],
+        default_mouse: None,
+        group: Group::Edit,
+        order: 30,
+        drag_only: false,
+        in_menu: true,
+        can_execute: can_annotate,
+        checked: Some(editing),
+        choices: None,
+        run: annotate,
     },
     keyboard_move(
         "move_left",
@@ -664,7 +720,8 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 0,
         drag_only: true,
         in_menu: false,
-        can_execute: not_trimming,
+        can_execute: normal,
+        checked: None,
         choices: None,
         run: drag,
     },
@@ -678,6 +735,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: true,
         can_execute: not_compact,
+        checked: None,
         choices: Some(zoom_choices),
         run: zoom_to,
     },
@@ -691,6 +749,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: false,
         can_execute: not_compact,
+        checked: None,
         choices: None,
         run: zoom_in,
     },
@@ -704,6 +763,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: false,
         can_execute: not_compact,
+        checked: None,
         choices: None,
         run: zoom_out,
     },
@@ -717,6 +777,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: false,
         can_execute: not_compact,
+        checked: None,
         choices: None,
         run: zoom_actual,
     },
@@ -730,6 +791,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: true,
         can_execute: not_compact,
+        checked: None,
         choices: Some(opacity_choices),
         run: opacity_to,
     },
@@ -743,6 +805,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: false,
         can_execute: not_compact,
+        checked: None,
         choices: None,
         run: opacity_up,
     },
@@ -756,6 +819,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: false,
         can_execute: not_compact,
+        checked: None,
         choices: None,
         run: opacity_down,
     },
@@ -769,6 +833,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: true,
         can_execute: not_compact,
+        checked: None,
         choices: Some(border_choices),
         run: border_to,
     },
@@ -782,6 +847,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         drag_only: false,
         in_menu: true,
         can_execute: not_compact,
+        checked: None,
         choices: Some(shadow_choices),
         run: shadow_to,
     },
@@ -794,7 +860,8 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 30,
         drag_only: false,
         in_menu: true,
-        can_execute: not_trimming,
+        can_execute: normal,
+        checked: None,
         choices: None,
         run: toggle_compact,
     },
@@ -807,7 +874,8 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 10,
         drag_only: false,
         in_menu: true,
-        can_execute: not_trimming,
+        can_execute: normal,
+        checked: None,
         choices: None,
         run: close,
     },
@@ -1032,6 +1100,8 @@ pub struct MenuItem {
     pub enabled: bool,
     /// 項目の右に出すショートカット。複数あれば最初の 1 つ。
     pub shortcut: Option<Chord>,
+    /// チェックを付ける（`OperationDescriptor::checked`）。
+    pub checked: bool,
 }
 
 /// 右クリックメニューを `ops`（ふつうは `OPERATIONS`）から作る。`group` の宣言の順、その中は `order` の順に並べ、
@@ -1069,6 +1139,7 @@ pub fn menu(
                 label_key: op.label_key,
                 enabled,
                 shortcut: shortcuts.chords(op.id).first().copied(),
+                checked: op.checked.is_some_and(|checked| checked(model)),
             }),
         };
         let Some(&(label_key, _)) = FOLDERS.iter().find(|(_, ids)| ids.contains(&op.id)) else {
@@ -1091,13 +1162,14 @@ pub fn menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotate::Style;
     use crate::geometry::{Point, Rect, Size};
     use crate::image::Image;
     use crate::scrap::{
         Appearance, Border, Mode, ScrapModel, TrimInput, ZOOM_ACTUAL, ZOOM_MAX, ZOOM_MIN,
         ZoomAnchor,
     };
-    use crate::settings::Conflict;
+    use crate::settings::{Conflict, Rgb};
 
     fn scrap() -> ScrapModel {
         ScrapModel::new(Point::new(-100, 50), Size::new(300, 200))
@@ -1249,6 +1321,77 @@ mod tests {
         trim(&mut model);
         assert_eq!(model.mode, Mode::Normal);
         assert!(model.is_trimmed());
+    }
+
+    fn editing_context() -> OpContext {
+        OpContext {
+            annotation: Style {
+                color: Rgb(0, 0x80, 0xFF),
+                width: 5,
+            },
+            ..OpContext::default()
+        }
+    }
+
+    #[test]
+    fn annotate_enters_the_edit_mode_with_the_configured_style_and_leaves_it_when_run_again() {
+        let mut model = scrap();
+        let effects = execute(op("annotate"), &mut model, &editing_context());
+        assert_eq!(effects, vec![Effect::EnterEditMode]);
+        let Mode::Editing(state) = &model.mode else {
+            panic!("not editing: {:?}", model.mode);
+        };
+        assert_eq!(state.style, editing_context().annotation);
+        let effects = execute(op("annotate"), &mut model, &editing_context());
+        assert_eq!(effects, vec![Effect::LeaveEditMode]);
+        assert_eq!(model.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn only_annotate_can_run_while_editing() {
+        let mut model = scrap();
+        trim(&mut model);
+        execute(op("annotate"), &mut model, &editing_context());
+        for op in OPERATIONS {
+            assert_eq!((op.can_execute)(&model), op.id == "annotate", "{}", op.id);
+        }
+        let before = model.clone();
+        assert_eq!(
+            execute(op("move_left"), &mut model, &OpContext::default()),
+            vec![]
+        );
+        assert_eq!(model, before);
+    }
+
+    #[test]
+    fn annotate_cannot_run_while_folded_or_trimming() {
+        let mut model = scrap();
+        model.enter_compact(ZoomAnchor::Center);
+        assert!(!(op("annotate").can_execute)(&model));
+        model.leave_compact();
+        execute(op("trim"), &mut model, &OpContext::default());
+        assert!(!(op("annotate").can_execute)(&model));
+    }
+
+    #[test]
+    fn the_menu_checks_annotate_while_editing_and_greys_out_the_rest() {
+        let shortcuts = Shortcuts::new(OPERATIONS, &ShortcutOverrides::new());
+        let mut model = scrap();
+        let items = |model: &ScrapModel| -> Vec<(OperationId, bool, bool)> {
+            menu(OPERATIONS, model, &shortcuts, &Appearance::default())
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    MenuEntry::Item(item) => Some((item.id, item.enabled, item.checked)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(items(&model).iter().all(|&(_, _, checked)| !checked));
+        execute(op("annotate"), &mut model, &editing_context());
+        for (id, enabled, checked) in items(&model) {
+            assert_eq!(enabled, id == "annotate", "{id}");
+            assert_eq!(checked, id == "annotate", "{id}");
+        }
     }
 
     #[test]
@@ -1656,6 +1799,7 @@ mod tests {
                 ("save_as", false),
                 ("trim", false),
                 ("untrim", false),
+                ("annotate", false),
                 ("zoom", false),
                 ("opacity", false),
                 ("border", false),
@@ -1758,6 +1902,7 @@ mod tests {
             label_key: find(id).map_or(id, |op| op.label_key),
             enabled,
             shortcut: shortcut.map(chord),
+            checked: false,
         })
     }
 
@@ -1784,6 +1929,7 @@ mod tests {
                 MenuEntry::Separator,
                 item("trim", true, Some("Ctrl+T")),
                 item("untrim", false, None),
+                item("annotate", true, Some("E")),
                 MenuEntry::Separator,
                 MenuEntry::Submenu(Submenu {
                     id: "zoom",
@@ -1883,6 +2029,7 @@ mod tests {
             OperationDescriptor {
                 choices: Some(levels),
                 can_execute: never,
+                checked: None,
                 ..test_op("blocked", Group::View, 20, &[])
             },
             OperationDescriptor {
@@ -1937,6 +2084,7 @@ mod tests {
             },
             OperationDescriptor {
                 can_execute: never,
+                checked: None,
                 ..test_op("a", Group::Move, 10, &[])
             },
         ];
@@ -2081,6 +2229,7 @@ mod tests {
         }
         static BLOCKED: OperationDescriptor = OperationDescriptor {
             can_execute: never,
+            checked: None,
             run: move_by!(5, 5),
             ..test_op("blocked", Group::Move, 0, &[])
         };
@@ -2148,7 +2297,8 @@ mod tests {
             order,
             drag_only: false,
             in_menu: true,
-            can_execute: not_trimming,
+            can_execute: normal,
+            checked: None,
             choices: None,
             run: nothing,
         }

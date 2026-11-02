@@ -86,6 +86,7 @@ capture_cursor = false
 # save_as         保存先を確認して保存              Ctrl+Shift+S
 # trim            トリム                            Ctrl+T
 # untrim          トリムを解除                      （なし）
+# annotate        書き込み                          E
 # move_left       左へ移動（1px）                   Left
 # move_right      右へ移動（1px）                   Right
 # move_up         上へ移動（1px）                   Up
@@ -148,6 +149,14 @@ border_width = 1
 border_color = "#808080"
 # 影を出すかどうか（true / false）。
 shadow = true
+
+[annotation]
+# 書き込み（スクラップの上に描き加える図形や文字）の既定値。書き込みの編集モード（スクラップ操作「書き込み」、
+# 既定のショートカットは E）で新しく描くものに使います。描いた書き込みは、あとで変えても変わりません。
+# 色。"#RRGGBB" の形で書きます。
+color = "#E53935"
+# 太さ。1〜64 の整数で、画像の画素で数えます（拡大縮小すると一緒に太く・細くなります）。
+width = 3
 
 [selection]
 # 範囲選択の画面。

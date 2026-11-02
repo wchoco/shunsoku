@@ -6,12 +6,16 @@
 //!   縮小は線形補間で描く。
 //! - 倍率を変えた直後は、画像の左上に倍率（`ZoomLabel`）を重ねて描く。
 //! - トリムの範囲を選んでいる間は、選んだ範囲の外を暗くし、範囲の縁に線を引く（`TrimOverlay`）。
+//! - 書き込み（`annotate::Annotation`）は画像の上、トリムの範囲の上の重ねものの下に、画像の矩形の中だけに
+//!   描く（`draw_annotations`）。座標の換算は core の `annotate::View` で、表示なら `ScrapModel::annotation_view`、
+//!   保存とコピーなら `ScrapModel::output_view` を渡す。画像は補間せずに描くが、書き込みはアンチエイリアスする。
 //! - 透明度はここでは掛けない（レイヤード ウィンドウの `SourceConstantAlpha` で掛ける）。
-//! - コピーと保存の画像は、`render_image` で画像だけを画像の大きさに描いてから作る（表示と同じ描き方にするため。
-//!   M1 では書き込みがないので、元の画像と同じになる）。
+//! - コピーと保存の画像は、`render_image` で画像と書き込みを画像の大きさに描いてから作る（表示と同じ描き方に
+//!   するため。ADR-0006）。
 
 use std::ffi::c_void;
 
+use shunsoku_core::annotate::{Annotation, Shape, View};
 use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::image::Image;
 use shunsoku_core::scrap::{Appearance, SHADOW_WIDTH};
@@ -20,7 +24,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE,
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
     D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -60,6 +64,25 @@ const TRIM_EDGE_COLOR: u32 = 0xFF_FF_FF;
 pub struct TrimOverlay {
     /// 選んだ範囲（ウィンドウの中の座標）。まだ選んでいなければ None（画像全体を暗くする）。
     pub selection: Option<Rect>,
+}
+
+/// 画像に重ねる書き込み。
+#[derive(Debug, Clone, Copy)]
+pub struct AnnotationLayer<'a> {
+    /// 描く順（後のものほど上）。
+    pub annotations: &'a [Annotation],
+    /// 元の画像の画素から、画像の左上を原点とした座標への変換。
+    pub view: View,
+}
+
+/// スクラップの画像に重ねるもの。下から書き込み・トリムの範囲・倍率の順に描く。
+#[derive(Debug, Clone, Copy)]
+pub struct Overlays<'a> {
+    pub annotations: AnnotationLayer<'a>,
+    /// あれば、画像の左上に倍率を出す。
+    pub label: Option<ZoomLabel>,
+    /// あれば、トリムの範囲を出す。
+    pub trim: Option<TrimOverlay>,
 }
 
 /// 画像に重ねる倍率の表示。
@@ -193,16 +216,20 @@ impl Renderer {
 
     /// スクラップのウィンドウの中身を描く。`canvas` はウィンドウの大きさ（`ScrapModel::window_rect`）で、
     /// 画像は余白（`Appearance::margin`）の内側に `display`（`ScrapModel::display_size`）の大きさで置く。
-    /// `label` があれば、画像の左上に倍率を重ねる。`trim` があれば、トリムの範囲を重ねる。
+    /// 画像の上に `overlays` を重ねる。
     pub fn paint_scrap(
         &mut self,
         canvas: &Canvas,
         image: &Image,
         display: Size,
         appearance: &Appearance,
-        label: Option<ZoomLabel>,
-        trim: Option<TrimOverlay>,
+        overlays: Overlays,
     ) -> Result<()> {
+        let Overlays {
+            annotations,
+            label,
+            trim,
+        } = overlays;
         let margin = appearance.margin();
         let image_rect = Rect::from_origin_size(Point::new(margin, margin), display);
         let dwrite = match label {
@@ -240,6 +267,7 @@ impl Renderer {
                 }
             }
             draw_image(target, image, image_rect)?;
+            draw_annotations(target, annotations, image_rect)?;
             if let Some(trim) = trim {
                 draw_trim_overlay(target, image_rect, trim)?;
             }
@@ -260,14 +288,17 @@ impl Renderer {
         Ok(dwrite)
     }
 
-    /// 画像だけを画像の大きさの `canvas` に描く（コピーや保存で、表示と同じ描き方を使うため）。
-    pub fn paint_image(&self, canvas: &Canvas, image: &Image) -> Result<()> {
+    /// 画像と書き込みを画像の大きさの `canvas` に描く（コピーや保存で、表示と同じ描き方を使うため）。
+    pub fn paint_image(
+        &self,
+        canvas: &Canvas,
+        image: &Image,
+        annotations: AnnotationLayer,
+    ) -> Result<()> {
+        let rect = Rect::from_origin_size(Point::default(), image.size());
         self.paint(canvas, |target| {
-            draw_image(
-                target,
-                image,
-                Rect::from_origin_size(Point::default(), image.size()),
-            )
+            draw_image(target, image, rect)?;
+            draw_annotations(target, annotations, rect)
         })
     }
 
@@ -298,13 +329,13 @@ impl Renderer {
     }
 }
 
-/// コピーと保存の画像を作る: 画像だけを画像の画素の大きさに、表示と同じ描き方で描く。
-pub fn render_image(image: &Image) -> Result<Image> {
+/// コピーと保存の画像を作る: 画像と書き込みを画像の画素の大きさに、表示と同じ描き方で描く。
+pub fn render_image(image: &Image, annotations: AnnotationLayer) -> Result<Image> {
     if image.width() == 0 || image.height() == 0 {
         return Ok(image.clone());
     }
     let canvas = Canvas::new(image.size())?;
-    Renderer::new()?.paint_image(&canvas, image)?;
+    Renderer::new()?.paint_image(&canvas, image, annotations)?;
     canvas
         .to_image()
         .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED))
@@ -346,6 +377,56 @@ fn draw_image(target: &ID2D1RenderTarget, image: &Image, dest: Rect) -> Result<(
         target.DrawBitmap(&bitmap, Some(&dest), 1.0, interpolation, None);
     }
     Ok(())
+}
+
+/// 書き込みを、`image_rect` の左上を原点に `layer.view` で置いて描く。画像の矩形の外（トリムで隠した部分など）は
+/// 描かない。線は画素の中心を通るので、奇数の太さを等倍で描くと画素に揃う。
+fn draw_annotations(
+    target: &ID2D1RenderTarget,
+    layer: AnnotationLayer,
+    image_rect: Rect,
+) -> Result<()> {
+    if layer.annotations.is_empty() || image_rect.is_empty() {
+        return Ok(());
+    }
+    let (dx, dy) = (f64::from(image_rect.left), f64::from(image_rect.top));
+    let at = |p: Point| {
+        let (x, y) = layer.view.point(p);
+        ((x + dx) as f32, (y + dy) as f32)
+    };
+    // SAFETY: BeginDraw と EndDraw の間で呼ぶ。Push と Pop は対にする
+    unsafe {
+        target.PushAxisAlignedClip(&to_rect_f(image_rect), D2D1_ANTIALIAS_MODE_ALIASED);
+        target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        let drawn = (|| {
+            let brush = target.CreateSolidColorBrush(&rgb(0, 1.0), None)?;
+            for annotation in layer.annotations {
+                let shunsoku_core::settings::Rgb(r, g, b) = annotation.style.color;
+                brush.SetColor(&rgb(
+                    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
+                    1.0,
+                ));
+                let width = layer.view.width(annotation.style.width) as f32;
+                match annotation.shape {
+                    Shape::Rect { from, to } => {
+                        let (x0, y0) = at(from);
+                        let (x1, y1) = at(to);
+                        let rect = D2D_RECT_F {
+                            left: x0.min(x1),
+                            top: y0.min(y1),
+                            right: x0.max(x1),
+                            bottom: y0.max(y1),
+                        };
+                        target.DrawRectangle(&rect, &brush, width, None);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+        target.PopAxisAlignedClip();
+        drawn
+    }
 }
 
 /// トリムの範囲の外（画像の中だけ）を暗くし、範囲の縁に 1px の線を引く。

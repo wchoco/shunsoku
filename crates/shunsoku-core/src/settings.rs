@@ -42,6 +42,10 @@
 //! border_color = "#808080"
 //! shadow = true
 //!
+//! [annotation]                                 # 書き込みの既定値。新しく描く書き込みに使う
+//! color = "#E53935"
+//! width = 3                                    # 1〜64（画像の画素）
+//!
 //! [selection]                                  # 範囲選択の画面
 //! mode = "normal"                              # 開いたときのモード: normal / precise
 //! crosshair = false                            # 通常モードでも十字線を出す（精密モードでは常に出す）
@@ -90,6 +94,9 @@ pub const TRASH_LIMIT_RANGE: std::ops::RangeInclusive<u8> = 0..=100;
 /// 枠の太さ（px）として書ける範囲。
 pub const BORDER_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 1..=16;
 
+/// 書き込みの太さ（画像の画素）として書ける範囲。
+pub const ANNOTATION_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 1..=64;
+
 /// 設定。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Settings {
@@ -98,6 +105,7 @@ pub struct Settings {
     pub shortcuts: ShortcutOverrides,
     pub mouse: MouseOverrides,
     pub scrap: ScrapAppearance,
+    pub annotation: AnnotationDefaults,
     pub selection: SelectionScreen,
     /// ログのレベル（隠し項目）。
     pub log_level: LogLevel,
@@ -303,6 +311,25 @@ impl Default for Border {
             visible: true,
             width: 1,
             color: Rgb(0x80, 0x80, 0x80),
+        }
+    }
+}
+
+/// 書き込みの既定値（`[annotation]`）。書き込みの編集モードに入るときに読む。描いた書き込みは描いたときの
+/// 値を持つので、あとで変えても変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnotationDefaults {
+    pub color: Rgb,
+    /// 太さ（画像の画素）。
+    pub width: u32,
+}
+
+impl Default for AnnotationDefaults {
+    /// 赤 `#E53935`、太さ 3（spec #35）。
+    fn default() -> AnnotationDefaults {
+        AnnotationDefaults {
+            color: Rgb(0xE5, 0x39, 0x35),
+            width: 3,
         }
     }
 }
@@ -638,6 +665,16 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
     if let Some(on) = r.value(scrap, "scrap", "shadow", Item::as_bool) {
         s.scrap.shadow = on;
+    }
+
+    let annotation = r.table(root, "annotation");
+    if let Some(color) = r.value(annotation, "annotation", "color", rgb) {
+        s.annotation.color = color;
+    }
+    if let Some(w) = r.value(annotation, "annotation", "width", |i| {
+        in_range(i, ANNOTATION_WIDTH_RANGE)
+    }) {
+        s.annotation.width = w;
     }
 
     let selection = r.table(root, "selection");
@@ -987,6 +1024,7 @@ shadow = false
                     },
                     shadow: false,
                 },
+                annotation: AnnotationDefaults::default(),
                 selection: SelectionScreen::default(),
                 log_level: LogLevel::Debug,
                 regions: Vec::new(),
@@ -1182,6 +1220,38 @@ shadow = 1
         }
         let (_, issues) = load("version = 1\nselection = 1\n");
         assert_eq!(issues, vec![invalid("selection")]);
+    }
+
+    #[test]
+    fn annotations_default_to_red_3px_and_read_the_annotation_section() {
+        let (settings, _) = load("version = 1\n");
+        assert_eq!(settings.annotation.color, Rgb(0xE5, 0x39, 0x35));
+        assert_eq!(settings.annotation.width, 3);
+        let (settings, issues) =
+            load("version = 1\n[annotation]\ncolor = \"#1E88E5\"\nwidth = 8\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.annotation.color, Rgb(0x1E, 0x88, 0xE5));
+        assert_eq!(settings.annotation.width, 8);
+    }
+
+    #[test]
+    fn invalid_annotation_items_fall_back_to_the_defaults_and_are_named() {
+        for value in ["\"red\"", "\"#E5393\"", "\"E53935\"", "1"] {
+            let (settings, issues) = load(&format!("version = 1\n[annotation]\ncolor = {value}\n"));
+            assert_eq!(issues, vec![invalid("annotation.color")], "{value}");
+            assert_eq!(settings.annotation.color, Rgb(0xE5, 0x39, 0x35), "{value}");
+        }
+        for value in ["0", "-1", "65", "\"3\"", "2.5"] {
+            let (settings, issues) = load(&format!("version = 1\n[annotation]\nwidth = {value}\n"));
+            assert_eq!(issues, vec![invalid("annotation.width")], "{value}");
+            assert_eq!(settings.annotation.width, 3, "{value}");
+        }
+        for value in ["1", "64"] {
+            let (_, issues) = load(&format!("version = 1\n[annotation]\nwidth = {value}\n"));
+            assert_eq!(issues, vec![], "{value}");
+        }
+        let (_, issues) = load("version = 1\nannotation = 1\n");
+        assert_eq!(issues, vec![invalid("annotation")]);
     }
 
     #[test]

@@ -7,21 +7,29 @@
 //! トリムは、元の画像（`ScrapModel::image_size`）の中の表示する範囲だけを持つ。画素は持たず、表示する画像は
 //! 元の画像から `ScrapModel::shown_image` で切り出す。トリムの範囲の選択（`Mode::Trimming`）は
 //! `ScrapModel::trim_input` が受ける。
+//!
+//! 書き込み（`crate::annotate`）は元の画像の画素の座標で `ScrapModel::annotations` に持ち、`mode` の外に
+//! 置く（モードを抜けても、ごみ箱から戻しても残る）。書き込みの編集モード（`Mode::Editing`）の間の入力は
+//! `ScrapModel::edit_input` が受ける。
 
 pub mod ops;
 
+use crate::annotate::{Annotation, Annotations, EditInput, EditOutput, EditState, Style, View};
 use crate::geometry::{Point, Rect, Size};
 use crate::image::Image;
 use crate::settings::{DpiScaling, ScrapAppearance};
 
 /// スクラップの表示のモード。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Mode {
     /// 画像をそのまま出す。
     #[default]
     Normal,
     /// トリムの範囲を選んでいる（`ScrapModel::start_trim` から確定か中止まで）。スクラップ操作はどれも効かない。
     Trimming(TrimState),
+    /// 書き込みの編集モード（`ScrapModel::start_editing` から抜けるまで）。スクラップ操作は「書き込み」の
+    /// ほかは効かない。
+    Editing(EditState),
 }
 
 /// トリムの範囲の選択の状態。座標は表示している画像（トリム済みならその部分）の画素。
@@ -140,6 +148,8 @@ pub struct ScrapModel {
     compact: Option<CompactOrigin>,
     /// トリムしていれば、表示する範囲（元の画像の画素）。
     trimmed: Option<Rect>,
+    /// 書き込み。元の画像（トリム前）の画素の座標で持つ。
+    annotations: Annotations,
 }
 
 impl ScrapModel {
@@ -154,6 +164,7 @@ impl ScrapModel {
             dpi_origin: None,
             compact: None,
             trimmed: None,
+            annotations: Annotations::default(),
         }
     }
 
@@ -175,6 +186,7 @@ impl ScrapModel {
             && self.mode == before.mode
             && self.is_compact() == before.is_compact()
             && self.appearance_overrides == before.appearance_overrides
+            && self.annotations == before.annotations
     }
 
     /// コンパクト表示（一辺 `compact_side` の正方形）に畳む。`anchor` が正方形の中心になる（`Center` なら
@@ -485,6 +497,94 @@ impl ScrapModel {
         )
     }
 
+    /// スクリーン座標の点の下にある、元の画像（トリム前）の画素。画像の外なら端の画素に留める。
+    fn image_pixel_at(&self, at: Point) -> Point {
+        let shown = self.shown_pixel_at(at);
+        let origin = self.trimmed.map_or(Point::default(), |r| r.origin());
+        Point::new(shown.x + origin.x, shown.y + origin.y)
+    }
+
+    /// 書き込みの編集モードにいるか（`Mode::Editing`）。
+    pub const fn is_editing(&self) -> bool {
+        matches!(self.mode, Mode::Editing(_))
+    }
+
+    /// 書き込みの編集モードに入る。これから描く書き込みは `style`。ほかのモード（トリムの範囲の選択、
+    /// 編集モード）にいるときとコンパクト表示の間は入らずに false。
+    pub fn start_editing(&mut self, style: Style) -> bool {
+        if self.mode != Mode::Normal || self.is_compact() {
+            return false;
+        }
+        self.mode = Mode::Editing(EditState::new(style));
+        true
+    }
+
+    /// 書き込みの編集モードへの入力を受ける（座標はスクリーン座標）。抜けたら（`EditOutput::Left`）
+    /// `Mode::Normal` に戻す。編集モードでなければ何もせず、空を返す。
+    pub fn edit_input(&mut self, input: EditInput) -> Vec<EditOutput> {
+        let input = input.map_point(|at| self.image_pixel_at(at));
+        let Mode::Editing(state) = &mut self.mode else {
+            return vec![];
+        };
+        let outputs = state.input(input, &mut self.annotations);
+        if outputs.contains(&EditOutput::Left) {
+            self.mode = Mode::Normal;
+        }
+        outputs
+    }
+
+    /// 書き込み（描き終えたもの）。
+    pub fn annotations(&self) -> &Annotations {
+        &self.annotations
+    }
+
+    /// 描く書き込み。描き終えたものの上に、編集モードの描きかけを重ねる。
+    pub fn annotations_to_draw(&self) -> Vec<Annotation> {
+        let mut drawn = self.annotations.items().to_vec();
+        if let Mode::Editing(state) = &self.mode {
+            drawn.extend(state.draft());
+        }
+        drawn
+    }
+
+    /// 画面に書き込みを描く変換。描く先の原点は画像を出す矩形（`image_rect`）の左上で、倍率とトリムと
+    /// コンパクト表示の正方形に映す部分に合わせる。
+    pub fn annotation_view(&self) -> View {
+        let origin = self.trimmed.map_or(Point::default(), |r| r.origin());
+        let shown = self.shown_size();
+        let (from, to, view) = match self.compact_view() {
+            Some(view) => {
+                let side = self.compact_side();
+                (view.size(), Size::new(side, side), view.origin())
+            }
+            None => (shown, self.display_size(), Point::default()),
+        };
+        View {
+            left: f64::from(origin.x) + f64::from(view.x),
+            top: f64::from(origin.y) + f64::from(view.y),
+            scale_x: f64::from(to.width) / f64::from(from.width.max(1)),
+            scale_y: f64::from(to.height) / f64::from(from.height.max(1)),
+        }
+    }
+
+    /// 保存とコピーで書き込みを描く変換。描く先は表示する画像（`shown_image`）で、画素の大きさに描く。
+    pub fn output_view(&self) -> View {
+        let origin = self.trimmed.map_or(Point::default(), |r| r.origin());
+        View {
+            left: f64::from(origin.x),
+            top: f64::from(origin.y),
+            scale_x: 1.0,
+            scale_y: 1.0,
+        }
+    }
+
+    /// 閉じる前に、そのときだけのモードを終える。トリムの範囲の選択はやめ、書き込みの編集モードは描きかけを
+    /// 書き込みにして抜ける。ごみ箱から戻したときは `Mode::Normal` で、書き込みは残っている。
+    pub fn settle(&mut self) {
+        self.trim_input(TrimInput::Cancel);
+        self.edit_input(EditInput::Leave);
+    }
+
     /// 表示している画像の中の `selection`（画素）だけを表示する。残った部分の画面上の位置は動かさない。
     fn trim_to(&mut self, selection: Rect) {
         let shown = Rect::from_origin_size(Point::default(), self.shown_size());
@@ -767,7 +867,10 @@ impl Wheel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotate::{Annotation, Shape};
     use crate::image::Image;
+    use crate::keys::{Chord, Key};
+    use crate::settings::Rgb;
 
     #[test]
     fn a_new_scrap_is_normal_and_shows_its_image_where_it_was_captured() {
@@ -1572,5 +1675,198 @@ mod tests {
         assert!(scrap.is_trimming());
         scrap.trim_input(TrimInput::Cancel);
         assert!(!scrap.is_trimming());
+    }
+
+    /// (100, 50) の 300x200 を、元の画像の (10, 20) から 50x40 にトリムし、200% にしたスクラップ。
+    fn trimmed_and_zoomed() -> ScrapModel {
+        let mut scrap = ScrapModel::new(Point::new(100, 50), Size::new(300, 200));
+        scrap.start_trim();
+        scrap.trim_input(TrimInput::Press(Point::new(110, 70)));
+        scrap.trim_input(TrimInput::Move(Point::new(159, 109)));
+        scrap.trim_input(TrimInput::Release);
+        scrap.trim_input(TrimInput::Confirm);
+        scrap.set_zoom(200, ZoomAnchor::Center);
+        scrap
+    }
+
+    fn rect(from: (i32, i32), to: (i32, i32)) -> Shape {
+        Shape::Rect {
+            from: Point::new(from.0, from.1),
+            to: Point::new(to.0, to.1),
+        }
+    }
+
+    #[test]
+    fn dragging_while_editing_draws_a_rect_in_the_original_image_pixels_with_the_style() {
+        let mut scrap = trimmed_and_zoomed();
+        let o = scrap.image_rect().origin();
+        assert!(scrap.start_editing(Style::default()));
+        assert!(scrap.is_editing());
+        scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
+        assert_eq!(
+            scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21))),
+            vec![EditOutput::Redraw]
+        );
+        // 描きかけも描く
+        assert_eq!(scrap.annotations_to_draw().len(), 1);
+        assert!(scrap.annotations().is_empty());
+        assert_eq!(
+            scrap.edit_input(EditInput::Release),
+            vec![EditOutput::Redraw]
+        );
+        // 表示している画素 (4, 3)〜(20, 10) は、元の画像では (14, 23)〜(30, 30)
+        assert_eq!(
+            scrap.annotations().items(),
+            &[Annotation {
+                shape: rect((14, 23), (30, 30)),
+                style: Style {
+                    color: Rgb(0xE5, 0x39, 0x35),
+                    width: 3,
+                },
+            }]
+        );
+        assert_eq!(scrap.annotations_to_draw(), scrap.annotations().items());
+        // 画像の外へはみ出したドラッグは画像の端の画素で止まる
+        scrap.edit_input(EditInput::Press(Point::new(o.x - 50, o.y - 50)));
+        scrap.edit_input(EditInput::Move(Point::new(o.x + 1000, o.y + 1000)));
+        scrap.edit_input(EditInput::Release);
+        assert_eq!(
+            scrap.annotations().items()[1].shape,
+            rect((10, 20), (59, 59))
+        );
+        assert!(scrap.is_editing());
+    }
+
+    #[test]
+    fn a_drag_that_ends_on_the_pixel_it_started_draws_nothing() {
+        let mut scrap = trimmed_and_zoomed();
+        let o = scrap.image_rect().origin();
+        scrap.start_editing(Style::default());
+        scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 8)));
+        // 200% なので 1px 動いても同じ画素
+        scrap.edit_input(EditInput::Move(Point::new(o.x + 9, o.y + 9)));
+        assert_eq!(scrap.annotations_to_draw(), vec![]);
+        assert_eq!(scrap.edit_input(EditInput::Release), vec![]);
+        // 離れてから戻ってきても同じ
+        scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 8)));
+        scrap.edit_input(EditInput::Move(Point::new(o.x + 30, o.y + 30)));
+        scrap.edit_input(EditInput::Move(Point::new(o.x + 8, o.y + 8)));
+        scrap.edit_input(EditInput::Release);
+        assert!(scrap.annotations().is_empty());
+        // 押していないホバーでは何も描かない
+        assert_eq!(
+            scrap.edit_input(EditInput::Move(Point::new(o.x + 30, o.y + 30))),
+            vec![]
+        );
+        assert!(scrap.annotations_to_draw().is_empty());
+    }
+
+    #[test]
+    fn zooming_and_untrimming_keep_the_annotations_and_move_only_where_they_are_drawn() {
+        let mut scrap = trimmed_and_zoomed();
+        let o = scrap.image_rect().origin();
+        scrap.start_editing(Style::default());
+        scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
+        scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21)));
+        scrap.edit_input(EditInput::Release);
+        let drawn = scrap.annotations().clone();
+        // 200% でトリムの左上が (10, 20) なので、画素 (14, 23) の中心は画像の左上から (9, 7)
+        let view = scrap.annotation_view();
+        assert_eq!(view.point(Point::new(14, 23)), (9.0, 7.0));
+        assert_eq!(view.width(3), 6.0);
+        scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x1B))));
+        scrap.set_zoom(50, ZoomAnchor::Center);
+        assert_eq!(scrap.annotations(), &drawn);
+        assert_eq!(
+            scrap.annotation_view().point(Point::new(14, 23)),
+            (2.25, 1.75)
+        );
+        assert_eq!(scrap.annotation_view().width(3), 1.5);
+        scrap.untrim();
+        assert_eq!(scrap.annotations(), &drawn);
+        assert_eq!(
+            scrap.annotation_view().point(Point::new(14, 23)),
+            (7.25, 11.75)
+        );
+        // 保存とコピーは、表示している画像の画素の大きさに描く
+        scrap.set_zoom(300, ZoomAnchor::Center);
+        assert_eq!(scrap.output_view().point(Point::new(14, 23)), (14.5, 23.5));
+        assert_eq!(scrap.output_view().width(3), 3.0);
+    }
+
+    #[test]
+    fn the_output_of_a_trimmed_scrap_starts_at_the_trimmed_corner() {
+        let scrap = trimmed_and_zoomed();
+        assert_eq!(scrap.output_view().point(Point::new(14, 23)), (4.5, 3.5));
+    }
+
+    #[test]
+    fn escape_leaves_the_edit_mode_and_keeps_what_was_drawn() {
+        let mut scrap = trimmed_and_zoomed();
+        let o = scrap.image_rect().origin();
+        scrap.start_editing(Style::default());
+        // 押したまま Esc でも、描きかけを残して抜ける
+        scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
+        scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21)));
+        let outputs = scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x1B))));
+        assert!(outputs.contains(&EditOutput::Left));
+        assert_eq!(scrap.mode, Mode::Normal);
+        assert_eq!(scrap.annotations().items().len(), 1);
+        // 抜けたあとの入力は受けない
+        assert_eq!(scrap.edit_input(EditInput::Press(o)), vec![]);
+    }
+
+    #[test]
+    fn keys_other_than_escape_are_not_taken_while_editing() {
+        let mut scrap = trimmed_and_zoomed();
+        scrap.start_editing(Style::default());
+        assert_eq!(
+            scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x41)))),
+            vec![]
+        );
+        assert!(scrap.is_editing());
+    }
+
+    #[test]
+    fn settling_leaves_the_edit_mode_keeping_the_drawing_and_cancels_a_trim() {
+        let mut scrap = trimmed_and_zoomed();
+        let o = scrap.image_rect().origin();
+        scrap.start_editing(Style::default());
+        scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
+        scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21)));
+        scrap.settle();
+        assert_eq!(scrap.mode, Mode::Normal);
+        assert_eq!(scrap.annotations().items().len(), 1);
+        scrap.start_trim();
+        scrap.settle();
+        assert_eq!(scrap.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn editing_cannot_start_while_trimming_or_folded() {
+        let mut scrap = trimmed_and_zoomed();
+        scrap.start_trim();
+        assert!(!scrap.start_editing(Style::default()));
+        scrap.trim_input(TrimInput::Cancel);
+        scrap.enter_compact(ZoomAnchor::Center);
+        assert!(!scrap.start_editing(Style::default()));
+        scrap.leave_compact();
+        assert!(scrap.start_editing(Style::default()));
+        assert!(!scrap.start_editing(Style::default()));
+    }
+
+    #[test]
+    fn drawing_changes_the_content() {
+        let mut scrap = trimmed_and_zoomed();
+        let o = scrap.image_rect().origin();
+        scrap.start_editing(Style::default());
+        let before = scrap.clone();
+        scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
+        scrap.edit_input(EditInput::Move(Point::new(o.x + 41, o.y + 21)));
+        assert!(!scrap.same_content(&before));
+        scrap.settle();
+        let mut drawn_in_normal = before.clone();
+        drawn_in_normal.settle();
+        assert!(!scrap.same_content(&drawn_in_normal));
     }
 }
