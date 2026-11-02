@@ -1,13 +1,18 @@
 //! shunsoku のロジック層。`windows` クレートに依存せず、Windows API なしでテストできる（ADR-0005）。
 
 pub mod capture;
+pub mod cli_args;
+pub mod cursor;
 pub mod geometry;
 pub mod i18n;
 pub mod image;
 pub mod keys;
 pub mod log_file;
 pub mod magnifier;
+pub mod monitor;
+pub mod monitors;
 pub mod perf;
+pub mod protocol;
 pub mod scrap;
 pub mod selection;
 pub mod settings;

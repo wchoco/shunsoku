@@ -3,9 +3,15 @@
 //! 発生源（トレイ、ホットキー、M3 の CLI）ごとの違いは `CaptureRequest::from_source` の中だけで決める。
 //! Win32 層の `app` は依頼を受けて、待機（`delay`）→ 取得 → 範囲選択の画面 → 切り抜き → 出力 → 結果、
 //! の 1 本の流れで進める。発生源を足すときは `Source` に 1 つ足し、ここで対応する依頼を返す。
-//! M3 で CLI からの依頼を足すときは、`Source` と `CaptureRequest::reply` を足す（ADR-0003）。
+//! CLI からの依頼は `CaptureRequest::from_cli` で作り、結果を返す先（`reply`）を持たせる（ADR-0003）。
+//! 定型領域（ホットキー・トレイ）は領域の設定で決まるので、`CaptureRequest::region` で作る。
 
+use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::cli_args;
+use crate::geometry::Rect;
+use crate::settings::Region;
 
 /// 依頼の発生源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,13 +27,30 @@ pub enum Source {
 }
 
 /// どう撮るか。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureMethod {
     /// 範囲選択キャプチャ。範囲選択の画面でユーザーが範囲を選ぶ。
     Select,
     /// ウィンドウキャプチャ。依頼を受けた時点でアクティブなウィンドウを撮る。
     ActiveWindow,
+    /// 決まった範囲（CLI の `capture rect`）。範囲選択の画面は出さない。
+    Rect {
+        /// `monitors` の番号（1 から）。None ならメインモニタ。
+        monitor: Option<u32>,
+        /// モニタ相対の物理ピクセル。モニタからはみ出すかは撮るときに `monitors::locate` で調べる。
+        rect: Rect,
+    },
+    /// 定型領域キャプチャ。撮るときに、その名前の定型領域を設定から引く。
+    Region(RegionId),
 }
+
+/// 定型領域を指すもの。名前（`settings::Region::name`。重ならない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionId(pub String);
+
+/// 結果を返す先。Win32 層のパイプのサーバ（`pipe_server`）が依頼ごとに振る番号で、応答をその依頼の接続に返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyTo(pub u64);
 
 /// 撮ったものをどこへ出すか。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +70,12 @@ pub struct Outputs {
 pub enum SaveTarget {
     /// 全体設定の保存先とファイル名テンプレート。
     Default,
+    /// 定型領域の保存先とファイル名テンプレート。`dir` が None なら全体の保存先。`name` は `{name}` の値。
+    Region {
+        dir: Option<PathBuf>,
+        file_name_template: String,
+        name: String,
+    },
 }
 
 /// 保存に失敗したときにどうするか。
@@ -68,6 +97,8 @@ pub struct CaptureRequest {
     pub delay: Duration,
     /// 結果をトレイ通知で知らせる。
     pub notify: bool,
+    /// 結果（保存したパス、失敗）を返す先。CLI からの依頼だけが持つ。
+    pub reply: Option<ReplyTo>,
 }
 
 impl CaptureRequest {
@@ -78,6 +109,48 @@ impl CaptureRequest {
                 CaptureRequest::scrap(CaptureMethod::Select)
             }
             Source::ActiveWindowHotkey => CaptureRequest::scrap(CaptureMethod::ActiveWindow),
+        }
+    }
+
+    /// CLI の `capture` から依頼を作る。既定は保存だけで、保存に失敗したらスクラップに逃がさず失敗として返す。
+    pub fn from_cli(capture: &cli_args::Capture, reply: ReplyTo) -> CaptureRequest {
+        let method = match capture.target {
+            cli_args::Target::Rect { monitor, rect } => CaptureMethod::Rect { monitor, rect },
+        };
+        CaptureRequest {
+            method,
+            outputs: Outputs {
+                save: Some(SaveTarget::Default),
+                scrap: false,
+                copy: false,
+                focus_scrap: false,
+            },
+            on_save_failure: OnSaveFailure::Fail,
+            delay: Duration::ZERO,
+            notify: true,
+            reply: Some(reply),
+        }
+    }
+
+    /// 定型領域キャプチャ（ホットキー・トレイ）: 領域の設定に従って保存する・スクラップを出す。スクラップには
+    /// フォーカスを移さない（撮ったあとも元のアプリで作業を続けるため）。保存に失敗したらスクラップに逃がす。
+    pub fn region(region: &Region) -> CaptureRequest {
+        CaptureRequest {
+            method: CaptureMethod::Region(RegionId(region.name.clone())),
+            outputs: Outputs {
+                save: region.save.then(|| SaveTarget::Region {
+                    dir: region.save_dir.clone(),
+                    file_name_template: region.file_name_template.clone(),
+                    name: region.name.clone(),
+                }),
+                scrap: region.scrap,
+                copy: false,
+                focus_scrap: false,
+            },
+            on_save_failure: OnSaveFailure::FallbackToScrap,
+            delay: Duration::ZERO,
+            notify: true,
+            reply: None,
         }
     }
 
@@ -94,6 +167,7 @@ impl CaptureRequest {
             on_save_failure: OnSaveFailure::FallbackToScrap,
             delay: Duration::ZERO,
             notify: true,
+            reply: None,
         }
     }
 }
@@ -117,6 +191,7 @@ mod tests {
             on_save_failure: OnSaveFailure::FallbackToScrap,
             delay: Duration::ZERO,
             notify: true,
+            reply: None,
         }
     }
 
@@ -148,5 +223,110 @@ mod tests {
     fn hotkey_requests_a_select_capture_shown_as_a_focused_scrap() {
         let request = CaptureRequest::from_source(Source::Hotkey);
         assert_eq!(request, select_capture());
+    }
+
+    /// CLI の既定（spec #34）: 保存だけ・スクラップは出さない・保存に失敗したら失敗として返す・通知は設定に従う。
+    #[test]
+    fn a_cli_rect_capture_only_saves_and_fails_when_saving_fails() {
+        let rect = Rect::new(0, 0, 100, 100);
+        let capture = cli_args::Capture {
+            target: cli_args::Target::Rect {
+                monitor: Some(2),
+                rect,
+            },
+        };
+        let request = CaptureRequest::from_cli(&capture, ReplyTo(7));
+        assert_eq!(
+            request,
+            CaptureRequest {
+                method: CaptureMethod::Rect {
+                    monitor: Some(2),
+                    rect,
+                },
+                outputs: Outputs {
+                    save: Some(SaveTarget::Default),
+                    scrap: false,
+                    copy: false,
+                    focus_scrap: false,
+                },
+                on_save_failure: OnSaveFailure::Fail,
+                delay: Duration::ZERO,
+                notify: true,
+                reply: Some(ReplyTo(7)),
+            }
+        );
+    }
+
+    #[test]
+    fn hotkey_and_tray_requests_expect_no_reply() {
+        for source in [Source::Hotkey, Source::TrayClick, Source::TrayMenu] {
+            assert_eq!(CaptureRequest::from_source(source).reply, None);
+        }
+    }
+
+    fn region(save: bool, scrap: bool) -> Region {
+        Region {
+            name: "dash".to_owned(),
+            hotkey: None,
+            monitor: "M1".to_owned(),
+            rect: Rect::new(0, 0, 10, 10),
+            save_dir: Some(PathBuf::from(r"D:\dash")),
+            file_name_template: "{name}_{seq}".to_owned(),
+            save,
+            scrap,
+        }
+    }
+
+    fn region_save_target() -> SaveTarget {
+        SaveTarget::Region {
+            dir: Some(PathBuf::from(r"D:\dash")),
+            file_name_template: "{name}_{seq}".to_owned(),
+            name: "dash".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_region_by_default_is_only_saved_to_its_own_folder_and_notified() {
+        let request = CaptureRequest::region(&region(true, false));
+        assert_eq!(
+            request,
+            CaptureRequest {
+                method: CaptureMethod::Region(RegionId("dash".to_owned())),
+                outputs: Outputs {
+                    save: Some(region_save_target()),
+                    scrap: false,
+                    copy: false,
+                    focus_scrap: false,
+                },
+                on_save_failure: OnSaveFailure::FallbackToScrap,
+                delay: Duration::ZERO,
+                notify: true,
+                reply: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_region_shown_as_a_scrap_does_not_take_the_focus() {
+        let request = CaptureRequest::region(&region(false, true));
+        assert_eq!(
+            request.outputs,
+            Outputs {
+                save: None,
+                scrap: true,
+                copy: false,
+                focus_scrap: false,
+            }
+        );
+        let both = CaptureRequest::region(&region(true, true));
+        assert_eq!(both.outputs.save, Some(region_save_target()));
+        assert!(both.outputs.scrap && !both.outputs.focus_scrap);
+    }
+
+    #[test]
+    fn a_region_that_fails_to_save_falls_back_to_a_scrap_without_the_focus() {
+        let request = CaptureRequest::region(&region(true, false));
+        assert_eq!(request.on_save_failure, OnSaveFailure::FallbackToScrap);
+        assert!(!request.outputs.focus_scrap);
     }
 }

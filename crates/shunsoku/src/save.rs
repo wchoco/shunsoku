@@ -57,12 +57,14 @@ pub fn now() -> LocalTime {
 }
 
 /// `dir` に保存するファイルのパスを決める。フォルダがまだなければ、中は空とみなす（作るのは `write_png`）。
+/// `name` はテンプレートの `{name}` の値（定型領域の名前。ほかは空）。
 ///
 /// `pending` は名前を決めたがまだ書き終えていない保存先。裏のスレッドが書き終えるまではフォルダに
 /// ないので、続けて保存したときに同じ名前にならないよう、これも使われている名前として数える。
 pub fn destination(
     dir: &Path,
     file_name_template: &str,
+    name: &str,
     now: LocalTime,
     pending: &[PathBuf],
 ) -> std::io::Result<PathBuf> {
@@ -80,7 +82,7 @@ pub fn destination(
         Err(e) => return Err(e),
     };
     let existing: Vec<String> = on_disk.into_iter().chain(in_flight).collect();
-    let context = template::Context { name: "", now };
+    let context = template::Context { name, now };
     let name = template::file_name(file_name_template, &context, &existing, EXTENSION);
     Ok(dir.join(name))
 }
