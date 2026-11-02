@@ -25,6 +25,8 @@ pub enum Source {
     TrayMenu,
     /// アクティブウィンドウのキャプチャのホットキー。
     ActiveWindowHotkey,
+    /// トレイのメニューの「定型領域を追加…」。
+    AddRegion,
 }
 
 /// どう撮るか。
@@ -46,6 +48,9 @@ pub enum CaptureMethod {
     /// ウィンドウキャプチャ。範囲選択の画面でハイライトから選んだウィンドウ（部品）を撮る。
     /// 範囲選択の画面で選んだあとに `CaptureRequest::for_window` で作る。
     Window(WindowTarget),
+    /// 定型領域の登録。範囲選択の画面を登録のモード（`Selection::registering`）で開き、決めた範囲を
+    /// `[[regions]]` に足す。撮らない。
+    RegisterRegion,
 }
 
 /// 範囲選択の画面で選んだ、撮るウィンドウ。
@@ -124,6 +129,15 @@ impl CaptureRequest {
                 CaptureRequest::scrap(CaptureMethod::Select)
             }
             Source::ActiveWindowHotkey => CaptureRequest::scrap(CaptureMethod::ActiveWindow),
+            Source::AddRegion => CaptureRequest {
+                outputs: Outputs {
+                    save: None,
+                    scrap: false,
+                    copy: false,
+                    focus_scrap: false,
+                },
+                ..CaptureRequest::scrap(CaptureMethod::RegisterRegion)
+            },
         }
     }
 
@@ -269,6 +283,24 @@ mod tests {
     fn tray_menu_requests_a_select_capture_shown_as_a_focused_scrap() {
         let request = CaptureRequest::from_source(Source::TrayMenu);
         assert_eq!(request, select_capture());
+    }
+
+    #[test]
+    fn adding_a_region_opens_the_overlay_to_register_it_and_outputs_nothing() {
+        let request = CaptureRequest::from_source(Source::AddRegion);
+        assert_eq!(
+            request,
+            CaptureRequest {
+                method: CaptureMethod::RegisterRegion,
+                outputs: Outputs {
+                    save: None,
+                    scrap: false,
+                    copy: false,
+                    focus_scrap: false,
+                },
+                ..select_capture()
+            }
+        );
     }
 
     #[test]

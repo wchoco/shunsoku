@@ -143,6 +143,7 @@ const CMD_SELECT_CAPTURE: u32 = 2;
 const CMD_CLOSE_ALL: u32 = 3;
 const CMD_HIDE_ALL: u32 = 4;
 const CMD_SHOW_ALL: u32 = 5;
+const CMD_ADD_REGION: u32 = 6;
 /// ごみ箱の一覧の項目の番号は、これに一覧の添字を足したもの。
 const CMD_TRASH_FIRST: u32 = 100;
 /// 「定型領域」の項目の番号は、これに `Settings::regions` の添字を足したもの。
@@ -921,6 +922,7 @@ fn on_tray(owner: HWND, event: tray::Event) {
                     enabled: true,
                     items: region_entries,
                 },
+                menu::Entry::item(CMD_ADD_REGION, text("tray.menu.add_region"), true),
                 menu::Entry::Submenu {
                     label: text("tray.menu.trash").into(),
                     enabled: true,
@@ -964,6 +966,7 @@ fn on_tray(owner: HWND, event: tray::Event) {
 fn on_command(command: u32) {
     match command {
         CMD_SELECT_CAPTURE => request_capture(Source::TrayMenu),
+        CMD_ADD_REGION => request_capture(Source::AddRegion),
         CMD_CLOSE_ALL => close_all_scraps(),
         CMD_HIDE_ALL => set_scraps_visible(false),
         CMD_SHOW_ALL => set_scraps_visible(true),
@@ -2054,6 +2057,15 @@ fn finish_selection() {
     let Some((request, overlay, selection, module, appearance)) = taken else {
         return;
     };
+    if selection.is_registering() {
+        drop(overlay);
+        end_capture();
+        log::info!("overlay closed");
+        if let Some(rect) = selection.rect() {
+            register_region(rect);
+        }
+        return;
+    }
     if let Some(chosen) = selection.chosen_window() {
         // ハイライトから選んだウィンドウは、範囲選択の画面を閉じてから WGC で撮る
         log::info!("window chosen on the overlay");
@@ -2224,7 +2236,9 @@ fn take_capture() {
     })
     .flatten();
     match method {
-        Some(request::CaptureMethod::Select) => open_overlay(),
+        Some(request::CaptureMethod::Select | request::CaptureMethod::RegisterRegion) => {
+            open_overlay()
+        }
         Some(request::CaptureMethod::ActiveWindow) => capture_active_window(),
         Some(request::CaptureMethod::Window(target)) => {
             capture_window(window_list::hwnd(target.window), target.crop);
@@ -2686,10 +2700,15 @@ fn open_overlay() {
     let rejected = with_app(|app| match std::mem::take(&mut app.capture) {
         Capture::Waiting(request) => {
             // 開くたびに設定の既定のモードから始める（Tab の切り替えはその回だけ）
-            let selection = selection
+            let mut selection = selection
                 .with_mode(app.settings.selection.mode)
                 .with_crosshair(app.settings.selection.crosshair);
             let mut overlay = overlay;
+            if request.method == request::CaptureMethod::RegisterRegion {
+                // 定型領域の登録は常に精密モードで、画面の上端に登録だと出す
+                selection = selection.registering();
+                overlay.set_banner(Some(text("selection.register_banner")));
+            }
             let view = selection.view();
             if view.crosshair.is_some() || view.highlight.is_some() {
                 // 描くだけでウィンドウは作らないので、借りたまま描いてよい
@@ -3063,6 +3082,52 @@ fn capture_region(request: CaptureRequest) {
     }
 }
 
+/// 範囲選択の画面で決めた範囲（スクリーン座標）を、定型領域として設定ファイルの `[[regions]]` に足す。
+/// 名前は重ならない「領域 N」、モニタは範囲の左上を含むモニタ。足せたら、トレイの「定型領域」サブメニュー
+/// （開くたびに `App::settings` から作る）に出て、すぐに撮れる。結果は通知で知らせる。
+fn register_region(rect: Rect) {
+    let monitors = monitor_ids::list();
+    let Some(monitor) = monitors.iter().find(|m| m.rect.contains(rect.origin())) else {
+        log::warn!("no monitor contains the region to register at {rect:?}");
+        notify_user(notify::Level::Error, text("region.register_failed"));
+        return;
+    };
+    let relative = rect.offset(-monitor.rect.left, -monitor.rect.top);
+    let result = with_app(|app| {
+        let region = settings::new_region(
+            &app.settings,
+            text("region.default_name"),
+            &monitor.id,
+            relative,
+        );
+        let mut new = app.settings.clone();
+        new.regions.push(region.clone());
+        write_settings(app, &new).map(|()| region)
+    });
+    match result {
+        Some(Ok(region)) => {
+            log::info!(
+                "registered region {} on monitor {} at {:?}",
+                region.name,
+                region.monitor,
+                region.rect
+            );
+            notify_user(
+                notify::Level::Success,
+                &format!("{}{}", text("region.registered"), region.name),
+            );
+        }
+        Some(Err(e)) => {
+            log::error!("could not register the region: {e}");
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{e}", text("region.register_failed")),
+            );
+        }
+        None => {}
+    }
+}
+
 /// 保存先: `target` の保存先に、`target` のファイル名テンプレートで付けた重ならない名前。
 fn save_destination(target: &SaveTarget) -> Option<PathBuf> {
     match target {
@@ -3127,7 +3192,6 @@ fn read_settings(path: Option<&Path>) -> (Settings, Vec<SettingsIssue>) {
 ///   `App::settings` を `new` にする。ホットキーなど、使うときに読むのでは足りないものの反映は呼び出し側で行う。
 /// - 今のファイルが TOML として読めなければ、上書きせずにエラーを返す（手で書いた中身を消さないため）。
 /// - 書きかけの中身を監視に読まれないよう、隣の一時ファイルに書いてから名前を変える。
-#[expect(dead_code, reason = "定型領域の登録（#72）から呼ぶ")]
 fn write_settings(app: &mut App, new: &Settings) -> std::result::Result<(), String> {
     let path = app
         .settings_path

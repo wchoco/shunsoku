@@ -116,6 +116,8 @@ const LABEL_GAP: f32 = 4.0;
 /// カーソルの横の座標の表示を、カーソルの画素から右下へずらす量（DPI 100% のときの物理ピクセル）。
 /// 十字のカーソルに重ならないように。
 const CURSOR_LABEL_OFFSET: f32 = 20.0;
+/// 画面の上端に出す文字（定型領域の登録）の、モニタの上端からの距離（96 DPI での物理ピクセル）。
+const BANNER_TOP: f32 = 8.0;
 /// 拡大鏡で、モニタの外の画素を塗る色。
 const MAGNIFIER_OUTSIDE: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 0.25,
@@ -158,6 +160,8 @@ pub struct Overlay {
     monitors: Vec<MonitorView>,
     /// 範囲を描くための資源。初めて範囲を描くときに作る。
     painter: Option<Painter>,
+    /// 各モニタの上端の中央に出す文字（`set_banner`）。
+    banner: Option<String>,
 }
 
 /// 1 モニタ分のウィンドウと、そこに出す固定された画面。
@@ -208,12 +212,15 @@ struct Scene {
     cursor_label: Option<Label>,
     /// ハイライトしているウィンドウの矩形。名前とサイズは `size_label` に入れる。
     highlight: Option<Rect>,
+    /// 各モニタの上端に出す文字（`Overlay::set_banner`）。
+    banners: Vec<Label>,
     magnifier: Option<Magnifier>,
 }
 
 impl Scene {
     fn is_empty(&self) -> bool {
-        self.rect.is_none()
+        self.banners.is_empty()
+            && self.rect.is_none()
             && self.crosshair.is_none()
             && self.cursor_label.is_none()
             && self.highlight.is_none()
@@ -250,6 +257,7 @@ impl Overlay {
         let mut overlay = Overlay {
             monitors: Vec::with_capacity(shots.len()),
             painter: None,
+            banner: None,
         };
         // 途中で失敗したら、overlay の drop で作った分を片付ける
         for shot in shots {
@@ -303,6 +311,11 @@ impl Overlay {
         Selection::new(monitors, Point::new(cursor.x, cursor.y))
     }
 
+    /// 各モニタの上端の中央に出す文字（定型領域の登録）。次の `redraw` から出す。
+    pub fn set_banner(&mut self, text: Option<&str>) {
+        self.banner = text.map(str::to_owned);
+    }
+
     /// 全モニタのウィンドウを描き直す。描くもの（`Selection::view`）がなければ固定された画面を
     /// そのまま出し、あれば範囲の枠とサイズ、つまみ、十字線、カーソルの横の座標を出す。
     pub fn redraw(&mut self, selection: &Selection) {
@@ -333,6 +346,13 @@ impl Overlay {
             }
             None => None,
         };
+        let banners = match self.banners() {
+            Ok(banners) => banners,
+            Err(e) => {
+                log::warn!("could not lay out the banner: {e}");
+                Vec::new()
+            }
+        };
         // 拡大鏡を出すなら、カーソルの横の座標は拡大鏡の下に付ける
         let cursor_label = match (&view.cursor_label, &magnifier) {
             (Some((at, text)), None) => {
@@ -344,6 +364,7 @@ impl Overlay {
             _ => None,
         };
         let scene = Scene {
+            banners,
             rect: view.rect,
             size_label,
             handles: view.handles,
@@ -425,6 +446,26 @@ impl Overlay {
         Ok(Some(Label::new(
             text, format, left, top, width, height, dpi,
         )))
+    }
+
+    /// `banner` を、モニタごとにその DPI の大きさで、上端の中央に置く。
+    fn banners(&mut self) -> Result<Vec<Label>> {
+        let Some(banner) = self.banner.clone() else {
+            return Ok(Vec::new());
+        };
+        let monitors: Vec<(Rect, u32)> = self
+            .monitors
+            .iter()
+            .map(|view| (to_rect(view.shot.rect), view.shot.dpi))
+            .collect();
+        let mut labels = Vec::with_capacity(monitors.len());
+        for (rect, dpi) in monitors {
+            let (text, format, width, height) = self.measure(&banner, dpi)?;
+            let left = rect.left as f32 + (rect.width() as f32 - width) / 2.0;
+            let top = rect.top as f32 + BANNER_TOP * dpi as f32 / 96.0;
+            labels.push(Label::new(text, format, left, top, width, height, dpi));
+        }
+        Ok(labels)
     }
 
     /// 拡大鏡を、カーソルのあるモニタの DPI の大きさで組む。拡大した画素の下に `label`（カーソルの横の
@@ -797,6 +838,14 @@ impl MonitorView {
         }
         if let Some(label) = &scene.cursor_label {
             text(label);
+        }
+        // 上端の文字はこのモニタのものだけ（ほかのモニタの分は描いても外れる）
+        for label in &scene.banners {
+            let inside =
+                monitor.contains(Point::new(label.back.left as i32, label.back.top as i32));
+            if inside {
+                text(label);
+            }
         }
         if let Some(m) = &scene.magnifier {
             // 黒で縁取り、拡大した画素を塗り、カーソルの画素を白と黒の枠で囲む
