@@ -18,7 +18,7 @@
 use std::ffi::c_void;
 
 use shunsoku_core::annotate::toolbar::{Button, Layout, ToolSlot};
-use shunsoku_core::annotate::{Annotation, EditState, Shape, View, arrow_head};
+use shunsoku_core::annotate::{Annotation, Annotations, EditState, Shape, View, arrow_head};
 use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::image::Image;
 use shunsoku_core::scrap::{Appearance, SHADOW_WIDTH};
@@ -295,11 +295,12 @@ impl Renderer {
         canvas: &Canvas,
         layout: &Layout,
         state: &EditState,
+        annotations: &Annotations,
         scale: f32,
     ) -> Result<()> {
         let factory = &self.factory;
         self.paint(canvas, |target| {
-            draw_toolbar(target, factory, layout, state, scale)
+            draw_toolbar(target, factory, layout, state, annotations, scale)
         })
     }
 
@@ -700,6 +701,7 @@ fn draw_toolbar(
     factory: &ID2D1Factory,
     layout: &Layout,
     state: &EditState,
+    annotations: &Annotations,
     scale: f32,
 ) -> Result<()> {
     let whole = Rect::from_origin_size(Point::default(), layout.size());
@@ -724,7 +726,7 @@ fn draw_toolbar(
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         let drawn = (|| {
             for &(button, rect) in layout.buttons() {
-                let icon = if button.is_enabled(state) {
+                let icon = if button.is_enabled(state, annotations) {
                     TOOLBAR_ICON
                 } else {
                     TOOLBAR_DISABLED
@@ -848,6 +850,29 @@ fn draw_toolbar_button(
                     Y: y,
                 };
                 target.DrawLine(from, to, brush, thick, None);
+            }
+            Button::Undo | Button::Redo => {
+                // 曲がった矢印: 元に戻すは左へ、やり直すは右へ戻ってくる（左右を映した形）
+                let mirror = |(u, v): (f32, f32)| match button {
+                    Button::Redo => (1.0 - u, v),
+                    _ => (u, v),
+                };
+                let curve: Vec<_> = [
+                    (0.12, 0.42),
+                    (0.55, 0.42),
+                    (0.78, 0.48),
+                    (0.92, 0.64),
+                    (0.88, 0.82),
+                    (0.72, 0.94),
+                    (0.5, 0.96),
+                ]
+                .map(mirror)
+                .to_vec();
+                lines(&curve, false, plain, stroke)?;
+                let head: Vec<_> = [(0.36, 0.16), (0.12, 0.42), (0.36, 0.68)]
+                    .map(mirror)
+                    .to_vec();
+                lines(&head, false, plain, stroke)?;
             }
             Button::Delete => {
                 // ごみ箱: ふた、取っ手、胴、縦の筋

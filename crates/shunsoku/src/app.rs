@@ -389,7 +389,13 @@ impl Scrap {
                     Some(painter) => painter,
                     None => render::Renderer::new()?,
                 };
-                painter.paint_toolbar(&canvas, &layout, state, scale as f32)?;
+                painter.paint_toolbar(
+                    &canvas,
+                    &layout,
+                    state,
+                    self.model.annotations(),
+                    scale as f32,
+                )?;
                 *renderer = Some(painter);
                 toolbar.window.present(canvas.dc(), rect)
             })()
@@ -1519,6 +1525,12 @@ fn on_toolbar_press(hwnd: HWND, at: Point) {
         }
         ToolbarButton::Delete => {
             on_edit_input(scrap, EditInput::Delete);
+        }
+        ToolbarButton::Undo => {
+            on_edit_input(scrap, EditInput::Undo);
+        }
+        ToolbarButton::Redo => {
+            on_edit_input(scrap, EditInput::Redo);
         }
         button => {
             if let Some(pick) = button.pick() {

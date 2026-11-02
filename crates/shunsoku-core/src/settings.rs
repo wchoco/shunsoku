@@ -25,7 +25,7 @@
 //!
 //! [hotkeys]
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
-//! restore_last = "Ctrl+Shift+Z"                # 最後に閉じたものを復元。既定は空で、必須ではない
+//! restore_last = "Ctrl+Alt+Z"                  # 最後に閉じたものを復元。既定は空で、必須ではない
 //! active_window_capture = "Ctrl+Shift+W"       # アクティブウィンドウのキャプチャ。既定は空で、必須ではない
 //!
 //! [shortcuts]                                  # スクラップ操作の id ごとの上書き。"" は割り当てなし

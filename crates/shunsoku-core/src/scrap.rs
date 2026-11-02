@@ -1862,6 +1862,51 @@ mod tests {
     }
 
     #[test]
+    fn the_history_stays_after_leaving_so_ctrl_z_works_on_coming_back() {
+        let mut scrap = ScrapModel::new(Point::new(100, 50), Size::new(300, 200));
+        let o = scrap.image_rect().origin();
+        let at = |x: i32, y: i32| Point::new(o.x + x, o.y + y);
+        let ctrl = |vk: u16| EditInput::Key(Chord::plain(Key::known(vk)).ctrl());
+        scrap.start_editing(Style::default());
+        for y in [10, 20] {
+            scrap.edit_input(EditInput::Press(at(10, y)));
+            scrap.edit_input(EditInput::Move {
+                at: at(50, y + 10),
+                shift: false,
+            });
+            scrap.edit_input(EditInput::Release);
+        }
+        scrap.edit_input(ctrl(0x5A));
+        scrap.edit_input(EditInput::Leave);
+        assert_eq!(scrap.annotations().items().len(), 1);
+
+        scrap.start_editing(Style::default());
+        assert!(scrap.annotations().can_redo());
+        assert_eq!(scrap.edit_input(ctrl(0x59)), vec![EditOutput::Redraw]);
+        assert_eq!(scrap.annotations().items().len(), 2);
+        scrap.edit_input(ctrl(0x5A));
+        scrap.edit_input(ctrl(0x5A));
+        assert!(scrap.annotations().is_empty());
+        assert!(!scrap.annotations().can_undo());
+    }
+
+    #[test]
+    fn ctrl_z_outside_the_edit_mode_changes_nothing() {
+        let mut scrap = ScrapModel::new(Point::new(100, 50), Size::new(300, 200));
+        let o = scrap.image_rect().origin();
+        scrap.start_editing(Style::default());
+        scrap.edit_input(EditInput::Press(o));
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 20, o.y + 20),
+            shift: false,
+        });
+        scrap.edit_input(EditInput::Leave);
+        let ctrl_z = EditInput::Key(Chord::plain(Key::known(0x5A)).ctrl());
+        assert_eq!(scrap.edit_input(ctrl_z), vec![]);
+        assert_eq!(scrap.annotations().items().len(), 1);
+    }
+
+    #[test]
     fn zooming_and_untrimming_keep_the_annotations_and_move_only_where_they_are_drawn() {
         let mut scrap = trimmed_and_zoomed();
         let o = scrap.image_rect().origin();
