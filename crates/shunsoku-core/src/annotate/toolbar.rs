@@ -1,7 +1,7 @@
 //! 書き込みの編集モードのツールバーの、Win32 に依らない部分: 並び（`Layout`）、当たり判定、色の並び
 //! （`palette`）、置き場所（`place`）。
 
-use super::{EditState, Pick, Tool};
+use super::{Annotations, EditState, Pick, Tool};
 use crate::geometry::{Point, Rect, Size};
 use crate::settings::Rgb;
 
@@ -93,6 +93,10 @@ pub enum Button {
     Tool(ToolSlot),
     Color(Rgb),
     Width(u32),
+    /// 元に戻す。
+    Undo,
+    /// やり直す。
+    Redo,
     /// 削除（選んでいる書き込みを消す）。
     Delete,
     /// 完了（編集モードを抜ける）。
@@ -108,14 +112,17 @@ impl Button {
             Button::Tool(slot) => slot.tool().map(Pick::Tool),
             Button::Color(color) => Some(Pick::Color(color)),
             Button::Width(width) => Some(Pick::Width(width)),
-            Button::Delete | Button::Done | Button::Grip => None,
+            Button::Undo | Button::Redo | Button::Delete | Button::Done | Button::Grip => None,
         }
     }
 
-    /// 押せるか（押せないものは灰色で描く）。まだない道具と、書き込みを選んでいないときの削除は押せない。
-    pub fn is_enabled(self, state: &EditState) -> bool {
+    /// 押せるか（押せないものは灰色で描く）。まだない道具、書き込みを選んでいないときの削除、戻す・
+    /// やり直すものがないときの元に戻す・やり直すは押せない。
+    pub fn is_enabled(self, state: &EditState, annotations: &Annotations) -> bool {
         match self {
             Button::Tool(slot) => slot.tool().is_some(),
+            Button::Undo => annotations.can_undo(),
+            Button::Redo => annotations.can_redo(),
             Button::Delete => state.selected().is_some(),
             _ => true,
         }
@@ -139,7 +146,7 @@ const SPACING: f64 = 2.0;
 const GROUP_SPACING: f64 = 10.0;
 const GRIP_WIDTH: f64 = 14.0;
 
-/// ツールバーの並び: 左から道具、色、太さ、削除と完了、端に移動用のつまみ。座標はツールバーの左上が原点。
+/// ツールバーの並び: 左から道具、色、太さ、元に戻す・やり直す・削除・完了、端に移動用のつまみ。座標はツールバーの左上が原点。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     size: Size,
@@ -156,7 +163,7 @@ impl Layout {
             ToolSlot::ALL.iter().map(|&s| Button::Tool(s)).collect(),
             colours.iter().map(|&c| Button::Color(c)).collect(),
             WIDTHS.iter().map(|&w| Button::Width(w)).collect(),
-            vec![Button::Delete, Button::Done],
+            vec![Button::Undo, Button::Redo, Button::Delete, Button::Done],
         ];
         let mut buttons = Vec::new();
         let mut x = padding;
@@ -248,18 +255,24 @@ mod tests {
     }
 
     #[test]
-    fn the_toolbar_lines_up_tools_colours_widths_done_and_the_grip_at_the_end() {
+    fn the_toolbar_lines_up_tools_colours_widths_history_done_and_the_grip_at_the_end() {
         let layout = Layout::new(&PALETTE, 1.0);
         let order: Vec<Button> = layout.buttons().iter().map(|&(b, _)| b).collect();
         let mut expected: Vec<Button> = ToolSlot::ALL.iter().map(|&s| Button::Tool(s)).collect();
         expected.extend(PALETTE.iter().map(|&c| Button::Color(c)));
         expected.extend(WIDTHS.iter().map(|&w| Button::Width(w)));
-        expected.extend([Button::Delete, Button::Done, Button::Grip]);
+        expected.extend([
+            Button::Undo,
+            Button::Redo,
+            Button::Delete,
+            Button::Done,
+            Button::Grip,
+        ]);
         assert_eq!(order, expected);
-        // 7 + 8 + 4 + 2 個の 28px のボタン、間 2px、組の間 10px、つまみ 14px、外の余白 4px
+        // 7 + 8 + 4 + 4 個の 28px のボタン、間 2px、組の間 10px、つまみ 14px、外の余白 4px
         assert_eq!(
             layout.size(),
-            Size::new(4 + 21 * 28 + 17 * 2 + 4 * 10 + 14 + 4, 36)
+            Size::new(4 + 23 * 28 + 19 * 2 + 4 * 10 + 14 + 4, 36)
         );
     }
 
@@ -298,6 +311,7 @@ mod tests {
 
     #[test]
     fn buttons_pick_tools_colours_and_widths_and_show_what_is_current() {
+        let annotations = crate::annotate::Annotations::default();
         let state = EditState::new(crate::annotate::Style {
             color: PALETTE[4],
             width: 5,
@@ -317,11 +331,14 @@ mod tests {
         );
         assert!(!Button::Tool(ToolSlot::Ellipse).is_current(&state));
         // 文字（#87）はまだない
-        assert!(!Button::Tool(ToolSlot::Text).is_enabled(&state));
-        assert!(Button::Tool(ToolSlot::Arrow).is_enabled(&state));
+        assert!(!Button::Tool(ToolSlot::Text).is_enabled(&state, &annotations));
+        assert!(Button::Tool(ToolSlot::Arrow).is_enabled(&state, &annotations));
         assert_eq!(Button::Done.pick(), None);
         assert_eq!(Button::Grip.pick(), None);
-        assert!(Button::Done.is_enabled(&state) && Button::Grip.is_enabled(&state));
+        assert!(
+            Button::Done.is_enabled(&state, &annotations)
+                && Button::Grip.is_enabled(&state, &annotations)
+        );
     }
 
     #[test]
@@ -331,8 +348,8 @@ mod tests {
         assert_eq!(select.pick(), Some(Pick::Tool(Tool::Select)));
         let mut state = EditState::new(crate::annotate::Style::default());
         let mut annotations = Annotations::default();
-        assert!(select.is_enabled(&state));
-        assert!(!Button::Delete.is_enabled(&state));
+        assert!(select.is_enabled(&state, &annotations));
+        assert!(!Button::Delete.is_enabled(&state, &annotations));
         assert_eq!(Button::Delete.pick(), None);
         // 線を描いて選ぶ
         state.input(EditInput::Press(Point::new(0, 0)), &mut annotations);
@@ -348,6 +365,34 @@ mod tests {
         assert!(select.is_current(&state));
         state.input(EditInput::Press(Point::new(10, 0)), &mut annotations);
         state.input(EditInput::Release, &mut annotations);
-        assert!(Button::Delete.is_enabled(&state));
+        assert!(Button::Delete.is_enabled(&state, &annotations));
+    }
+
+    #[test]
+    fn undo_and_redo_are_pressable_only_when_there_is_something_to_take_back_or_redo() {
+        use crate::annotate::{Annotations, EditInput};
+        let mut state = EditState::new(crate::annotate::Style::default());
+        let mut annotations = Annotations::default();
+        let enabled = |state: &EditState, annotations: &Annotations| {
+            (
+                Button::Undo.is_enabled(state, annotations),
+                Button::Redo.is_enabled(state, annotations),
+            )
+        };
+        assert_eq!(enabled(&state, &annotations), (false, false));
+        state.input(EditInput::Press(Point::new(0, 0)), &mut annotations);
+        state.input(
+            EditInput::Move {
+                at: Point::new(20, 0),
+                shift: false,
+            },
+            &mut annotations,
+        );
+        state.input(EditInput::Release, &mut annotations);
+        assert_eq!(enabled(&state, &annotations), (true, false));
+        state.input(EditInput::Undo, &mut annotations);
+        assert_eq!(enabled(&state, &annotations), (false, true));
+        assert_eq!(Button::Undo.pick(), None);
+        assert!(!Button::Undo.is_current(&state));
     }
 }

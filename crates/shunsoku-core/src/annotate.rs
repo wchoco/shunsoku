@@ -18,6 +18,10 @@
 //! 矩形と楕円は縁だけが当たる）。選んだ書き込みはドラッグと矢印キーで動かし、色と太さを選べばそれにも当てはめ、
 //! `Delete` / `Backspace` / ツールバーの削除で消す。書き込みを変えるのは `Annotations` の `push` / `translate` /
 //! `restyle` / `remove` だけで、ひとまとまりの変更（ドラッグは押してから離すまで）がそれぞれ履歴の 1 件になる。
+//!
+//! 履歴（元に戻す / やり直す）は `Annotations` が書き込みと一緒に持つ（`mode` の外なので、モードを抜けても、
+//! ごみ箱から戻しても残る）。編集モードの間、`Ctrl+Z` で元に戻し、`Ctrl+Y` か `Ctrl+Shift+Z` でやり直す。
+//! 元に戻す・やり直すと選択は外れる。新しい変更を積むと、やり直しの履歴は消える。
 
 pub mod toolbar;
 
@@ -193,10 +197,56 @@ fn segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
 }
 
-/// 1 枚のスクラップの書き込み。描いた順に並べ、後のものほど上に描く。
+/// 1 枚のスクラップの書き込みと、その元に戻す / やり直すの履歴。描いた順に並べ、後のものほど上に描く。
+///
+/// 書き込みを変えるのは private な `push` / `translate` / `restyle` / `remove`（と、ひとまとまりの変更を
+/// 続けて足す `drag`）だけで、それぞれが履歴に 1 件を積み、やり直しの履歴を捨てる。履歴は書き込みと一緒に
+/// `ScrapModel` の `mode` の外にあるので、編集モードを抜けても、ごみ箱から戻しても残る。上限はない。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Annotations {
     items: Vec<Annotation>,
+    /// 元に戻せる変更。最後のものが最新。
+    undo: Vec<Change>,
+    /// やり直せる変更（元に戻したもの）。最後のものが最も新しく戻したもの。
+    redo: Vec<Change>,
+}
+
+/// 履歴の 1 件。`items` の `index` の位置への変更で、逆向きに当てれば元に戻る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Change {
+    /// `index` に足した。
+    Add {
+        index: usize,
+        annotation: Annotation,
+    },
+    /// `index` から消した。
+    Remove {
+        index: usize,
+        annotation: Annotation,
+    },
+    /// `index` を `before` から `after` に変えた（移動、色や太さの変更）。
+    Replace {
+        index: usize,
+        before: Annotation,
+        after: Annotation,
+    },
+}
+
+impl Change {
+    /// `items` に当てる。`forward` が false なら逆向き（元に戻す）。
+    fn apply(&self, items: &mut Vec<Annotation>, forward: bool) {
+        match (self, forward) {
+            (Change::Add { index, annotation }, true)
+            | (Change::Remove { index, annotation }, false) => {
+                items.insert(*index, annotation.clone());
+            }
+            (Change::Add { index, .. }, false) | (Change::Remove { index, .. }, true) => {
+                items.remove(*index);
+            }
+            (Change::Replace { index, after, .. }, true) => items[*index] = after.clone(),
+            (Change::Replace { index, before, .. }, false) => items[*index] = before.clone(),
+        }
+    }
 }
 
 impl Annotations {
@@ -209,30 +259,110 @@ impl Annotations {
         self.items.is_empty()
     }
 
+    /// 元に戻せるか（戻す変更があるか）。
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    /// やり直せるか。
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// 最後の変更を元に戻す。戻すものがなければ false。
+    fn undo(&mut self) -> bool {
+        let Some(change) = self.undo.pop() else {
+            return false;
+        };
+        change.apply(&mut self.items, false);
+        self.redo.push(change);
+        true
+    }
+
+    /// 最後に元に戻した変更をやり直す。やり直すものがなければ false。
+    fn redo(&mut self) -> bool {
+        let Some(change) = self.redo.pop() else {
+            return false;
+        };
+        change.apply(&mut self.items, true);
+        self.undo.push(change);
+        true
+    }
+
+    /// `change` を当てて履歴に積む。新しい変更なので、やり直しの履歴は捨てる。
+    fn record(&mut self, change: Change) {
+        change.apply(&mut self.items, true);
+        self.undo.push(change);
+        self.redo.clear();
+    }
+
     fn push(&mut self, annotation: Annotation) {
-        self.items.push(annotation);
+        self.record(Change::Add {
+            index: self.items.len(),
+            annotation,
+        });
     }
 
     /// `index` の書き込みを消す。
     fn remove(&mut self, index: usize) -> Option<Annotation> {
-        (index < self.items.len()).then(|| self.items.remove(index))
+        let annotation = self.items.get(index)?.clone();
+        self.record(Change::Remove {
+            index,
+            annotation: annotation.clone(),
+        });
+        Some(annotation)
     }
 
-    /// `index` の書き込みの色と太さを `style` にする。変わったら true。
-    fn restyle(&mut self, index: usize, style: Style) -> bool {
-        match self.items.get_mut(index) {
-            Some(annotation) if annotation.style != style => {
-                annotation.style = style;
+    /// `index` の書き込みを `after` に置き換える。同じなら何もせずに false。
+    fn replace(&mut self, index: usize, after: Annotation) -> bool {
+        match self.items.get(index) {
+            Some(before) if *before != after => {
+                let before = before.clone();
+                self.record(Change::Replace {
+                    index,
+                    before,
+                    after,
+                });
                 true
             }
             _ => false,
         }
     }
 
-    /// `index` の書き込みを `(dx, dy)` 画素ずらす。
-    fn translate(&mut self, index: usize, dx: i32, dy: i32) {
-        if let Some(annotation) = self.items.get_mut(index) {
-            annotation.shape.translate(dx, dy);
+    /// `index` の書き込みの色と太さを `style` にする。変わったら true。
+    fn restyle(&mut self, index: usize, style: Style) -> bool {
+        let Some(annotation) = self.items.get(index) else {
+            return false;
+        };
+        let after = Annotation {
+            style,
+            ..annotation.clone()
+        };
+        self.replace(index, after)
+    }
+
+    /// `index` の書き込みを `(dx, dy)` 画素ずらす。動いたら true。
+    fn translate(&mut self, index: usize, dx: i32, dy: i32) -> bool {
+        let Some(mut after) = self.items.get(index).cloned() else {
+            return false;
+        };
+        after.shape.translate(dx, dy);
+        self.replace(index, after)
+    }
+
+    /// ドラッグの続きで `index` の書き込みを `(dx, dy)` 画素ずらす。直前の履歴（ドラッグの最初の `translate`）に
+    /// まとめるので、ドラッグ全体が 1 件になる。直前の履歴が同じ書き込みの変更でなければ `translate` と同じ。
+    fn drag(&mut self, index: usize, dx: i32, dy: i32) {
+        match self.undo.last_mut() {
+            Some(Change::Replace {
+                index: i, after, ..
+            }) if *i == index => {
+                after.shape.translate(dx, dy);
+                self.items[index].shape.translate(dx, dy);
+            }
+            _ => {
+                self.translate(index, dx, dy);
+            }
         }
     }
 }
@@ -379,10 +509,19 @@ pub struct EditState {
     draft: Option<Draft>,
     /// 選んでいる書き込み（`Annotations::items` の位置）。選べるのは 1 回に 1 つだけ。
     selected: Option<usize>,
-    /// 選んだ書き込みをドラッグで動かしている間の、最後のカーソルの画素。
-    grab: Option<Point>,
+    /// 選んだ書き込みをドラッグで動かしている間（押してから離すまで）。
+    grab: Option<Grab>,
     /// 当たり判定を線の太さの外に広げる画素数（`Annotation::hits` の `slop`）。
     hit_slop: u32,
+}
+
+/// 選んだ書き込みのドラッグ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Grab {
+    /// 最後のカーソルの画素。
+    last: Point,
+    /// もう動かしたか。最初に動かしたときに履歴を 1 件足し、あとはそこにまとめる。
+    moved: bool,
 }
 
 impl EditState {
@@ -445,6 +584,14 @@ impl EditState {
                 outputs
             }
             EditInput::Delete => self.delete_selected(annotations),
+            EditInput::Undo => self.step_history(annotations, Annotations::undo),
+            EditInput::Redo => self.step_history(annotations, Annotations::redo),
+            EditInput::Key(chord) if chord == UNDO => {
+                self.step_history(annotations, Annotations::undo)
+            }
+            EditInput::Key(chord) if REDO.contains(&chord) => {
+                self.step_history(annotations, Annotations::redo)
+            }
             EditInput::Key(chord) if chord == DELETE || chord == BACKSPACE => {
                 self.delete_selected(annotations)
             }
@@ -499,7 +646,10 @@ impl EditState {
             .items()
             .iter()
             .rposition(|a| a.hits(at, self.hit_slop));
-        self.grab = hit.map(|_| at);
+        self.grab = hit.map(|_| Grab {
+            last: at,
+            moved: false,
+        });
         if hit == self.selected {
             return vec![];
         }
@@ -509,14 +659,20 @@ impl EditState {
 
     /// 選んだ書き込みのドラッグでカーソルが `at` に動いた。動いた分だけずらす。
     fn drag_selected(&mut self, at: Point, annotations: &mut Annotations) -> Vec<EditOutput> {
-        let (Some(index), Some(last)) = (self.selected, self.grab) else {
+        let (Some(index), Some(grab)) = (self.selected, self.grab) else {
             return vec![];
         };
-        if at == last {
+        if at == grab.last {
             return vec![];
         }
-        annotations.translate(index, at.x - last.x, at.y - last.y);
-        self.grab = Some(at);
+        let (dx, dy) = (at.x - grab.last.x, at.y - grab.last.y);
+        let moved = if grab.moved {
+            annotations.drag(index, dx, dy);
+            true
+        } else {
+            annotations.translate(index, dx, dy)
+        };
+        self.grab = Some(Grab { last: at, moved });
         vec![EditOutput::Redraw]
     }
 
@@ -554,8 +710,28 @@ impl EditState {
         let Some(index) = self.selected else {
             return vec![];
         };
-        annotations.translate(index, dx, dy);
+        if !annotations.translate(index, dx, dy) {
+            return vec![];
+        }
         vec![EditOutput::Redraw]
+    }
+
+    /// 元に戻す（`step` が `Annotations::undo`）かやり直す（`Annotations::redo`）。描きかけは先に書き込みに
+    /// して（元に戻すなら、それが最初に戻る）、選択は外す（戻した変更で位置がずれたり消えたりするため）。
+    /// 戻す・やり直すものがなければ受けない。
+    fn step_history(
+        &mut self,
+        annotations: &mut Annotations,
+        step: fn(&mut Annotations) -> bool,
+    ) -> Vec<EditOutput> {
+        let committed = self.commit(annotations);
+        self.grab = None;
+        let deselected = self.selected.take().is_some();
+        if step(annotations) || deselected || !committed.is_empty() {
+            vec![EditOutput::Redraw]
+        } else {
+            vec![]
+        }
     }
 
     /// 描きかけを書き込みにする。長さ 0 なら捨てる。
@@ -605,6 +781,15 @@ const BACKSPACE: Chord = Chord::plain(Key::known(0x08));
 /// `V`。選択の道具を選ぶ。
 const VK_V: u16 = 0x56;
 
+/// `Ctrl+Z`。元に戻す。
+const UNDO: Chord = Chord::plain(Key::known(0x5A)).ctrl();
+
+/// `Ctrl+Y` と `Ctrl+Shift+Z`。やり直す。
+const REDO: [Chord; 2] = [
+    Chord::plain(Key::known(0x59)).ctrl(),
+    Chord::plain(Key::known(0x5A)).ctrl().shift(),
+];
+
 /// `Esc`。編集モードを抜ける。
 const ESCAPE: Chord = Chord::plain(Key::known(0x1B));
 
@@ -618,12 +803,17 @@ pub enum EditInput {
     Move { at: Point, shift: bool },
     /// 左ボタンを離した、またはマウスを捕まえていられなくなった。描きかけを書き込みにする。
     Release,
-    /// キーを押した。`Esc` で抜け、数字キーで道具を選ぶ。ほかのキーは受けない（何も返さない）。
+    /// キーを押した。`Esc` で抜け、数字キーで道具を選び、`Ctrl+Z` で元に戻し、`Ctrl+Y` と `Ctrl+Shift+Z` で
+    /// やり直す。ほかのキーは受けない（何も返さない）。
     Key(Chord),
     /// ツールバーで道具・色・太さを選んだ（数字キーで道具を選ぶのは `Key`）。
     Pick(Pick),
     /// ツールバーの削除を押した（`Delete` と `Backspace` は `Key`）。選んだ書き込みを消す。
     Delete,
+    /// ツールバーの元に戻すを押した（`Ctrl+Z` は `Key`）。
+    Undo,
+    /// ツールバーのやり直すを押した（`Ctrl+Y` と `Ctrl+Shift+Z` は `Key`）。
+    Redo,
     /// 抜ける（メニューの「書き込み」、ほかのウィンドウへのフォーカスの移動、スクラップを閉じる前）。
     Leave,
 }
@@ -1527,5 +1717,236 @@ mod tests {
         let head = arrow_head((0.0, 0.0), (5.0, 0.0), 3.0).unwrap();
         assert_eq!((head.base, head.left), ((0.0, 0.0), (0.0, -2.5)));
         assert_eq!(arrow_head((1.0, 1.0), (1.0, 1.0), 3.0), None);
+    }
+
+    const Z: u16 = 0x5A;
+    const Y: u16 = 0x59;
+
+    fn undo() -> EditInput {
+        EditInput::Key(Chord::plain(Key::known(Z)).ctrl())
+    }
+
+    fn redo() -> EditInput {
+        EditInput::Key(Chord::plain(Key::known(Y)).ctrl())
+    }
+
+    #[test]
+    fn ctrl_z_takes_back_the_last_drawing_and_ctrl_y_puts_it_back() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        draw(&mut state, &mut annotations, Tool::Rect, p(0, 10), p(9, 19));
+        assert_eq!(
+            state.input(undo(), &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(
+            shapes(&annotations),
+            vec![Shape::Line {
+                from: p(0, 0),
+                to: p(40, 0),
+            }]
+        );
+        state.input(undo(), &mut annotations);
+        assert!(annotations.is_empty());
+        // もう戻すものがなければ受けない
+        assert_eq!(state.input(undo(), &mut annotations), vec![]);
+        assert_eq!(
+            state.input(redo(), &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        state.input(redo(), &mut annotations);
+        assert_eq!(
+            shapes(&annotations),
+            vec![
+                Shape::Line {
+                    from: p(0, 0),
+                    to: p(40, 0),
+                },
+                Shape::Rect {
+                    from: p(0, 10),
+                    to: p(9, 19),
+                },
+            ]
+        );
+        assert_eq!(state.input(redo(), &mut annotations), vec![]);
+    }
+
+    #[test]
+    fn a_whole_drag_of_the_selected_annotation_is_taken_back_at_once() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        state.input(key(V), &mut annotations);
+        state.input(EditInput::Press(p(20, 0)), &mut annotations);
+        for at in [p(21, 1), p(25, 5), p(30, 10)] {
+            state.input(EditInput::Move { at, shift: false }, &mut annotations);
+        }
+        state.input(EditInput::Release, &mut annotations);
+        let moved = vec![Shape::Line {
+            from: p(10, 10),
+            to: p(50, 10),
+        }];
+        assert_eq!(shapes(&annotations), moved);
+        state.input(undo(), &mut annotations);
+        assert_eq!(
+            shapes(&annotations),
+            vec![Shape::Line {
+                from: p(0, 0),
+                to: p(40, 0),
+            }]
+        );
+        state.input(redo(), &mut annotations);
+        assert_eq!(shapes(&annotations), moved);
+        // 2 回目の元に戻すは線を描いたことを戻す
+        state.input(undo(), &mut annotations);
+        state.input(undo(), &mut annotations);
+        assert!(annotations.is_empty());
+    }
+
+    #[test]
+    fn changing_the_colour_or_width_of_the_selected_annotation_is_one_entry_each() {
+        let red = Rgb(0xE5, 0x39, 0x35);
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(20, 0));
+        state.input(EditInput::Pick(Pick::Color(red)), &mut annotations);
+        state.input(EditInput::Pick(Pick::Width(8)), &mut annotations);
+        state.input(undo(), &mut annotations);
+        assert_eq!(
+            annotations.items()[0].style,
+            Style {
+                color: red,
+                width: 5,
+            }
+        );
+        state.input(undo(), &mut annotations);
+        assert_eq!(annotations.items()[0].style, BLUE);
+        state.input(redo(), &mut annotations);
+        assert_eq!(annotations.items()[0].style.color, red);
+        // 元に戻しても、これから描くものの色と太さはそのまま
+        assert_eq!(state.style.width, 8);
+    }
+
+    #[test]
+    fn a_deleted_annotation_comes_back_in_its_place_with_ctrl_z() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        for y in [0, 10, 20] {
+            draw(&mut state, &mut annotations, Tool::Line, p(0, y), p(40, y));
+        }
+        let drawn = shapes(&annotations);
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(20, 10));
+        state.input(key(DELETE), &mut annotations);
+        assert_eq!(annotations.items().len(), 2);
+        state.input(undo(), &mut annotations);
+        // 重なりの順（真ん中）にも戻る
+        assert_eq!(shapes(&annotations), drawn);
+        state.input(redo(), &mut annotations);
+        assert_eq!(
+            shapes(&annotations),
+            vec![drawn[0].clone(), drawn[2].clone()]
+        );
+    }
+
+    #[test]
+    fn each_arrow_key_move_is_taken_back_one_at_a_time() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(20, 0));
+        state.input(key(RIGHT), &mut annotations);
+        state.input(key(DOWN), &mut annotations);
+        state.input(undo(), &mut annotations);
+        assert_eq!(
+            shapes(&annotations),
+            vec![Shape::Line {
+                from: p(1, 0),
+                to: p(41, 0),
+            }]
+        );
+        // 元に戻すと選択が外れる
+        assert_eq!(state.selected(), None);
+        state.input(undo(), &mut annotations);
+        assert_eq!(
+            shapes(&annotations),
+            vec![Shape::Line {
+                from: p(0, 0),
+                to: p(40, 0),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_new_change_after_ctrl_z_drops_what_could_be_redone() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(0, 10),
+            p(40, 10),
+        );
+        state.input(undo(), &mut annotations);
+        assert!(annotations.can_redo());
+        draw(&mut state, &mut annotations, Tool::Rect, p(0, 20), p(9, 29));
+        assert!(!annotations.can_redo());
+        assert_eq!(state.input(redo(), &mut annotations), vec![]);
+        assert_eq!(
+            shapes(&annotations),
+            vec![
+                Shape::Line {
+                    from: p(0, 0),
+                    to: p(40, 0),
+                },
+                Shape::Rect {
+                    from: p(0, 20),
+                    to: p(9, 29),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_z_also_redoes_and_ctrl_z_mid_drag_takes_back_the_drawing_in_progress() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(EditInput::Press(p(0, 0)), &mut annotations);
+        state.input(
+            EditInput::Move {
+                at: p(30, 30),
+                shift: false,
+            },
+            &mut annotations,
+        );
+        assert_eq!(
+            state.input(undo(), &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert!(annotations.is_empty());
+        assert_eq!(state.draft(), None);
+        let ctrl_shift_z = EditInput::Key(Chord::plain(Key::known(Z)).ctrl().shift());
+        assert_eq!(
+            state.input(ctrl_shift_z, &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(annotations.items().len(), 1);
+        // ツールバーのボタンも同じ
+        assert_eq!(
+            state.input(EditInput::Undo, &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert!(annotations.is_empty());
+        assert_eq!(
+            state.input(EditInput::Redo, &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(annotations.items().len(), 1);
     }
 }
