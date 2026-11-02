@@ -2393,7 +2393,7 @@ fn capture_active_window() {
             log::warn!("could not capture the active window: {e}");
             // UAC で昇格したウィンドウなど、WGC で撮れないときは見えている部分だけを撮る（#64）
             match (!hwnd.is_invalid())
-                .then(|| grab_visible_part(hwnd))
+                .then(|| grab_visible_part(hwnd, cursor))
                 .flatten()
             {
                 Some(shot) => (shot, true),
@@ -2440,9 +2440,9 @@ fn capture_active_window() {
 }
 
 /// WGC で撮れなかったウィンドウの、モニタに写っている部分を Desktop Duplication で撮る。撮れなければ None。
-fn grab_visible_part(hwnd: HWND) -> Option<crate::window_grab::WindowShot> {
+fn grab_visible_part(hwnd: HWND, cursor: bool) -> Option<crate::window_grab::WindowShot> {
     // 取得のスレッドは App に触らないので、借りたまま待ってよい
-    let grabbed = with_app(|app| crate::window_grab::grab_visible(&mut app.gpu, hwnd))?;
+    let grabbed = with_app(|app| crate::window_grab::grab_visible(&mut app.gpu, hwnd, cursor))?;
     let shot = match grabbed {
         Ok(Some(shot)) => Some(shot),
         Ok(None) => {

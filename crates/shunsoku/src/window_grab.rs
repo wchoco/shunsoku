@@ -192,12 +192,13 @@ fn window_bounds(hwnd: HWND) -> Rect {
 
 /// WGC で撮れなかったウィンドウ（UAC で昇格したウィンドウなど）の後退: ウィンドウの矩形のうちモニタに
 /// 写っている部分を Desktop Duplication で撮る（spec #34、#64）。他のウィンドウに隠れた部分は、
-/// 隠しているウィンドウが写る。どのモニタにも重ならなければ Ok(None)。
+/// 隠しているウィンドウが写る。どのモニタにも重ならなければ Ok(None)。`cursor` は `grab_window` と同じ。
 pub fn grab_visible(
     gpu: &mut Gpu,
     hwnd: HWND,
+    cursor: bool,
 ) -> std::result::Result<Option<WindowShot>, GrabError> {
-    let shots = gpu.grab()?;
+    let shots = gpu.grab(cursor)?;
     let monitors: Vec<Rect> = shots
         .iter()
         .map(|s| Rect::new(s.rect.left, s.rect.top, s.rect.right, s.rect.bottom))
