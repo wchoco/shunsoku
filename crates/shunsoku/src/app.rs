@@ -2967,7 +2967,7 @@ fn capture_region(request: CaptureRequest) {
     })
     .flatten();
     let Some(region) = region else {
-        log::warn!("region {name} is no longer in the settings");
+        log::warn!("region {name} is not in the settings");
         let message = format!("{}{name}", text("region.gone"));
         if request.notify {
             notify_user(notify::Level::Error, &message);
