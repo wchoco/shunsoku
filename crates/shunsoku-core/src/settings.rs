@@ -642,7 +642,15 @@ fn regions(root: &dyn TableLike, r: &mut Reader) -> Vec<Region> {
         r.invalid("regions");
         return Vec::new();
     };
-    let mut regions: Vec<Region> = Vec::new();
+    read_regions(tables, r)
+        .into_iter()
+        .map(|(_, region)| region)
+        .collect()
+}
+
+/// `[[regions]]` の要素のうち読み込みで残る定型領域と、その要素の位置（0 から）。
+fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(usize, Region)> {
+    let mut regions: Vec<(usize, Region)> = Vec::new();
     for (i, table) in tables.iter().enumerate() {
         let path = format!("regions[{}]", i + 1);
         let t: Option<&dyn TableLike> = Some(table);
@@ -663,33 +671,30 @@ fn regions(root: &dyn TableLike, r: &mut Reader) -> Vec<Region> {
         let (Some(name), Some(monitor), Some(rect)) = (name, monitor, rect) else {
             continue;
         };
-        if regions.iter().any(|region| region.name == name) {
+        if regions.iter().any(|(_, region)| region.name == name) {
             r.invalid(format!("{path}.name"));
             continue;
         }
-        regions.push(Region {
-            name,
-            hotkey,
-            monitor,
-            rect,
-            save_dir,
-            file_name_template,
-            save,
-            scrap,
-        });
+        regions.push((
+            i,
+            Region {
+                name,
+                hotkey,
+                monitor,
+                rect,
+                save_dir,
+                file_name_template,
+                save,
+                scrap,
+            },
+        ));
     }
     regions
 }
 
 /// 定型領域の範囲（`x` / `y` / `width` / `height`）。どれかが読めなければ None。
 fn region_rect(table: &toml_edit::Table, path: &str, r: &mut Reader) -> Option<Rect> {
-    let mut read = |key: &str, min: i64| {
-        r.required(table, path, key, |i| {
-            i.as_integer()
-                .filter(|&n| n >= min)
-                .and_then(|n| i32::try_from(n).ok())
-        })
-    };
+    let mut read = |key: &str, min: i32| r.required(table, path, key, |i| region_number(i, min));
     let x = read("x", 0);
     let y = read("y", 0);
     let width = read("width", 1);
@@ -701,6 +706,11 @@ fn region_rect(table: &toml_edit::Table, path: &str, r: &mut Reader) -> Option<R
         x.checked_add(width)?,
         y.checked_add(height)?,
     ))
+}
+
+/// 定型領域の範囲の数 1 つ。`min` 以上の i32。
+fn region_number(item: &Item, min: i32) -> Option<i32> {
+    i32::try_from(item.as_integer()?).ok().filter(|&n| n >= min)
 }
 
 /// 実行中に設定ファイルを読み込み直す。`src` は新しい中身（ファイルがなければ None で、既定値にする）。

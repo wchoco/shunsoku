@@ -10,6 +10,8 @@ mod clipboard;
 #[cfg(windows)]
 mod grab;
 #[cfg(windows)]
+mod hdr;
+#[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
 mod logger;
