@@ -13,10 +13,15 @@
 //! 道具は矩形・楕円・矢印・線・フリーハンド（`Tool`）で、編集モードの間は数字キーで選ぶ（`Tool::from_key`。
 //! 5 は文字のために空けてある）。`Shift` を押しながら描くと、矩形は正方形、楕円は円、線と矢印は 45° 刻みに
 //! なる（`Draft::end`）。道具を足すときは `Tool` と `Shape` に行を足し、`Draft::shape` と番号の表を足す。
+//!
+//! 選択の道具（`Tool::Select`、`V`）では、クリックでいちばん上の書き込みを 1 つ選ぶ（`Annotation::hits`。
+//! 矩形と楕円は縁だけが当たる）。選んだ書き込みはドラッグと矢印キーで動かし、色と太さを選べばそれにも当てはめ、
+//! `Delete` / `Backspace` / ツールバーの削除で消す。書き込みを変えるのは `Annotations` の `push` / `translate` /
+//! `restyle` / `remove` だけで、ひとまとまりの変更（ドラッグは押してから離すまで）がそれぞれ履歴の 1 件になる。
 
 pub mod toolbar;
 
-use crate::geometry::Point;
+use crate::geometry::{Point, Rect};
 use crate::keys::{Chord, Key, Modifiers};
 use crate::settings::{AnnotationDefaults, Rgb};
 
@@ -58,11 +63,134 @@ pub enum Shape {
     Freehand { points: Vec<Point> },
 }
 
+impl Shape {
+    /// `(dx, dy)` 画素ずらす。
+    fn translate(&mut self, dx: i32, dy: i32) {
+        let shift = |p: &mut Point| *p = Point::new(p.x.saturating_add(dx), p.y.saturating_add(dy));
+        match self {
+            Shape::Rect { from, to }
+            | Shape::Ellipse { from, to }
+            | Shape::Arrow { from, to }
+            | Shape::Line { from, to } => {
+                shift(from);
+                shift(to);
+            }
+            Shape::Freehand { points } => points.iter_mut().for_each(shift),
+        }
+    }
+}
+
 /// 1 つの書き込み。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Annotation {
     pub shape: Shape,
     pub style: Style,
+}
+
+impl Annotation {
+    /// 元の画像の画素 `at` が、この書き込みの線の上（太さの半分と `slop` 画素の内）にあるか。矩形と楕円は
+    /// 縁だけで、中は当たらない（囲んだものの上の書き込みを選べるように）。
+    pub fn hits(&self, at: Point, slop: u32) -> bool {
+        let reach = f64::from(self.style.width) / 2.0 + f64::from(slop);
+        let at = (f64::from(at.x), f64::from(at.y));
+        let near = |points: &[(f64, f64)], closed: bool| {
+            let n = points.len();
+            let segments = if closed { n } else { n.saturating_sub(1) };
+            (0..segments).any(|i| segment_distance(at, points[i], points[(i + 1) % n]) <= reach)
+        };
+        match &self.shape {
+            Shape::Rect { from, to } => {
+                let (a, b) = (xy(*from), xy(*to));
+                near(&[a, (b.0, a.1), b, (a.0, b.1)], true)
+            }
+            Shape::Ellipse { from, to } => {
+                let (a, b) = (xy(*from), xy(*to));
+                let (cx, cy) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+                let (rx, ry) = ((b.0 - a.0).abs() / 2.0, (b.1 - a.1).abs() / 2.0);
+                let outline: Vec<_> = (0..ELLIPSE_SEGMENTS)
+                    .map(|i| {
+                        let t = f64::from(i) * std::f64::consts::TAU / f64::from(ELLIPSE_SEGMENTS);
+                        (cx + rx * t.cos(), cy + ry * t.sin())
+                    })
+                    .collect();
+                near(&outline, true)
+            }
+            Shape::Line { from, to } => near(&[xy(*from), xy(*to)], false),
+            Shape::Arrow { from, to } => {
+                let width = f64::from(self.style.width);
+                near(&[xy(*from), xy(*to)], false)
+                    || arrow_head(xy(*from), xy(*to), width).is_some_and(|head| {
+                        let corners = [head.tip, head.left, head.right];
+                        in_triangle(at, corners) || near(&corners, true)
+                    })
+            }
+            Shape::Freehand { points } => {
+                let points: Vec<_> = points.iter().map(|&p| xy(p)).collect();
+                near(&points, false)
+            }
+        }
+    }
+}
+
+/// 楕円の当たり判定で、縁を何本の線分で近似するか。
+const ELLIPSE_SEGMENTS: u16 = 64;
+
+/// 点 `p` が三角形 `t` の中にあるか（縁も含む）。
+fn in_triangle(p: (f64, f64), t: [(f64, f64); 3]) -> bool {
+    let side = |a: (f64, f64), b: (f64, f64)| (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+    let (d0, d1, d2) = (side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0]));
+    let negative = d0 < 0.0 || d1 < 0.0 || d2 < 0.0;
+    let positive = d0 > 0.0 || d1 > 0.0 || d2 > 0.0;
+    !(negative && positive)
+}
+
+impl Annotation {
+    /// 外接矩形（元の画像の画素。選択の印を描く場所）。辺は端の画素の中心から太さの半分（切り上げ）だけ外で、
+    /// 矢印は頭の三角形も含む。
+    pub fn bounds(&self) -> Rect {
+        let half = self.style.width.div_ceil(2) as i32;
+        let points: Vec<Point> = match &self.shape {
+            Shape::Rect { from, to }
+            | Shape::Ellipse { from, to }
+            | Shape::Arrow { from, to }
+            | Shape::Line { from, to } => vec![*from, *to],
+            Shape::Freehand { points } => points.clone(),
+        };
+        let mut bounds = Rect::new(i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        let mut cover = |x: f64, y: f64, pad: i32| {
+            bounds.left = bounds.left.min(x.floor() as i32 - pad);
+            bounds.top = bounds.top.min(y.floor() as i32 - pad);
+            bounds.right = bounds.right.max(x.ceil() as i32 + pad);
+            bounds.bottom = bounds.bottom.max(y.ceil() as i32 + pad);
+        };
+        for p in &points {
+            cover(f64::from(p.x), f64::from(p.y), half);
+        }
+        if let Shape::Arrow { from, to } = &self.shape
+            && let Some(head) = arrow_head(xy(*from), xy(*to), f64::from(self.style.width))
+        {
+            for (x, y) in [head.tip, head.left, head.right] {
+                cover(x, y, 0);
+            }
+        }
+        bounds
+    }
+}
+
+fn xy(p: Point) -> (f64, f64) {
+    (f64::from(p.x), f64::from(p.y))
+}
+
+/// 点 `p` から線分 `a`–`b` までの距離。
+fn segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let length2 = dx * dx + dy * dy;
+    let t = if length2 == 0.0 {
+        0.0
+    } else {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / length2).clamp(0.0, 1.0)
+    };
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
 }
 
 /// 1 枚のスクラップの書き込み。描いた順に並べ、後のものほど上に描く。
@@ -84,11 +212,36 @@ impl Annotations {
     fn push(&mut self, annotation: Annotation) {
         self.items.push(annotation);
     }
+
+    /// `index` の書き込みを消す。
+    fn remove(&mut self, index: usize) -> Option<Annotation> {
+        (index < self.items.len()).then(|| self.items.remove(index))
+    }
+
+    /// `index` の書き込みの色と太さを `style` にする。変わったら true。
+    fn restyle(&mut self, index: usize, style: Style) -> bool {
+        match self.items.get_mut(index) {
+            Some(annotation) if annotation.style != style => {
+                annotation.style = style;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `index` の書き込みを `(dx, dy)` 画素ずらす。
+    fn translate(&mut self, index: usize, dx: i32, dy: i32) {
+        if let Some(annotation) = self.items.get_mut(index) {
+            annotation.shape.translate(dx, dy);
+        }
+    }
 }
 
 /// 編集モードで左ドラッグが描くもの。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tool {
+    /// 選択。クリックで書き込みを 1 つ選び、ドラッグで動かす（描かない）。
+    Select,
     #[default]
     Rect,
     Ellipse,
@@ -105,6 +258,7 @@ impl Tool {
             return None;
         }
         let n = match chord.key.vk() {
+            VK_V => return Some(Tool::Select),
             vk @ 0x31..=0x39 => vk - 0x30,
             vk @ 0x61..=0x69 => vk - 0x60,
             _ => return None,
@@ -172,7 +326,7 @@ impl Draft {
             Tool::Ellipse => Some(Shape::Ellipse { from, to }),
             Tool::Arrow => Some(Shape::Arrow { from, to }),
             Tool::Line => Some(Shape::Line { from, to }),
-            Tool::Freehand => None,
+            Tool::Select | Tool::Freehand => None,
         }
     }
 
@@ -188,7 +342,7 @@ impl Draft {
                 let side = dx.abs().max(dy.abs());
                 Point::new(self.from.x + side * sign(dx), self.from.y + side * sign(dy))
             }
-            Tool::Freehand => self.to,
+            Tool::Select | Tool::Freehand => self.to,
             Tool::Arrow | Tool::Line => {
                 let (ax, ay) = (f64::from(dx.abs()), f64::from(dy.abs()));
                 let (dx, dy) = if ay < ax * TAN_22_5 {
@@ -223,6 +377,12 @@ pub struct EditState {
     /// これから描く書き込みの色と太さ。入ったときは設定の `[annotation]` の値。
     pub style: Style,
     draft: Option<Draft>,
+    /// 選んでいる書き込み（`Annotations::items` の位置）。選べるのは 1 回に 1 つだけ。
+    selected: Option<usize>,
+    /// 選んだ書き込みをドラッグで動かしている間の、最後のカーソルの画素。
+    grab: Option<Point>,
+    /// 当たり判定を線の太さの外に広げる画素数（`Annotation::hits` の `slop`）。
+    hit_slop: u32,
 }
 
 impl EditState {
@@ -231,7 +391,20 @@ impl EditState {
             tool: Tool::default(),
             style,
             draft: None,
+            selected: None,
+            grab: None,
+            hit_slop: 0,
         }
+    }
+
+    /// 当たり判定の広さ（元の画像の画素）。`ScrapModel` が表示の倍率から決める（画面での広さを揃えるため）。
+    pub(crate) fn set_hit_slop(&mut self, slop: u32) {
+        self.hit_slop = slop;
+    }
+
+    /// 選んでいる書き込みの位置（`Annotations::items` の添え字）。
+    pub fn selected(&self) -> Option<usize> {
+        self.selected
     }
 
     /// 描きかけの書き込み（ドラッグ中だけ）。長さ 0 なら None。
@@ -246,9 +419,13 @@ impl EditState {
     /// 入力を受けて、`annotations` を変える。座標は元の画像の画素（`ScrapModel::edit_input` が直したもの）。
     pub fn input(&mut self, input: EditInput, annotations: &mut Annotations) -> Vec<EditOutput> {
         match input {
+            EditInput::Press(at) if self.tool == Tool::Select => self.select_at(at, annotations),
             EditInput::Press(at) => {
                 self.draft = Some(Draft::new(at));
                 vec![]
+            }
+            EditInput::Move { at, .. } if self.grab.is_some() => {
+                self.drag_selected(at, annotations)
             }
             EditInput::Move { at, shift } => match &mut self.draft {
                 Some(draft) if (draft.to, draft.shift) != (at, shift) => {
@@ -257,17 +434,29 @@ impl EditState {
                 }
                 _ => vec![],
             },
-            EditInput::Release => self.commit(annotations),
+            EditInput::Release => {
+                self.grab = None;
+                self.commit(annotations)
+            }
             EditInput::Pick(pick) => self.pick(pick, annotations),
             EditInput::Key(chord) if chord == ESCAPE => {
                 let mut outputs = self.commit(annotations);
                 outputs.push(EditOutput::Left);
                 outputs
             }
-            EditInput::Key(chord) => match Tool::from_key(chord) {
-                Some(tool) => self.pick(Pick::Tool(tool), annotations),
-                None => vec![],
-            },
+            EditInput::Delete => self.delete_selected(annotations),
+            EditInput::Key(chord) if chord == DELETE || chord == BACKSPACE => {
+                self.delete_selected(annotations)
+            }
+            EditInput::Key(chord) => {
+                if let Some((dx, dy)) = nudge(chord) {
+                    return self.nudge(dx, dy, annotations);
+                }
+                match Tool::from_key(chord) {
+                    Some(tool) => self.pick(Pick::Tool(tool), annotations),
+                    None => vec![],
+                }
+            }
             EditInput::Leave => {
                 let mut outputs = self.commit(annotations);
                 outputs.push(EditOutput::Left);
@@ -283,13 +472,90 @@ impl EditState {
             Pick::Tool(tool) => {
                 outputs = self.commit(annotations);
                 self.tool = tool;
+                if tool != Tool::Select {
+                    self.grab = None;
+                    if self.selected.take().is_some() {
+                        outputs.push(EditOutput::Redraw);
+                    }
+                }
                 outputs.push(EditOutput::ToolChanged);
             }
-            Pick::Color(color) => self.style.color = color,
-            Pick::Width(width) => self.style.width = width,
+            Pick::Color(color) => {
+                self.style.color = color;
+                outputs = self.restyle_selected(annotations, |style| style.color = color);
+            }
+            Pick::Width(width) => {
+                self.style.width = width;
+                outputs = self.restyle_selected(annotations, |style| style.width = width);
+            }
         }
         outputs.push(EditOutput::Picked(pick));
         outputs
+    }
+
+    /// `at` にある書き込みのうち、いちばん上のものを選ぶ。何もなければ選択を外す。
+    fn select_at(&mut self, at: Point, annotations: &Annotations) -> Vec<EditOutput> {
+        let hit = annotations
+            .items()
+            .iter()
+            .rposition(|a| a.hits(at, self.hit_slop));
+        self.grab = hit.map(|_| at);
+        if hit == self.selected {
+            return vec![];
+        }
+        self.selected = hit;
+        vec![EditOutput::Redraw]
+    }
+
+    /// 選んだ書き込みのドラッグでカーソルが `at` に動いた。動いた分だけずらす。
+    fn drag_selected(&mut self, at: Point, annotations: &mut Annotations) -> Vec<EditOutput> {
+        let (Some(index), Some(last)) = (self.selected, self.grab) else {
+            return vec![];
+        };
+        if at == last {
+            return vec![];
+        }
+        annotations.translate(index, at.x - last.x, at.y - last.y);
+        self.grab = Some(at);
+        vec![EditOutput::Redraw]
+    }
+
+    /// 選んだ書き込みの色か太さを `change` で変える。選んでいないか、もう同じなら何もしない。
+    fn restyle_selected(
+        &mut self,
+        annotations: &mut Annotations,
+        change: impl FnOnce(&mut Style),
+    ) -> Vec<EditOutput> {
+        let Some(index) = self.selected else {
+            return vec![];
+        };
+        let Some(mut style) = annotations.items().get(index).map(|a| a.style) else {
+            return vec![];
+        };
+        change(&mut style);
+        if !annotations.restyle(index, style) {
+            return vec![];
+        }
+        vec![EditOutput::Redraw]
+    }
+
+    /// 選んだ書き込みを消す。選んでいなければ受けない。
+    fn delete_selected(&mut self, annotations: &mut Annotations) -> Vec<EditOutput> {
+        let Some(index) = self.selected.take() else {
+            return vec![];
+        };
+        self.grab = None;
+        annotations.remove(index);
+        vec![EditOutput::Redraw]
+    }
+
+    /// 選んだ書き込みを矢印キーで `(dx, dy)` 画素ずらす。選んでいなければ受けない。
+    fn nudge(&mut self, dx: i32, dy: i32, annotations: &mut Annotations) -> Vec<EditOutput> {
+        let Some(index) = self.selected else {
+            return vec![];
+        };
+        annotations.translate(index, dx, dy);
+        vec![EditOutput::Redraw]
     }
 
     /// 描きかけを書き込みにする。長さ 0 なら捨てる。
@@ -308,6 +574,37 @@ impl EditState {
     }
 }
 
+/// 矢印キーで書き込みを動かす向きと画素数。`Shift` を押していれば 10 画素、修飾キーがなければ 1 画素。
+fn nudge(chord: Chord) -> Option<(i32, i32)> {
+    let step = match chord.modifiers {
+        m if m == Modifiers::default() => 1,
+        Modifiers {
+            shift: true,
+            win: false,
+            ctrl: false,
+            alt: false,
+        } => NUDGE_SHIFT_STEP,
+        _ => return None,
+    };
+    match chord.key.vk() {
+        0x25 => Some((-step, 0)),
+        0x26 => Some((0, -step)),
+        0x27 => Some((step, 0)),
+        0x28 => Some((0, step)),
+        _ => None,
+    }
+}
+
+/// `Shift` を押しながらの矢印キーで動かす画素数。
+const NUDGE_SHIFT_STEP: i32 = 10;
+
+/// `Delete` と `Backspace`。選んだ書き込みを消す。
+const DELETE: Chord = Chord::plain(Key::known(0x2E));
+const BACKSPACE: Chord = Chord::plain(Key::known(0x08));
+
+/// `V`。選択の道具を選ぶ。
+const VK_V: u16 = 0x56;
+
 /// `Esc`。編集モードを抜ける。
 const ESCAPE: Chord = Chord::plain(Key::known(0x1B));
 
@@ -325,6 +622,8 @@ pub enum EditInput {
     Key(Chord),
     /// ツールバーで道具・色・太さを選んだ（数字キーで道具を選ぶのは `Key`）。
     Pick(Pick),
+    /// ツールバーの削除を押した（`Delete` と `Backspace` は `Key`）。選んだ書き込みを消す。
+    Delete,
     /// 抜ける（メニューの「書き込み」、ほかのウィンドウへのフォーカスの移動、スクラップを閉じる前）。
     Leave,
 }
@@ -366,7 +665,7 @@ pub enum Pick {
 /// 書き戻さない）。色と太さは選ぶまでは設定の既定値に従う（設定を変えればそれが効く）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Carryover {
-    /// 最後に使った描く道具。最初は矩形。
+    /// 最後に使った描く道具（選択は覚えない）。最初は矩形。
     tool: Tool,
     color: Option<Rgb>,
     width: Option<u32>,
@@ -387,6 +686,8 @@ impl Carryover {
     pub fn record(&mut self, outputs: &[EditOutput]) {
         for output in outputs {
             match *output {
+                // 選択は描く道具ではないので、次の編集モードは最後に使った描く道具で始める
+                EditOutput::Picked(Pick::Tool(Tool::Select)) => {}
                 EditOutput::Picked(Pick::Tool(tool)) => self.tool = tool,
                 EditOutput::Picked(Pick::Color(color)) => self.color = Some(color),
                 EditOutput::Picked(Pick::Width(width)) => self.width = Some(width),
@@ -715,6 +1016,497 @@ mod tests {
             }
         );
         assert_eq!(state.draft(), None);
+    }
+
+    fn key(vk: u16) -> EditInput {
+        EditInput::Key(Chord::plain(Key::known(vk)))
+    }
+
+    const V: u16 = 0x56;
+
+    /// 左ボタンを押して離す（動かさない）。
+    fn click(state: &mut EditState, annotations: &mut Annotations, at: Point) -> Vec<EditOutput> {
+        let mut outputs = state.input(EditInput::Press(at), annotations);
+        outputs.extend(state.input(EditInput::Release, annotations));
+        outputs
+    }
+
+    /// 道具 `tool` で `from` から `to` へ描く。
+    fn draw(
+        state: &mut EditState,
+        annotations: &mut Annotations,
+        tool: Tool,
+        from: Point,
+        to: Point,
+    ) {
+        state.input(EditInput::Pick(Pick::Tool(tool)), annotations);
+        drag(state, annotations, from, to);
+    }
+
+    #[test]
+    fn v_picks_the_select_tool_and_a_click_on_the_edge_of_a_rect_selects_it() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Rect,
+            p(10, 10),
+            p(50, 40),
+        );
+        state.input(key(V), &mut annotations);
+        assert_eq!(state.tool, Tool::Select);
+        assert_eq!(state.selected(), None);
+        assert_eq!(
+            click(&mut state, &mut annotations, p(30, 11)),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(state.selected(), Some(0));
+        // 選択の道具のクリックでは描かない
+        assert_eq!(annotations.items().len(), 1);
+    }
+
+    fn annotation(shape: Shape, width: u32) -> Annotation {
+        Annotation {
+            shape,
+            style: Style {
+                color: BLUE.color,
+                width,
+            },
+        }
+    }
+
+    #[test]
+    fn rects_and_ellipses_are_hit_on_their_outline_but_not_inside() {
+        let rect = annotation(
+            Shape::Rect {
+                from: p(50, 40),
+                to: p(10, 10),
+            },
+            3,
+        );
+        assert!(rect.hits(p(10, 25), 0));
+        assert!(rect.hits(p(51, 25), 0)); // 太さの半分（1.5）の内
+        assert!(!rect.hits(p(52, 25), 0));
+        assert!(rect.hits(p(53, 25), 2)); // slop の分だけ広がる
+        assert!(!rect.hits(p(30, 25), 0));
+        let ellipse = annotation(
+            Shape::Ellipse {
+                from: p(0, 0),
+                to: p(100, 50),
+            },
+            2,
+        );
+        assert!(ellipse.hits(p(50, 0), 0));
+        assert!(ellipse.hits(p(101, 25), 0));
+        assert!(ellipse.hits(p(50, 50), 0));
+        assert!(!ellipse.hits(p(50, 25), 0));
+        // 外接矩形の角は楕円から遠い
+        assert!(!ellipse.hits(p(2, 2), 0));
+    }
+
+    #[test]
+    fn lines_freehand_and_arrows_are_hit_along_their_strokes_and_arrows_on_their_heads() {
+        let line = annotation(
+            Shape::Line {
+                from: p(0, 0),
+                to: p(100, 100),
+            },
+            2,
+        );
+        assert!(line.hits(p(50, 50), 0));
+        assert!(line.hits(p(51, 50), 0));
+        assert!(!line.hits(p(54, 50), 0));
+        // 端より先は当たらない
+        assert!(!line.hits(p(103, 103), 0));
+        let freehand = annotation(
+            Shape::Freehand {
+                points: vec![p(0, 0), p(20, 0), p(20, 20)],
+            },
+            1,
+        );
+        assert!(freehand.hits(p(10, 0), 0));
+        assert!(freehand.hits(p(20, 10), 0));
+        assert!(!freehand.hits(p(10, 10), 0));
+        // 太さ 3 の矢印の頭は長さ 12、底辺の幅 12（x = 88 から 100）。軸から 3 離れた頭の中も当たる
+        let arrow = annotation(
+            Shape::Arrow {
+                from: p(0, 0),
+                to: p(100, 0),
+            },
+            3,
+        );
+        assert!(arrow.hits(p(50, 1), 0));
+        assert!(!arrow.hits(p(50, 5), 0));
+        assert!(arrow.hits(p(92, 3), 0));
+        assert!(!arrow.hits(p(98, 4), 0));
+        assert!(!arrow.hits(p(85, 5), 0));
+    }
+
+    #[test]
+    fn where_annotations_overlap_the_click_selects_the_one_on_top_and_an_empty_spot_clears_it() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(0, 20),
+            p(100, 20),
+        );
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Rect,
+            p(10, 20),
+            p(60, 50),
+        );
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(0, 80),
+            p(100, 80),
+        );
+        state.input(key(V), &mut annotations);
+        // 線と矩形の上の辺が重なる。後に描いた矩形が上
+        click(&mut state, &mut annotations, p(30, 20));
+        assert_eq!(state.selected(), Some(1));
+        click(&mut state, &mut annotations, p(80, 20));
+        assert_eq!(state.selected(), Some(0));
+        // 選んでいるものをもう一度押しても何も変わらない
+        assert_eq!(click(&mut state, &mut annotations, p(80, 20)), vec![]);
+        assert_eq!(
+            click(&mut state, &mut annotations, p(30, 65)),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(state.selected(), None);
+    }
+
+    fn shapes(annotations: &Annotations) -> Vec<Shape> {
+        annotations
+            .items()
+            .iter()
+            .map(|a| a.shape.clone())
+            .collect()
+    }
+
+    #[test]
+    fn dragging_an_annotation_with_the_select_tool_selects_it_and_moves_it_by_the_drag() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Rect,
+            p(10, 10),
+            p(50, 40),
+        );
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Freehand,
+            p(100, 100),
+            p(110, 100),
+        );
+        state.input(key(V), &mut annotations);
+        state.input(EditInput::Press(p(10, 30)), &mut annotations);
+        for at in [p(12, 31), p(15, 35)] {
+            let outputs = state.input(EditInput::Move { at, shift: false }, &mut annotations);
+            assert_eq!(outputs, vec![EditOutput::Redraw]);
+        }
+        state.input(EditInput::Release, &mut annotations);
+        assert_eq!(state.selected(), Some(0));
+        state.input(EditInput::Press(p(104, 100)), &mut annotations);
+        state.input(
+            EditInput::Move {
+                at: p(100, 90),
+                shift: false,
+            },
+            &mut annotations,
+        );
+        state.input(EditInput::Release, &mut annotations);
+        assert_eq!(
+            shapes(&annotations),
+            vec![
+                Shape::Rect {
+                    from: p(15, 15),
+                    to: p(55, 45),
+                },
+                Shape::Freehand {
+                    points: vec![p(96, 90), p(106, 90)],
+                },
+            ]
+        );
+        // 離したあとのカーソルの移動では動かない
+        let moved = state.input(
+            EditInput::Move {
+                at: p(0, 0),
+                shift: false,
+            },
+            &mut annotations,
+        );
+        assert_eq!(moved, vec![]);
+    }
+
+    #[test]
+    fn dragging_from_an_empty_spot_moves_nothing() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(10, 0));
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(5, 0));
+        let before = annotations.clone();
+        drag(&mut state, &mut annotations, p(50, 50), p(60, 60));
+        assert_eq!(annotations, before);
+        assert_eq!(state.selected(), None);
+    }
+
+    const LEFT: u16 = 0x25;
+    const UP: u16 = 0x26;
+    const RIGHT: u16 = 0x27;
+    const DOWN: u16 = 0x28;
+
+    #[test]
+    fn arrow_keys_move_the_selected_annotation_a_pixel_or_ten_with_shift() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(10, 10),
+            p(20, 10),
+        );
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(15, 10));
+        for vk in [RIGHT, RIGHT, DOWN, LEFT, DOWN, DOWN] {
+            assert_eq!(
+                state.input(key(vk), &mut annotations),
+                vec![EditOutput::Redraw]
+            );
+        }
+        let shift_up = EditInput::Key(Chord::plain(Key::known(UP)).shift());
+        state.input(shift_up, &mut annotations);
+        assert_eq!(
+            shapes(&annotations),
+            vec![Shape::Line {
+                from: p(11, 3),
+                to: p(21, 3),
+            }]
+        );
+        // Ctrl つきの矢印は受けない
+        let ctrl_up = EditInput::Key(Chord::plain(Key::known(UP)).ctrl());
+        assert_eq!(state.input(ctrl_up, &mut annotations), vec![]);
+    }
+
+    #[test]
+    fn arrow_keys_do_nothing_when_nothing_is_selected() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Rect,
+            p(10, 10),
+            p(20, 20),
+        );
+        let before = annotations.clone();
+        for vk in [LEFT, UP, RIGHT, DOWN] {
+            assert_eq!(state.input(key(vk), &mut annotations), vec![]);
+        }
+        state.input(key(V), &mut annotations);
+        for vk in [LEFT, UP, RIGHT, DOWN] {
+            assert_eq!(state.input(key(vk), &mut annotations), vec![]);
+        }
+        assert_eq!(annotations, before);
+    }
+
+    #[test]
+    fn picking_a_colour_or_width_while_selected_applies_it_to_the_annotation_and_the_tool() {
+        let red = Rgb(0xE5, 0x39, 0x35);
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Ellipse,
+            p(0, 0),
+            p(40, 20),
+        );
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(0, 50),
+            p(40, 50),
+        );
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(20, 0));
+        let outputs = state.input(EditInput::Pick(Pick::Color(red)), &mut annotations);
+        assert_eq!(
+            outputs,
+            vec![EditOutput::Redraw, EditOutput::Picked(Pick::Color(red))]
+        );
+        state.input(EditInput::Pick(Pick::Width(8)), &mut annotations);
+        let changed = Style {
+            color: red,
+            width: 8,
+        };
+        assert_eq!(annotations.items()[0].style, changed);
+        // 選んでいないものは変わらない
+        assert_eq!(annotations.items()[1].style, BLUE);
+        // 今のツールの色と太さもその値になり、次に描くものに効く
+        assert_eq!(state.style, changed);
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Rect,
+            p(60, 60),
+            p(70, 70),
+        );
+        assert_eq!(annotations.items()[2].style, changed);
+    }
+
+    #[test]
+    fn picking_a_colour_with_nothing_selected_changes_only_the_tool() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        state.input(key(V), &mut annotations);
+        let black = Rgb(0x21, 0x21, 0x21);
+        let outputs = state.input(EditInput::Pick(Pick::Color(black)), &mut annotations);
+        assert_eq!(outputs, vec![EditOutput::Picked(Pick::Color(black))]);
+        assert_eq!(annotations.items()[0].style, BLUE);
+        assert_eq!(state.style.color, black);
+    }
+
+    #[test]
+    fn picking_a_colour_for_the_selected_annotation_keeps_its_width_and_the_other_way_round() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        // 太さ 5 の線を描いたあとで、ツールを太さ 2・黒にする
+        let black = Rgb(0x21, 0x21, 0x21);
+        state.input(EditInput::Pick(Pick::Width(2)), &mut annotations);
+        state.input(EditInput::Pick(Pick::Color(black)), &mut annotations);
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(20, 0));
+        let white = Rgb(0xFF, 0xFF, 0xFF);
+        state.input(EditInput::Pick(Pick::Color(white)), &mut annotations);
+        assert_eq!(
+            annotations.items()[0].style,
+            Style {
+                color: white,
+                width: 5,
+            }
+        );
+        state.input(EditInput::Pick(Pick::Width(8)), &mut annotations);
+        assert_eq!(
+            annotations.items()[0].style,
+            Style {
+                color: white,
+                width: 8,
+            }
+        );
+    }
+
+    const DELETE: u16 = 0x2E;
+    const BACKSPACE: u16 = 0x08;
+
+    #[test]
+    fn delete_backspace_and_the_toolbar_button_remove_the_selected_annotation() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        for y in [0, 10, 20, 30] {
+            draw(&mut state, &mut annotations, Tool::Line, p(0, y), p(40, y));
+        }
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(20, 10));
+        assert_eq!(
+            state.input(key(DELETE), &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(state.selected(), None);
+        click(&mut state, &mut annotations, p(20, 30));
+        state.input(key(BACKSPACE), &mut annotations);
+        click(&mut state, &mut annotations, p(20, 0));
+        assert_eq!(
+            state.input(EditInput::Delete, &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(
+            shapes(&annotations),
+            vec![Shape::Line {
+                from: p(0, 20),
+                to: p(40, 20),
+            }]
+        );
+    }
+
+    #[test]
+    fn delete_does_nothing_when_nothing_is_selected() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        state.input(key(V), &mut annotations);
+        assert_eq!(state.input(key(DELETE), &mut annotations), vec![]);
+        assert_eq!(state.input(key(BACKSPACE), &mut annotations), vec![]);
+        assert_eq!(state.input(EditInput::Delete, &mut annotations), vec![]);
+        assert_eq!(annotations.items().len(), 1);
+    }
+
+    #[test]
+    fn picking_a_drawing_tool_drops_the_selection() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(20, 0));
+        state.input(digit(1), &mut annotations);
+        assert_eq!(state.selected(), None);
+        // 矢印キーはもう何も動かさない
+        assert_eq!(state.input(key(RIGHT), &mut annotations), vec![]);
+    }
+
+    #[test]
+    fn the_next_edit_mode_starts_with_the_last_drawing_tool_not_the_select_tool() {
+        let mut carryover = Carryover::default();
+        let mut state = carryover.start(BLUE);
+        let mut annotations = Annotations::default();
+        carryover.record(&state.input(digit(4), &mut annotations));
+        carryover.record(&state.input(key(V), &mut annotations));
+        assert_eq!(state.tool, Tool::Select);
+        assert_eq!(carryover.start(BLUE).tool, Tool::Line);
+    }
+
+    #[test]
+    fn the_bounds_cover_the_stroke_and_the_arrow_head() {
+        let line = annotation(
+            Shape::Line {
+                from: p(50, 30),
+                to: p(10, 10),
+            },
+            3,
+        );
+        // 太さの半分（1.5）を画素に切り上げて広げる
+        assert_eq!(line.bounds(), Rect::new(8, 8, 52, 32));
+        let freehand = annotation(
+            Shape::Freehand {
+                points: vec![p(5, 9), p(1, 4), p(7, 2)],
+            },
+            2,
+        );
+        assert_eq!(freehand.bounds(), Rect::new(0, 1, 8, 10));
+        // 太さ 3 の矢印の頭は底辺の幅が 12
+        let arrow = annotation(
+            Shape::Arrow {
+                from: p(0, 0),
+                to: p(100, 0),
+            },
+            3,
+        );
+        assert_eq!(arrow.bounds(), Rect::new(-2, -6, 102, 6));
     }
 
     #[test]

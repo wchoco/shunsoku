@@ -522,6 +522,7 @@ fn paint_scrap(
         annotations: render::AnnotationLayer {
             annotations: &annotations,
             view: model.annotation_view(),
+            selected: model.selected_annotation().map(|a| a.bounds()),
         },
         label,
         trim,
@@ -1516,6 +1517,9 @@ fn on_toolbar_press(hwnd: HWND, at: Point) {
         ToolbarButton::Done => {
             on_edit_input(scrap, EditInput::Leave);
         }
+        ToolbarButton::Delete => {
+            on_edit_input(scrap, EditInput::Delete);
+        }
         button => {
             if let Some(pick) = button.pick() {
                 on_edit_input(scrap, EditInput::Pick(pick));
@@ -1883,6 +1887,7 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
     let layer = render::AnnotationLayer {
         annotations: scrap.model.annotations().items(),
         view: scrap.model.output_view(),
+        selected: None,
     };
     match render::render_image(scrap.shown(), layer) {
         Ok(image) => job(image),

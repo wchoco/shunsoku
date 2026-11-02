@@ -80,6 +80,9 @@ pub struct AnnotationLayer<'a> {
     pub annotations: &'a [Annotation],
     /// 元の画像の画素から、画像の左上を原点とした座標への変換。
     pub view: View,
+    /// 選んでいる書き込みの外接矩形（元の画像の画素、`Annotation::bounds`）。あれば選択の印を描く。
+    /// 保存とコピーには描かない（None）。
+    pub selected: Option<Rect>,
 }
 
 /// スクラップの画像に重ねるもの。下から書き込み・トリムの範囲・倍率の順に描く。
@@ -452,10 +455,64 @@ fn draw_annotations(
             }
             Ok(())
         })();
-        target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
         target.PopAxisAlignedClip();
-        drawn
+        // 選択の印は画像の端の書き込みでも見えるよう、画像の矩形で切らない
+        let marked = match (drawn, layer.selected) {
+            (Ok(()), Some(bounds)) => {
+                let (x0, y0) = at(Point::new(bounds.left, bounds.top));
+                let (x1, y1) = at(Point::new(bounds.right, bounds.bottom));
+                draw_selection_mark(target, (x0, y0, x1, y1))
+            }
+            (drawn, _) => drawn,
+        };
+        target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+        marked
     }
+}
+
+/// 選択の印の色と、外接矩形から外へ空ける幅・角の四角の大きさ（物理ピクセル）。
+const SELECTION_COLOR: u32 = 0x1E_88_E5;
+const SELECTION_PAD: f64 = 3.0;
+const SELECTION_HANDLE: f64 = 5.0;
+
+/// 選んでいる書き込みの印: 外接矩形（描く先の座標 `(left, top, right, bottom)`）を少し広げた青い枠と、
+/// 角の白い四角。どんな色の上でも見えるように、枠は白い縁の上に引く。
+fn draw_selection_mark(
+    target: &ID2D1RenderTarget,
+    (left, top, right, bottom): (f64, f64, f64, f64),
+) -> Result<()> {
+    let frame = D2D_RECT_F {
+        left: (left.min(right) - SELECTION_PAD) as f32,
+        top: (top.min(bottom) - SELECTION_PAD) as f32,
+        right: (left.max(right) + SELECTION_PAD) as f32,
+        bottom: (top.max(bottom) + SELECTION_PAD) as f32,
+    };
+    let half = (SELECTION_HANDLE / 2.0) as f32;
+    // SAFETY: BeginDraw と EndDraw の間で呼ぶ（draw_annotations）
+    unsafe {
+        let brush = &target.CreateSolidColorBrush(&rgb(0xFF_FF_FF, 1.0), None)?;
+        target.DrawRectangle(&frame, brush, 3.0, None);
+        brush.SetColor(&rgb(SELECTION_COLOR, 1.0));
+        target.DrawRectangle(&frame, brush, 1.0, None);
+        for (x, y) in [
+            (frame.left, frame.top),
+            (frame.right, frame.top),
+            (frame.left, frame.bottom),
+            (frame.right, frame.bottom),
+        ] {
+            let handle = D2D_RECT_F {
+                left: x - half,
+                top: y - half,
+                right: x + half,
+                bottom: y + half,
+            };
+            brush.SetColor(&rgb(0xFF_FF_FF, 1.0));
+            target.FillRectangle(&handle, brush);
+            brush.SetColor(&rgb(SELECTION_COLOR, 1.0));
+            target.DrawRectangle(&handle, brush, 1.0, None);
+        }
+    }
+    Ok(())
 }
 
 /// 書き込みを 1 つずつ描く道具一式。BeginDraw と EndDraw の間だけ使う。
@@ -667,7 +724,7 @@ fn draw_toolbar(
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         let drawn = (|| {
             for &(button, rect) in layout.buttons() {
-                let icon = if button.is_enabled() {
+                let icon = if button.is_enabled(state) {
                     TOOLBAR_ICON
                 } else {
                     TOOLBAR_DISABLED
@@ -791,6 +848,24 @@ fn draw_toolbar_button(
                     Y: y,
                 };
                 target.DrawLine(from, to, brush, thick, None);
+            }
+            Button::Delete => {
+                // ごみ箱: ふた、取っ手、胴、縦の筋
+                lines(&[(0.05, 0.2), (0.95, 0.2)], false, plain, stroke)?;
+                lines(
+                    &[(0.35, 0.2), (0.38, 0.04), (0.62, 0.04), (0.65, 0.2)],
+                    false,
+                    plain,
+                    stroke,
+                )?;
+                lines(
+                    &[(0.15, 0.2), (0.22, 0.98), (0.78, 0.98), (0.85, 0.2)],
+                    false,
+                    plain,
+                    stroke,
+                )?;
+                lines(&[(0.4, 0.38), (0.42, 0.8)], false, plain, stroke)?;
+                lines(&[(0.6, 0.38), (0.58, 0.8)], false, plain, stroke)?;
             }
             Button::Done => {
                 let done = target.CreateSolidColorBrush(&rgb(TOOLBAR_DONE, 1.0), None)?;

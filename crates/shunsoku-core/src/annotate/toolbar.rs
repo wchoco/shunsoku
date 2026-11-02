@@ -80,8 +80,9 @@ impl ToolSlot {
             ToolSlot::Arrow => Some(Tool::Arrow),
             ToolSlot::Line => Some(Tool::Line),
             ToolSlot::Freehand => Some(Tool::Freehand),
-            // 選択（#86）と文字（#87）
-            ToolSlot::Select | ToolSlot::Text => None,
+            ToolSlot::Select => Some(Tool::Select),
+            // 文字（#87）
+            ToolSlot::Text => None,
         }
     }
 }
@@ -92,6 +93,8 @@ pub enum Button {
     Tool(ToolSlot),
     Color(Rgb),
     Width(u32),
+    /// 削除（選んでいる書き込みを消す）。
+    Delete,
     /// 完了（編集モードを抜ける）。
     Done,
     /// 移動用のつまみ。ドラッグでスクラップごと動かす。
@@ -105,13 +108,17 @@ impl Button {
             Button::Tool(slot) => slot.tool().map(Pick::Tool),
             Button::Color(color) => Some(Pick::Color(color)),
             Button::Width(width) => Some(Pick::Width(width)),
-            Button::Done | Button::Grip => None,
+            Button::Delete | Button::Done | Button::Grip => None,
         }
     }
 
-    /// 押せるか。まだない道具は押せない（灰色で描く）。
-    pub fn is_enabled(self) -> bool {
-        !matches!(self, Button::Tool(slot) if slot.tool().is_none())
+    /// 押せるか（押せないものは灰色で描く）。まだない道具と、書き込みを選んでいないときの削除は押せない。
+    pub fn is_enabled(self, state: &EditState) -> bool {
+        match self {
+            Button::Tool(slot) => slot.tool().is_some(),
+            Button::Delete => state.selected().is_some(),
+            _ => true,
+        }
     }
 
     /// いま選ばれているか（`state` の道具・色・太さと同じ）。
@@ -132,7 +139,7 @@ const SPACING: f64 = 2.0;
 const GROUP_SPACING: f64 = 10.0;
 const GRIP_WIDTH: f64 = 14.0;
 
-/// ツールバーの並び: 左から道具、色、太さ、完了、端に移動用のつまみ。座標はツールバーの左上が原点。
+/// ツールバーの並び: 左から道具、色、太さ、削除と完了、端に移動用のつまみ。座標はツールバーの左上が原点。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     size: Size,
@@ -149,7 +156,7 @@ impl Layout {
             ToolSlot::ALL.iter().map(|&s| Button::Tool(s)).collect(),
             colours.iter().map(|&c| Button::Color(c)).collect(),
             WIDTHS.iter().map(|&w| Button::Width(w)).collect(),
-            vec![Button::Done],
+            vec![Button::Delete, Button::Done],
         ];
         let mut buttons = Vec::new();
         let mut x = padding;
@@ -247,12 +254,12 @@ mod tests {
         let mut expected: Vec<Button> = ToolSlot::ALL.iter().map(|&s| Button::Tool(s)).collect();
         expected.extend(PALETTE.iter().map(|&c| Button::Color(c)));
         expected.extend(WIDTHS.iter().map(|&w| Button::Width(w)));
-        expected.extend([Button::Done, Button::Grip]);
+        expected.extend([Button::Delete, Button::Done, Button::Grip]);
         assert_eq!(order, expected);
-        // 7 + 8 + 4 + 1 個の 28px のボタン、間 2px、組の間 10px、つまみ 14px、外の余白 4px
+        // 7 + 8 + 4 + 2 個の 28px のボタン、間 2px、組の間 10px、つまみ 14px、外の余白 4px
         assert_eq!(
             layout.size(),
-            Size::new(4 + 20 * 28 + 16 * 2 + 4 * 10 + 14 + 4, 36)
+            Size::new(4 + 21 * 28 + 17 * 2 + 4 * 10 + 14 + 4, 36)
         );
     }
 
@@ -309,12 +316,38 @@ mod tests {
             Some(Pick::Tool(Tool::Freehand))
         );
         assert!(!Button::Tool(ToolSlot::Ellipse).is_current(&state));
-        // 選択（#86）と文字（#87）はまだない
-        assert!(!Button::Tool(ToolSlot::Select).is_enabled());
-        assert!(!Button::Tool(ToolSlot::Text).is_enabled());
-        assert!(Button::Tool(ToolSlot::Arrow).is_enabled());
+        // 文字（#87）はまだない
+        assert!(!Button::Tool(ToolSlot::Text).is_enabled(&state));
+        assert!(Button::Tool(ToolSlot::Arrow).is_enabled(&state));
         assert_eq!(Button::Done.pick(), None);
         assert_eq!(Button::Grip.pick(), None);
-        assert!(Button::Done.is_enabled() && Button::Grip.is_enabled());
+        assert!(Button::Done.is_enabled(&state) && Button::Grip.is_enabled(&state));
+    }
+
+    #[test]
+    fn the_select_button_picks_the_select_tool_and_delete_is_enabled_only_with_a_selection() {
+        use crate::annotate::{Annotations, EditInput};
+        let select = Button::Tool(ToolSlot::Select);
+        assert_eq!(select.pick(), Some(Pick::Tool(Tool::Select)));
+        let mut state = EditState::new(crate::annotate::Style::default());
+        let mut annotations = Annotations::default();
+        assert!(select.is_enabled(&state));
+        assert!(!Button::Delete.is_enabled(&state));
+        assert_eq!(Button::Delete.pick(), None);
+        // 線を描いて選ぶ
+        state.input(EditInput::Press(Point::new(0, 0)), &mut annotations);
+        state.input(
+            EditInput::Move {
+                at: Point::new(20, 0),
+                shift: false,
+            },
+            &mut annotations,
+        );
+        state.input(EditInput::Release, &mut annotations);
+        state.input(EditInput::Pick(Pick::Tool(Tool::Select)), &mut annotations);
+        assert!(select.is_current(&state));
+        state.input(EditInput::Press(Point::new(10, 0)), &mut annotations);
+        state.input(EditInput::Release, &mut annotations);
+        assert!(Button::Delete.is_enabled(&state));
     }
 }
