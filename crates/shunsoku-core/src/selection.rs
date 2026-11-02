@@ -5,7 +5,7 @@
 //! - 通常モードでは、範囲を決めた時点（ドラッグを離す、`Space`、`Ctrl+A`）で確定する。精密モードでは
 //!   確定せずに調整の状態（`State::Adjusting`）に入り、つまみ・範囲の中のドラッグ・矢印で直してから
 //!   `Enter`・ダブルクリックで確定する。
-//! - 画面に描くもの（範囲、つまみ、十字線、カーソルの横の座標）は `view` にまとめる。Win32 層は
+//! - 画面に描くもの（範囲、つまみ、十字線、カーソルの横の座標、拡大鏡）は `view` にまとめる。Win32 層は
 //!   入力の前後で `view` を比べ、変わったときだけ描き直す。
 //! - 入力（`Input`）は Win32 層がマウスとキーのイベントから作る。座標はすべてスクリーン座標（物理ピクセル）。
 //! - モニタの一覧（`MonitorInfo`）は Win32 層が集めて渡す。
@@ -263,6 +263,8 @@ pub struct View {
     pub cursor_label: Option<(Point, String)>,
     /// ハイライトしているウィンドウ（`Selection::highlight`）。このときは範囲とサイズを出さない。
     pub highlight: Option<Highlight>,
+    /// 拡大鏡で見せるカーソルの画素（精密モードだけ。置き場所は `magnifier::place`）。
+    pub magnifier: Option<Point>,
 }
 
 impl Selection {
@@ -751,6 +753,7 @@ impl Selection {
             crosshair: self.shows_crosshair().then_some(self.cursor),
             cursor_label: self.cursor_label().map(|text| (self.cursor, text)),
             highlight,
+            magnifier: (self.mode == Mode::Precise).then_some(self.cursor),
         }
     }
 
@@ -1494,6 +1497,20 @@ mod tests {
         });
         s.handle(Input::Move { at: p(140, 90) });
         assert_eq!(s.cursor_label().as_deref(), Some("140, 90   110 × 50"));
+    }
+
+    #[test]
+    fn the_magnifier_follows_the_cursor_only_in_precise_mode() {
+        let mut s = one_monitor().with_crosshair(true);
+        s.handle(Input::Move { at: p(30, 40) });
+        assert_eq!(s.view().magnifier, None);
+        s.handle(Input::ToggleMode);
+        assert_eq!(s.view().magnifier, Some(p(30, 40)));
+        s.handle(Input::Arrow {
+            direction: Direction::Right,
+            shift: false,
+        });
+        assert_eq!(s.view().magnifier, Some(p(31, 40)));
     }
 
     #[test]
