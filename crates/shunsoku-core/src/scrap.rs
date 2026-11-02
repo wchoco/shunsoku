@@ -1119,7 +1119,7 @@ mod tests {
         assert_eq!(wheel.turn(-20), -1);
     }
 
-    /// (x, y) の画素の B に x、G に y を入れた画像（切り抜いた位置が分かるように）。
+    /// (x, y) の画素の B に x、G に y を入れた画像（切り出した位置が分かるように）。
     fn numbered(size: Size) -> Image {
         let mut pixels = Vec::new();
         for y in 0..size.height {

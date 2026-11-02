@@ -16,10 +16,10 @@
 //!   Explorer の再起動のあとにトレイを登録し直せるように、トレイだけ通常の（見えない）ウィンドウに持たせる。
 //!   ほかに、範囲選択の画面を開いている間だけ、モニタごとのウィンドウ（`overlay`）がある。
 //! - キャプチャは `capture::request` の依頼 1 本の流れで進める: 依頼 → 待機（`delay`）→ 取得（`grab`）→
-//!   範囲選択の画面（`overlay`）→ 切り抜き → 出力 → 結果。同時に進める依頼は 1 件だけ（`Capture`）。
+//!   範囲選択の画面（`overlay`）→ 切り出し → 出力 → 結果。同時に進める依頼は 1 件だけ（`Capture`）。
 //! - 定型領域キャプチャ（`CaptureMethod::Region`）は範囲選択の画面を出さず、1 つのメッセージの処理の中で
 //!   撮り終える（`capture_region`）: モニタの一覧（`monitor_list`）→ core の `monitors::locate_by_id` → そのモニタだけ取得
-//!   （`Gpu::grab_monitor`）→ 切り抜き → 出力。依頼は `App::regions_waiting` に届いた順に待たせ、`WM_APP_REGION`
+//!   （`Gpu::grab_monitor`）→ 切り出し → 出力。依頼は `App::regions_waiting` に届いた順に待たせ、`WM_APP_REGION`
 //!   で 1 件ずつ撮る。範囲選択の画面を開いている間の依頼は無視する。shunsoku のメニューは閉じ、消えきるまで
 //!   待ってから撮る（`run_waiting_regions`）。保存に失敗したら、スクラップに逃がす（`App::save_fallbacks`）。
 //! - 範囲選択の入力（マウス・キー）は core の `selection::Input` にして `Selection::handle` に渡す。
@@ -2524,7 +2524,7 @@ fn capture_active_window() {
 }
 
 /// 待っている依頼で `hwnd` のウィンドウを WGC で撮り、依頼の出力（スクラップ）を出す。
-/// `crop`（スクリーン座標）があれば、撮った画像からその部分（部品）を切り抜く。
+/// `crop`（スクリーン座標）があれば、撮った画像からその部分（部品）を切り出す。
 fn capture_window(hwnd: HWND, crop: Option<Rect>) {
     let started = Instant::now();
     let taken = with_app(|app| match &app.capture {
@@ -2572,7 +2572,7 @@ fn capture_window(hwnd: HWND, crop: Option<Rect>) {
     if partial && request.notify {
         notify_user(notify::Level::Warning, text("capture.window_partial"));
     }
-    // 部品は、撮ったウィンドウの画像から切り抜く（WGC は最上位のウィンドウしか撮れない）
+    // 部品は、撮ったウィンドウの画像から切り出す（WGC は最上位のウィンドウしか撮れない）
     let shot = match crop.map(|crop| crop.intersect(&shot.rect)) {
         None => shot,
         Some(Some(area)) => crate::window_grab::WindowShot {

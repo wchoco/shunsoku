@@ -1,5 +1,5 @@
 //! マウスカーソルの合成。Desktop Duplication はカーソルを画面の画像に含めず、形と位置を別に返す。
-//! カーソルを写す設定（`[general] capture_cursor`）が ON のとき、Win32 層（`grab`）が切り抜く前の
+//! カーソルを写す設定（`[general] capture_cursor`）が ON のとき、Win32 層（`grab`）が切り出す前の
 //! 画面の画像に、ここで重ねる。
 
 use crate::geometry::{Point, Rect, Size};

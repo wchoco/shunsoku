@@ -1,6 +1,6 @@
 //! 画像。BGRA（1 画素 4 バイト、B, G, R, A の順）、アルファは premultiply しない、上の行から並べる。
 //!
-//! キャプチャでは、モニタごとに切り抜いた断片（`Fragment`）を `Image::compose` で 1 枚にする。
+//! キャプチャでは、モニタごとに切り出した断片（`Fragment`）を `Image::compose` で 1 枚にする。
 //! どのモニタにも当たらない部分は透明（アルファ 0）になる。
 //! 保存画像は `write_png` で PNG に書き出す。
 
@@ -151,7 +151,7 @@ impl Image {
         Some(Image { size, pixels })
     }
 
-    /// `rect`（画像の中の座標）の部分を切り抜く。画像からはみ出した部分は捨てる。
+    /// `rect`（画像の中の座標）の部分を切り出す。画像からはみ出した部分は捨てる。
     pub fn crop(&self, rect: Rect) -> Image {
         let whole = Rect::from_origin_size(Point::default(), self.size);
         let Some(area) = whole.intersect(&rect) else {
