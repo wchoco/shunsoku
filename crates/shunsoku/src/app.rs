@@ -2375,11 +2375,31 @@ fn output(request: CaptureRequest, area: Rect, image: Image) {
 }
 
 /// 待っている依頼で、いまアクティブなウィンドウを WGC で撮り、依頼の出力（スクラップ）を出す。
+///
+/// 前面がデスクトップやタスクバー、または前面のウィンドウがないときは撮らない（#63）。
+/// 通知は出さず、CLI の依頼には撮れるアクティブウィンドウがないことを返す。
 fn capture_active_window() {
     // 撮る前にアクティブなウィンドウを決める（スクラップを出すとフォーカスが移る）
     // SAFETY: 引数なし
     let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-    capture_window(hwnd, None);
+    let class = (!hwnd.is_invalid()).then(|| crate::window_list::class_name(hwnd));
+    if shunsoku_core::capture::window::is_active_window_to_take(class.as_deref()) {
+        capture_window(hwnd, None);
+        return;
+    }
+    log::info!(
+        "no active window to capture (foreground class: {})",
+        class.as_deref().unwrap_or("none")
+    );
+    let waiting = with_app(|app| match &app.capture {
+        Capture::Waiting(request) => Some(request.reply),
+        _ => None,
+    })
+    .flatten();
+    if let Some(reply_to) = waiting {
+        end_capture();
+        reply_failed(reply_to, text("cli.no_active_window"));
+    }
 }
 
 /// 待っている依頼で `hwnd` のウィンドウを WGC で撮り、依頼の出力（スクラップ）を出す。
