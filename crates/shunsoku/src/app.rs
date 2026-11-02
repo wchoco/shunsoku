@@ -3017,7 +3017,10 @@ fn capture_region(request: CaptureRequest) {
             .map_err(|e| e.to_string())
             .and_then(|shot| match shot.read_back(screen) {
                 Ok(Some(fragment)) => Ok(fragment),
-                Ok(None) => Err("the monitor cannot be captured (rotated or HDR)".to_owned()),
+                Ok(None) => {
+                    log::warn!("the monitor of region {name} cannot be read back");
+                    Err(text("cli.unreadable_monitor").to_owned())
+                }
                 Err(e) => Err(e.to_string()),
             });
         app.gpu.trim();
