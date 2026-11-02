@@ -18,6 +18,8 @@ mod logger;
 #[cfg(windows)]
 mod menu;
 #[cfg(windows)]
+mod monitor_list;
+#[cfg(windows)]
 mod notify;
 #[cfg(windows)]
 mod overlay;
@@ -25,6 +27,10 @@ mod overlay;
 mod panic_hook;
 #[cfg(windows)]
 mod perf;
+#[cfg(windows)]
+mod pipe_identity;
+#[cfg(windows)]
+mod pipe_server;
 #[cfg(windows)]
 mod render;
 #[cfg(windows)]

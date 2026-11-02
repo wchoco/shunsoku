@@ -85,6 +85,14 @@ panicked = "予期しないエラーが起きました。詳しくはログを�
 [capture]
 failed = "画面を撮れませんでした。"
 
+# CLI（shunsoku-cli）に返す失敗の理由。標準エラーに出る
+[cli]
+selecting = "範囲選択の画面を開いているため、撮れません。"
+no_such_monitor = "その番号のモニタはありません（番号は shunsoku-cli monitors で調べられます）: "
+no_main_monitor = "メインモニタが見つかりません。"
+out_of_monitor = "範囲がモニタからはみ出しています。"
+unreadable_monitor = "このモニタの画面はそのまま出せません（回転・HDR のモニタなど）。"
+
 [copy]
 failed = "クリップボードにコピーできませんでした。"
 
