@@ -1044,15 +1044,14 @@ fn on_overlay_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> O
             Some(LRESULT(0))
         }
         // 他のアプリに前面を取られるとキー入力が来なくなり、閉じられなくなるので閉じる
+        // （確定・取り消しで閉じた後にも届くので、そのときは何もしない）
         WM_ACTIVATEAPP if wparam.0 == 0 => {
-            log::info!("overlay lost the foreground; closing");
-            close_overlay();
+            close_overlay("the overlay lost the foreground");
             Some(LRESULT(0))
         }
         // モニタの構成が変わると、固定された画面は実際の画面と合わなくなる
         WM_DISPLAYCHANGE => {
-            log::info!("display changed while the overlay is open; closing");
-            close_overlay();
+            close_overlay("the display changed");
             Some(LRESULT(0))
         }
         // 背景は塗らない（描くのはスワップチェーンだけ）
@@ -2025,10 +2024,7 @@ fn on_selection_input(input: Input) {
     });
     match state {
         Some(State::Confirmed) => finish_selection(),
-        Some(State::Cancelled) => {
-            log::info!("overlay cancelled");
-            close_overlay();
-        }
+        Some(State::Cancelled) => close_overlay("cancelled"),
         _ => {}
     }
 }
@@ -2741,7 +2737,8 @@ fn open_overlay() {
 }
 
 /// 範囲選択の画面を閉じ、依頼を終える。CLI の依頼なら、取り消し（終了コード 4）として返す。
-fn close_overlay() {
+/// 開いていなければ何もしない。`why` は閉じるわけ（ログに出す）。
+fn close_overlay(why: &str) {
     let taken = with_app(|app| match std::mem::take(&mut app.capture) {
         Capture::Selecting {
             overlay, request, ..
@@ -2759,7 +2756,7 @@ fn close_overlay() {
     drop(overlay);
     end_capture();
     reply_cancelled(reply_to);
-    log::info!("overlay closed");
+    log::info!("overlay closed: {why}");
 }
 
 /// CLI の依頼なら、ユーザーが取り消した（終了コード 4）として返す。
