@@ -51,6 +51,40 @@ pub fn register_class(module: HINSTANCE, wndproc: WNDPROC) -> Result<()> {
     Ok(())
 }
 
+/// レイヤード ウィンドウ `hwnd` に、`source`（premultiplied BGRA の DIB を選んだ DC、大きさは `rect` と同じ）の
+/// 中身を `rect` で出す。`opacity` は透明度（%）。書き込みのツールバー（`toolbar_window`）も使う。
+pub fn present_layered(hwnd: HWND, source: HDC, rect: Rect, opacity: u8) -> Result<()> {
+    let position = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let size = SIZE {
+        cx: rect.width() as i32,
+        cy: rect.height() as i32,
+    };
+    let origin = POINT::default();
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: (u32::from(opacity.min(100)) * 255 / 100) as u8,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    // SAFETY: 呼び元のスレッドのウィンドウ。引数はこの関数の中で生きている
+    unsafe {
+        UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&position),
+            Some(&size),
+            Some(source),
+            Some(&origin),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        )
+    }
+}
+
 /// スクラップのウィンドウ 1 枚。
 pub struct ScrapWindow {
     hwnd: HWND,
@@ -89,35 +123,7 @@ impl ScrapWindow {
     /// `source`（premultiplied BGRA の DIB を選んだ DC、大きさは `rect` と同じ）の中身を `rect` に出す。
     /// `opacity` は透明度（%）。
     pub fn present(&self, source: HDC, rect: Rect, opacity: u8) -> Result<()> {
-        let position = POINT {
-            x: rect.left,
-            y: rect.top,
-        };
-        let size = SIZE {
-            cx: rect.width() as i32,
-            cy: rect.height() as i32,
-        };
-        let origin = POINT::default();
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: (u32::from(opacity.min(100)) * 255 / 100) as u8,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        // SAFETY: 自分のウィンドウ。引数はこの関数の中で生きている
-        unsafe {
-            UpdateLayeredWindow(
-                self.hwnd,
-                None,
-                Some(&position),
-                Some(&size),
-                Some(source),
-                Some(&origin),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            )
-        }
+        present_layered(self.hwnd, source, rect, opacity)
     }
 
     pub fn hwnd(&self) -> HWND {

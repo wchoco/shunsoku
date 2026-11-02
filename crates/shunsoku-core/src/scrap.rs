@@ -512,11 +512,24 @@ impl ScrapModel {
     /// 書き込みの編集モードに入る。これから描く書き込みは `style`。ほかのモード（トリムの範囲の選択、
     /// 編集モード）にいるときとコンパクト表示の間は入らずに false。
     pub fn start_editing(&mut self, style: Style) -> bool {
+        self.start_editing_with(EditState::new(style))
+    }
+
+    /// `start_editing` の、道具・色・太さを決めた状態 `state` から始めるもの（`annotate::Carryover::start`）。
+    pub fn start_editing_with(&mut self, state: EditState) -> bool {
         if self.mode != Mode::Normal || self.is_compact() {
             return false;
         }
-        self.mode = Mode::Editing(EditState::new(style));
+        self.mode = Mode::Editing(state);
         true
+    }
+
+    /// 書き込みの編集モードの状態（いまの道具・色・太さ）。編集モードでなければ None。
+    pub fn edit_state(&self) -> Option<&EditState> {
+        match &self.mode {
+            Mode::Editing(state) => Some(state),
+            _ => None,
+        }
     }
 
     /// 書き込みの編集モードへの入力を受ける（座標はスクリーン座標）。抜けたら（`EditOutput::Left`）
@@ -1849,6 +1862,34 @@ mod tests {
             vec![]
         );
         assert!(scrap.is_editing());
+    }
+
+    #[test]
+    fn leaving_in_the_middle_of_a_drag_keeps_it_unless_it_has_no_length() {
+        // 「完了」とスクラップが非アクティブになったとき（EditInput::Leave）
+        let mut scrap = trimmed_and_zoomed();
+        let o = scrap.image_rect().origin();
+        scrap.start_editing(Style::default());
+        scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
+        scrap.edit_input(EditInput::Move {
+            at: Point::new(o.x + 41, o.y + 21),
+            shift: false,
+        });
+        let outputs = scrap.edit_input(EditInput::Leave);
+        assert_eq!(outputs, vec![EditOutput::Redraw, EditOutput::Left]);
+        assert!(!scrap.is_editing());
+        assert_eq!(
+            scrap.annotations().items()[0].shape,
+            Shape::Rect {
+                from: Point::new(14, 23),
+                to: Point::new(30, 30)
+            }
+        );
+
+        scrap.start_editing(Style::default());
+        scrap.edit_input(EditInput::Press(Point::new(o.x + 8, o.y + 7)));
+        assert_eq!(scrap.edit_input(EditInput::Leave), vec![EditOutput::Left]);
+        assert_eq!(scrap.annotations().items().len(), 1);
     }
 
     #[test]

@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::annotate::{EditInput, Style};
+use crate::annotate::{Carryover, EditInput, Style};
 use crate::geometry::Point;
 use crate::keys::{Chord, Key, Modifiers};
 use crate::scrap::{Appearance, BorderOverride, Mode, ScrapModel, ZoomAnchor};
@@ -216,6 +216,8 @@ pub struct OpContext {
     pub cursor: Option<Point>,
     /// 書き込みの色と太さの既定値（設定ファイルの `[annotation]`）。書き込みの編集モードに入るときに使う。
     pub annotation: Style,
+    /// 前の編集モードで選んだ道具・色・太さ（アプリが動いている間だけ、すべてのスクラップで引き継ぐ）。
+    pub carryover: Carryover,
 }
 
 /// 操作の結果、Win32 層がすること。
@@ -536,7 +538,7 @@ fn annotate(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     if model.is_editing() {
         model.edit_input(EditInput::Leave);
         vec![Effect::LeaveEditMode]
-    } else if model.start_editing(context.annotation) {
+    } else if model.start_editing_with(context.carryover.start(context.annotation)) {
         vec![Effect::EnterEditMode]
     } else {
         Vec::new()
@@ -1162,7 +1164,7 @@ pub fn menu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotate::Style;
+    use crate::annotate::{Carryover, EditOutput, Pick, Style, Tool};
     use crate::geometry::{Point, Rect, Size};
     use crate::image::Image;
     use crate::scrap::{
@@ -1345,6 +1347,81 @@ mod tests {
         let effects = execute(op("annotate"), &mut model, &editing_context());
         assert_eq!(effects, vec![Effect::LeaveEditMode]);
         assert_eq!(model.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn the_colour_and_width_chosen_on_one_scrap_carry_over_to_the_next_scrap() {
+        let defaults = editing_context();
+        let mut carryover = Carryover::default();
+        let mut first = scrap();
+        let context = OpContext {
+            carryover,
+            ..defaults
+        };
+        execute(op("annotate"), &mut first, &context);
+        let blue = Rgb(0x1E, 0x88, 0xE5);
+        for pick in [Pick::Color(blue), Pick::Width(8)] {
+            let outputs = first.edit_input(EditInput::Pick(pick));
+            assert!(outputs.contains(&EditOutput::Picked(pick)));
+            carryover.record(&outputs);
+        }
+        let chosen = Style {
+            color: blue,
+            width: 8,
+        };
+        assert_eq!(first.edit_state().map(|s| s.style), Some(chosen));
+        execute(op("annotate"), &mut first, &context);
+        assert_eq!(first.edit_state(), None);
+
+        // 別のスクラップで入っても前回の値。設定の既定値（defaults.annotation）には戻らない
+        let mut second = scrap();
+        let context = OpContext {
+            carryover,
+            ..defaults
+        };
+        execute(op("annotate"), &mut second, &context);
+        assert_eq!(second.edit_state().map(|s| s.style), Some(chosen));
+    }
+
+    #[test]
+    fn edit_mode_starts_with_the_drawing_tool_used_last_on_any_scrap() {
+        let defaults = editing_context();
+        let mut carryover = Carryover::default();
+        let mut first = scrap();
+        let context = OpContext {
+            carryover,
+            ..defaults
+        };
+        execute(op("annotate"), &mut first, &context);
+        assert_eq!(first.edit_state().map(|s| s.tool), Some(Tool::Rect));
+        // ツールバーで楕円、続けて数字キーの 4 で線
+        carryover.record(&first.edit_input(EditInput::Pick(Pick::Tool(Tool::Ellipse))));
+        let four = Chord::plain(Key::known(0x34));
+        carryover.record(&first.edit_input(EditInput::Key(four)));
+        execute(op("annotate"), &mut first, &context);
+
+        let mut second = scrap();
+        let context = OpContext {
+            carryover,
+            ..defaults
+        };
+        execute(op("annotate"), &mut second, &context);
+        assert_eq!(second.edit_state().map(|s| s.tool), Some(Tool::Line));
+    }
+
+    #[test]
+    fn only_the_width_carries_over_when_only_the_width_was_chosen() {
+        let mut carryover = Carryover::default();
+        carryover.record(&[EditOutput::Picked(Pick::Width(2))]);
+        let state = carryover.start(editing_context().annotation);
+        assert_eq!(
+            state.style,
+            Style {
+                color: editing_context().annotation.color,
+                width: 2
+            }
+        );
+        assert_eq!(state.tool, Tool::Rect);
     }
 
     #[test]

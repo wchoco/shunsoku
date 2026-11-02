@@ -14,6 +14,8 @@
 //! 5 は文字のために空けてある）。`Shift` を押しながら描くと、矩形は正方形、楕円は円、線と矢印は 45° 刻みに
 //! なる（`Draft::end`）。道具を足すときは `Tool` と `Shape` に行を足し、`Draft::shape` と番号の表を足す。
 
+pub mod toolbar;
+
 use crate::geometry::Point;
 use crate::keys::{Chord, Key, Modifiers};
 use crate::settings::{AnnotationDefaults, Rgb};
@@ -256,13 +258,14 @@ impl EditState {
                 _ => vec![],
             },
             EditInput::Release => self.commit(annotations),
+            EditInput::Pick(pick) => self.pick(pick, annotations),
             EditInput::Key(chord) if chord == ESCAPE => {
                 let mut outputs = self.commit(annotations);
                 outputs.push(EditOutput::Left);
                 outputs
             }
             EditInput::Key(chord) => match Tool::from_key(chord) {
-                Some(tool) => self.pick(tool, annotations),
+                Some(tool) => self.pick(Pick::Tool(tool), annotations),
                 None => vec![],
             },
             EditInput::Leave => {
@@ -273,11 +276,19 @@ impl EditState {
         }
     }
 
-    /// 道具を `tool` に替える。描きかけがあれば、前の道具のまま書き込みにしてから替える。
-    fn pick(&mut self, tool: Tool, annotations: &mut Annotations) -> Vec<EditOutput> {
-        let mut outputs = self.commit(annotations);
-        self.tool = tool;
-        outputs.push(EditOutput::ToolChanged);
+    /// 道具・色・太さを選ぶ。道具を替えるときは、描きかけがあれば前の道具のまま書き込みにしてから替える。
+    fn pick(&mut self, pick: Pick, annotations: &mut Annotations) -> Vec<EditOutput> {
+        let mut outputs = vec![];
+        match pick {
+            Pick::Tool(tool) => {
+                outputs = self.commit(annotations);
+                self.tool = tool;
+                outputs.push(EditOutput::ToolChanged);
+            }
+            Pick::Color(color) => self.style.color = color,
+            Pick::Width(width) => self.style.width = width,
+        }
+        outputs.push(EditOutput::Picked(pick));
         outputs
     }
 
@@ -312,6 +323,8 @@ pub enum EditInput {
     Release,
     /// キーを押した。`Esc` で抜け、数字キーで道具を選ぶ。ほかのキーは受けない（何も返さない）。
     Key(Chord),
+    /// ツールバーで道具・色・太さを選んだ（数字キーで道具を選ぶのは `Key`）。
+    Pick(Pick),
     /// 抜ける（メニューの「書き込み」、ほかのウィンドウへのフォーカスの移動、スクラップを閉じる前）。
     Leave,
 }
@@ -336,6 +349,51 @@ pub enum EditOutput {
     ToolChanged,
     /// 編集モードを抜けた。
     Left,
+    /// 道具・色・太さを（ツールバーか数字キーで）選んだ。ツールバーを描き直し、`Carryover::record` で次の
+    /// 編集モードに引き継ぐ。
+    Picked(Pick),
+}
+
+/// 編集モードで選べる、これから描くものの道具・色・太さ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    Tool(Tool),
+    Color(Rgb),
+    Width(u32),
+}
+
+/// 前の編集モードで選んだ道具・色・太さ。アプリが動いている間、すべてのスクラップで引き継ぐ（設定ファイルには
+/// 書き戻さない）。色と太さは選ぶまでは設定の既定値に従う（設定を変えればそれが効く）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Carryover {
+    /// 最後に使った描く道具。最初は矩形。
+    tool: Tool,
+    color: Option<Rgb>,
+    width: Option<u32>,
+}
+
+impl Carryover {
+    /// 編集モードの始まりの状態。`defaults` は設定の `[annotation]`。
+    pub fn start(&self, defaults: Style) -> EditState {
+        let mut state = EditState::new(Style {
+            color: self.color.unwrap_or(defaults.color),
+            width: self.width.unwrap_or(defaults.width),
+        });
+        state.tool = self.tool;
+        state
+    }
+
+    /// 編集モードの出力のうち、選んだもの（`EditOutput::Picked`）を覚える。
+    pub fn record(&mut self, outputs: &[EditOutput]) {
+        for output in outputs {
+            match *output {
+                EditOutput::Picked(Pick::Tool(tool)) => self.tool = tool,
+                EditOutput::Picked(Pick::Color(color)) => self.color = Some(color),
+                EditOutput::Picked(Pick::Width(width)) => self.width = Some(width),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// 矢印の頭（三角形）。座標は描く先のもの。
@@ -643,7 +701,11 @@ mod tests {
         );
         assert_eq!(
             state.input(digit(4), &mut annotations),
-            vec![EditOutput::Redraw, EditOutput::ToolChanged]
+            vec![
+                EditOutput::Redraw,
+                EditOutput::ToolChanged,
+                EditOutput::Picked(Pick::Tool(Tool::Line))
+            ]
         );
         assert_eq!(
             annotations.items()[0].shape,
