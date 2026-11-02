@@ -14,10 +14,11 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, TableLike, Value};
 
 use super::{
     BORDER_WIDTH_RANGE, DEFAULT_REGION_FILE_NAME_TEMPLATE, DpiScaling, General, HotkeyAction,
-    Hotkeys, LogLevel, OPACITY_RANGE, Reader, Region, Rgb, ScrapAppearance, Settings,
-    TRASH_LIMIT_RANGE, VERSION, dpi_scaling, in_range, log_level, non_empty_str, optional_chord,
-    optional_gesture, read_regions, region_number, rgb, save_dir,
+    Hotkeys, LogLevel, OPACITY_RANGE, Reader, Region, Rgb, ScrapAppearance, SelectionScreen,
+    Settings, TRASH_LIMIT_RANGE, VERSION, dpi_scaling, in_range, log_level, non_empty_str,
+    optional_chord, optional_gesture, read_regions, region_number, rgb, save_dir, selection_mode,
 };
+use crate::selection::Mode;
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
 pub fn write(doc: &mut DocumentMut, settings: &Settings) {
@@ -42,6 +43,9 @@ pub fn write(doc: &mut DocumentMut, settings: &Settings) {
         write_overrides(t, &settings.mouse, optional_gesture)
     });
     section(root, "scrap", |t| write_scrap(t, &settings.scrap));
+    section(root, "selection", |t| {
+        write_selection(t, &settings.selection)
+    });
     write_regions(root, &settings.regions);
 }
 
@@ -220,6 +224,21 @@ fn write_scrap(t: &mut dyn TableLike, s: &ScrapAppearance) {
         Item::as_bool,
         Some(d.shadow),
         &s.shadow,
+        |&v| Some(v.into()),
+    );
+}
+
+fn write_selection(t: &mut dyn TableLike, s: &SelectionScreen) {
+    let d = SelectionScreen::default();
+    put(t, "mode", selection_mode, Some(d.mode), &s.mode, |&m| {
+        Some(selection_mode_name(m).into())
+    });
+    put(
+        t,
+        "crosshair",
+        Item::as_bool,
+        Some(d.crosshair),
+        &s.crosshair,
         |&v| Some(v.into()),
     );
 }
@@ -418,6 +437,13 @@ fn dpi_scaling_name(v: DpiScaling) -> &'static str {
     }
 }
 
+fn selection_mode_name(v: Mode) -> &'static str {
+    match v {
+        Mode::Normal => "normal",
+        Mode::Precise => "precise",
+    }
+}
+
 fn log_level_name(v: LogLevel) -> &'static str {
     match v {
         LogLevel::Off => "off",
@@ -494,6 +520,8 @@ notifications = false
         s.scrap.border.width = 4;
         s.scrap.border.color = Rgb(0x12, 0xAB, 0xEF);
         s.scrap.shadow = false;
+        s.selection.mode = Mode::Precise;
+        s.selection.crosshair = true;
         s
     }
 
