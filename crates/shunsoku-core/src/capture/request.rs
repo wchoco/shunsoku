@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::cli_args;
 use crate::geometry::Rect;
+use crate::selection::{Highlight, WindowId};
 use crate::settings::Region;
 
 /// 依頼の発生源。
@@ -42,6 +43,18 @@ pub enum CaptureMethod {
     },
     /// 定型領域キャプチャ。撮るときに、その名前の定型領域を設定から引く。
     Region(RegionId),
+    /// ウィンドウキャプチャ。範囲選択の画面でハイライトから選んだウィンドウ（部品）を撮る。
+    /// 範囲選択の画面で選んだあとに `CaptureRequest::for_window` で作る。
+    Window(WindowTarget),
+}
+
+/// 範囲選択の画面で選んだ、撮るウィンドウ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowTarget {
+    /// 撮る最上位のウィンドウ。
+    pub window: WindowId,
+    /// 部品を選んだら、撮った画像から切り抜く範囲（スクリーン座標）。ウィンドウ全体なら None。
+    pub crop: Option<Rect>,
 }
 
 /// 定型領域を指すもの。名前（`settings::Region::name`。重ならない）。
@@ -68,8 +81,10 @@ pub struct Outputs {
 /// 保存先。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveTarget {
-    /// 全体設定の保存先とファイル名テンプレート。
+    /// 全体設定の保存先とファイル名テンプレート。同名があれば連番を付ける。
     Default,
+    /// 決まったファイル（CLI の `--out`）。あれば上書きする。
+    File(PathBuf),
     /// 定型領域の保存先とファイル名テンプレート。`dir` が None なら全体の保存先。`name` は `{name}` の値。
     Region {
         dir: Option<PathBuf>,
@@ -112,7 +127,22 @@ impl CaptureRequest {
         }
     }
 
-    /// CLI の `capture` から依頼を作る。既定は保存だけで、保存に失敗したらスクラップに逃がさず失敗として返す。
+    /// 範囲選択の画面でハイライトから選んだウィンドウを撮る依頼。出力・通知・保存の失敗の扱いは
+    /// 範囲選択の画面を開いた依頼（`self`）のものを引き継ぐ。待つ時間はもう過ぎたので 0 にする。
+    pub fn for_window(&self, chosen: &Highlight) -> CaptureRequest {
+        CaptureRequest {
+            method: CaptureMethod::Window(WindowTarget {
+                window: chosen.window,
+                crop: chosen.part.map(|_| chosen.rect),
+            }),
+            delay: Duration::ZERO,
+            ..self.clone()
+        }
+    }
+
+    /// CLI の `capture` から依頼を作る。既定は保存だけで、ほかの出力はオプションで足す。`--scrap` のときだけ
+    /// スクラップにフォーカスを移す。保存に失敗したら、`--scrap` の有無にかかわらずスクラップに逃がさず失敗として返す。
+    /// `--quiet` ならトレイ通知を出さない。
     pub fn from_cli(capture: &cli_args::Capture, reply: ReplyTo) -> CaptureRequest {
         let method = match &capture.target {
             cli_args::Target::Rect { monitor, rect } => CaptureMethod::Rect {
@@ -127,17 +157,23 @@ impl CaptureRequest {
             cli_args::Target::Active { delay } => Duration::from_secs(u64::from(delay)),
             _ => Duration::ZERO,
         };
+        let output = &capture.output;
+        let save = match &output.save {
+            cli_args::Save::Default => Some(SaveTarget::Default),
+            cli_args::Save::To(path) => Some(SaveTarget::File(PathBuf::from(path))),
+            cli_args::Save::No => None,
+        };
         CaptureRequest {
             method,
             outputs: Outputs {
-                save: Some(SaveTarget::Default),
-                scrap: false,
-                copy: false,
-                focus_scrap: false,
+                save,
+                scrap: output.scrap,
+                copy: output.copy,
+                focus_scrap: output.scrap,
             },
             on_save_failure: OnSaveFailure::Fail,
             delay,
-            notify: true,
+            notify: !output.quiet,
             reply: Some(reply),
         }
     }
@@ -201,6 +237,7 @@ fn region_save_target(region: &Region) -> SaveTarget {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use super::*;
@@ -246,6 +283,77 @@ mod tests {
         );
     }
 
+    fn chosen_part() -> Highlight {
+        Highlight {
+            window: WindowId(7),
+            rect: Rect::new(300, 130, 1100, 800),
+            part: Some(WindowId(9)),
+            name: "エディタ › 本文".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_window_chosen_on_the_overlay_becomes_a_window_capture_with_the_same_outputs() {
+        let request = CaptureRequest::from_source(Source::Hotkey).for_window(&chosen_part());
+        assert_eq!(
+            request,
+            CaptureRequest {
+                method: CaptureMethod::Window(WindowTarget {
+                    window: WindowId(7),
+                    crop: Some(Rect::new(300, 130, 1100, 800)),
+                }),
+                ..select_capture()
+            }
+        );
+    }
+
+    #[test]
+    fn a_whole_window_chosen_on_the_overlay_is_captured_without_cropping() {
+        let whole = Highlight {
+            part: None,
+            rect: Rect::new(100, 100, 1100, 800),
+            ..chosen_part()
+        };
+        let request = CaptureRequest::from_source(Source::TrayMenu).for_window(&whole);
+        assert_eq!(
+            request.method,
+            CaptureMethod::Window(WindowTarget {
+                window: WindowId(7),
+                crop: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_window_capture_keeps_the_outputs_of_the_request_that_opened_the_overlay() {
+        // 範囲選択の画面を開いた依頼の出力（M3 の CLI の `--no-save` なしの保存など）をそのまま使う。
+        // 待つ時間はもう過ぎているので 0 にする
+        let opened = CaptureRequest {
+            outputs: Outputs {
+                save: Some(SaveTarget::Default),
+                scrap: false,
+                copy: true,
+                focus_scrap: false,
+            },
+            on_save_failure: OnSaveFailure::Fail,
+            delay: Duration::from_secs(3),
+            notify: false,
+            ..select_capture()
+        };
+        let request = opened.for_window(&chosen_part());
+        assert_eq!(
+            request,
+            CaptureRequest {
+                method: CaptureMethod::Window(WindowTarget {
+                    window: WindowId(7),
+                    crop: Some(Rect::new(300, 130, 1100, 800)),
+                }),
+                delay: Duration::ZERO,
+                ..opened
+            }
+        );
+    }
+
     #[test]
     fn hotkey_requests_a_select_capture_shown_as_a_focused_scrap() {
         let request = CaptureRequest::from_source(Source::Hotkey);
@@ -261,6 +369,7 @@ mod tests {
                 monitor: Some(2),
                 rect,
             },
+            output: cli_args::Output::default(),
         };
         let request = CaptureRequest::from_cli(&capture, ReplyTo(7));
         assert_eq!(
@@ -282,6 +391,78 @@ mod tests {
                 reply: Some(ReplyTo(7)),
             }
         );
+    }
+
+    fn cli_outputs(output: cli_args::Output) -> (Outputs, bool) {
+        let capture = cli_args::Capture {
+            target: cli_args::Target::Rect {
+                monitor: None,
+                rect: Rect::new(0, 0, 1, 1),
+            },
+            output,
+        };
+        let request = CaptureRequest::from_cli(&capture, ReplyTo(1));
+        // 出力を何にしても、保存に失敗したらスクラップに逃がさない
+        assert_eq!(request.on_save_failure, OnSaveFailure::Fail);
+        (request.outputs, request.notify)
+    }
+
+    #[test]
+    fn cli_scrap_shows_a_focused_scrap_besides_saving() {
+        let (outputs, _) = cli_outputs(cli_args::Output {
+            scrap: true,
+            ..cli_args::Output::default()
+        });
+        assert_eq!(
+            outputs,
+            Outputs {
+                save: Some(SaveTarget::Default),
+                scrap: true,
+                copy: false,
+                focus_scrap: true,
+            }
+        );
+    }
+
+    #[test]
+    fn cli_copy_and_no_save_copy_without_saving_or_moving_focus() {
+        let (outputs, _) = cli_outputs(cli_args::Output {
+            save: cli_args::Save::No,
+            copy: true,
+            ..cli_args::Output::default()
+        });
+        assert_eq!(
+            outputs,
+            Outputs {
+                save: None,
+                scrap: false,
+                copy: true,
+                focus_scrap: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cli_out_saves_to_that_file() {
+        let (outputs, _) = cli_outputs(cli_args::Output {
+            save: cli_args::Save::To(r"C:\shots\a.png".to_owned()),
+            ..cli_args::Output::default()
+        });
+        assert_eq!(
+            outputs.save,
+            Some(SaveTarget::File(PathBuf::from(r"C:\shots\a.png")))
+        );
+    }
+
+    #[test]
+    fn cli_quiet_turns_off_the_notifications() {
+        let (_, notify) = cli_outputs(cli_args::Output::default());
+        assert!(notify);
+        let (_, notify) = cli_outputs(cli_args::Output {
+            quiet: true,
+            ..cli_args::Output::default()
+        });
+        assert!(!notify);
     }
 
     #[test]
@@ -351,7 +532,13 @@ mod tests {
     }
 
     fn cli(target: cli_args::Target) -> CaptureRequest {
-        CaptureRequest::from_cli(&cli_args::Capture { target }, ReplyTo(3))
+        CaptureRequest::from_cli(
+            &cli_args::Capture {
+                target,
+                output: cli_args::Output::default(),
+            },
+            ReplyTo(3),
+        )
     }
 
     /// CLI の既定の出力: 保存だけ・保存に失敗したら失敗として返す。
@@ -407,6 +594,34 @@ mod tests {
                 Duration::ZERO
             )
         );
+    }
+
+    #[test]
+    fn a_cli_region_capture_keeps_an_explicit_out_or_no_save() {
+        for save in [
+            cli_args::Save::To("C:\\a.png".to_owned()),
+            cli_args::Save::No,
+        ] {
+            let request = CaptureRequest::from_cli(
+                &cli_args::Capture {
+                    target: cli_args::Target::Region {
+                        name: "dash".to_owned(),
+                    },
+                    output: cli_args::Output {
+                        save,
+                        scrap: true,
+                        ..cli_args::Output::default()
+                    },
+                },
+                ReplyTo(3),
+            );
+            assert_eq!(
+                request
+                    .clone()
+                    .with_region_destination(&region(true, false)),
+                request
+            );
+        }
     }
 
     #[test]

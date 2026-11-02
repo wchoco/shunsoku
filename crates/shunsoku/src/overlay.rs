@@ -8,15 +8,20 @@
 //! - ウィンドウ プロシージャは `app` が持つ（Win32 層のモジュールは `app` を通してつながる）。
 //! - 画面は暗くしない。範囲を選んでいる間は、固定された画面をバックバッファに写したうえに Direct2D で
 //!   範囲のすぐ外側に細い枠（内側が白、外側が黒の 1 物理ピクセルずつ。どんな背景でも見えるように）を描き、
-//!   範囲の左上の外側にサイズを出す。Direct2D の資源は初めて範囲を描くときに作る（開くまでの時間を
-//!   延ばさないため）。Direct2D の座標は 1 DIP = 1 物理ピクセル。
-//! - 描くもの（範囲、つまみ、十字線、カーソルの横の座標）は core の `Selection::view` が決める。
+//!   範囲の左上の外側にサイズを出す。ウィンドウをハイライトしている間は、範囲の代わりにその矩形を
+//!   半透明の青で塗って内側に枠を描き、名前とサイズを出す。Direct2D の資源は初めて範囲を描くときに
+//!   作る（開くまでの時間を延ばさないため）。Direct2D の座標は 1 DIP = 1 物理ピクセル。
+//! - 描くもの（範囲、ハイライト、つまみ、十字線、カーソルの横の座標、拡大鏡）は core の `Selection::view` が決める。
 //!   十字線はカーソルのあるモニタにだけ、そのモニタいっぱいに引く。
+//! - 拡大鏡（精密モード）は、カーソルのまわりの画素を固定された画面のテクスチャから CPU に読み、拡大した
+//!   画素を 1 つずつ塗る。その下にカーソルの横の座標と色コードを付けて 1 まとまりにし、置き場所は
+//!   core の `magnifier::place` で決める（カーソルのあるモニタの中で、端では反対側に回る）。
 //! - drop で Direct2D の描画先、スワップチェーンの順に解放してからウィンドウを壊す。そのあと
 //!   `grab::Gpu::trim` を呼ぶ。
 
 use shunsoku_core::geometry::{Point, Rect};
 use shunsoku_core::image::Fragment;
+use shunsoku_core::magnifier;
 use shunsoku_core::selection::{CursorShape, MonitorInfo, Part, Selection};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -87,6 +92,22 @@ const LABEL_TEXT: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 1.0,
 };
+/// ハイライトの枠の色（Windows の既定のアクセントに近い青）。
+const HIGHLIGHT_FRAME: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.0,
+    g: 0.47,
+    b: 0.84,
+    a: 1.0,
+};
+/// ハイライトの中に重ねる色。
+const HIGHLIGHT_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.0,
+    g: 0.47,
+    b: 0.84,
+    a: 0.15,
+};
+/// ハイライトの枠の太さ（DPI 100% のときの物理ピクセル。DPI に合わせて太くする）。
+const HIGHLIGHT_WIDTH: f32 = 3.0;
 /// サイズの表示の文字の大きさ・余白・範囲との間（DPI 100% のときの物理ピクセル。DPI に合わせて大きくする）。
 const LABEL_FONT_SIZE: f32 = 12.0;
 const LABEL_PADDING_X: f32 = 6.0;
@@ -95,6 +116,13 @@ const LABEL_GAP: f32 = 4.0;
 /// カーソルの横の座標の表示を、カーソルの画素から右下へずらす量（DPI 100% のときの物理ピクセル）。
 /// 十字のカーソルに重ならないように。
 const CURSOR_LABEL_OFFSET: f32 = 20.0;
+/// 拡大鏡で、モニタの外の画素を塗る色。
+const MAGNIFIER_OUTSIDE: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.25,
+    g: 0.25,
+    b: 0.25,
+    a: 1.0,
+};
 /// 十字線の色。どんな背景でも見えるよう、半透明のマゼンタにする。
 const CROSSHAIR: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,
@@ -153,7 +181,11 @@ struct D2dTarget {
     frame_outer: ID2D1SolidColorBrush,
     label_back: ID2D1SolidColorBrush,
     label_text: ID2D1SolidColorBrush,
+    highlight_frame: ID2D1SolidColorBrush,
+    highlight_fill: ID2D1SolidColorBrush,
     crosshair: ID2D1SolidColorBrush,
+    /// 拡大鏡の画素を塗る（色は塗るたびに変える）。
+    pixel: ID2D1SolidColorBrush,
     _target: ID2D1Bitmap1,
     context: ID2D1DeviceContext,
 }
@@ -174,12 +206,31 @@ struct Scene {
     handles: Vec<Rect>,
     crosshair: Option<Point>,
     cursor_label: Option<Label>,
+    /// ハイライトしているウィンドウの矩形。名前とサイズは `size_label` に入れる。
+    highlight: Option<Rect>,
+    magnifier: Option<Magnifier>,
 }
 
 impl Scene {
     fn is_empty(&self) -> bool {
-        self.rect.is_none() && self.crosshair.is_none() && self.cursor_label.is_none()
+        self.rect.is_none()
+            && self.crosshair.is_none()
+            && self.cursor_label.is_none()
+            && self.highlight.is_none()
+            && self.magnifier.is_none()
     }
+}
+
+/// 拡大鏡と、その下に付ける表示。座標はスクリーン座標。
+struct Magnifier {
+    /// 拡大した画素と、その色（モニタの外は None）。
+    cells: Vec<(Rect, Option<D2D1_COLOR_F>)>,
+    /// カーソルの画素を拡大したもの（枠で囲む）。
+    center: Rect,
+    /// 拡大した画素の並び全体。
+    area: Rect,
+    /// 下に付ける座標と色コード。
+    labels: Vec<Label>,
 }
 
 /// サイズや座標の表示。座標はスクリーン座標。
@@ -256,19 +307,41 @@ impl Overlay {
     /// そのまま出し、あれば範囲の枠とサイズ、つまみ、十字線、カーソルの横の座標を出す。
     pub fn redraw(&mut self, selection: &Selection) {
         let view = selection.view();
-        let size_label = match (view.rect, &view.size_label) {
-            (Some(rect), Some(text)) => self.label(selection, rect, text).unwrap_or_else(|e| {
+        // ハイライトしていれば、範囲のサイズの代わりにウィンドウの名前とサイズを出す
+        let text = match (&view.highlight, view.rect, &view.size_label) {
+            (Some(highlight), _, _) => Some((
+                highlight_label_at(selection, highlight.rect),
+                highlight.label(),
+            )),
+            (None, Some(rect), Some(text)) => Some((rect, text.clone())),
+            _ => None,
+        };
+        let size_label = match text {
+            Some((at, text)) => self.label(selection, at, &text).unwrap_or_else(|e| {
                 log::warn!("could not lay out the size label: {e}");
                 None
             }),
-            _ => None,
-        };
-        let cursor_label = match &view.cursor_label {
-            Some((at, text)) => self.cursor_label(selection, *at, text).unwrap_or_else(|e| {
-                log::warn!("could not lay out the cursor label: {e}");
-                None
-            }),
             None => None,
+        };
+        let magnifier = match view.magnifier {
+            Some(at) => {
+                let text = view.cursor_label.as_ref().map(|(_, text)| text.as_str());
+                self.magnifier(selection, at, text).unwrap_or_else(|e| {
+                    log::warn!("could not lay out the magnifier: {e}");
+                    None
+                })
+            }
+            None => None,
+        };
+        // 拡大鏡を出すなら、カーソルの横の座標は拡大鏡の下に付ける
+        let cursor_label = match (&view.cursor_label, &magnifier) {
+            (Some((at, text)), None) => {
+                self.cursor_label(selection, *at, text).unwrap_or_else(|e| {
+                    log::warn!("could not lay out the cursor label: {e}");
+                    None
+                })
+            }
+            _ => None,
         };
         let scene = Scene {
             rect: view.rect,
@@ -276,6 +349,8 @@ impl Overlay {
             handles: view.handles,
             crosshair: view.crosshair,
             cursor_label,
+            highlight: view.highlight.map(|h| h.rect),
+            magnifier,
         };
         let factory = if scene.is_empty() {
             None
@@ -304,13 +379,18 @@ impl Overlay {
     }
 
     /// サイズの表示を、範囲の左上があるモニタの DPI の大きさで、範囲の左上の外側に置く。
-    /// そのモニタの上にはみ出すなら、範囲の内側の左上に置く。
+    /// そのモニタの上にはみ出すなら、範囲の内側の左上に置く。右にはみ出すなら、モニタの右端に寄せる。
     fn label(&mut self, selection: &Selection, rect: Rect, text: &str) -> Result<Option<Label>> {
         let monitor = monitor_at(selection, rect.origin());
         let dpi = monitor.map_or(96, |m| m.dpi);
         let gap = LABEL_GAP * dpi as f32 / 96.0;
         let (text, format, width, height) = self.measure(text, dpi)?;
-        let left = rect.left as f32;
+        let mut left = rect.left as f32;
+        if let Some(m) = monitor {
+            left = left
+                .min(m.rect.right as f32 - width)
+                .max(m.rect.left as f32);
+        }
         let mut top = rect.top as f32 - gap - height;
         if monitor.is_some_and(|m| top < m.rect.top as f32) {
             top = rect.top as f32 + gap;
@@ -345,6 +425,107 @@ impl Overlay {
         Ok(Some(Label::new(
             text, format, left, top, width, height, dpi,
         )))
+    }
+
+    /// 拡大鏡を、カーソルのあるモニタの DPI の大きさで組む。拡大した画素の下に `label`（カーソルの横の
+    /// 座標）と色コードを並べ、全体を `magnifier::place` で置く。カーソルのあるモニタの画面を読めなければ
+    /// （HDR・回転など）None。
+    fn magnifier(
+        &mut self,
+        selection: &Selection,
+        at: Point,
+        label: Option<&str>,
+    ) -> Result<Option<Magnifier>> {
+        let Some(index) = selection
+            .monitors()
+            .iter()
+            .position(|m| m.rect.contains(at))
+        else {
+            return Ok(None);
+        };
+        let monitor = selection.monitors()[index];
+        let Some(view) = self.monitors.get(index) else {
+            return Ok(None);
+        };
+        let source = magnifier::source(at);
+        let Some(fragment) = source
+            .intersect(&monitor.rect)
+            .map(|area| view.shot.read_back(area))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let color_at = |p: Point| {
+            let x = p.x - fragment.at.x;
+            let y = p.y - fragment.at.y;
+            let inside = (0..fragment.image.width() as i32).contains(&x)
+                && (0..fragment.image.height() as i32).contains(&y);
+            inside.then(|| fragment.image.pixel(x as u32, y as u32))
+        };
+        let Some(under) = color_at(at) else {
+            return Ok(None);
+        };
+
+        let dpi = monitor.dpi;
+        let scaled = |len: i32| (len * dpi as i32 + 48) / 96;
+        let cell = scaled(magnifier::ZOOM).max(1);
+        let side = cell * magnifier::SPAN;
+        let mut texts = Vec::new();
+        for text in label
+            .map(str::to_owned)
+            .into_iter()
+            .chain([magnifier::color_code(under)])
+        {
+            texts.push(self.measure(&text, dpi)?);
+        }
+        let width = texts
+            .iter()
+            .map(|(_, _, w, _)| w.ceil() as i32)
+            .fold(side, i32::max);
+        let height = side
+            + texts
+                .iter()
+                .map(|(_, _, _, h)| h.ceil() as i32)
+                .sum::<i32>();
+        let panel = magnifier::place(at, width, height, scaled(magnifier::OFFSET), monitor.rect);
+
+        let area = Rect::new(panel.left, panel.top, panel.left + side, panel.top + side);
+        let mut cells = Vec::with_capacity((magnifier::SPAN * magnifier::SPAN) as usize);
+        let mut center = area;
+        for row in 0..magnifier::SPAN {
+            for col in 0..magnifier::SPAN {
+                let pixel = Point::new(source.left + col, source.top + row);
+                let left = area.left + col * cell;
+                let top = area.top + row * cell;
+                let rect = Rect::new(left, top, left + cell, top + cell);
+                if pixel == at {
+                    center = rect;
+                }
+                cells.push((rect, color_at(pixel).map(color_f)));
+            }
+        }
+        let mut labels = Vec::with_capacity(texts.len());
+        let mut top = area.bottom as f32;
+        for (text, format, _, height) in texts {
+            let height = height.ceil();
+            labels.push(Label::new(
+                text,
+                format,
+                panel.left as f32,
+                top,
+                width as f32,
+                height,
+                dpi,
+            ));
+            top += height;
+        }
+        Ok(Some(Magnifier {
+            cells,
+            center,
+            area,
+            labels,
+        }))
     }
 
     /// `text` を `dpi` のモニタの大きさで測る。返すのは UTF-16 の文字列、書式、余白を含む幅と高さ。
@@ -432,6 +613,16 @@ impl Label {
     }
 }
 
+/// BGRA の画素を Direct2D の色にする（描画先は sRGB の変換をしない UNORM なので、値がそのまま出る）。
+fn color_f([b, g, r, _]: [u8; 4]) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        r: f32::from(r) / 255.0,
+        g: f32::from(g) / 255.0,
+        b: f32::from(b) / 255.0,
+        a: 1.0,
+    }
+}
+
 /// `at` の画素を含むモニタ。
 fn monitor_at(selection: &Selection, at: Point) -> Option<MonitorInfo> {
     selection
@@ -507,10 +698,13 @@ impl MonitorView {
         }
     }
 
-    /// 十字線、範囲の枠、つまみ、サイズ、カーソルの横の座標を出す。スクリーン座標からこのウィンドウの
+    /// 十字線、ハイライト、範囲の枠、つまみ、サイズ（ハイライトなら名前とサイズ）、カーソルの横の座標を出す。スクリーン座標からこのウィンドウの
     /// 座標に直して描く。
     fn draw_selection(&mut self, factory: &ID2D1Factory1, scene: &Scene) -> Result<()> {
         let monitor = to_rect(self.shot.rect);
+        let highlight_width = (HIGHLIGHT_WIDTH * self.shot.dpi as f32 / 96.0)
+            .round()
+            .max(1.0) as i32;
         let Some(surface) = &mut self.surface else {
             return Ok(());
         };
@@ -576,6 +770,18 @@ impl MonitorView {
                 &d2d.crosshair,
             );
         }
+        // ハイライトは中を薄く塗り、枠を内側に描く（最大化したウィンドウでもモニタの端で見えるように）
+        if let Some(rect) = scene.highlight {
+            fill(rect, &d2d.highlight_fill);
+            let inner = rect.inflate(-highlight_width);
+            if inner.is_empty() {
+                fill(rect, &d2d.highlight_frame);
+            } else {
+                for band in ring(rect, inner) {
+                    fill(band, &d2d.highlight_frame);
+                }
+            }
+        }
         for (outer, inner, brush) in lines.into_iter().flatten() {
             for band in ring(outer, inner) {
                 fill(band, brush);
@@ -591,6 +797,24 @@ impl MonitorView {
         }
         if let Some(label) = &scene.cursor_label {
             text(label);
+        }
+        if let Some(m) = &scene.magnifier {
+            // 黒で縁取り、拡大した画素を塗り、カーソルの画素を白と黒の枠で囲む
+            fill(m.area.inflate(1), &d2d.frame_outer);
+            for &(cell, color) in &m.cells {
+                // SAFETY: このデバイス コンテキストのブラシ
+                unsafe { d2d.pixel.SetColor(&color.unwrap_or(MAGNIFIER_OUTSIDE)) };
+                fill(cell, &d2d.pixel);
+            }
+            for band in ring(m.center.inflate(2), m.center.inflate(1)) {
+                fill(band, &d2d.frame_outer);
+            }
+            for band in ring(m.center.inflate(1), m.center) {
+                fill(band, &d2d.frame_inner);
+            }
+            for label in &m.labels {
+                text(label);
+            }
         }
         // SAFETY: BeginDraw と対
         unsafe { context.EndDraw(None, None) }
@@ -694,12 +918,26 @@ impl D2dTarget {
                 frame_outer: context.CreateSolidColorBrush(&FRAME_OUTER, None)?,
                 label_back: context.CreateSolidColorBrush(&LABEL_BACK, None)?,
                 label_text: context.CreateSolidColorBrush(&LABEL_TEXT, None)?,
+                highlight_frame: context.CreateSolidColorBrush(&HIGHLIGHT_FRAME, None)?,
+                highlight_fill: context.CreateSolidColorBrush(&HIGHLIGHT_FILL, None)?,
                 crosshair: context.CreateSolidColorBrush(&CROSSHAIR, None)?,
+                pixel: context.CreateSolidColorBrush(&MAGNIFIER_OUTSIDE, None)?,
                 _target: target,
                 context,
             })
         }
     }
+}
+
+/// ハイライトの名前とサイズを置く基準の矩形。ハイライトのうちカーソルのあるモニタに見えている部分
+/// （モニタをまたぐウィンドウや、画面の外にはみ出したウィンドウでも見えるように）。
+fn highlight_label_at(selection: &Selection, rect: Rect) -> Rect {
+    selection
+        .monitors()
+        .iter()
+        .find(|m| m.rect.contains(selection.cursor()))
+        .and_then(|m| m.rect.intersect(&rect))
+        .unwrap_or(rect)
 }
 
 /// `outer` から `inner`（`outer` の内側）を除いた輪を、上・下・左・右の 4 つの帯で返す。

@@ -1,6 +1,6 @@
 //! `shunsoku-cli` と常駐本体の間の、名前付きパイプでの依頼と応答の形式（ADR-0003）。
 
-use crate::cli_args::{Capture, Target};
+use crate::cli_args::{Capture, Output, Save, Target};
 use crate::geometry::Rect;
 use crate::monitors::Monitor;
 
@@ -60,6 +60,18 @@ pub fn encode_request(request: &Request) -> String {
                     w.field("delay", &delay.to_string());
                 }
             }
+            let output = &capture.output;
+            match &output.save {
+                Save::Default => w.field("save", "default"),
+                Save::To(path) => {
+                    w.field("save", "file");
+                    w.field("out", path);
+                }
+                Save::No => w.field("save", "none"),
+            }
+            w.field("scrap", flag(output.scrap));
+            w.field("copy", flag(output.copy));
+            w.field("quiet", flag(output.quiet));
         }
     }
     w.finish()
@@ -86,7 +98,19 @@ pub fn decode_request(text: &str) -> Result<Request, DecodeError> {
                 },
                 other => return Err(malformed(&format!("unknown target {other}"))),
             };
-            Request::Capture(Capture { target })
+            let save = match r.take("save")? {
+                "default" => Save::Default,
+                "file" => Save::To(r.take("out")?.to_owned()),
+                "none" => Save::No,
+                other => return Err(malformed(&format!("bad save {other}"))),
+            };
+            let output = Output {
+                save,
+                scrap: parse_flag(r.take("scrap")?)?,
+                copy: parse_flag(r.take("copy")?)?,
+                quiet: parse_flag(r.take("quiet")?)?,
+            };
+            Request::Capture(Capture { target, output })
         }
         other => return Err(malformed(&format!("unknown command {other}"))),
     };
@@ -192,7 +216,7 @@ pub fn encode_response(response: &Response) -> String {
                 w.field("monitor", &m.name);
                 w.field("rect", &rect_value(&m.rect));
                 w.field("dpi", &m.dpi.to_string());
-                w.field("primary", if m.primary { "1" } else { "0" });
+                w.field("primary", flag(m.primary));
             }
         }
         Response::Failed { kind, message } => {
@@ -217,11 +241,7 @@ pub fn decode_response(text: &str) -> Result<Response, DecodeError> {
                 let name = name.to_owned();
                 let rect = parse_rect(r.take("rect")?)?;
                 let dpi = parse_number(r.take("dpi")?)?;
-                let primary = match r.take("primary")? {
-                    "1" => true,
-                    "0" => false,
-                    other => return Err(malformed(&format!("bad primary {other}"))),
-                };
+                let primary = parse_flag(r.take("primary")?)?;
                 monitors.push(Monitor {
                     name,
                     rect,
@@ -242,6 +262,18 @@ pub fn decode_response(text: &str) -> Result<Response, DecodeError> {
     };
     r.end()?;
     Ok(response)
+}
+
+fn flag(value: bool) -> &'static str {
+    if value { "1" } else { "0" }
+}
+
+fn parse_flag(value: &str) -> Result<bool, DecodeError> {
+    match value {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        other => Err(malformed(&format!("bad flag {other}"))),
+    }
 }
 
 fn rect_value(rect: &Rect) -> String {
@@ -373,12 +405,40 @@ mod tests {
                 monitor,
                 rect: Rect::new(-5, 10, 95, 210),
             },
+            output: Output::default(),
         })
     }
 
     #[test]
     fn requests_survive_a_round_trip() {
         for request in [rect_capture(None), rect_capture(Some(3)), Request::Monitors] {
+            let wire = encode_request(&request);
+            assert_eq!(decode_request(&wire), Ok(request));
+        }
+    }
+
+    #[test]
+    fn capture_outputs_survive_a_round_trip() {
+        let outputs = [
+            Output {
+                save: Save::No,
+                scrap: true,
+                copy: true,
+                quiet: true,
+            },
+            Output {
+                save: Save::To("C:\\撮影\\a\nb.png".to_owned()),
+                ..Output::default()
+            },
+        ];
+        for output in outputs {
+            let request = Request::Capture(Capture {
+                target: Target::Rect {
+                    monitor: None,
+                    rect: Rect::new(0, 0, 1, 1),
+                },
+                output,
+            });
             let wire = encode_request(&request);
             assert_eq!(decode_request(&wire), Ok(request));
         }
@@ -395,7 +455,10 @@ mod tests {
             Target::Active { delay: 60 },
         ];
         for target in targets {
-            let request = Request::Capture(Capture { target });
+            let request = Request::Capture(Capture {
+                target,
+                output: Output::default(),
+            });
             let wire = encode_request(&request);
             assert_eq!(decode_request(&wire), Ok(request));
         }
