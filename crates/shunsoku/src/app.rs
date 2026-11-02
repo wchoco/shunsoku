@@ -94,7 +94,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EndMenu, EnumThreadWindows,
     GetClassNameW, GetMessagePos, GetMessageW, HWND_MESSAGE, IDI_APPLICATION, IsWindowVisible,
     KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SetCursorPos, SetTimer, TranslateMessage, WINDOW_EX_STYLE,
+    RegisterWindowMessageW, SPI_GETSELECTIONFADE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetCursorPos, SetTimer, SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE,
     WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
@@ -145,6 +146,9 @@ const TIMER_REGION_RETRY: usize = 2;
 const REGION_RETRY_MS: u32 = 30;
 /// メニューが消えきるのを待つ回数の上限。超えたらそのまま撮る。
 const MAX_REGION_RETRIES: u32 = 30;
+/// メニューの項目をマウスで選んだときのフェード（SPI_GETSELECTIONFADE）を待つ時間。フェードのウィンドウは
+/// 列挙で見つからないことがあるので、メニューから選ばれた依頼は時間で待つ。
+const MENU_FADE_MS: u64 = 400;
 /// 倍率の表示を消すタイマーの番号（スクラップのウィンドウの WM_TIMER）と、出しておく時間。
 const TIMER_ZOOM_LABEL: usize = 1;
 const ZOOM_LABEL_MS: u32 = 1000;
@@ -189,6 +193,8 @@ struct App {
     regions_waiting: VecDeque<CaptureRequest>,
     /// shunsoku のメニューが消えきるのを待った回数（`run_waiting_regions`）。
     region_retries: u32,
+    /// これより前には定型領域キャプチャを撮らない（メニューで選んだ項目のフェードを待つ）。
+    region_not_before: Option<Instant>,
     scraps: Vec<Scrap>,
     /// 閉じたスクラップ。drop で一時ファイルを消す。
     trash: trash_store::TrashStore,
@@ -626,6 +632,7 @@ fn start(
         capture: Capture::Idle,
         regions_waiting: VecDeque::new(),
         region_retries: 0,
+        region_not_before: None,
         scraps: Vec::new(),
         trash,
         saves: mpsc::channel(),
@@ -2156,6 +2163,7 @@ fn on_hotkey(wparam: WPARAM) {
 ///
 /// shunsoku のメニュー（トレイ・スクラップの右クリック）が出ていれば閉じ、消えきってから撮る（`run_waiting_regions`）。
 fn request_region(index: usize, from: &str) {
+    let from_menu = from == "tray";
     let queued = with_app(|app| {
         if matches!(app.capture, Capture::Selecting { .. }) {
             return Err("the overlay is open");
@@ -2167,6 +2175,10 @@ fn request_region(index: usize, from: &str) {
             .ok_or("the region is no longer in the settings")?;
         app.regions_waiting
             .push_back(CaptureRequest::region(region));
+        if from_menu && selection_fades() {
+            app.region_not_before =
+                Some(Instant::now() + std::time::Duration::from_millis(MENU_FADE_MS));
+        }
         Ok(app.windows.message)
     });
     match queued {
@@ -2210,6 +2222,13 @@ fn run_waiting_regions() {
             if !matches!(app.capture, Capture::Idle) || app.regions_waiting.is_empty() {
                 return Ok(None);
             }
+            if app
+                .region_not_before
+                .is_some_and(|not_before| Instant::now() < not_before)
+            {
+                return Err(app.windows.message);
+            }
+            app.region_not_before = None;
             if app.region_retries < MAX_REGION_RETRIES && menus_visible() {
                 app.region_retries += 1;
                 return Err(app.windows.message);
@@ -2239,6 +2258,21 @@ fn run_waiting_regions() {
             _ => return,
         }
     }
+}
+
+/// メニューで選んだ項目を消える前にフェードさせる設定（SPI_GETSELECTIONFADE）が有効か。
+fn selection_fades() -> bool {
+    let mut fades = windows::core::BOOL(0);
+    // SAFETY: BOOL を 1 つ受け取るだけ
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETSELECTIONFADE,
+            0,
+            Some(&mut fades as *mut windows::core::BOOL as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    read.is_ok() && fades.as_bool()
 }
 
 /// このスレッドのメニュー（`#32768`）か、その影・閉じるときのフェードのウィンドウが見えているか。
