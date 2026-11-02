@@ -1,5 +1,7 @@
 //! `shunsoku-cli` の引数の解釈（ADR-0003）。`clap` は使わない。
 
+use std::path::Path;
+
 use crate::geometry::Rect;
 
 /// 解釈した結果。
@@ -18,12 +20,21 @@ pub enum Command {
 /// `--help` で出す使い方。
 pub const USAGE: &str = "\
 使い方:
-  shunsoku-cli capture rect [--monitor <番号>] <x>,<y>,<w>,<h>
+  shunsoku-cli capture rect [--monitor <番号>] <x>,<y>,<w>,<h> [出力のオプション]
       モニタ相対の物理ピクセルの範囲を撮り、保存した絶対パスを出します。
       --monitor を省くとメインモニタです。番号は monitors で調べられます。
   shunsoku-cli monitors
       モニタの番号・名前・解像度・拡大率を出します。
   shunsoku-cli --help | --version
+
+capture の出力のオプション（既定は保存だけ）:
+  --scrap        スクラップを出して、フォーカスを移します。
+  --copy         クリップボードにコピーします。
+  --no-save      保存しません（--scrap か --copy と合わせて使います）。標準出力には何も出しません。
+  --out <path>   このファイルに保存します（あれば上書きします。拡張子は .png だけ）。
+                 省くと、設定の保存先にファイル名テンプレートで名前を付けて保存します。
+  --quiet        この回はトレイ通知を出しません。
+  保存に失敗したら、スクラップには逃がさず終了コード 1 で終わります。
 
 終了コード:
   0 成功 / 1 キャプチャの失敗 / 2 引数の誤り / 3 常駐本体に依頼できない・バージョンが合わない
@@ -34,6 +45,31 @@ pub const USAGE: &str = "\
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capture {
     pub target: Target,
+    pub output: Output,
+}
+
+/// 撮ったものの出し先（対象の後ろのオプション）。既定は保存だけ。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Output {
+    pub save: Save,
+    /// `--scrap`: スクラップを出してフォーカスを移す。
+    pub scrap: bool,
+    /// `--copy`: クリップボードにコピーする。
+    pub copy: bool,
+    /// `--quiet`: その回はトレイ通知を出さない。
+    pub quiet: bool,
+}
+
+/// 保存するか、どこへ保存するか。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Save {
+    /// 全体設定の保存先に、ファイル名テンプレートで名前を付けて保存する。
+    #[default]
+    Default,
+    /// `--out <path>`: そのファイルに保存する（上書きする）。
+    To(String),
+    /// `--no-save`: 保存しない。
+    No,
 }
 
 /// 何を撮るか。
@@ -63,7 +99,10 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Command, ArgError> {
     }
     match args.as_slice() {
         ["capture", "rect", rest @ ..] => {
-            parse_rect(rest).map(|target| Command::Capture(Capture { target }))
+            let mut output = Output::default();
+            let target = parse_rect(rest, &mut output)?;
+            check_output(&output)?;
+            Ok(Command::Capture(Capture { target, output }))
         }
         ["capture", target, ..] => Err(error(&format!("不明なキャプチャの対象です: {target}"))),
         ["capture"] => Err(error("キャプチャの対象（rect）を指定してください")),
@@ -75,11 +114,14 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Command, ArgError> {
 }
 
 /// `rect` のあとの引数。`--monitor <番号>` は範囲の前にも後ろにも置ける。
-fn parse_rect(args: &[&str]) -> Result<Target, ArgError> {
+fn parse_rect(args: &[&str], output: &mut Output) -> Result<Target, ArgError> {
     let mut monitor = None;
     let mut rect = None;
     let mut rest = args.iter();
     while let Some(&arg) = rest.next() {
+        if parse_output_option(arg, &mut rest, output)? {
+            continue;
+        }
         if arg == "--monitor" {
             let value = rest
                 .next()
@@ -98,6 +140,62 @@ fn parse_rect(args: &[&str]) -> Result<Target, ArgError> {
     }
     let rect = rect.ok_or_else(|| error("範囲を <x>,<y>,<w>,<h> で指定してください"))?;
     Ok(Target::Rect { monitor, rect })
+}
+
+/// 出力のオプションなら `output` に入れて true を返す。どの対象でも、対象の引数の前にも後ろにも置ける。
+fn parse_output_option(
+    arg: &str,
+    rest: &mut std::slice::Iter<&str>,
+    output: &mut Output,
+) -> Result<bool, ArgError> {
+    let flag = match arg {
+        "--scrap" => &mut output.scrap,
+        "--copy" => &mut output.copy,
+        "--quiet" => &mut output.quiet,
+        "--no-save" | "--out" => {
+            if output.save != Save::Default {
+                return Err(error(
+                    "--no-save と --out は合わせて 1 回だけ指定できます（保存しないなら保存先は指定できません）",
+                ));
+            }
+            output.save = if arg == "--no-save" {
+                Save::No
+            } else {
+                Save::To(parse_out(rest.next().copied())?)
+            };
+            return Ok(true);
+        }
+        _ => return Ok(false),
+    };
+    if *flag {
+        return Err(error(&format!("{arg} が 2 回指定されています")));
+    }
+    *flag = true;
+    Ok(true)
+}
+
+/// `--out` の値。拡張子は `.png`（大文字・小文字は問わない）だけ。
+fn parse_out(value: Option<&str>) -> Result<String, ArgError> {
+    let path = value.ok_or_else(|| error("--out に保存先のファイルを指定してください"))?;
+    let is_png = Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+    if !is_png {
+        return Err(error(&format!(
+            "--out の拡張子は .png にしてください: {path}"
+        )));
+    }
+    Ok(path.to_owned())
+}
+
+/// 出力のオプションの組み合わせを調べる。
+fn check_output(output: &Output) -> Result<(), ArgError> {
+    if output.save == Save::No && !output.scrap && !output.copy {
+        return Err(error(
+            "--no-save を付けるときは --scrap か --copy も付けてください（何も出さないことになります）",
+        ));
+    }
+    Ok(())
 }
 
 /// モニタの番号（1 から）。
@@ -150,6 +248,7 @@ mod tests {
                     monitor: None,
                     rect: Rect::new(10, 20, 310, 220),
                 },
+                output: Output::default(),
             }))
         );
     }
@@ -157,6 +256,7 @@ mod tests {
     fn rect_on(monitor: Option<u32>, rect: Rect) -> Result<Command, ArgError> {
         Ok(Command::Capture(Capture {
             target: Target::Rect { monitor, rect },
+            output: Output::default(),
         }))
     }
 
@@ -204,6 +304,118 @@ mod tests {
                 "1",
                 "0,0,1,1",
             ],
+        ];
+        for args in bad {
+            assert!(parse(args).is_err(), "{args:?} should be rejected");
+        }
+    }
+
+    fn capture_with(output: Output) -> Result<Command, ArgError> {
+        Ok(Command::Capture(Capture {
+            target: Target::Rect {
+                monitor: None,
+                rect: Rect::new(0, 0, 100, 100),
+            },
+            output,
+        }))
+    }
+
+    #[test]
+    fn scrap_shows_a_scrap_and_still_saves() {
+        assert_eq!(
+            parse(&["capture", "rect", "0,0,100,100", "--scrap"]),
+            capture_with(Output {
+                scrap: true,
+                ..Output::default()
+            })
+        );
+    }
+
+    #[test]
+    fn copy_and_quiet_can_come_before_the_rect() {
+        assert_eq!(
+            parse(&["capture", "rect", "--copy", "--quiet", "0,0,100,100"]),
+            capture_with(Output {
+                copy: true,
+                quiet: true,
+                ..Output::default()
+            })
+        );
+    }
+
+    #[test]
+    fn no_save_with_another_output_does_not_save() {
+        assert_eq!(
+            parse(&[
+                "capture",
+                "rect",
+                "0,0,100,100",
+                "--scrap",
+                "--copy",
+                "--no-save"
+            ]),
+            capture_with(Output {
+                save: Save::No,
+                scrap: true,
+                copy: true,
+                quiet: false,
+            })
+        );
+    }
+
+    #[test]
+    fn out_saves_to_the_given_png() {
+        assert_eq!(
+            parse(&["capture", "rect", "--out", r"shots\a b.png", "0,0,100,100"]),
+            capture_with(Output {
+                save: Save::To(r"shots\a b.png".to_owned()),
+                ..Output::default()
+            })
+        );
+        // 拡張子の大文字・小文字は問わない
+        assert_eq!(
+            parse(&["capture", "rect", "0,0,100,100", "--out", "A.PNG"]),
+            capture_with(Output {
+                save: Save::To("A.PNG".to_owned()),
+                ..Output::default()
+            })
+        );
+    }
+
+    #[test]
+    fn contradictory_or_malformed_outputs_are_argument_errors() {
+        let bad: [&[&str]; 9] = [
+            // 何も出さないことになる
+            &["capture", "rect", "0,0,1,1", "--no-save"],
+            &["capture", "rect", "0,0,1,1", "--no-save", "--quiet"],
+            // 保存しないのに保存先を指定している
+            &[
+                "capture",
+                "rect",
+                "0,0,1,1",
+                "--scrap",
+                "--no-save",
+                "--out",
+                "a.png",
+            ],
+            &[
+                "capture",
+                "rect",
+                "0,0,1,1",
+                "--out",
+                "a.png",
+                "--no-save",
+                "--copy",
+            ],
+            // 拡張子は .png だけ
+            &["capture", "rect", "0,0,1,1", "--out", "x.jpg"],
+            &["capture", "rect", "0,0,1,1", "--out", "png"],
+            &["capture", "rect", "0,0,1,1", "--out"],
+            // 同じオプションを 2 回
+            &[
+                "capture", "rect", "0,0,1,1", "--out", "a.png", "--out", "b.png",
+            ],
+            &["capture", "rect", "0,0,1,1", "--scrap", "--scrap"],
         ];
         for args in bad {
             assert!(parse(args).is_err(), "{args:?} should be rejected");

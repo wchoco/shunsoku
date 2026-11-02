@@ -37,7 +37,20 @@ fn run() -> i32 {
             println!("shunsoku-cli {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        Ok(Command::Capture(capture)) => Request::Capture(capture),
+        Ok(Command::Capture(mut capture)) => {
+            // 常駐本体は作業フォルダが違うので、--out の相対パスはここで絶対パスにする
+            if let cli_args::Save::To(path) = &mut capture.output.save {
+                let absolute = std::path::absolute(&*path)
+                    .ok()
+                    .and_then(|absolute| absolute.into_os_string().into_string().ok());
+                let Some(absolute) = absolute else {
+                    error(&format!("--out のパスを絶対パスにできません: {path}"));
+                    return EXIT_ARGS;
+                };
+                *path = absolute;
+            }
+            Request::Capture(capture)
+        }
         Ok(Command::Monitors) => Request::Monitors,
         Err(e) => {
             error(&e.0);
@@ -112,6 +125,7 @@ mod pipe {
         GetNamedPipeServerProcessId, GetNamedPipeServerSessionId, PIPE_READMODE_MESSAGE,
         SetNamedPipeHandleState, WaitNamedPipeW,
     };
+    use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
     use windows::core::HSTRING;
 
     use super::{Failure, pipe_identity};
@@ -145,7 +159,11 @@ mod pipe {
             .map_err(|e| Failure::unavailable(format!("ユーザーを調べられません: {e}")))?;
         let name = HSTRING::from(protocol::pipe_name(session, &sid));
         let pipe = connect(&name)?;
-        verify_server(&pipe, session, &sid)?;
+        let server = verify_server(&pipe, session, &sid)?;
+        // `--scrap` のスクラップにフォーカスを移せるよう、前面にする権利を常駐本体に渡す。渡せるのは、この
+        // プロセスが前面にする権利を持つとき（前面のプロセスから起動されたときなど）だけ。渡せなくても依頼は進める
+        // SAFETY: 引数は確かめた相手のプロセス ID
+        let _ = unsafe { AllowSetForegroundWindow(server) };
 
         // SAFETY: 自分で開いたハンドルのモードを変える
         unsafe { SetNamedPipeHandleState(pipe.0, Some(&PIPE_READMODE_MESSAGE), None, None) }
@@ -225,7 +243,8 @@ mod pipe {
     }
 
     /// 相手が同じセッションの同じユーザーのプロセスか確かめる（名前を先に取られていたときのため）。
-    fn verify_server(pipe: &Pipe, session: u32, sid: &str) -> Result<(), Failure> {
+    /// 確かめた相手のプロセス ID を返す。
+    fn verify_server(pipe: &Pipe, session: u32, sid: &str) -> Result<u32, Failure> {
         let refused = || Failure::unavailable("パイプの相手が常駐本体ではありません");
         let mut server_session = u32::MAX;
         let mut pid = 0u32;
@@ -238,7 +257,7 @@ mod pipe {
         if server_session != session || user != sid {
             return Err(refused());
         }
-        Ok(())
+        Ok(pid)
     }
 
     /// この exe と同じフォルダの常駐本体を起動する。待たずに返る。
