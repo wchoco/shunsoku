@@ -16,6 +16,8 @@ pub enum Source {
     TrayClick,
     /// トレイのメニューの「範囲選択キャプチャ」。
     TrayMenu,
+    /// アクティブウィンドウのキャプチャのホットキー。
+    ActiveWindowHotkey,
 }
 
 /// どう撮るか。
@@ -23,6 +25,8 @@ pub enum Source {
 pub enum CaptureMethod {
     /// 範囲選択キャプチャ。範囲選択の画面でユーザーが範囲を選ぶ。
     Select,
+    /// ウィンドウキャプチャ。依頼を受けた時点でアクティブなウィンドウを撮る。
+    ActiveWindow,
 }
 
 /// 撮ったものをどこへ出すか。
@@ -70,14 +74,17 @@ impl CaptureRequest {
     /// 発生源から依頼を作る。
     pub fn from_source(source: Source) -> CaptureRequest {
         match source {
-            Source::Hotkey | Source::TrayClick | Source::TrayMenu => CaptureRequest::select(),
+            Source::Hotkey | Source::TrayClick | Source::TrayMenu => {
+                CaptureRequest::scrap(CaptureMethod::Select)
+            }
+            Source::ActiveWindowHotkey => CaptureRequest::scrap(CaptureMethod::ActiveWindow),
         }
     }
 
-    /// 範囲選択キャプチャ: スクラップを出してフォーカスを移す。保存しない。
-    fn select() -> CaptureRequest {
+    /// 範囲選択・ウィンドウのキャプチャ: スクラップを出してフォーカスを移す。保存しない。
+    fn scrap(method: CaptureMethod) -> CaptureRequest {
         CaptureRequest {
-            method: CaptureMethod::Select,
+            method,
             outputs: Outputs {
                 save: None,
                 scrap: true,
@@ -123,6 +130,18 @@ mod tests {
     fn tray_menu_requests_a_select_capture_shown_as_a_focused_scrap() {
         let request = CaptureRequest::from_source(Source::TrayMenu);
         assert_eq!(request, select_capture());
+    }
+
+    #[test]
+    fn active_window_hotkey_requests_a_window_capture_shown_as_a_focused_scrap() {
+        let request = CaptureRequest::from_source(Source::ActiveWindowHotkey);
+        assert_eq!(
+            request,
+            CaptureRequest {
+                method: CaptureMethod::ActiveWindow,
+                ..select_capture()
+            }
+        );
     }
 
     #[test]
