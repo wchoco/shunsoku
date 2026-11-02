@@ -84,7 +84,8 @@ impl Replier {
             Some(sender) => {
                 let _ = sender.send(response);
             }
-            None => log::warn!("no pipe client is waiting for reply {}", to.0),
+            // 切った・待ちきれなかった依頼は行き先を先に消している（`forget`）。そのあとの応答なので普通に起きる
+            None => log::debug!("no pipe client is waiting for reply {}; dropped", to.0),
         }
     }
 
