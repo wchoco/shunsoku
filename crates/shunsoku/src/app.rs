@@ -25,7 +25,8 @@
 //!   実行する。操作が返す `Effect` を実行するのはここ（`run_scrap_operation`）。操作を足すときは core の表に
 //!   行を足し、新しい `Effect` があればそこに足す。
 //! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
-//!   読み込み直す。ファイルは作らず、書き換えない。読み込み直しでは core の `settings::diff` で変わった部分を調べ、
+//!   読み込み直す。アプリから書き戻すときは `write_settings` で変わった項目だけを書き、書いた直後の中身を監視が
+//!   拾っても読み込み直さない（`App::own_writes`）。読み込み直しでは core の `settings::diff` で変わった部分を調べ、
 //!   ホットキーの登録し直し・スクラップの描き直しなど、変わったものだけを反映する（`on_settings_changed`）。
 //!   保存先・ファイル名テンプレート・通知のオン/オフは、使うときに `App::settings` から読むので、次から効く。
 //!   キーの割り当てと重なりは core の `settings::keymap` で決める。
@@ -51,7 +52,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
-use shunsoku_core::capture::request::{CaptureMethod, CaptureRequest, ReplyTo, Source};
+use shunsoku_core::capture::request::{self, CaptureRequest, ReplyTo, Source};
 use shunsoku_core::geometry::{Point, Rect};
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
@@ -66,7 +67,7 @@ use shunsoku_core::scrap::ops::{
 use shunsoku_core::scrap::{
     Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
-use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
+use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
 use shunsoku_core::trash::TrashId;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -91,6 +92,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
+// 精密モード（#66）で足したもの
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
+use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
 
 use crate::{
     clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook, perf,
@@ -166,6 +170,8 @@ struct App {
     settings_path: Option<PathBuf>,
     /// 設定ファイルの監視が知らせを入れる口。
     settings_events: mpsc::Receiver<settings_watch::Event>,
+    /// 自分で書いた設定ファイルの中身（`write_settings`）。監視が拾っても読み込み直さない。
+    own_writes: settings::OwnWrites,
     /// スクラップ操作のショートカットの対応表（表の既定値に `settings.shortcuts` を重ねたもの）。
     shortcuts: Shortcuts,
     /// スクラップ操作のマウスの対応表（表の既定値に `settings.mouse` を重ねたもの）。
@@ -607,6 +613,7 @@ fn start(
         settings,
         settings_path,
         settings_events,
+        own_writes: settings::OwnWrites::default(),
         shortcuts: keymap.shortcuts,
         mouse: keymap.mouse,
         capture: Capture::Idle,
@@ -744,7 +751,7 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_CAPTURE_DELAY);
             }
-            start_capture();
+            take_capture();
             Some(LRESULT(0))
         }
         WM_CLOSE => {
@@ -905,12 +912,29 @@ fn on_overlay_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> O
             });
             Some(LRESULT(0))
         }
+        // 2 回目の押下は WM_LBUTTONDOWN の代わりにこれで来る（CS_DBLCLKS）
+        WM_LBUTTONDBLCLK => {
+            // SAFETY: 自分のウィンドウ
+            unsafe { SetCapture(hwnd) };
+            on_selection_input(Input::DoubleClick { at: at() });
+            Some(LRESULT(0))
+        }
         WM_RBUTTONDOWN => {
             on_selection_input(Input::Press {
                 button: Button::Right,
                 at: at(),
             });
             Some(LRESULT(0))
+        }
+        // 調整の状態では、つまみや範囲の上でカーソルの形を変える
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+            let shape = with_app(|app| match &app.capture {
+                Capture::Selecting { selection, .. } => Some(selection.cursor_shape()),
+                _ => None,
+            })
+            .flatten();
+            overlay::set_cursor(shape.unwrap_or(CursorShape::Cross));
+            Some(LRESULT(1))
         }
         WM_KEYDOWN => {
             if let Some(input) = selection_key(wparam, lparam) {
@@ -1773,9 +1797,18 @@ fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
     let repeat = lparam.0 & (1 << 30) != 0;
     let shift = down(VK_SHIFT);
     let win = down(VK_LWIN) || down(VK_RWIN);
-    let arrow = |direction| Some(Input::Arrow { direction, shift });
+    let ctrl = down(VK_CONTROL);
+    let arrow = |direction| {
+        Some(if ctrl {
+            Input::ResizeArrow { direction, shift }
+        } else {
+            Input::Arrow { direction, shift }
+        })
+    };
     match VIRTUAL_KEY(wparam.0 as u16) {
         VK_ESCAPE => Some(Input::Escape),
+        VK_TAB if !repeat => Some(Input::ToggleMode),
+        VK_RETURN if !repeat => Some(Input::Enter),
         VK_LEFT => arrow(Direction::Left),
         VK_RIGHT => arrow(Direction::Right),
         VK_UP => arrow(Direction::Up),
@@ -1783,7 +1816,7 @@ fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
         // 押しっぱなしで始点と終点が続けて決まらないよう、リピートは無視する
         VK_SPACE if !repeat => Some(Input::Space),
         // Ctrl+A と Ctrl+Shift+A だけ。Ctrl+Alt+A などほかの修飾キーとの組み合わせは対象にしない
-        VK_A if down(VK_CONTROL) && !down(VK_MENU) && !win && !repeat => Some(if shift {
+        VK_A if ctrl && !down(VK_MENU) && !win && !repeat => Some(if shift {
             Input::SelectAllMonitors
         } else {
             Input::SelectMonitor
@@ -1801,9 +1834,9 @@ fn on_selection_input(input: Input) {
         else {
             return None;
         };
-        let before = selection.rect();
+        let before = selection.view();
         let state = selection.handle(input);
-        if selection.rect() != before {
+        if selection.view() != before {
             // 描くだけでウィンドウは作らないので、借りたまま描いてよい
             overlay.redraw(selection);
         }
@@ -1813,7 +1846,10 @@ fn on_selection_input(input: Input) {
     let state = state.map(|(state, cursor)| {
         // 矢印で動かしたカーソルの位置に、実際のマウスのカーソルを合わせる。
         // 合わせたあとの WM_MOUSEMOVE は同じ位置なので、状態は変わらない
-        if matches!(input, Input::Arrow { .. }) && matches!(state, State::Idle | State::Selecting) {
+        // 調整の状態の矢印は範囲を動かすので、カーソルは動かさない
+        if matches!(input, Input::Arrow { .. } | Input::ResizeArrow { .. })
+            && matches!(state, State::Idle | State::Selecting)
+        {
             // SAFETY: UI スレッドで呼ぶ。座標はスクリーン座標（物理ピクセル、PMv2）
             if let Err(e) = unsafe { SetCursorPos(cursor.x, cursor.y) } {
                 log::warn!("could not move the cursor: {e}");
@@ -1986,27 +2022,28 @@ fn submit(request: CaptureRequest) {
         return;
     };
     if delay.is_zero() {
-        start_capture();
+        take_capture();
         return;
     }
     let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
     // SAFETY: 自分のウィンドウのタイマー
     if unsafe { SetTimer(Some(message_window), TIMER_CAPTURE_DELAY, ms, None) } == 0 {
         log::warn!("could not start the capture delay timer; capturing now");
-        start_capture();
+        take_capture();
     }
 }
 
 /// 待っている依頼を、撮り方に合わせて進める。
-fn start_capture() {
+fn take_capture() {
     let method = with_app(|app| match &app.capture {
         Capture::Waiting(request) => Some(request.method),
         _ => None,
     })
     .flatten();
     match method {
-        Some(CaptureMethod::Select) => open_overlay(),
-        Some(CaptureMethod::Rect { monitor, rect }) => capture_rect(monitor, rect),
+        Some(request::CaptureMethod::Select) => open_overlay(),
+        Some(request::CaptureMethod::ActiveWindow) => capture_active_window(),
+        Some(request::CaptureMethod::Rect { monitor, rect }) => capture_rect(monitor, rect),
         None => {}
     }
 }
@@ -2174,6 +2211,72 @@ fn reply_failed(to: Option<ReplyTo>, message: &str) {
     }
 }
 
+/// 待っている依頼で、いまアクティブなウィンドウを WGC で撮り、依頼の出力（スクラップ）を出す。
+fn capture_active_window() {
+    let started = Instant::now();
+    // 撮る前にアクティブなウィンドウを決める（スクラップを出すとフォーカスが移る）
+    // SAFETY: 引数なし
+    let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    let taken = with_app(|app| match &app.capture {
+        Capture::Waiting(request) => Some((
+            request.clone(),
+            app.gpu.primary_device(),
+            app.module,
+            Appearance::from(app.settings.scrap),
+        )),
+        _ => None,
+    })
+    .flatten();
+    let Some((request, device, module, appearance)) = taken else {
+        return;
+    };
+    let grabbed = if hwnd.is_invalid() {
+        Err("no active window".to_owned())
+    } else {
+        device.map_err(|e| e.to_string()).and_then(|device| {
+            crate::window_grab::grab_window(&device, hwnd, false).map_err(|e| e.to_string())
+        })
+    };
+    let shot = match grabbed {
+        Ok(shot) => shot,
+        Err(e) => {
+            log::warn!("could not capture the active window: {e}");
+            end_capture();
+            notify_user(notify::Level::Error, text("capture.failed"));
+            return;
+        }
+    };
+    log::info!(
+        "captured window {}x{} at ({}, {}) in {:.1} ms",
+        shot.rect.width(),
+        shot.rect.height(),
+        shot.rect.left,
+        shot.rect.top,
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    end_capture();
+    if !request.outputs.scrap {
+        return;
+    }
+    // ウィンドウを作るとメッセージが届くので、App を借りずに作る
+    let model = ScrapModel::new(shot.rect.origin(), shot.image.size());
+    match open_scrap(
+        module,
+        model,
+        shot.image,
+        &appearance,
+        request.outputs.focus_scrap,
+    ) {
+        Ok(scrap) => {
+            if with_app(|app| app.scraps.push(scrap)).is_none() {
+                log::warn!("could not keep the scrap");
+            }
+            perf::mark(Mark::ScrapShown);
+        }
+        Err(e) => log::error!("could not open a scrap: {e}"),
+    }
+}
+
 /// 待っている依頼の画面を取得して、範囲選択の画面を出す。
 fn open_overlay() {
     let started = Instant::now();
@@ -2219,6 +2322,15 @@ fn open_overlay() {
     let selection = overlay.new_selection();
     let rejected = with_app(|app| match std::mem::take(&mut app.capture) {
         Capture::Waiting(request) => {
+            // 開くたびに設定の既定のモードから始める（Tab の切り替えはその回だけ）
+            let selection = selection
+                .with_mode(app.settings.selection.mode)
+                .with_crosshair(app.settings.selection.crosshair);
+            let mut overlay = overlay;
+            if selection.view().crosshair.is_some() {
+                // 描くだけでウィンドウは作らないので、借りたまま描いてよい
+                overlay.redraw(&selection);
+            }
             app.capture = Capture::Selecting {
                 request,
                 overlay,
@@ -2283,6 +2395,9 @@ fn on_hotkey(wparam: WPARAM) {
     match action {
         Some(settings::HotkeyAction::SelectCapture) => request_capture(Source::Hotkey),
         Some(settings::HotkeyAction::RestoreLast) => restore_last_scrap(),
+        Some(settings::HotkeyAction::ActiveWindowCapture) => {
+            request_capture(Source::ActiveWindowHotkey)
+        }
         None => log::warn!("unknown hotkey id {}", wparam.0),
     }
 }
@@ -2312,6 +2427,43 @@ fn read_settings(path: Option<&Path>) -> (Settings, Vec<SettingsIssue>) {
     (settings, issues)
 }
 
+/// 設定ファイルに `new` を書き戻す。変わった項目だけを書き換え、手で書いたコメントと並び順は残す
+/// （`settings::rewrite`）。ファイルがなければ作る。
+///
+/// - 書いた中身を `App::own_writes` に覚え、監視が拾っても読み込み直さない。そのため、書けたら
+///   `App::settings` を `new` にする。ホットキーなど、使うときに読むのでは足りないものの反映は呼び出し側で行う。
+/// - 今のファイルが TOML として読めなければ、上書きせずにエラーを返す（手で書いた中身を消さないため）。
+/// - 書きかけの中身を監視に読まれないよう、隣の一時ファイルに書いてから名前を変える。
+#[expect(dead_code, reason = "定型領域の登録（#72）から呼ぶ")]
+fn write_settings(app: &mut App, new: &Settings) -> std::result::Result<(), String> {
+    let path = app
+        .settings_path
+        .clone()
+        .ok_or_else(|| "APPDATA is not set".to_owned())?;
+    let src = match std::fs::read_to_string(&path) {
+        Ok(src) => src,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    let text = settings::rewrite(&src, new)
+        .ok_or_else(|| format!("{} is not TOML; not overwriting it", path.display()))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    // 名前を変える前に覚える（監視の知らせは UI スレッドのこの関数が返ってから処理されるが、念のため）
+    app.own_writes.wrote(&text);
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        app.own_writes.forget();
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    log::info!("settings written to {}", path.display());
+    app.settings = new.clone();
+    Ok(())
+}
+
 fn log_issues(issues: &[SettingsIssue]) {
     for issue in issues {
         log::warn!("settings issue: {issue:?}");
@@ -2331,6 +2483,7 @@ fn log_failed(failed: &[hotkey::Failed]) {
 
 /// `WM_APP_SETTINGS`: 設定ファイルの監視の知らせを受け、読み込み直した設定を反映する。
 ///
+/// - 中身が自分で書いた直後のもの（`write_settings`）なら、読み込み直さず、通知もしない。
 /// - TOML として読めなければ、直前の有効な設定のまま動き、エラーを通知する（`settings::reload`）。
 /// - `settings::diff` で変わったものだけを反映する: ホットキーの登録し直し、浮かべているスクラップの描き直し、
 ///   ログのレベル。ショートカットの対応表は毎回作り直す（右クリックメニューは開くたびにこれから作る）。
@@ -2356,6 +2509,17 @@ fn on_settings_changed() {
         return;
     };
     let notice = with_app(|app| {
+        let own = match &content {
+            settings_watch::Content::Text(src) => app.own_writes.is_own(src),
+            settings_watch::Content::Missing | settings_watch::Content::Unreadable(_) => {
+                app.own_writes.forget();
+                false
+            }
+        };
+        if own {
+            log::info!("settings file changed by shunsoku itself; not reloading");
+            return None;
+        }
         let current = &app.settings;
         let (new, mut issues) = match content {
             settings_watch::Content::Missing => settings::reload(current, None),

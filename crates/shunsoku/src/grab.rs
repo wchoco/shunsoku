@@ -258,6 +258,24 @@ impl Gpu {
         Ok(shots)
     }
 
+    /// モニタがつながった最初のアダプタのデバイス。ウィンドウキャプチャ（WGC）で使う（WGC はアダプタを
+    /// またいで写すので、ウィンドウのあるモニタのアダプタでなくてよい）。
+    pub fn primary_device(&mut self) -> std::result::Result<ID3D11Device, GrabError> {
+        // SAFETY: 引数なしの生成
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+        let mut index = 0;
+        // SAFETY: 列挙は Err（DXGI_ERROR_NOT_FOUND）で終わる
+        while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
+            index += 1;
+            if attached_outputs(&adapter)?.is_empty() {
+                continue;
+            }
+            let device = self.device_for(&adapter)?;
+            return Ok(self.adapters[device].device.clone());
+        }
+        Err(GrabError::NoOutputs)
+    }
+
     /// 範囲選択の画面を閉じたあと（テクスチャとスワップチェーンを解放したあと）に呼び、
     /// ドライバが持っている一時的なメモリを返す。
     pub fn trim(&self) {

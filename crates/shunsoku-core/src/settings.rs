@@ -2,7 +2,8 @@
 //!
 //! - `load` は項目ごとに値を取り出す。不正な項目はその項目だけ既定値にし、項目名を `SettingsIssue` に載せる。
 //!   知らないキーは無視する。ファイル全体が TOML として読めなければ、すべて既定値にする。
-//! - ファイルは書き換えない（`write` は M3）。
+//! - アプリから書き戻すときは `write`（`settings/write.rs`）で変わった項目だけを書き換え、手で書いたコメントと
+//!   並び順を残す。自分で書いた直後の中身を監視が拾ったら、`OwnWrites` で見分けて読み込み直さない。
 //! - 読み込み直しでは `diff` で変わった部分を調べ、`app` が変わったものだけを反映し直す。
 //! - キーの重なりは `keymap` で見つける。同じ範囲（ホットキー同士、ショートカット同士）の重なりは `assign` の
 //!   規則で両方を無効にし、ホットキーとショートカットの重なりは警告だけにする。
@@ -24,6 +25,7 @@
 //! [hotkeys]
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
 //! restore_last = "Ctrl+Shift+Z"                # 最後に閉じたものを復元。既定は空で、必須ではない
+//! active_window_capture = "Ctrl+Shift+W"       # アクティブウィンドウのキャプチャ。既定は空で、必須ではない
 //!
 //! [shortcuts]                                  # スクラップ操作の id ごとの上書き。"" は割り当てなし
 //! copy = "Ctrl+Shift+C"
@@ -38,6 +40,10 @@
 //! border_width = 1                             # 1〜16（px）
 //! border_color = "#808080"
 //! shadow = true
+//!
+//! [selection]                                  # 範囲選択の画面
+//! mode = "normal"                              # 開いたときのモード: normal / precise
+//! crosshair = false                            # 通常モードでも十字線を出す（精密モードでは常に出す）
 //! ```
 
 use std::collections::BTreeMap;
@@ -47,6 +53,10 @@ use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OperationDescriptor, Shortcuts};
+use crate::selection::Mode;
+
+mod write;
+pub use write::{OwnWrites, rewrite, write};
 
 /// 対応している設定ファイルの形式の版。
 pub const VERSION: i64 = 1;
@@ -74,6 +84,7 @@ pub struct Settings {
     pub shortcuts: ShortcutOverrides,
     pub mouse: MouseOverrides,
     pub scrap: ScrapAppearance,
+    pub selection: SelectionScreen,
     /// ログのレベル（隠し項目）。
     pub log_level: LogLevel,
 }
@@ -112,17 +123,24 @@ pub enum HotkeyAction {
     SelectCapture,
     /// 最後に閉じたスクラップをごみ箱から復元する。任意（空でも通知しない）。
     RestoreLast,
+    /// アクティブウィンドウのキャプチャ。任意（空でも通知しない）。
+    ActiveWindowCapture,
 }
 
 impl HotkeyAction {
     /// すべて。
-    pub const ALL: [HotkeyAction; 2] = [HotkeyAction::SelectCapture, HotkeyAction::RestoreLast];
+    pub const ALL: [HotkeyAction; 3] = [
+        HotkeyAction::SelectCapture,
+        HotkeyAction::RestoreLast,
+        HotkeyAction::ActiveWindowCapture,
+    ];
 
     /// `[hotkeys]` の中のキー。
     pub fn key(self) -> &'static str {
         match self {
             HotkeyAction::SelectCapture => "select_capture",
             HotkeyAction::RestoreLast => "restore_last",
+            HotkeyAction::ActiveWindowCapture => "active_window_capture",
         }
     }
 }
@@ -132,6 +150,7 @@ impl HotkeyAction {
 pub struct Hotkeys {
     pub select_capture: Option<Chord>,
     pub restore_last: Option<Chord>,
+    pub active_window_capture: Option<Chord>,
 }
 
 impl Hotkeys {
@@ -140,6 +159,7 @@ impl Hotkeys {
         match action {
             HotkeyAction::SelectCapture => self.select_capture,
             HotkeyAction::RestoreLast => self.restore_last,
+            HotkeyAction::ActiveWindowCapture => self.active_window_capture,
         }
     }
 
@@ -156,6 +176,7 @@ impl Hotkeys {
         match action {
             HotkeyAction::SelectCapture => &mut self.select_capture,
             HotkeyAction::RestoreLast => &mut self.restore_last,
+            HotkeyAction::ActiveWindowCapture => &mut self.active_window_capture,
         }
     }
 }
@@ -213,6 +234,15 @@ impl Default for Border {
 /// 色。設定ファイルでは `#RRGGBB` で書く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
+
+/// 範囲選択の画面（`[selection]`）。開くたびに読む。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SelectionScreen {
+    /// 開いたときのモード。`Tab` での切り替えはその回だけで、次に開いたらこれに戻る。
+    pub mode: Mode,
+    /// 通常モードでも十字線を出す。精密モードでは設定によらず出す。
+    pub crosshair: bool,
+}
 
 /// DPI の違うモニタへスクラップを動かしたときの見え方（`[general] dpi_scaling`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -509,6 +539,14 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
         s.scrap.shadow = on;
     }
 
+    let selection = r.table(root, "selection");
+    if let Some(mode) = r.value(selection, "selection", "mode", selection_mode) {
+        s.selection.mode = mode;
+    }
+    if let Some(on) = r.value(selection, "selection", "crosshair", Item::as_bool) {
+        s.selection.crosshair = on;
+    }
+
     (s, r.issues)
 }
 
@@ -627,6 +665,14 @@ fn rgb(item: &Item) -> Option<Rgb> {
     Some(Rgb(channel(0)?, channel(2)?, channel(4)?))
 }
 
+fn selection_mode(item: &Item) -> Option<Mode> {
+    match item.as_str()? {
+        "normal" => Some(Mode::Normal),
+        "precise" => Some(Mode::Precise),
+        _ => None,
+    }
+}
+
 fn dpi_scaling(item: &Item) -> Option<DpiScaling> {
     match item.as_str()? {
         "keep_pixels" => Some(DpiScaling::KeepPixels),
@@ -730,6 +776,7 @@ shadow = false
                 hotkeys: Hotkeys {
                     select_capture: Some(chord("Win+Shift+PrintScreen")),
                     restore_last: Some(chord("Ctrl+Alt+Z")),
+                    active_window_capture: None,
                 },
                 shortcuts: BTreeMap::from([
                     ("close".to_owned(), None),
@@ -745,6 +792,7 @@ shadow = false
                     },
                     shadow: false,
                 },
+                selection: SelectionScreen::default(),
                 log_level: LogLevel::Debug,
             }
         );
@@ -895,6 +943,38 @@ shadow = 1
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn the_selection_screen_defaults_to_normal_mode_without_crosshair() {
+        let (settings, _) = load("version = 1\n");
+        assert_eq!(settings.selection.mode, Mode::Normal);
+        assert!(!settings.selection.crosshair);
+        let (settings, issues) =
+            load("version = 1\n[selection]\nmode = \"precise\"\ncrosshair = true\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.selection.mode, Mode::Precise);
+        assert!(settings.selection.crosshair);
+        let (settings, issues) = load("version = 1\n[selection]\nmode = \"normal\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.selection.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn invalid_selection_screen_items_fall_back_to_the_defaults_and_are_named() {
+        for value in ["\"Precise\"", "\"fine\"", "\"\"", "true", "1"] {
+            let (settings, issues) = load(&format!("version = 1\n[selection]\nmode = {value}\n"));
+            assert_eq!(issues, vec![invalid("selection.mode")], "{value}");
+            assert_eq!(settings.selection.mode, Mode::Normal, "{value}");
+        }
+        for value in ["\"true\"", "1"] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[selection]\ncrosshair = {value}\n"));
+            assert_eq!(issues, vec![invalid("selection.crosshair")], "{value}");
+            assert!(!settings.selection.crosshair, "{value}");
+        }
+        let (_, issues) = load("version = 1\nselection = 1\n");
+        assert_eq!(issues, vec![invalid("selection")]);
     }
 
     #[test]
@@ -1071,6 +1151,7 @@ a = 1
         let hotkeys = Hotkeys {
             select_capture: Some(chord("Ctrl+Alt+S")),
             restore_last: None,
+            active_window_capture: None,
         };
         let assigned = hotkeys.assign();
         assert_eq!(
@@ -1098,6 +1179,31 @@ a = 1
         assert_eq!(
             settings.hotkeys.assign().bound,
             BTreeMap::from([(chord("Ctrl+Alt+Z"), HotkeyAction::RestoreLast)])
+        );
+    }
+
+    #[test]
+    fn active_window_capture_hotkey_is_unset_by_default() {
+        let (settings, issues) = load("version = 1\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.hotkeys.get(HotkeyAction::ActiveWindowCapture),
+            None
+        );
+    }
+
+    #[test]
+    fn active_window_capture_hotkey_is_read_and_assigned() {
+        let (settings, issues) =
+            load("version = 1\n[hotkeys]\nactive_window_capture = \"Ctrl+Alt+W\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.hotkeys.get(HotkeyAction::ActiveWindowCapture),
+            Some(chord("Ctrl+Alt+W"))
+        );
+        assert_eq!(
+            settings.hotkeys.assign().bound,
+            BTreeMap::from([(chord("Ctrl+Alt+W"), HotkeyAction::ActiveWindowCapture)])
         );
     }
 
