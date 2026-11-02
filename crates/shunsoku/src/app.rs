@@ -2239,7 +2239,10 @@ fn capture_rect(monitor: Option<u32>, rect: Rect) {
         }
     };
     // 取得のスレッドは App に触らないので、借りたまま待ってよい
-    let Some(grabbed) = with_app(|app| app.gpu.grab()) else {
+    let Some(grabbed) = with_app(|app| {
+        let cursor = app.settings.general.capture_cursor;
+        app.gpu.grab(cursor)
+    }) else {
         fail_capture(text("job.panicked"));
         return;
     };
@@ -2369,18 +2372,19 @@ fn capture_active_window() {
             app.gpu.primary_device(),
             app.module,
             Appearance::from(app.settings.scrap),
+            app.settings.general.capture_cursor,
         )),
         _ => None,
     })
     .flatten();
-    let Some((request, device, module, appearance)) = taken else {
+    let Some((request, device, module, appearance, cursor)) = taken else {
         return;
     };
     let grabbed = if hwnd.is_invalid() {
         Err("no active window".to_owned())
     } else {
         device.map_err(|e| e.to_string()).and_then(|device| {
-            crate::window_grab::grab_window(&device, hwnd, false).map_err(|e| e.to_string())
+            crate::window_grab::grab_window(&device, hwnd, cursor).map_err(|e| e.to_string())
         })
     };
     let shot = match grabbed {
@@ -2428,7 +2432,10 @@ fn open_overlay() {
     let started = Instant::now();
     // 取得のスレッドは App に触らないので、借りたまま待ってよい
     let grabbed = with_app(|app| {
-        matches!(app.capture, Capture::Waiting(_)).then(|| (app.gpu.grab(), app.module))
+        matches!(app.capture, Capture::Waiting(_)).then(|| {
+            let cursor = app.settings.general.capture_cursor;
+            (app.gpu.grab(cursor), app.module)
+        })
     })
     .flatten();
     let Some((grabbed, module)) = grabbed else {
@@ -2747,9 +2754,10 @@ fn capture_region(request: CaptureRequest) {
     }
     // 取得のスレッドは App に触らないので、借りたまま待ってよい
     let captured = with_app(|app| {
+        let cursor = app.settings.general.capture_cursor;
         let result = app
             .gpu
-            .grab_monitor(monitor_rect)
+            .grab_monitor(monitor_rect, cursor)
             .map_err(|e| e.to_string())
             .and_then(|shot| match shot.read_back(screen) {
                 Ok(Some(fragment)) => Ok(fragment),
