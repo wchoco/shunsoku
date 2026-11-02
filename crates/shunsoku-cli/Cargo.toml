@@ -1,8 +1,24 @@
 [package]
 name = "shunsoku-cli"
-description = "コマンドラインから常駐本体を操作する CLI（M1 では中身がない）"
+description = "コマンドラインから常駐本体にキャプチャを依頼する CLI"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+shunsoku-core = { path = "../shunsoku-core" }
+
+# 名前付きパイプは Windows でだけ組む。`pipe_identity` は常駐本体のファイルを `#[path]` で取り込む。
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]

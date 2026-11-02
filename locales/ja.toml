@@ -7,6 +7,8 @@ tooltip = "shunsoku"
 
 [tray.menu]
 select_capture = "範囲選択キャプチャ"
+regions = "定型領域"
+regions_empty = "（なし）"
 trash = "ごみ箱"
 trash_empty = "（空）"
 close_all = "すべてのスクラップを閉じる"
@@ -84,6 +86,21 @@ panicked = "予期しないエラーが起きました。詳しくはログを�
 
 [capture]
 failed = "画面を撮れませんでした。"
+# ウィンドウを WGC で撮れず（UAC で昇格したウィンドウなど）、見えている部分だけを撮ったとき
+window_partial = "隠れた部分は撮れませんでした。"
+
+# 定型領域キャプチャの失敗。後ろに定型領域の名前を付けて出す
+[region]
+monitor_not_found = "定型領域のモニタが見つからないため、撮れませんでした: "
+out_of_bounds = "定型領域の範囲がモニタからはみ出すため、撮れませんでした: "
+gone = "定型領域が設定からなくなったため、撮れませんでした: "
+# CLI（shunsoku-cli）に返す失敗の理由。標準エラーに出る
+[cli]
+selecting = "範囲選択の画面を開いているため、撮れません。"
+no_such_monitor = "その番号のモニタはありません（番号は shunsoku-cli monitors で調べられます）: "
+no_main_monitor = "メインモニタが見つかりません。"
+out_of_monitor = "範囲がモニタからはみ出しています。"
+unreadable_monitor = "このモニタの画面はそのまま出せません（回転・HDR のモニタなど）。"
 
 [copy]
 failed = "クリップボードにコピーできませんでした。"

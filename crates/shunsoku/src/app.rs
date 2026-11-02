@@ -17,6 +17,11 @@
 //!   ほかに、範囲選択の画面を開いている間だけ、モニタごとのウィンドウ（`overlay`）がある。
 //! - キャプチャは `capture::request` の依頼 1 本の流れで進める: 依頼 → 待機（`delay`）→ 取得（`grab`）→
 //!   範囲選択の画面（`overlay`）→ 切り抜き → 出力 → 結果。同時に進める依頼は 1 件だけ（`Capture`）。
+//! - 定型領域キャプチャ（`CaptureMethod::Region`）は範囲選択の画面を出さず、1 つのメッセージの処理の中で
+//!   撮り終える（`capture_region`）: モニタの一覧（`monitor_ids`）→ core の `monitor::locate` → そのモニタだけ取得
+//!   （`Gpu::grab_monitor`）→ 切り抜き → 出力。依頼は `App::regions_waiting` に届いた順に待たせ、`WM_APP_REGION`
+//!   で 1 件ずつ撮る。範囲選択の画面を開いている間の依頼は無視する。shunsoku のメニューは閉じ、消えきるまで
+//!   待ってから撮る（`run_waiting_regions`）。保存に失敗したら、スクラップに逃がす（`App::save_fallbacks`）。
 //! - 範囲選択の入力（マウス・キー）は core の `selection::Input` にして `Selection::handle` に渡す。
 //!   入力を足すときは `Input` を足し、ここではメッセージから作るだけにする。
 //! - スクラップ（`Scrap`）は `App::scraps` に持つ。ウィンドウは `scrap_window`、中身の描画は `render`。
@@ -45,6 +50,7 @@
 //!   ダブルクリックを core の `ScrapModel::trim_input` に渡し、範囲を描き直す（`on_trim_input`）。
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -52,12 +58,17 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
-use shunsoku_core::capture::request::{self, CaptureRequest, Source};
+use shunsoku_core::capture::request::{
+    self, CaptureMethod, CaptureRequest, OnSaveFailure, ReplyTo, SaveTarget, Source,
+};
 use shunsoku_core::geometry::{Point, Rect};
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
+use shunsoku_core::monitor;
+use shunsoku_core::monitors::{self, LocateError};
 use shunsoku_core::perf::Mark;
+use shunsoku_core::protocol::{ErrorKind, Response};
 use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseBindings, MouseGesture, OpContext,
     OperationDescriptor, OperationId, Shortcuts,
@@ -69,10 +80,12 @@ use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection,
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
 use shunsoku_core::trash::TrashId;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
@@ -81,13 +94,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_ESCAPE, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessagePos, GetMessageW,
-    HWND_MESSAGE, IDI_APPLICATION, KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, RegisterWindowMessageW, SetCursorPos, SetTimer, TranslateMessage,
-    WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EndMenu, EnumThreadWindows,
+    GetClassNameW, GetMessagePos, GetMessageW, HWND_MESSAGE, IDI_APPLICATION, IsWindowVisible,
+    KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SPI_GETSELECTIONFADE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetCursorPos, SetTimer, SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE,
+    WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 // 精密モード（#66）で足したもの
@@ -95,8 +110,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
 use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
 
 use crate::{
-    clipboard, grab, hotkey, logger, menu, notify, overlay, panic_hook, perf, render, save,
-    scrap_window, settings_watch, single_instance, trash_store, tray, window_grab, window_list,
+    clipboard, grab, hotkey, logger, menu, monitor_ids, monitor_list, notify, overlay, panic_hook,
+    perf, pipe_server, render, save, scrap_window, settings_watch, single_instance, trash_store,
+    tray, window_list,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
@@ -110,6 +126,11 @@ const WM_APP_SAVED: u32 = WM_APP + 3;
 const WM_APP_SETTINGS: u32 = WM_APP + 4;
 /// ごみ箱の画素を一時ファイルに書き終えた（結果は `App::trash` の受け口に入っている）。
 const WM_APP_TRASH: u32 = WM_APP + 5;
+/// CLI の依頼がパイプのサーバから届いた（中身は `App::pipe` の受け口に入っている）。依頼を終えたときにも
+/// 自分に送り、待たせている依頼を進める。
+const WM_APP_PIPE: u32 = WM_APP + 6;
+/// 待っている定型領域キャプチャの依頼（`App::regions_waiting`）を進める。
+const WM_APP_REGION: u32 = WM_APP + 7;
 
 /// 2 つのウィンドウのクラス名。2 つ目のプロセスはこの名前でメッセージ専用ウィンドウを探す。
 const CLASS_NAME: PCWSTR = w!("shunsoku.app");
@@ -124,9 +145,20 @@ const CMD_HIDE_ALL: u32 = 4;
 const CMD_SHOW_ALL: u32 = 5;
 /// ごみ箱の一覧の項目の番号は、これに一覧の添字を足したもの。
 const CMD_TRASH_FIRST: u32 = 100;
+/// 「定型領域」の項目の番号は、これに `Settings::regions` の添字を足したもの。
+const CMD_REGION_FIRST: u32 = 1000;
 
 /// 依頼の `delay` を待つタイマーの番号（メッセージ専用ウィンドウの WM_TIMER）。
 const TIMER_CAPTURE_DELAY: usize = 1;
+/// shunsoku のメニューが消えきるのを待って定型領域キャプチャを進め直すタイマーの番号（メッセージ専用
+/// ウィンドウの WM_TIMER）と間隔。
+const TIMER_REGION_RETRY: usize = 2;
+const REGION_RETRY_MS: u32 = 30;
+/// メニューが消えきるのを待つ回数の上限。超えたらそのまま撮る。
+const MAX_REGION_RETRIES: u32 = 30;
+/// メニューの項目をマウスで選んだときのフェード（SPI_GETSELECTIONFADE）を待つ時間。フェードのウィンドウは
+/// 列挙で見つからないことがあるので、メニューから選ばれた依頼は時間で待つ。
+const MENU_FADE_MS: u64 = 400;
 /// 倍率の表示を消すタイマーの番号（スクラップのウィンドウの WM_TIMER）と、出しておく時間。
 const TIMER_ZOOM_LABEL: usize = 1;
 const ZOOM_LABEL_MS: u32 = 1000;
@@ -143,6 +175,9 @@ static SECOND_INSTANCE: OnceLock<u32> = OnceLock::new();
 
 /// 埋め込みの文言（`locales/ja.toml`）。
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
+
+/// CLI の依頼に応答する口（`pipe_server`）。App を借りられないときにも応答できるよう、App の外に置く。
+static REPLIER: OnceLock<pipe_server::Replier> = OnceLock::new();
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -169,14 +204,25 @@ struct App {
     /// スクラップ操作のマウスの対応表（表の既定値に `settings.mouse` を重ねたもの）。
     mouse: MouseBindings,
     capture: Capture,
+    /// 待っている定型領域キャプチャの依頼（届いた順）。`Capture` が `Idle` のときに 1 件ずつ撮る。
+    regions_waiting: VecDeque<CaptureRequest>,
+    /// shunsoku のメニューが消えきるのを待った回数（`run_waiting_regions`）。
+    region_retries: u32,
+    /// これより前には定型領域キャプチャを撮らない（メニューで選んだ項目のフェードを待つ）。
+    region_not_before: Option<Instant>,
     scraps: Vec<Scrap>,
     /// 閉じたスクラップ。drop で一時ファイルを消す。
     trash: trash_store::TrashStore,
     /// 保存の裏のスレッドが結果を入れる口と、UI スレッドが受ける口。
     saves: (mpsc::Sender<Saved>, mpsc::Receiver<Saved>),
+    /// CLI の依頼を受けるパイプのサーバの受け口。始められなかったときは None。
+    pipe: Option<pipe_server::PipeServer>,
     /// 名前を決めて裏のスレッドに渡し、まだ結果（`WM_APP_SAVED`）を受けていない保存先。次の名前を決めるとき、
     /// 使われている名前として数える（`save::destination`）。
     pending_saves: Vec<PathBuf>,
+    /// 書き込み中の保存のうち、失敗したらスクラップを浮かべるもの（定型領域キャプチャの
+    /// `OnSaveFailure::FallbackToScrap`）。結果（`WM_APP_SAVED`）を受けたら外す。
+    save_fallbacks: Vec<(PathBuf, Fallback)>,
     /// スクラップの中身を描く Direct2D の描き手。描き直しのたびに作らないよう使い回す（`paint_scrap`）。
     renderer: Option<render::Renderer>,
     /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
@@ -209,6 +255,16 @@ struct Saved {
     path: PathBuf,
     /// 失敗の理由（裏のスレッドのパニックも失敗にする）。
     result: std::result::Result<(), String>,
+    /// 結果を返す先（CLI の依頼の保存だけ）。
+    reply: Option<ReplyTo>,
+    /// 結果をトレイ通知で知らせる（CLI の `--quiet` なら false）。
+    notify: bool,
+}
+
+/// 保存に失敗したときに浮かべるスクラップの位置（スクリーン座標）と画像。フォーカスは移さない。
+struct Fallback {
+    at: Point,
+    image: Image,
 }
 
 /// 浮かべているスクラップ 1 枚。
@@ -443,7 +499,16 @@ pub fn run() -> i32 {
     );
     #[cfg(debug_assertions)]
     start_test_panic(app.windows.message);
+    let message_window = app.windows.message;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
+    // 依頼が届くのは App を置いてから
+    match pipe_server::start(message_window, WM_APP_PIPE, text("job.panicked").to_owned()) {
+        Ok((server, replier)) => {
+            let _ = REPLIER.set(replier);
+            with_app(|app| app.pipe = Some(server));
+        }
+        Err(e) => log::error!("could not start the pipe server: {e}"),
+    }
     if let Some((level, body)) = notice {
         notify_user(level, &body);
     }
@@ -597,10 +662,15 @@ fn start(
         shortcuts: keymap.shortcuts,
         mouse: keymap.mouse,
         capture: Capture::Idle,
+        regions_waiting: VecDeque::new(),
+        region_retries: 0,
+        region_not_before: None,
         scraps: Vec::new(),
         trash,
         saves: mpsc::channel(),
+        pipe: None,
         pending_saves: Vec::new(),
+        save_fallbacks: Vec::new(),
         renderer: None,
         notice_folder: None,
         gpu: grab::Gpu::default(),
@@ -717,8 +787,24 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             with_app(|app| app.trash.on_written());
             Some(LRESULT(0))
         }
+        WM_APP_PIPE => {
+            on_pipe_requests();
+            Some(LRESULT(0))
+        }
         WM_HOTKEY => {
             on_hotkey(wparam);
+            Some(LRESULT(0))
+        }
+        WM_APP_REGION => {
+            run_waiting_regions();
+            Some(LRESULT(0))
+        }
+        WM_TIMER if wparam.0 == TIMER_REGION_RETRY => {
+            // SAFETY: 自分のタイマーを止める
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_REGION_RETRY);
+            }
+            run_waiting_regions();
             Some(LRESULT(0))
         }
         WM_TIMER if wparam.0 == TIMER_CAPTURE_DELAY => {
@@ -792,6 +878,29 @@ fn on_tray(owner: HWND, event: tray::Event) {
                     false,
                 ));
             }
+            // 定型領域の一覧（設定ファイルの順）。項目の番号は CMD_REGION_FIRST + 添字
+            let region_names: Vec<String> = with_app(|app| {
+                app.settings
+                    .regions
+                    .iter()
+                    .map(|region| region.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+            let mut region_entries: Vec<menu::Entry> = region_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    menu::Entry::item(CMD_REGION_FIRST + i as u32, name.as_str(), true)
+                })
+                .collect();
+            if region_entries.is_empty() {
+                region_entries.push(menu::Entry::item(
+                    CMD_REGION_FIRST,
+                    text("tray.menu.regions_empty"),
+                    false,
+                ));
+            }
             // 1 枚でも隠れていれば「すべて表示」、なければ「すべて隠す」
             let (any_scrap, any_hidden) = with_app(|app| {
                 (
@@ -808,6 +917,11 @@ fn on_tray(owner: HWND, event: tray::Event) {
             let items = [
                 menu::Entry::item(CMD_SELECT_CAPTURE, text("tray.menu.select_capture"), true),
                 menu::Entry::Submenu {
+                    label: text("tray.menu.regions").into(),
+                    enabled: true,
+                    items: region_entries,
+                },
+                menu::Entry::Submenu {
                     label: text("tray.menu.trash").into(),
                     enabled: true,
                     items: trash_entries,
@@ -820,6 +934,10 @@ fn on_tray(owner: HWND, event: tray::Event) {
             let Some(command) = menu::show(owner, &items, x, y) else {
                 return;
             };
+            if let Some(i) = command.checked_sub(CMD_REGION_FIRST) {
+                request_region(i as usize, "tray");
+                return;
+            }
             match command.checked_sub(CMD_TRASH_FIRST) {
                 Some(i) => {
                     if let Some(&(id, _)) = trashed.get(i as usize) {
@@ -1494,7 +1612,7 @@ fn copy_to_clipboard(image: &Image) {
 /// 失敗してもスクラップはそのまま残る。
 fn save_default(image: Image) {
     if let Some(path) = default_destination() {
-        start_save(path, image, save::Overwrite::Deny);
+        start_save(path, image, save::Overwrite::Deny, None, None, true);
     }
 }
 
@@ -1506,7 +1624,7 @@ fn save_as(owner: HWND, image: Image) {
     };
     // モーダルなので App を借りずに呼ぶ
     match save::ask_path(owner, &proposed, text("save.png_filter")) {
-        Ok(Some(path)) => start_save(path, image, save::Overwrite::Allow),
+        Ok(Some(path)) => start_save(path, image, save::Overwrite::Allow, None, None, true),
         Ok(None) => log::info!("save as cancelled"),
         Err(e) => {
             log::error!("could not show the save dialog: {e}");
@@ -1518,43 +1636,87 @@ fn save_as(owner: HWND, image: Image) {
 /// 既定の保存先: 全体設定の保存先に、全体のファイル名テンプレートで付けた重ならない名前。フォルダがなければ作る。
 /// 決められなければ失敗を通知して None を返す。
 fn default_destination() -> Option<PathBuf> {
-    let (save_dir, template, pending) = with_app(|app| {
-        let general = &app.settings.general;
+    let template = with_app(|app| app.settings.general.file_name_template.clone())?;
+    destination_in(None, &template, "")
+}
+
+/// `dir`（None なら全体設定の保存先）に、`template` で付けた重ならない名前。`name` はテンプレートの `{name}`。
+/// フォルダがなければ作る（`write_png`）。決められなければ失敗を通知して None を返す。
+fn destination_in(dir: Option<PathBuf>, template: &str, name: &str) -> Option<PathBuf> {
+    match resolve_destination(dir, template, name) {
+        Ok(path) => Some(path),
+        Err((dir, reason)) => {
+            save_failed(dir.as_deref(), &reason);
+            None
+        }
+    }
+}
+
+/// 既定の保存先を決める。決められなければ、ログに書いて（あれば）フォルダと理由を返す。通知はしない。
+fn resolve_default_destination() -> std::result::Result<PathBuf, (Option<PathBuf>, String)> {
+    let Some(template) = with_app(|app| app.settings.general.file_name_template.clone()) else {
+        return Err((None, text("job.panicked").to_owned()));
+    };
+    resolve_destination(None, &template, "")
+}
+
+/// `dir`（None なら全体設定の保存先）に、`template` で付けた重ならない名前を決める。決められなければ、ログに
+/// 書いて（あれば）フォルダと理由を返す。通知はしない。
+fn resolve_destination(
+    dir: Option<PathBuf>,
+    template: &str,
+    name: &str,
+) -> std::result::Result<PathBuf, (Option<PathBuf>, String)> {
+    let Some((save_dir, pending)) = with_app(|app| {
         (
-            general.save_dir.clone(),
-            general.file_name_template.clone(),
+            dir.or_else(|| app.settings.general.save_dir.clone()),
             app.pending_saves.clone(),
         )
-    })?;
+    }) else {
+        return Err((None, text("job.panicked").to_owned()));
+    };
     let dir = match save_dir {
         Some(dir) => dir,
         None => match save::default_dir() {
             Ok(dir) => dir,
             Err(e) => {
                 log::error!("could not find the Pictures folder: {e}");
-                save_failed(None, &e.to_string());
-                return None;
+                return Err((None, e.to_string()));
             }
         },
     };
-    match save::destination(&dir, &template, save::now(), &pending) {
-        Ok(path) => Some(path),
+    match save::destination(&dir, template, name, save::now(), &pending) {
+        Ok(path) => Ok(path),
         Err(e) => {
             log::error!("could not prepare the save folder {}: {e}", dir.display());
-            save_failed(Some(&dir), &e.to_string());
-            None
+            Err((Some(dir), e.to_string()))
         }
     }
 }
 
-/// `path` に PNG を書く仕事を裏のスレッドで始める。結果は `WM_APP_SAVED` で受ける。
-fn start_save(path: PathBuf, image: Image, overwrite: save::Overwrite) {
+/// `path` に PNG を書く仕事を裏のスレッドで始める。結果は `WM_APP_SAVED` で受ける。失敗したら `fallback` を
+/// スクラップとして浮かべる。`reply` があれば、結果を CLI にも返す。`notify` が false なら結果を通知しない。
+fn start_save(
+    path: PathBuf,
+    image: Image,
+    overwrite: save::Overwrite,
+    fallback: Option<Fallback>,
+    reply: Option<ReplyTo>,
+    notify: bool,
+) {
     let Some((sender, message_window)) = with_app(|app| (app.saves.0.clone(), app.windows.message))
     else {
+        reply_failed(reply, text("job.panicked"));
         return;
     };
     // 書き終えるまでの間に次の保存が同じ名前を選ばないように、結果を受けるまで覚えておく
-    if with_app(|app| app.pending_saves.push(path.clone())).is_none() {
+    let remembered = with_app(|app| {
+        app.pending_saves.push(path.clone());
+        if let Some(fallback) = fallback {
+            app.save_fallbacks.push((path.clone(), fallback));
+        }
+    });
+    if remembered.is_none() {
         log::warn!("could not remember the pending save {}", path.display());
     }
     // HWND は Send でないので、番号にして渡す
@@ -1571,6 +1733,8 @@ fn start_save(path: PathBuf, image: Image, overwrite: save::Overwrite) {
             let _ = sender.send(Saved {
                 path: job_path,
                 result,
+                reply,
+                notify,
             });
             // SAFETY: UI スレッドのメッセージ専用ウィンドウに送るだけ。もう壊れていれば失敗するだけ
             let _ = unsafe {
@@ -1584,14 +1748,25 @@ fn start_save(path: PathBuf, image: Image, overwrite: save::Overwrite) {
         });
     if let Err(e) = spawned {
         log::error!("could not start the save thread: {e}");
-        forget_pending_save(&path);
-        save_failed(Some(&path), &e.to_string());
+        let fallback = forget_pending_save(&path);
+        if notify {
+            save_failed(Some(&path), &e.to_string());
+        }
+        if let Some(fallback) = fallback {
+            float_scrap(fallback.at, fallback.image, false);
+        }
+        reply_failed(reply, &e.to_string());
     }
 }
 
-/// 保存先を、書き込み中の保存先から外す。
-fn forget_pending_save(path: &Path) {
-    with_app(|app| app.pending_saves.retain(|p| p != path));
+/// 保存先を、書き込み中の保存先から外す。失敗したときに浮かべるスクラップがあれば返す。
+fn forget_pending_save(path: &Path) -> Option<Fallback> {
+    with_app(|app| {
+        app.pending_saves.retain(|p| p != path);
+        let i = app.save_fallbacks.iter().position(|(p, _)| p == path)?;
+        Some(app.save_fallbacks.swap_remove(i).1)
+    })
+    .flatten()
 }
 
 /// `WM_APP_SAVED`: 保存の結果を通知する。成功なら、通知のクリックで保存先のフォルダを開けるようにする。
@@ -1600,19 +1775,43 @@ fn on_saved() {
         return;
     };
     for saved in results {
-        forget_pending_save(&saved.path);
+        let fallback = forget_pending_save(&saved.path);
         match saved.result {
             Ok(()) => {
                 log::info!("saved {}", saved.path.display());
                 let body = format!("{}\n{}", text("save.saved"), saved.path.display());
-                if notify_user(notify::Level::Success, &body) {
+                if saved.notify && notify_user(notify::Level::Success, &body) {
                     let folder = saved.path.parent().map(Path::to_path_buf);
                     with_app(|app| app.notice_folder = folder);
+                }
+                if let Some(to) = saved.reply {
+                    // 保存先の設定が相対パスでも、CLI には絶対パスを返す
+                    let path = std::path::absolute(&saved.path).unwrap_or(saved.path);
+                    reply(
+                        to,
+                        Response::Captured {
+                            path: Some(path.display().to_string()),
+                        },
+                    );
                 }
             }
             Err(e) => {
                 log::error!("could not save {}: {e}", saved.path.display());
-                save_failed(Some(&saved.path), &e);
+                if !saved.notify {
+                    // CLI の --quiet: 通知しない
+                } else if saved.reply.is_some() {
+                    // CLI の依頼はスクラップを出さないので、保存の失敗の通知の「スクラップは残っています」は使わない
+                    notify_user(
+                        notify::Level::Error,
+                        &format!("{}\n{e}\n{}", text("capture.failed"), saved.path.display()),
+                    );
+                } else {
+                    save_failed(Some(&saved.path), &e);
+                }
+                reply_failed(saved.reply, &e);
+                if let Some(fallback) = fallback {
+                    float_scrap(fallback.at, fallback.image, false);
+                }
             }
         }
     }
@@ -1968,15 +2167,21 @@ fn open_scrap(
     })
 }
 
-/// 発生源からキャプチャの依頼を受ける。ほかの依頼を進めている間（範囲選択の画面を開いている間など）は無視する。
-///
-/// spec の「残りは順に待たせる」ための待ち行列は M1 では作らない。M1 の依頼は `delay` が 0 で、
-/// 待機と取得と範囲選択の画面を開くまでが 1 つのメッセージの処理の中で終わる（その間に次の依頼は届かない）。
-/// ほかの依頼が届きうるのは範囲選択の画面を開いている間だけで、spec はそのときのホットキーを無視すると決めている
-/// （トレイは画面に覆われて押せない）。待ち行列は、`delay` や CLI の依頼が入る M3 で `Capture` に足す。
+/// 発生源（トレイ・ホットキー）からキャプチャの依頼を受ける。
 fn request_capture(source: Source) {
-    let request = CaptureRequest::from_source(source);
+    log::info!("capture requested from {source:?}");
+    submit(CaptureRequest::from_source(source));
+}
+
+/// キャプチャの依頼を受ける。ほかの依頼を進めている間（範囲選択の画面を開いている間など）は、ホットキー・
+/// トレイの依頼は無視し、CLI の依頼は失敗として返す。
+///
+/// CLI の依頼は `App::pipe` の受け口で順に待たせ、進めている依頼がないときに 1 件ずつ取り出す
+/// （`on_pipe_requests`）。範囲選択の画面を開くまでと `capture rect` は 1 つのメッセージの処理の中で終わるので、
+/// 依頼が重なるのは範囲選択の画面を開いている間と `delay` を待っている間だけ。
+fn submit(request: CaptureRequest) {
     let delay = request.delay;
+    let reply = request.reply;
     let accepted = with_app(|app| {
         if !matches!(app.capture, Capture::Idle) {
             return None;
@@ -1986,10 +2191,10 @@ fn request_capture(source: Source) {
     })
     .flatten();
     let Some(message_window) = accepted else {
-        log::info!("capture requested from {source:?} while another one is in progress; ignored");
+        log::info!("capture requested while another one is in progress; rejected");
+        reply_failed(reply, text("cli.selecting"));
         return;
     };
-    log::info!("capture requested from {source:?}");
     if delay.is_zero() {
         take_capture();
         return;
@@ -2005,7 +2210,7 @@ fn request_capture(source: Source) {
 /// 待っている依頼を、撮り方に合わせて進める。
 fn take_capture() {
     let method = with_app(|app| match &app.capture {
-        Capture::Waiting(request) => Some(request.method),
+        Capture::Waiting(request) => Some(request.method.clone()),
         _ => None,
     })
     .flatten();
@@ -2015,7 +2220,265 @@ fn take_capture() {
         Some(request::CaptureMethod::Window(target)) => {
             capture_window(window_list::hwnd(target.window), target.crop);
         }
+        Some(request::CaptureMethod::Rect { monitor, rect }) => capture_rect(monitor, rect),
+        Some(request::CaptureMethod::Region(_)) => {
+            // 定型領域はふだん `request_region` の待ち行列から撮る。ここに来たら同じ流れで撮る
+            let request = with_app(|app| match std::mem::take(&mut app.capture) {
+                Capture::Waiting(request) => Some(request),
+                other => {
+                    app.capture = other;
+                    None
+                }
+            })
+            .flatten();
+            end_capture();
+            if let Some(request) = request {
+                capture_region(request);
+            }
+        }
         None => {}
+    }
+}
+
+/// `WM_APP_PIPE`: 届いている CLI の依頼を進める。範囲選択の画面を開いている間に届いたものは失敗として返し、
+/// `delay` を待っている間に届いたものは待たせる（終えたら `end_capture` が起こす）。
+fn on_pipe_requests() {
+    loop {
+        let next = with_app(|app| {
+            if matches!(app.capture, Capture::Waiting(_)) {
+                return None;
+            }
+            let selecting = matches!(app.capture, Capture::Selecting { .. });
+            app.pipe
+                .as_ref()?
+                .next()
+                .map(|request| (request, selecting))
+        })
+        .flatten();
+        let Some((request, selecting)) = next else {
+            return;
+        };
+        if selecting {
+            log::info!("CLI request while the overlay is open; rejected");
+            reply_failed(request.reply, text("cli.selecting"));
+        } else {
+            log::info!("capture requested from the CLI: {:?}", request.method);
+            submit(request);
+        }
+    }
+}
+
+/// `capture rect`: 範囲選択の画面を出さずに、決まった範囲を撮って出力する。
+fn capture_rect(monitor: Option<u32>, rect: Rect) {
+    let started = Instant::now();
+    let area = match monitors::locate(&monitor_list::list(), monitor, rect) {
+        Ok(area) => area,
+        Err(e) => {
+            log::warn!("could not locate {rect:?} on monitor {monitor:?}: {e:?}");
+            let reason = match e {
+                LocateError::NoSuchMonitor(n) => format!("{}{n}", text("cli.no_such_monitor")),
+                LocateError::NoMainMonitor => text("cli.no_main_monitor").to_owned(),
+                LocateError::OutOfMonitor => text("cli.out_of_monitor").to_owned(),
+            };
+            fail_capture(&reason);
+            return;
+        }
+    };
+    // 取得のスレッドは App に触らないので、借りたまま待ってよい
+    let Some(grabbed) = with_app(|app| {
+        let cursor = app.settings.general.capture_cursor;
+        app.gpu.grab(cursor)
+    }) else {
+        fail_capture(text("job.panicked"));
+        return;
+    };
+    let shots = match grabbed {
+        Ok(shots) => shots,
+        Err(e) => {
+            log::warn!("could not grab the screen: {e}");
+            let reason = match e {
+                grab::GrabError::Panicked => text("job.panicked").to_owned(),
+                e => e.to_string(),
+            };
+            fail_capture(&reason);
+            return;
+        }
+    };
+    let fragment = shots
+        .iter()
+        .find(|shot| {
+            let r = shot.rect;
+            Rect::new(r.left, r.top, r.right, r.bottom).intersect(&area) == Some(area)
+        })
+        .map(|shot| shot.read_back(area));
+    drop(shots);
+    let image = match fragment {
+        Some(Ok(Some(fragment))) if fragment.image.size() == area.size() => fragment.image,
+        Some(Err(e)) => {
+            log::warn!("could not read back {area:?}: {e}");
+            fail_capture(&e.to_string());
+            return;
+        }
+        _ => {
+            log::warn!("no readable shot covers {area:?}");
+            fail_capture(text("cli.unreadable_monitor"));
+            return;
+        }
+    };
+    let request = with_app(|app| match std::mem::take(&mut app.capture) {
+        Capture::Waiting(request) => Some(request),
+        other => {
+            app.capture = other;
+            None
+        }
+    })
+    .flatten();
+    end_capture();
+    let Some(request) = request else {
+        log::warn!("capture request vanished while capturing a rect");
+        return;
+    };
+    log::info!(
+        "captured {}x{} at ({}, {}) in {:.1} ms",
+        area.width(),
+        area.height(),
+        area.left,
+        area.top,
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    output_rect(request, area, image);
+}
+
+/// `capture rect` で撮った画像を、依頼の出力（コピー → スクラップ → 保存の順）に出して CLI に応答する。
+/// どれかに失敗したら、その先は出さずにキャプチャの失敗として返す。保存に失敗してもスクラップには逃がさない。
+fn output_rect(request: CaptureRequest, area: Rect, image: Image) {
+    let CaptureRequest {
+        outputs,
+        notify,
+        reply: reply_to,
+        ..
+    } = request;
+    let failed = |reason: &str| {
+        if notify {
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{reason}", text("capture.failed")),
+            );
+        }
+        reply_failed(reply_to, reason);
+    };
+    if outputs.copy {
+        let Some(owner) = with_app(|app| app.windows.message) else {
+            failed(text("job.panicked"));
+            return;
+        };
+        if let Err(e) = clipboard::copy(owner, &image) {
+            log::error!("could not copy to the clipboard: {e}");
+            failed(&format!("{}\n{e}", text("copy.failed")));
+            return;
+        }
+        log::info!("copied {}x{} to the clipboard", area.width(), area.height());
+    }
+    if outputs.scrap {
+        let Some((module, appearance)) =
+            with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
+        else {
+            failed(text("job.panicked"));
+            return;
+        };
+        // ウィンドウを作るとメッセージが届くので、App を借りずに作る
+        let model = ScrapModel::new(area.origin(), image.size());
+        match open_scrap(
+            module,
+            model,
+            image.clone(),
+            &appearance,
+            outputs.focus_scrap,
+        ) {
+            Ok(scrap) => {
+                if with_app(|app| app.scraps.push(scrap)).is_none() {
+                    log::warn!("could not keep the scrap");
+                }
+            }
+            Err(e) => {
+                log::error!("could not open a scrap: {e}");
+                failed(&e.to_string());
+                return;
+            }
+        }
+    }
+    let (path, overwrite) = match outputs.save {
+        None => {
+            if let Some(to) = reply_to {
+                reply(to, Response::Captured { path: None });
+            }
+            return;
+        }
+        Some(request::SaveTarget::File(path)) => (path, save::Overwrite::Allow),
+        Some(target) => {
+            let resolved = match target {
+                request::SaveTarget::Region {
+                    dir,
+                    file_name_template,
+                    name,
+                } => resolve_destination(dir, &file_name_template, &name),
+                _ => resolve_default_destination(),
+            };
+            match resolved {
+                Ok(path) => (path, save::Overwrite::Deny),
+                Err((dir, reason)) => {
+                    let mut reason = reason;
+                    if let Some(dir) = dir {
+                        reason.push('\n');
+                        reason.push_str(&dir.display().to_string());
+                    }
+                    failed(&reason);
+                    return;
+                }
+            }
+        }
+    };
+    start_save(path, image, overwrite, None, reply_to, notify);
+}
+
+/// 待っている依頼を失敗で終える。CLI の依頼なら理由を返す。
+fn fail_capture(reason: &str) {
+    let (reply_to, notify) = with_app(|app| match std::mem::take(&mut app.capture) {
+        Capture::Waiting(request) => (request.reply, request.notify),
+        other => {
+            app.capture = other;
+            (None, true)
+        }
+    })
+    .unwrap_or((None, true));
+    end_capture();
+    if notify {
+        notify_user(
+            notify::Level::Error,
+            &format!("{}\n{reason}", text("capture.failed")),
+        );
+    }
+    reply_failed(reply_to, reason);
+}
+
+/// CLI の依頼に応答する。
+fn reply(to: ReplyTo, response: Response) {
+    match REPLIER.get() {
+        Some(replier) => replier.reply(to, response),
+        None => log::warn!("no pipe server to reply to {}", to.0),
+    }
+}
+
+/// CLI の依頼なら、キャプチャの失敗（終了コード 1）として返す。
+fn reply_failed(to: Option<ReplyTo>, message: &str) {
+    if let Some(to) = to {
+        reply(
+            to,
+            Response::Failed {
+                kind: ErrorKind::CaptureFailed,
+                message: message.to_owned(),
+            },
+        );
     }
 }
 
@@ -2037,42 +2500,54 @@ fn capture_window(hwnd: HWND, crop: Option<Rect>) {
             app.gpu.primary_device(),
             app.module,
             Appearance::from(app.settings.scrap),
+            app.settings.general.capture_cursor,
         )),
         _ => None,
     })
     .flatten();
-    let Some((request, device, module, appearance)) = taken else {
+    let Some((request, device, module, appearance, cursor)) = taken else {
         return;
     };
     let grabbed = if hwnd.is_invalid() {
         Err("no active window".to_owned())
     } else {
         device.map_err(|e| e.to_string()).and_then(|device| {
-            window_grab::grab_window(&device, hwnd, false).map_err(|e| e.to_string())
+            crate::window_grab::grab_window(&device, hwnd, cursor).map_err(|e| e.to_string())
         })
     };
-    let shot = match grabbed {
-        Ok(shot) => match crop {
-            // 部品は、撮ったウィンドウの画像から切り抜く（WGC は最上位のウィンドウしか撮れない）
-            Some(crop) => match crop.intersect(&shot.rect) {
-                Some(area) => window_grab::WindowShot {
-                    rect: area,
-                    image: shot
-                        .image
-                        .crop(area.offset(-shot.rect.left, -shot.rect.top)),
-                },
-                None => {
-                    log::warn!("the chosen part is outside its window");
-                    shot
-                }
-            },
-            None => shot,
-        },
+    let (shot, partial) = match grabbed {
+        Ok(shot) => (shot, false),
         Err(e) => {
             log::warn!("could not capture the window: {e}");
-            end_capture();
-            notify_user(notify::Level::Error, text("capture.failed"));
-            return;
+            // UAC で昇格したウィンドウなど、WGC で撮れないときは見えている部分だけを撮る（#64）
+            match (!hwnd.is_invalid())
+                .then(|| grab_visible_part(hwnd, cursor))
+                .flatten()
+            {
+                Some(shot) => (shot, true),
+                None => {
+                    end_capture();
+                    notify_user(notify::Level::Error, text("capture.failed"));
+                    return;
+                }
+            }
+        }
+    };
+    if partial {
+        notify_user(notify::Level::Warning, text("capture.window_partial"));
+    }
+    // 部品は、撮ったウィンドウの画像から切り抜く（WGC は最上位のウィンドウしか撮れない）
+    let shot = match crop.map(|crop| crop.intersect(&shot.rect)) {
+        None => shot,
+        Some(Some(area)) => crate::window_grab::WindowShot {
+            rect: area,
+            image: shot
+                .image
+                .crop(area.offset(-shot.rect.left, -shot.rect.top)),
+        },
+        Some(None) => {
+            log::warn!("the chosen part is outside the captured window");
+            shot
         }
     };
     log::info!(
@@ -2106,12 +2581,35 @@ fn capture_window(hwnd: HWND, crop: Option<Rect>) {
     }
 }
 
+/// WGC で撮れなかったウィンドウの、モニタに写っている部分を Desktop Duplication で撮る。撮れなければ None。
+fn grab_visible_part(hwnd: HWND, cursor: bool) -> Option<crate::window_grab::WindowShot> {
+    // 取得のスレッドは App に触らないので、借りたまま待ってよい
+    let grabbed = with_app(|app| crate::window_grab::grab_visible(&mut app.gpu, hwnd, cursor))?;
+    let shot = match grabbed {
+        Ok(Some(shot)) => Some(shot),
+        Ok(None) => {
+            log::warn!("the active window is on no monitor");
+            None
+        }
+        Err(e) => {
+            log::warn!("could not grab the screen for the active window: {e}");
+            None
+        }
+    };
+    // 範囲選択の画面と同じく、取得で使った一時的なメモリを返す
+    with_app(|app| app.gpu.trim());
+    shot
+}
+
 /// 待っている依頼の画面を取得して、範囲選択の画面を出す。
 fn open_overlay() {
     let started = Instant::now();
     // 取得のスレッドは App に触らないので、借りたまま待ってよい
     let grabbed = with_app(|app| {
-        matches!(app.capture, Capture::Waiting(_)).then(|| (app.gpu.grab(), app.module))
+        matches!(app.capture, Capture::Waiting(_)).then(|| {
+            let cursor = app.settings.general.capture_cursor;
+            (app.gpu.grab(cursor), app.module)
+        })
     })
     .flatten();
     let Some((grabbed, module)) = grabbed else {
@@ -2212,25 +2710,326 @@ fn close_overlay() {
     log::info!("overlay closed");
 }
 
-/// 依頼を終えて、取得に使った GPU のメモリを返す。
+/// 依頼を終えて、取得に使った GPU のメモリを返す。待たせている CLI の依頼・定型領域キャプチャがあれば進める。
 fn end_capture() {
-    with_app(|app| {
+    let (message_window, regions_waiting) = with_app(|app| {
         app.capture = Capture::Idle;
         app.gpu.trim();
-    });
+        (app.windows.message, !app.regions_waiting.is_empty())
+    })
+    .unzip();
+    if let Some(window) = message_window {
+        // SAFETY: 自分のウィンドウに送るだけ
+        let _ = unsafe { PostMessageW(Some(window), WM_APP_PIPE, WPARAM(0), LPARAM(0)) };
+        // 待っている定型領域キャプチャは、この処理を抜けてから進める
+        if regions_waiting == Some(true) {
+            post_region_message(window);
+        }
+    }
 }
 
-/// `WM_HOTKEY`。範囲選択の画面を開いている間に押されたものは `request_capture` が無視する。
+/// `WM_HOTKEY`。範囲選択の画面を開いている間に押されたものは `request_capture`・`request_region` が無視する。
 fn on_hotkey(wparam: WPARAM) {
     perf::mark(Mark::HotkeyReceived);
     let action = with_app(|app| app.hotkeys.action(wparam)).flatten();
     match action {
         Some(settings::HotkeyAction::SelectCapture) => request_capture(Source::Hotkey),
         Some(settings::HotkeyAction::RestoreLast) => restore_last_scrap(),
+        Some(settings::HotkeyAction::Region(i)) => request_region(i, "hotkey"),
         Some(settings::HotkeyAction::ActiveWindowCapture) => {
             request_capture(Source::ActiveWindowHotkey)
         }
         None => log::warn!("unknown hotkey id {}", wparam.0),
+    }
+}
+
+/// 定型領域キャプチャの依頼を受ける（`index` は `Settings::regions` の添字）。範囲選択の画面を開いている間は
+/// 無視する。ほかの依頼を進めている間や、続けて押されたときは、届いた順に待たせて 1 件ずつ撮る。
+///
+/// shunsoku のメニュー（トレイ・スクラップの右クリック）が出ていれば閉じ、消えきってから撮る（`run_waiting_regions`）。
+fn request_region(index: usize, from: &str) {
+    let from_menu = from == "tray";
+    let queued = with_app(|app| {
+        if matches!(app.capture, Capture::Selecting { .. }) {
+            return Err("the overlay is open");
+        }
+        let region = app
+            .settings
+            .regions
+            .get(index)
+            .ok_or("the region is no longer in the settings")?;
+        app.regions_waiting
+            .push_back(CaptureRequest::region(region));
+        if from_menu && selection_fades() {
+            app.region_not_before =
+                Some(Instant::now() + std::time::Duration::from_millis(MENU_FADE_MS));
+        }
+        Ok(app.windows.message)
+    });
+    match queued {
+        Some(Ok(message_window)) => {
+            log::info!("region capture {} requested from {from}", index + 1);
+            // SAFETY: このスレッドのメニューを閉じるだけ（出ていなければ何もしない）
+            unsafe {
+                let _ = EndMenu();
+            }
+            post_region_message(message_window);
+        }
+        Some(Err(reason)) => {
+            log::info!(
+                "region capture {} requested from {from}: {reason}; ignored",
+                index + 1
+            )
+        }
+        None => log::warn!(
+            "region capture {} requested from {from} while busy; ignored",
+            index + 1
+        ),
+    }
+}
+
+/// 待っている定型領域キャプチャを、いまの処理を抜けてから進めるよう `WM_APP_REGION` を送る。
+fn post_region_message(message_window: HWND) {
+    // SAFETY: 自分のメッセージ専用ウィンドウに送るだけ
+    if let Err(e) =
+        unsafe { PostMessageW(Some(message_window), WM_APP_REGION, WPARAM(0), LPARAM(0)) }
+    {
+        log::error!("could not post the region capture message: {e}");
+    }
+}
+
+/// `WM_APP_REGION`: 待っている定型領域キャプチャを、届いた順に撮る。ほかの依頼を進めている間は待たせたまま
+/// にする（`end_capture` が送り直す）。shunsoku のメニューがまだ見えていれば（閉じる途中のフェードも）、
+/// 写り込まないよう少し待って撮り直す。
+fn run_waiting_regions() {
+    loop {
+        let next = with_app(|app| {
+            if !matches!(app.capture, Capture::Idle) || app.regions_waiting.is_empty() {
+                return Ok(None);
+            }
+            if app
+                .region_not_before
+                .is_some_and(|not_before| Instant::now() < not_before)
+            {
+                return Err(app.windows.message);
+            }
+            app.region_not_before = None;
+            if app.region_retries < MAX_REGION_RETRIES && menus_visible() {
+                app.region_retries += 1;
+                return Err(app.windows.message);
+            }
+            app.region_retries = 0;
+            Ok(app.regions_waiting.pop_front())
+        });
+        match next {
+            Some(Ok(Some(request))) => capture_region(request),
+            Some(Err(message_window)) => {
+                // SAFETY: 自分のウィンドウのタイマー
+                if unsafe {
+                    SetTimer(
+                        Some(message_window),
+                        TIMER_REGION_RETRY,
+                        REGION_RETRY_MS,
+                        None,
+                    )
+                } == 0
+                {
+                    log::warn!("could not start the region retry timer; capturing now");
+                    with_app(|app| app.region_retries = MAX_REGION_RETRIES);
+                    continue;
+                }
+                return;
+            }
+            _ => return,
+        }
+    }
+}
+
+/// メニューで選んだ項目を消える前にフェードさせる設定（SPI_GETSELECTIONFADE）が有効か。
+fn selection_fades() -> bool {
+    let mut fades = windows::core::BOOL(0);
+    // SAFETY: BOOL を 1 つ受け取るだけ
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETSELECTIONFADE,
+            0,
+            Some(&mut fades as *mut windows::core::BOOL as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    read.is_ok() && fades.as_bool()
+}
+
+/// このスレッドのメニュー（`#32768`）か、その影・閉じるときのフェードのウィンドウが見えているか。
+fn menus_visible() -> bool {
+    unsafe extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+        let mut class = [0u16; 32];
+        // SAFETY: バッファの長さを渡して読む
+        let len = unsafe { GetClassNameW(hwnd, &mut class) };
+        let class = String::from_utf16_lossy(&class[..usize::try_from(len).unwrap_or(0)]);
+        // SAFETY: ウィンドウの状態を読むだけ
+        let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+        if visible && matches!(class.as_str(), "#32768" | "SysShadow" | "SysFader") {
+            // SAFETY: found は menus_visible の bool
+            unsafe { *(found.0 as *mut bool) = true };
+            return false.into();
+        }
+        true.into()
+    }
+    let mut found = false;
+    // SAFETY: コールバックは列挙の間だけ found を借りる
+    unsafe {
+        let _ = EnumThreadWindows(
+            GetCurrentThreadId(),
+            Some(visit),
+            LPARAM(&mut found as *mut bool as isize),
+        );
+    }
+    found
+}
+
+/// 定型領域キャプチャを 1 件撮り、依頼の出力（保存・スクラップ）を出す。撮れなければ失敗を通知する。
+fn capture_region(request: CaptureRequest) {
+    let CaptureMethod::Region(id) = &request.method else {
+        return;
+    };
+    let name = id.0.as_str();
+    let region = with_app(|app| {
+        app.settings
+            .regions
+            .iter()
+            .find(|region| region.name == name)
+            .cloned()
+    })
+    .flatten();
+    let Some(region) = region else {
+        log::warn!("region {name} is no longer in the settings");
+        notify_user(
+            notify::Level::Error,
+            &format!("{}{name}", text("region.gone")),
+        );
+        return;
+    };
+    let monitors = monitor_ids::list();
+    let located = match monitor::locate(&monitors, &region.monitor, region.rect) {
+        Ok(located) => located,
+        Err(e) => {
+            log::warn!(
+                "could not capture region {name} (monitor {}): {e:?}; monitors: {:?}",
+                region.monitor,
+                monitors.iter().map(|m| &m.id).collect::<Vec<_>>()
+            );
+            let key = match e {
+                monitor::LocateError::MonitorNotFound => "region.monitor_not_found",
+                monitor::LocateError::OutOfBounds => "region.out_of_bounds",
+            };
+            notify_user(notify::Level::Error, &format!("{}{name}", text(key)));
+            return;
+        }
+    };
+    let monitor_rect = monitors[located.index].rect;
+    let screen = located.screen;
+    // 直前に閉じたウィンドウ（メニューなど）が消えた画面を撮るよう、合成を 1 回待つ
+    // SAFETY: 引数なしの呼び出し
+    unsafe {
+        let _ = DwmFlush();
+    }
+    // 取得のスレッドは App に触らないので、借りたまま待ってよい
+    let captured = with_app(|app| {
+        let cursor = app.settings.general.capture_cursor;
+        let result = app
+            .gpu
+            .grab_monitor(monitor_rect, cursor)
+            .map_err(|e| e.to_string())
+            .and_then(|shot| match shot.read_back(screen) {
+                Ok(Some(fragment)) => Ok(fragment),
+                Ok(None) => Err("the monitor cannot be captured (rotated or HDR)".to_owned()),
+                Err(e) => Err(e.to_string()),
+            });
+        app.gpu.trim();
+        result
+    });
+    let fragment = match captured {
+        Some(Ok(fragment)) => fragment,
+        Some(Err(e)) => {
+            log::error!("could not capture region {name}: {e}");
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{name}\n{e}", text("capture.failed")),
+            );
+            return;
+        }
+        None => return,
+    };
+    let (at, image) = (fragment.at, fragment.image);
+    log::info!(
+        "captured region {name}: {}x{} at ({}, {})",
+        image.width(),
+        image.height(),
+        at.x,
+        at.y
+    );
+
+    let outputs = &request.outputs;
+    if outputs.copy {
+        copy_to_clipboard(&image);
+    }
+    // スクラップを出すときは、保存に失敗してもスクラップが残るので、逃がすスクラップは要らない
+    let fallback = request.on_save_failure == OnSaveFailure::FallbackToScrap && !outputs.scrap;
+    if let Some(target) = &outputs.save {
+        match save_destination(target) {
+            Some(path) => {
+                let fallback = fallback.then(|| Fallback {
+                    at,
+                    image: image.clone(),
+                });
+                start_save(
+                    path,
+                    image.clone(),
+                    save::Overwrite::Deny,
+                    fallback,
+                    request.reply,
+                    request.notify,
+                );
+            }
+            None if fallback => float_scrap(at, image.clone(), false),
+            None => {}
+        }
+    }
+    if outputs.scrap {
+        float_scrap(at, image, outputs.focus_scrap);
+    }
+}
+
+/// 保存先: `target` の保存先に、`target` のファイル名テンプレートで付けた重ならない名前。
+fn save_destination(target: &SaveTarget) -> Option<PathBuf> {
+    match target {
+        SaveTarget::Default => default_destination(),
+        SaveTarget::File(path) => Some(path.clone()),
+        SaveTarget::Region {
+            dir,
+            file_name_template,
+            name,
+        } => destination_in(dir.clone(), file_name_template, name),
+    }
+}
+
+/// 画像をスクラップとして `at`（スクリーン座標）に等倍で浮かべ、`App::scraps` に入れる。
+fn float_scrap(at: Point, image: Image, focus: bool) {
+    let Some((module, appearance)) =
+        with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
+    else {
+        return;
+    };
+    // ウィンドウを作るとメッセージが届くので、App を借りずに作る
+    let model = ScrapModel::new(at, image.size());
+    match open_scrap(module, model, image, &appearance, focus) {
+        Ok(scrap) => {
+            if with_app(|app| app.scraps.push(scrap)).is_none() {
+                log::warn!("could not keep the scrap");
+            }
+        }
+        Err(e) => log::error!("could not open a scrap: {e}"),
     }
 }
 
