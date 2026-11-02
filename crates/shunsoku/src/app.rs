@@ -1809,7 +1809,9 @@ fn on_saved() {
                 } else {
                     save_failed(Some(&saved.path), &e);
                 }
-                reply_failed(saved.reply, &e);
+                // CLI にはどこに書けなかったかも返す（--out の誤りに気づけるように）
+                let path = std::path::absolute(&saved.path).unwrap_or(saved.path);
+                reply_failed(saved.reply, &format!("{}: {e}", path.display()));
                 if let Some(fallback) = fallback {
                     float_scrap(fallback.at, fallback.image, false);
                 }
