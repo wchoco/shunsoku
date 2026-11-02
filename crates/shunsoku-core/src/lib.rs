@@ -1,6 +1,7 @@
 //! shunsoku のロジック層。`windows` クレートに依存せず、Windows API なしでテストできる（ADR-0005）。
 
 pub mod capture;
+pub mod cursor;
 pub mod geometry;
 pub mod i18n;
 pub mod image;
