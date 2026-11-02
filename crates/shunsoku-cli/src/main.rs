@@ -108,8 +108,7 @@ mod pipe_identity;
 
 #[cfg(windows)]
 mod pipe {
-    use std::os::windows::process::CommandExt;
-    use std::process::Stdio;
+    use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
     use shunsoku_core::protocol::{self, MAX_MESSAGE};
@@ -125,8 +124,12 @@ mod pipe {
         GetNamedPipeServerProcessId, GetNamedPipeServerSessionId, PIPE_READMODE_MESSAGE,
         SetNamedPipeHandleState, WaitNamedPipeW,
     };
+    use windows::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, PROCESS_CREATION_FLAGS,
+        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    };
     use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
-    use windows::core::HSTRING;
+    use windows::core::{HSTRING, PWSTR};
 
     use super::{Failure, pipe_identity};
 
@@ -138,7 +141,8 @@ mod pipe {
     const RESIDENT_EXE: &str = "shunsoku.exe";
     /// 常駐本体をこのコンソールから切り離す（`DETACHED_PROCESS`）。Ctrl+C を受けないよう別のグループにする
     /// （`CREATE_NEW_PROCESS_GROUP`）。
-    const DETACH: u32 = 0x0000_0008 | 0x0000_0200;
+    const DETACH: PROCESS_CREATION_FLAGS =
+        PROCESS_CREATION_FLAGS(DETACHED_PROCESS.0 | CREATE_NEW_PROCESS_GROUP.0);
 
     struct Pipe(HANDLE);
 
@@ -261,24 +265,55 @@ mod pipe {
     }
 
     /// この exe と同じフォルダの常駐本体を起動する。待たずに返る。
+    ///
+    /// `std::process::Command` は `bInheritHandles = TRUE` で起動するため、CLI が受け継いだ
+    /// 継承可能なハンドル（`$(...)` で捕まえる標準出力のパイプなど）が常駐本体にも渡り、
+    /// 呼び出し元が常駐本体の終了まで EOF を受け取れずハングする。`CreateProcessW` を
+    /// `bInheritHandles = FALSE` で直接呼び、標準入出力も持たせない。
     fn launch() -> Result<(), Failure> {
         let exe = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join(RESIDENT_EXE)))
             .ok_or_else(|| Failure::unavailable("常駐本体の場所が分かりません"))?;
-        std::process::Command::new(&exe)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(DETACH)
-            .spawn()
-            .map(drop)
-            .map_err(|e| {
-                Failure::unavailable(format!(
-                    "常駐本体（{}）を起動できません: {e}",
-                    exe.display()
-                ))
-            })
+        let failed = |e: windows::core::Error| {
+            Failure::unavailable(format!(
+                "常駐本体（{}）を起動できません: {e}",
+                exe.display()
+            ))
+        };
+        let application = HSTRING::from(exe.as_os_str());
+        // lpCommandLine は書き換えられうるので自前の可変バッファで渡す。
+        let mut command_line: Vec<u16> = "\""
+            .encode_utf16()
+            .chain(exe.as_os_str().encode_wide())
+            .chain("\"\0".encode_utf16())
+            .collect();
+        // 標準入出力は空のハンドル（NULL）にする。継承しないので子は何も受け取らない。
+        let startup = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            dwFlags: STARTF_USESTDHANDLES,
+            ..Default::default()
+        };
+        let mut info = PROCESS_INFORMATION::default();
+        // SAFETY: 文字列とバッファは呼び出しの間生きている。成功時に返る 2 つのハンドルはすぐ閉じる。
+        unsafe {
+            CreateProcessW(
+                &application,
+                Some(PWSTR(command_line.as_mut_ptr())),
+                None,
+                None,
+                false,
+                DETACH,
+                None,
+                None,
+                &startup,
+                &mut info,
+            )
+            .map_err(failed)?;
+            let _ = CloseHandle(info.hThread);
+            let _ = CloseHandle(info.hProcess);
+        }
+        Ok(())
     }
 }
 
