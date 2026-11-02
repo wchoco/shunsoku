@@ -214,6 +214,7 @@ pub fn encode_response(response: &Response) -> String {
             w.field("status", "monitors");
             for m in monitors {
                 w.field("monitor", &m.name);
+                w.field("id", &m.id);
                 w.field("rect", &rect_value(&m.rect));
                 w.field("dpi", &m.dpi.to_string());
                 w.field("primary", flag(m.primary));
@@ -239,10 +240,12 @@ pub fn decode_response(text: &str) -> Result<Response, DecodeError> {
             let mut monitors = Vec::new();
             while let Some(name) = r.take_optional("monitor") {
                 let name = name.to_owned();
+                let id = r.take("id")?.to_owned();
                 let rect = parse_rect(r.take("rect")?)?;
                 let dpi = parse_number(r.take("dpi")?)?;
                 let primary = parse_flag(r.take("primary")?)?;
                 monitors.push(Monitor {
+                    id,
                     name,
                     rect,
                     dpi,
@@ -473,12 +476,14 @@ mod tests {
             Response::Captured { path: None },
             Response::Monitors(vec![
                 Monitor {
+                    id: r"\\?\DISPLAY#GSM1#4&1&UID1#{e6f07b5f}".to_owned(),
                     name: r"\\.\DISPLAY1".to_owned(),
                     rect: Rect::new(-1920, 0, 0, 1080),
                     dpi: 120,
                     primary: false,
                 },
                 Monitor {
+                    id: r"\\.\DISPLAY2".to_owned(),
                     name: "DELL U2720Q".to_owned(),
                     rect: Rect::new(0, 0, 3840, 2160),
                     dpi: 144,

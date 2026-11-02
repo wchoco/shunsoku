@@ -18,8 +18,6 @@ mod logger;
 #[cfg(windows)]
 mod menu;
 #[cfg(windows)]
-mod monitor_ids;
-#[cfg(windows)]
 mod monitor_list;
 #[cfg(windows)]
 mod notify;

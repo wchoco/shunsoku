@@ -40,7 +40,7 @@ pub enum CaptureMethod {
     Rect {
         /// `monitors` の番号（1 から）。None ならメインモニタ。
         monitor: Option<u32>,
-        /// モニタ相対の物理ピクセル。モニタからはみ出すかは撮るときに `monitors::locate` で調べる。
+        /// モニタ相対の物理ピクセル。モニタからはみ出すかは撮るときに `monitors::locate_numbered` で調べる。
         rect: Rect,
     },
     /// 定型領域キャプチャ。撮るときに、その名前の定型領域を設定から引く。

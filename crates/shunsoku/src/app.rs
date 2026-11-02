@@ -18,7 +18,7 @@
 //! - キャプチャは `capture::request` の依頼 1 本の流れで進める: 依頼 → 待機（`delay`）→ 取得（`grab`）→
 //!   範囲選択の画面（`overlay`）→ 切り抜き → 出力 → 結果。同時に進める依頼は 1 件だけ（`Capture`）。
 //! - 定型領域キャプチャ（`CaptureMethod::Region`）は範囲選択の画面を出さず、1 つのメッセージの処理の中で
-//!   撮り終える（`capture_region`）: モニタの一覧（`monitor_ids`）→ core の `monitor::locate` → そのモニタだけ取得
+//!   撮り終える（`capture_region`）: モニタの一覧（`monitor_list`）→ core の `monitors::locate_by_id` → そのモニタだけ取得
 //!   （`Gpu::grab_monitor`）→ 切り抜き → 出力。依頼は `App::regions_waiting` に届いた順に待たせ、`WM_APP_REGION`
 //!   で 1 件ずつ撮る。範囲選択の画面を開いている間の依頼は無視する。shunsoku のメニューは閉じ、消えきるまで
 //!   待ってから撮る（`run_waiting_regions`）。保存に失敗したら、スクラップに逃がす（`App::save_fallbacks`）。
@@ -65,7 +65,6 @@ use shunsoku_core::geometry::{Point, Rect};
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
-use shunsoku_core::monitor;
 use shunsoku_core::monitors::{self, LocateError};
 use shunsoku_core::perf::Mark;
 use shunsoku_core::protocol::{ErrorKind, Response};
@@ -110,9 +109,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
 use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
 
 use crate::{
-    clipboard, grab, hotkey, logger, menu, monitor_ids, monitor_list, notify, overlay, panic_hook,
-    perf, pipe_server, render, save, scrap_window, settings_watch, single_instance, trash_store,
-    tray, window_list,
+    clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook, perf,
+    pipe_server, render, save, scrap_window, settings_watch, single_instance, trash_store, tray,
+    window_list,
 };
 
 /// トレイのアイコンへの操作（`tray::event` で読む）。
@@ -2294,14 +2293,16 @@ fn on_pipe_requests() {
 /// `capture rect`: 範囲選択の画面を出さずに、決まった範囲を撮って出力する。
 fn capture_rect(monitor: Option<u32>, rect: Rect) {
     let started = Instant::now();
-    let area = match monitors::locate(&monitor_list::list(), monitor, rect) {
+    let area = match monitors::locate_numbered(&monitor_list::list(), monitor, rect) {
         Ok(area) => area,
         Err(e) => {
             log::warn!("could not locate {rect:?} on monitor {monitor:?}: {e:?}");
             let reason = match e {
                 LocateError::NoSuchMonitor(n) => format!("{}{n}", text("cli.no_such_monitor")),
-                LocateError::NoMainMonitor => text("cli.no_main_monitor").to_owned(),
-                LocateError::OutOfMonitor => text("cli.out_of_monitor").to_owned(),
+                LocateError::NoMainMonitor | LocateError::MonitorNotFound => {
+                    text("cli.no_main_monitor").to_owned()
+                }
+                LocateError::OutOfBounds => text("cli.out_of_monitor").to_owned(),
             };
             fail_capture(&reason);
             return;
@@ -2977,8 +2978,8 @@ fn capture_region(request: CaptureRequest) {
     };
     // CLI の依頼は、領域の保存先とファイル名テンプレートで保存する（領域の撮影後の動作は見ない）
     let request = request.clone().with_region_destination(&region);
-    let monitors = monitor_ids::list();
-    let located = match monitor::locate(&monitors, &region.monitor, region.rect) {
+    let monitors = monitor_list::list();
+    let located = match monitors::locate_by_id(&monitors, &region.monitor, region.rect) {
         Ok(located) => located,
         Err(e) => {
             log::warn!(
@@ -2987,8 +2988,10 @@ fn capture_region(request: CaptureRequest) {
                 monitors.iter().map(|m| &m.id).collect::<Vec<_>>()
             );
             let key = match e {
-                monitor::LocateError::MonitorNotFound => "region.monitor_not_found",
-                monitor::LocateError::OutOfBounds => "region.out_of_bounds",
+                LocateError::OutOfBounds => "region.out_of_bounds",
+                LocateError::MonitorNotFound
+                | LocateError::NoSuchMonitor(_)
+                | LocateError::NoMainMonitor => "region.monitor_not_found",
             };
             let message = format!("{}{name}", text(key));
             if request.notify {
@@ -3086,7 +3089,7 @@ fn capture_region(request: CaptureRequest) {
 /// 名前は重ならない「領域 N」、モニタは範囲の左上を含むモニタ。足せたら、トレイの「定型領域」サブメニュー
 /// （開くたびに `App::settings` から作る）に出て、すぐに撮れる。結果は通知で知らせる。
 fn register_region(rect: Rect) {
-    let monitors = monitor_ids::list();
+    let monitors = monitor_list::list();
     let Some(monitor) = monitors.iter().find(|m| m.rect.contains(rect.origin())) else {
         log::warn!("no monitor contains the region to register at {rect:?}");
         notify_user(notify::Level::Error, text("region.register_failed"));

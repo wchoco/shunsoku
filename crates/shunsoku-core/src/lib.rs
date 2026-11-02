@@ -9,7 +9,6 @@ pub mod image;
 pub mod keys;
 pub mod log_file;
 pub mod magnifier;
-pub mod monitor;
 pub mod monitors;
 pub mod perf;
 pub mod protocol;

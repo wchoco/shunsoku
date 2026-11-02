@@ -48,7 +48,7 @@
 //! [[regions]]                                  # 定型領域。並び順がトレイのサブメニューの順
 //! name = "領域 1"                               # 必須。空と重複は不可（重複した後ろのものを捨てる）
 //! hotkey = "Ctrl+Alt+1"                        # 既定は空
-//! monitor = '\\?\DISPLAY#…'                    # 必須。monitor::MonitorInfo::id
+//! monitor = '\\?\DISPLAY#…'                    # 必須。monitors::Monitor::id
 //! x = 0                                        # 必須。モニタ相対の物理ピクセル。x / y >= 0、
 //! y = 0                                        #   width / height >= 1
 //! width = 800
@@ -114,7 +114,7 @@ pub struct Region {
     /// 名前。空でなく、ほかの定型領域と重ならない。
     pub name: String,
     pub hotkey: Option<Chord>,
-    /// モニタの識別子（`monitor::MonitorInfo::id`）。
+    /// モニタの識別子（`monitors::Monitor::id`）。
     pub monitor: String,
     /// 範囲。モニタの左上を原点にした物理ピクセル。
     pub rect: Rect,
