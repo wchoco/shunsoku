@@ -29,6 +29,18 @@ scripts/win-build.sh [worktree-dir=.]   # env: PKG（既定 shunsoku）、PROFIL
 - `cargo.exe` は WSL の PATH にない。スクリプトの外で使うなら `%USERPROFILE%\.cargo\bin` を足す。
 - zsh では `time` が予約語で、`VAR=x time cmd` は構文エラーになる。先に `export` する。
 
+## 4. 描画を見て確かめる
+
+描画（スクラップ、範囲選択の画面、メニュー）を変えたら、3. の exe を動かして画面を撮り、Read で画像を見る。テストは見た目の違い（灰色の正方形、太さの違う枠）を捕まえない。
+
+```sh
+scripts/win-screenshot.sh <out.png> [x y width height]   # 範囲は仮想スクリーンの物理ピクセル
+```
+
+- 範囲を省くと全モニタ（この環境では 7680×3240）を撮る。Read に渡すなら、見たいところだけを範囲で撮る。
+- 出力は scratchpad に置く。リポジトリには入れない。
+- スクラップを出す・ドラッグするなどの操作は `SendInput` で送る。手本は `tools/perf-harness/src/measure.rs` の `drag` と `send_hotkey`。
+
 ## Win32 の落とし穴
 
 実装で踏んだもの。該当する API を触るときに読む。
