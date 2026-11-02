@@ -16,6 +16,8 @@ mod logger;
 #[cfg(windows)]
 mod menu;
 #[cfg(windows)]
+mod monitors;
+#[cfg(windows)]
 mod notify;
 #[cfg(windows)]
 mod overlay;

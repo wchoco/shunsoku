@@ -1,4 +1,4 @@
-//! 取得: Desktop Duplication で全モニタの画面を並列に取り、GPU 上の自前のテクスチャに写す（ADR-0002）。
+//! 取得: Desktop Duplication で全モニタ（定型領域キャプチャでは 1 モニタ）の画面を並列に取り、GPU 上の自前のテクスチャに写す（ADR-0002）。
 //!
 //! - モニタ（DXGI の出力）はアダプタに属する。D3D11 のデバイスはアダプタごとに 1 つ作り、`Gpu` に
 //!   持ち続ける（作り直すと範囲選択の画面が出るまでが遅くなるため）。閉じたあとは `Gpu::trim` で返す。
@@ -184,6 +184,22 @@ unsafe impl Send for Raw {}
 impl Gpu {
     /// 全モニタの画面を並列に取得する。
     pub fn grab(&mut self) -> std::result::Result<Vec<Shot>, GrabError> {
+        self.grab_outputs(|_| true)
+    }
+
+    /// `monitor`（スクリーン座標でのモニタの位置と大きさ）のモニタだけを取得する（定型領域キャプチャ）。
+    /// そのモニタが DXGI の出力に見つからなければ `GrabError::NoOutputs`。
+    pub fn grab_monitor(&mut self, monitor: Rect) -> std::result::Result<Shot, GrabError> {
+        let mut shots =
+            self.grab_outputs(|r| Rect::new(r.left, r.top, r.right, r.bottom) == monitor)?;
+        shots.pop().ok_or(GrabError::NoOutputs)
+    }
+
+    /// `wanted`（出力のスクリーン座標での位置と大きさ）が真の出力の画面を並列に取得する。
+    fn grab_outputs(
+        &mut self,
+        wanted: impl Fn(&RECT) -> bool,
+    ) -> std::result::Result<Vec<Shot>, GrabError> {
         // 抜き差しや配置の変更を拾うため、ファクトリは毎回作り直す（ファクトリは作った時点の一覧を持つ）
         // SAFETY: 引数なしの生成
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
@@ -192,7 +208,8 @@ impl Gpu {
         // SAFETY: 列挙は Err（DXGI_ERROR_NOT_FOUND）で終わる
         while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
             index += 1;
-            let outputs = attached_outputs(&adapter)?;
+            let mut outputs = attached_outputs(&adapter)?;
+            outputs.retain(|(_, rect, _)| wanted(rect));
             if outputs.is_empty() {
                 continue;
             }
