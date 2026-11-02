@@ -19,6 +19,9 @@ use crate::geometry::{Point, Rect, Size};
 use crate::image::Image;
 use crate::settings::{DpiScaling, ScrapAppearance};
 
+/// 書き込みの当たり判定の、線の外の広さ（画面の物理ピクセル）。
+const HIT_SLOP: u32 = 4;
+
 /// スクラップの表示のモード。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -536,14 +539,32 @@ impl ScrapModel {
     /// `Mode::Normal` に戻す。編集モードでなければ何もせず、空を返す。
     pub fn edit_input(&mut self, input: EditInput) -> Vec<EditOutput> {
         let input = input.map_point(|at| self.image_pixel_at(at));
+        let slop = self.hit_slop();
         let Mode::Editing(state) = &mut self.mode else {
             return vec![];
         };
+        state.set_hit_slop(slop);
         let outputs = state.input(input, &mut self.annotations);
         if outputs.contains(&EditOutput::Left) {
             self.mode = Mode::Normal;
         }
         outputs
+    }
+
+    /// 書き込みの当たり判定を、線の太さの外にどれだけ広げるか（元の画像の画素）。画面で `HIT_SLOP` の物理
+    /// ピクセルになるようにする（縮小していれば広く、拡大していれば狭い）。
+    fn hit_slop(&self) -> u32 {
+        let scale = self.annotation_view().scale_x;
+        if scale <= 0.0 {
+            return HIT_SLOP;
+        }
+        (f64::from(HIT_SLOP) / scale).ceil() as u32
+    }
+
+    /// 編集モードで選んでいる書き込み。選択の印を描くのに使う。
+    pub fn selected_annotation(&self) -> Option<&Annotation> {
+        let index = self.edit_state()?.selected()?;
+        self.annotations.items().get(index)
     }
 
     /// 書き込み（描き終えたもの）。
@@ -880,7 +901,7 @@ impl Wheel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotate::{Annotation, Shape};
+    use crate::annotate::{Annotation, Pick, Shape, Tool};
     use crate::image::Image;
     use crate::keys::{Chord, Key};
     use crate::settings::Rgb;
@@ -1790,6 +1811,54 @@ mod tests {
             vec![]
         );
         assert!(scrap.annotations_to_draw().is_empty());
+    }
+
+    #[test]
+    fn after_leaving_and_coming_back_the_select_tool_picks_moves_recolours_and_deletes() {
+        let mut scrap = ScrapModel::new(Point::new(100, 50), Size::new(300, 200));
+        scrap.set_zoom(50, ZoomAnchor::Center);
+        let o = scrap.image_rect().origin();
+        let at = |x: i32, y: i32| Point::new(o.x + x, o.y + y);
+        scrap.start_editing(Style::default());
+        // 50% なので、元の画像では (20, 100)〜(200, 100) の線
+        scrap.edit_input(EditInput::Pick(Pick::Tool(Tool::Line)));
+        scrap.edit_input(EditInput::Press(at(10, 50)));
+        scrap.edit_input(EditInput::Move {
+            at: at(100, 50),
+            shift: false,
+        });
+        scrap.edit_input(EditInput::Release);
+        scrap.edit_input(EditInput::Leave);
+        assert!(!scrap.is_editing());
+        assert_eq!(scrap.selected_annotation(), None);
+
+        scrap.start_editing(Style::default());
+        scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x56))));
+        // 画面で 6px 離れた所（元の画像では 12 画素）は当たらない
+        scrap.edit_input(EditInput::Press(at(50, 56)));
+        scrap.edit_input(EditInput::Release);
+        assert_eq!(scrap.selected_annotation(), None);
+        // 画面で 4px 離れた所（元の画像では 8 画素）は、太さの半分を超えても当たる（当たりの広さは画面の画素で決める）
+        scrap.edit_input(EditInput::Press(at(50, 54)));
+        scrap.edit_input(EditInput::Release);
+        let selected = scrap.selected_annotation().cloned();
+        assert_eq!(selected.as_ref(), scrap.annotations().items().first());
+        // 矢印キーは元の画像の画素で動かす
+        scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x28))));
+        assert_eq!(
+            scrap.annotations().items()[0].shape,
+            Shape::Line {
+                from: Point::new(20, 101),
+                to: Point::new(200, 101),
+            }
+        );
+        let black = Rgb(0x21, 0x21, 0x21);
+        scrap.edit_input(EditInput::Pick(Pick::Color(black)));
+        assert_eq!(scrap.annotations().items()[0].style.color, black);
+        assert_eq!(scrap.edit_state().map(|s| s.style.color), Some(black));
+        scrap.edit_input(EditInput::Delete);
+        assert!(scrap.annotations().is_empty());
+        assert_eq!(scrap.selected_annotation(), None);
     }
 
     #[test]
