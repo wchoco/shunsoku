@@ -271,6 +271,12 @@ impl Annotation {
         }
         bounds
     }
+
+    /// 元の画像の画素の範囲 `area`（トリムで見えている部分）に、少しでも映るか。外接矩形（`bounds`）で見るので、
+    /// 図形の種類ごとの手は要らない。
+    pub fn is_visible_in(&self, area: Rect) -> bool {
+        self.bounds().intersect(&area).is_some()
+    }
 }
 
 fn xy(p: Point) -> (f64, f64) {
@@ -611,6 +617,8 @@ pub struct EditState {
     pub font: Font,
     /// 打っている文字（文字の道具でクリックしてから確定するまで）。
     typing: Option<Typing>,
+    /// 見えている範囲（元の画像の画素）。外にある書き込みは選ばない。None なら絞らない。
+    visible: Option<Rect>,
 }
 
 /// 打っている文字。
@@ -659,6 +667,7 @@ impl EditState {
             hit_slop: 0,
             font: Font::default(),
             typing: None,
+            visible: None,
         }
     }
 
@@ -680,6 +689,28 @@ impl EditState {
     /// 当たり判定の広さ（元の画像の画素）。`ScrapModel` が表示の倍率から決める（画面での広さを揃えるため）。
     pub(crate) fn set_hit_slop(&mut self, slop: u32) {
         self.hit_slop = slop;
+    }
+
+    /// 見えている範囲（元の画像の画素）。`ScrapModel` がトリムの範囲（なければ画像全体）を入れる。
+    pub(crate) fn set_visible(&mut self, area: Rect) {
+        self.visible = Some(area);
+    }
+
+    /// 書き込み `a` が見えている範囲に映るか（範囲を絞っていなければ常に映る）。
+    fn is_visible(&self, a: &Annotation) -> bool {
+        self.visible.is_none_or(|area| a.is_visible_in(area))
+    }
+
+    /// 選んでいる書き込みが見えている範囲の外へ出たら、選択を外す（見えないものを動かしたり消したりしないため）。
+    fn drop_hidden_selection(&mut self, annotations: &Annotations) {
+        let hidden = self
+            .selected
+            .and_then(|i| annotations.items().get(i))
+            .is_some_and(|a| !self.is_visible(a));
+        if hidden {
+            self.selected = None;
+            self.grab = None;
+        }
     }
 
     /// 選んでいる書き込みの位置（`Annotations::items` の添え字）。
@@ -875,10 +906,9 @@ impl EditState {
 
     /// `at` にある文字の書き込みのうち、いちばん上のもの。
     fn text_at(&self, at: Point, annotations: &Annotations) -> Option<usize> {
-        annotations
-            .items()
-            .iter()
-            .rposition(|a| matches!(a.shape, Shape::Text { .. }) && a.hits(at, self.hit_slop))
+        annotations.items().iter().rposition(|a| {
+            matches!(a.shape, Shape::Text { .. }) && self.is_visible(a) && a.hits(at, self.hit_slop)
+        })
     }
 
     /// 打っている文字を確定する。空（空白だけ）なら何も残さず、打ち直していたなら元のものを消す。
@@ -968,7 +998,7 @@ impl EditState {
         let hit = annotations
             .items()
             .iter()
-            .rposition(|a| a.hits(at, self.hit_slop));
+            .rposition(|a| self.is_visible(a) && a.hits(at, self.hit_slop));
         self.grab = hit.map(|_| Grab {
             last: at,
             moved: false,
@@ -996,6 +1026,7 @@ impl EditState {
             annotations.translate(index, dx, dy)
         };
         self.grab = Some(Grab { last: at, moved });
+        self.drop_hidden_selection(annotations);
         vec![EditOutput::Redraw]
     }
 
@@ -1036,6 +1067,7 @@ impl EditState {
         if !annotations.translate(index, dx, dy) {
             return vec![];
         }
+        self.drop_hidden_selection(annotations);
         vec![EditOutput::Redraw]
     }
 
