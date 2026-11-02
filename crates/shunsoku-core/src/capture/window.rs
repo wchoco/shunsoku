@@ -2,8 +2,25 @@
 //!
 //! ウィンドウの矩形のうちモニタに写っている部分を Desktop Duplication の画面から切り出す。
 //! 他のウィンドウに隠れた部分は、隠しているウィンドウが写る。
+//!
+//! アクティブウィンドウのキャプチャで撮らないウィンドウ（デスクトップ・タスクバー）の判定もここに置く（#63）。
 
 use crate::geometry::Rect;
+
+/// シェルのウィンドウのクラス名。デスクトップ（壁紙とアイコン、`Progman` / `WorkerW`）と
+/// タスクバー（メインのモニタと、ほかのモニタ）。撮っても意味がない（デスクトップは仮想スクリーン全体になる）。
+const SHELL_CLASSES: [&str; 4] = [
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+];
+
+/// アクティブウィンドウのキャプチャで、前面のウィンドウ（クラス名。前面のウィンドウがなければ None）を撮るか。
+/// デスクトップやタスクバーが前面のとき、前面のウィンドウがないときは撮らない（#63）。
+pub fn is_active_window_to_take(class: Option<&str>) -> bool {
+    class.is_some_and(|class| !SHELL_CLASSES.contains(&class))
+}
 
 /// `window`（スクリーン座標）のうち、どれかのモニタ（`monitors`）に重なる部分を囲む矩形。
 /// どのモニタにも重ならなければ None。
@@ -45,6 +62,30 @@ mod tests {
             visible_bounds(window, &[left, right]),
             Some(Rect::new(-300, 0, 400, 600))
         );
+    }
+
+    #[test]
+    fn the_desktop_and_the_taskbar_are_not_active_windows_to_take() {
+        for class in [
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+        ] {
+            assert!(!is_active_window_to_take(Some(class)), "{class}");
+        }
+    }
+
+    #[test]
+    fn no_foreground_window_is_nothing_to_take() {
+        assert!(!is_active_window_to_take(None));
+    }
+
+    #[test]
+    fn an_ordinary_window_is_taken() {
+        for class in ["Notepad", "Chrome_WidgetWin_1", "CabinetWClass"] {
+            assert!(is_active_window_to_take(Some(class)), "{class}");
+        }
     }
 
     #[test]
