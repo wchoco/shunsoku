@@ -10,12 +10,13 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
-use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, TableLike, Value};
 
 use super::{
-    BORDER_WIDTH_RANGE, DpiScaling, General, HotkeyAction, Hotkeys, LogLevel, OPACITY_RANGE, Rgb,
-    ScrapAppearance, Settings, TRASH_LIMIT_RANGE, VERSION, dpi_scaling, in_range, log_level,
-    non_empty_str, optional_chord, optional_gesture, rgb, save_dir,
+    BORDER_WIDTH_RANGE, DEFAULT_REGION_FILE_NAME_TEMPLATE, DpiScaling, General, HotkeyAction,
+    Hotkeys, LogLevel, OPACITY_RANGE, Reader, Region, Rgb, ScrapAppearance, Settings,
+    TRASH_LIMIT_RANGE, VERSION, dpi_scaling, in_range, log_level, non_empty_str, optional_chord,
+    optional_gesture, read_regions, region_number, rgb, save_dir,
 };
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
@@ -41,6 +42,7 @@ pub fn write(doc: &mut DocumentMut, settings: &Settings) {
         write_overrides(t, &settings.mouse, optional_gesture)
     });
     section(root, "scrap", |t| write_scrap(t, &settings.scrap));
+    write_regions(root, &settings.regions);
 }
 
 /// 設定ファイルの中身 `src` に `settings` を書いた中身（`write` を文字列で行う）。ファイルがなければ `src` は空。
@@ -222,6 +224,134 @@ fn write_scrap(t: &mut dyn TableLike, s: &ScrapAppearance) {
     );
 }
 
+/// 定型領域（`[[regions]]`）。書く定型領域ごとに、ファイルの中の要素（読み込みで残るもの）を 1 つ対応させ、
+/// その要素に項目を書く。手で書いたコメントは要素ごと引き継がれる。
+///
+/// - 対応: 同じ名前の要素。残りは、名前の合わない要素と並び順で（名前を変えた定型領域）。どれにも対応しない
+///   定型領域は要素を新しく作り、どれにも対応しない要素は消す。
+/// - 並び: 対応のついた要素のあった場所に、書く定型領域を順に置く。場所が足りなければ最後の要素の後ろに足す。
+/// - 読み込みで捨てられる要素（名前・モニタ・範囲が不正、名前の重複）は、その場所にそのまま残す。
+fn write_regions(root: &mut Table, regions: &[Region]) {
+    let old = match root
+        .get_mut("regions")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        Some(tables) => std::mem::take(tables),
+        None if regions.is_empty() => return,
+        None => ArrayOfTables::new(),
+    };
+    let kept: Vec<(usize, String)> = read_regions(&old, &mut Reader { issues: Vec::new() })
+        .into_iter()
+        .map(|(i, region)| (i, region.name))
+        .collect();
+
+    // 定型領域ごとの要素の位置
+    let mut slots: Vec<Option<usize>> = regions
+        .iter()
+        .map(|region| {
+            kept.iter()
+                .find(|(_, name)| *name == region.name)
+                .map(|&(i, _)| i)
+        })
+        .collect();
+    let mut free = kept
+        .iter()
+        .map(|&(i, _)| i)
+        .filter(|i| !slots.contains(&Some(*i)))
+        .collect::<Vec<_>>()
+        .into_iter();
+    for slot in slots.iter_mut().filter(|slot| slot.is_none()) {
+        *slot = free.next();
+    }
+
+    let positions: Vec<Option<isize>> = old.iter().map(Table::position).collect();
+    let mut old: Vec<Option<Table>> = old.into_iter().map(Some).collect();
+    let mut queue = regions.iter().zip(slots.iter().copied());
+    // 定型領域 `region` を書いた要素。`slot` の要素があればそれに書く。
+    let take = |old: &mut Vec<Option<Table>>,
+                (region, slot): (&Region, Option<usize>),
+                position: Option<isize>| {
+        let mut table = slot.and_then(|i| old[i].take()).unwrap_or_else(Table::new);
+        table.set_position(position);
+        write_region(&mut table, region);
+        table
+    };
+    let mut new = ArrayOfTables::new();
+    for i in 0..old.len() {
+        if !kept.iter().any(|&(k, _)| k == i) {
+            if let Some(table) = old[i].take() {
+                new.push(table);
+            }
+            continue;
+        }
+        if !slots.contains(&Some(i)) {
+            continue; // 対応する定型領域がなくなった
+        }
+        if let Some(next) = queue.next() {
+            new.push(take(&mut old, next, positions[i]));
+        }
+    }
+    // 位置を持たない要素は、直前の表の後ろに書かれる
+    for next in queue {
+        new.push(take(&mut old, next, None));
+    }
+    root.insert("regions", Item::ArrayOfTables(new));
+}
+
+/// 定型領域 1 つ。名前・モニタ・範囲は既定値がないので、読めなければ常に書く。
+fn write_region(t: &mut dyn TableLike, r: &Region) {
+    put(t, "name", non_empty_str, None, &r.name, |s| {
+        Some(s.as_str().into())
+    });
+    put(t, "hotkey", optional_chord, Some(None), &r.hotkey, |c| {
+        Some(optional_str(c).into())
+    });
+    put(t, "monitor", non_empty_str, None, &r.monitor, |s| {
+        Some(s.as_str().into())
+    });
+    let size = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
+    for (key, min, n) in [
+        ("x", 0, r.rect.left),
+        ("y", 0, r.rect.top),
+        ("width", 1, size(r.rect.width())),
+        ("height", 1, size(r.rect.height())),
+    ] {
+        put(
+            t,
+            key,
+            |i| region_number(i, min),
+            None,
+            &n,
+            |&n| Some(i64::from(n).into()),
+        );
+    }
+    put(
+        t,
+        "save_dir",
+        |i| save_dir(i).map(Some),
+        Some(None),
+        &r.save_dir,
+        |dir| {
+            dir.as_ref()
+                .map(|p| p.to_string_lossy().into_owned().into())
+        },
+    );
+    put(
+        t,
+        "file_name_template",
+        non_empty_str,
+        Some(DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned()),
+        &r.file_name_template,
+        |s| Some(s.as_str().into()),
+    );
+    put(t, "save", Item::as_bool, Some(true), &r.save, |&v| {
+        Some(v.into())
+    });
+    put(t, "scrap", Item::as_bool, Some(false), &r.scrap, |&v| {
+        Some(v.into())
+    });
+}
+
 /// 表 `name` の中を `f` で書く。表がなければ（表でない値なら置き換えて）、何か書いたときだけ文書の末尾に足す。
 fn section(root: &mut Table, name: &str, f: impl FnOnce(&mut dyn TableLike)) {
     if let Some(table) = root.get_mut(name).and_then(Item::as_table_like_mut) {
@@ -304,6 +434,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::geometry::Rect;
     use crate::keys::Chord;
     use crate::scrap::ops::MouseGesture;
     use crate::settings::load;
@@ -502,6 +633,210 @@ paste = "Ctrl+V"
         );
         // 読めないファイルを上書きすると手で書いた中身が消えるので、書かない
         assert_eq!(rewrite("version = = 1\n", &s), None);
+    }
+
+    fn region(name: &str) -> Region {
+        Region {
+            name: name.to_owned(),
+            hotkey: None,
+            monitor: r"\\?\DISPLAY#AUS2701#5&1".to_owned(),
+            rect: Rect::new(10, 20, 650, 500),
+            save_dir: None,
+            file_name_template: DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned(),
+            save: true,
+            scrap: false,
+        }
+    }
+
+    #[test]
+    fn a_region_added_to_a_file_reads_back_the_same() {
+        let src = "version = 1 # 版\n\n[scrap]\nshadow = false\n";
+        let added = Region {
+            hotkey: chord("Ctrl+Alt+1"),
+            save_dir: Some(PathBuf::from(r"D:\shots")),
+            file_name_template: "{name}_{seq:3}".to_owned(),
+            save: false,
+            scrap: true,
+            ..region("領域 1")
+        };
+        let out = written(src, |s| s.regions.push(added.clone()));
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.regions, vec![added]);
+        assert!(out.starts_with(src), "{out}");
+    }
+
+    /// 手で書いた定型領域 2 つと、その後ろの表。
+    const TWO_REGIONS: &str = r#"version = 1
+
+# 定型領域
+[[regions]]
+name = "a"            # 左上
+monitor = 'M1'
+x = 0
+y = 0
+width = 10
+height = 10
+
+[[regions]]
+# 右下
+name = "b"
+monitor = 'M1'
+x = 100
+y = 100
+width = 20 # 幅
+height = 20
+
+[scrap]
+shadow = false
+"#;
+
+    #[test]
+    fn a_changed_region_keeps_its_comments_and_order() {
+        let out = written(TWO_REGIONS, |s| {
+            s.regions[1].rect = Rect::new(100, 100, 130, 120);
+            s.regions[1].scrap = true;
+        });
+        assert_eq!(
+            out,
+            TWO_REGIONS
+                .replace("height = 20\n", "height = 20\nscrap = true\n")
+                .replace("width = 20 # 幅", "width = 30 # 幅")
+        );
+    }
+
+    #[test]
+    fn a_region_added_after_others_goes_after_the_last_region() {
+        let added = Region {
+            monitor: "M2".to_owned(),
+            rect: Rect::new(1, 2, 4, 6),
+            ..region("c")
+        };
+        let out = written(TWO_REGIONS, |s| s.regions.push(added.clone()));
+        assert_eq!(
+            out,
+            TWO_REGIONS.replace(
+                "height = 20\n",
+                "height = 20\n\n[[regions]]\nname = \"c\"\nmonitor = \"M2\"\nx = 1\ny = 2\nwidth = 3\nheight = 4\n"
+            )
+        );
+        assert_eq!(load(&out).0.regions[2], added);
+    }
+
+    #[test]
+    fn a_removed_region_takes_only_its_own_lines() {
+        let out = written(TWO_REGIONS, |s| {
+            s.regions.remove(0);
+        });
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.regions.len(), 1);
+        assert_eq!(read.regions[0].name, "b");
+        assert!(out.contains("# 右下\nname = \"b\""), "{out}");
+        assert!(!out.contains("左上"), "{out}");
+        assert!(out.ends_with("[scrap]\nshadow = false\n"), "{out}");
+    }
+
+    /// `TWO_REGIONS` の定型領域 `name` の行（`[[regions]]` の前のコメントから、次の空行の前まで）。
+    fn region_lines(name: &str) -> &'static str {
+        match name {
+            "a" => {
+                "# 定型領域\n[[regions]]\nname = \"a\"            # 左上\nmonitor = 'M1'\nx = 0\ny = 0\nwidth = 10\nheight = 10\n"
+            }
+            _ => {
+                "[[regions]]\n# 右下\nname = \"b\"\nmonitor = 'M1'\nx = 100\ny = 100\nwidth = 20 # 幅\nheight = 20\n"
+            }
+        }
+    }
+
+    fn names(out: &str) -> Vec<String> {
+        load(out).0.regions.into_iter().map(|r| r.name).collect()
+    }
+
+    #[test]
+    fn reordered_regions_move_with_their_comments() {
+        let out = written(TWO_REGIONS, |s| s.regions.reverse());
+        assert_eq!(
+            out,
+            format!(
+                "version = 1\n\n{}\n{}\n[scrap]\nshadow = false\n",
+                region_lines("b"),
+                region_lines("a")
+            )
+        );
+        assert_eq!(names(&out), ["b", "a"]);
+    }
+
+    #[test]
+    fn a_renamed_region_is_rewritten_in_place() {
+        let out = written(TWO_REGIONS, |s| s.regions[0].name = "左上".to_owned());
+        assert_eq!(out, TWO_REGIONS.replace("name = \"a\"", "name = \"左上\""));
+    }
+
+    #[test]
+    fn a_region_inserted_between_others_keeps_the_order() {
+        let out = written(TWO_REGIONS, |s| s.regions.insert(1, region("c")));
+        assert_eq!(names(&out), ["a", "c", "b"]);
+        assert!(out.contains(region_lines("a")), "{out}");
+        assert!(out.contains(region_lines("b")), "{out}");
+    }
+
+    #[test]
+    fn regions_dropped_when_read_are_left_in_place() {
+        let src = r#"version = 1
+[[regions]]
+name = "a"
+monitor = 'M1'
+x = 0
+y = 0
+width = 10
+height = 10
+[[regions]]
+name = "書きかけ"
+monitor = 'M1'
+[[regions]]
+name = "b"
+monitor = 'M1'
+x = 0
+y = 0
+width = 10
+height = 10
+"#;
+        assert_eq!(written(src, |_| {}), src);
+        let out = written(src, |s| {
+            s.regions.remove(0);
+        });
+        assert_eq!(
+            out,
+            r#"version = 1
+[[regions]]
+name = "書きかけ"
+monitor = 'M1'
+[[regions]]
+name = "b"
+monitor = 'M1'
+x = 0
+y = 0
+width = 10
+height = 10
+"#
+        );
+    }
+
+    #[test]
+    fn regions_that_are_not_an_array_of_tables_are_replaced_only_when_regions_are_written() {
+        assert_eq!(
+            written("version = 1\nregions = 3\n", |_| {}),
+            "version = 1\nregions = 3\n"
+        );
+        let out = written("version = 1\nregions = 3\n", |s| {
+            s.regions.push(region("a"))
+        });
+        let wanted = Settings {
+            regions: vec![region("a")],
+            ..Settings::default()
+        };
+        assert_eq!(load(&out), (wanted, vec![]));
     }
 
     #[test]
