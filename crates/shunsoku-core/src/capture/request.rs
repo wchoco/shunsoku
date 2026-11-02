@@ -3,9 +3,12 @@
 //! 発生源（トレイ、ホットキー、M3 の CLI）ごとの違いは `CaptureRequest::from_source` の中だけで決める。
 //! Win32 層の `app` は依頼を受けて、待機（`delay`）→ 取得 → 範囲選択の画面 → 切り抜き → 出力 → 結果、
 //! の 1 本の流れで進める。発生源を足すときは `Source` に 1 つ足し、ここで対応する依頼を返す。
-//! M3 で CLI からの依頼を足すときは、`Source` と `CaptureRequest::reply` を足す（ADR-0003）。
+//! CLI からの依頼は `CaptureRequest::from_cli` で作り、結果を返す先（`reply`）を持たせる（ADR-0003）。
 
 use std::time::Duration;
+
+use crate::cli_args;
+use crate::geometry::Rect;
 
 /// 依頼の発生源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +26,18 @@ pub enum Source {
 pub enum CaptureMethod {
     /// 範囲選択キャプチャ。範囲選択の画面でユーザーが範囲を選ぶ。
     Select,
+    /// 決まった範囲（CLI の `capture rect`）。範囲選択の画面は出さない。
+    Rect {
+        /// `monitors` の番号（1 から）。None ならメインモニタ。
+        monitor: Option<u32>,
+        /// モニタ相対の物理ピクセル。モニタからはみ出すかは撮るときに `monitors::locate` で調べる。
+        rect: Rect,
+    },
 }
+
+/// 結果を返す先。Win32 層のパイプのサーバ（`pipe_server`）が依頼ごとに振る番号で、応答をその依頼の接続に返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyTo(pub u64);
 
 /// 撮ったものをどこへ出すか。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +78,8 @@ pub struct CaptureRequest {
     pub delay: Duration,
     /// 結果をトレイ通知で知らせる。
     pub notify: bool,
+    /// 結果（保存したパス、失敗）を返す先。CLI からの依頼だけが持つ。
+    pub reply: Option<ReplyTo>,
 }
 
 impl CaptureRequest {
@@ -71,6 +87,26 @@ impl CaptureRequest {
     pub fn from_source(source: Source) -> CaptureRequest {
         match source {
             Source::Hotkey | Source::TrayClick | Source::TrayMenu => CaptureRequest::select(),
+        }
+    }
+
+    /// CLI の `capture` から依頼を作る。既定は保存だけで、保存に失敗したらスクラップに逃がさず失敗として返す。
+    pub fn from_cli(capture: &cli_args::Capture, reply: ReplyTo) -> CaptureRequest {
+        let method = match capture.target {
+            cli_args::Target::Rect { monitor, rect } => CaptureMethod::Rect { monitor, rect },
+        };
+        CaptureRequest {
+            method,
+            outputs: Outputs {
+                save: Some(SaveTarget::Default),
+                scrap: false,
+                copy: false,
+                focus_scrap: false,
+            },
+            on_save_failure: OnSaveFailure::Fail,
+            delay: Duration::ZERO,
+            notify: true,
+            reply: Some(reply),
         }
     }
 
@@ -87,6 +123,7 @@ impl CaptureRequest {
             on_save_failure: OnSaveFailure::FallbackToScrap,
             delay: Duration::ZERO,
             notify: true,
+            reply: None,
         }
     }
 }
@@ -110,6 +147,7 @@ mod tests {
             on_save_failure: OnSaveFailure::FallbackToScrap,
             delay: Duration::ZERO,
             notify: true,
+            reply: None,
         }
     }
 
@@ -129,5 +167,44 @@ mod tests {
     fn hotkey_requests_a_select_capture_shown_as_a_focused_scrap() {
         let request = CaptureRequest::from_source(Source::Hotkey);
         assert_eq!(request, select_capture());
+    }
+
+    /// CLI の既定（spec #34）: 保存だけ・スクラップは出さない・保存に失敗したら失敗として返す・通知は設定に従う。
+    #[test]
+    fn a_cli_rect_capture_only_saves_and_fails_when_saving_fails() {
+        let rect = Rect::new(0, 0, 100, 100);
+        let capture = cli_args::Capture {
+            target: cli_args::Target::Rect {
+                monitor: Some(2),
+                rect,
+            },
+        };
+        let request = CaptureRequest::from_cli(&capture, ReplyTo(7));
+        assert_eq!(
+            request,
+            CaptureRequest {
+                method: CaptureMethod::Rect {
+                    monitor: Some(2),
+                    rect,
+                },
+                outputs: Outputs {
+                    save: Some(SaveTarget::Default),
+                    scrap: false,
+                    copy: false,
+                    focus_scrap: false,
+                },
+                on_save_failure: OnSaveFailure::Fail,
+                delay: Duration::ZERO,
+                notify: true,
+                reply: Some(ReplyTo(7)),
+            }
+        );
+    }
+
+    #[test]
+    fn hotkey_and_tray_requests_expect_no_reply() {
+        for source in [Source::Hotkey, Source::TrayClick, Source::TrayMenu] {
+            assert_eq!(CaptureRequest::from_source(source).reply, None);
+        }
     }
 }
