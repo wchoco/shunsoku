@@ -159,7 +159,7 @@ fn is_click_through(hwnd: HWND) -> bool {
     ex & WS_EX_TRANSPARENT.0 != 0
 }
 
-fn class_name(hwnd: HWND) -> String {
+pub fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     // SAFETY: バッファの大きさを渡して読むだけ
     let len = unsafe { GetClassNameW(hwnd, &mut buf) };
