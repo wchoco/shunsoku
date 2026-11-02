@@ -127,6 +127,27 @@ pub struct Region {
     pub scrap: bool,
 }
 
+/// 範囲選択の画面で登録する定型領域。名前は `"{base} N"`（N は、ほかの定型領域と重ならない最も小さい
+/// 1 以上の数。消した番号は埋める）。`monitor` はモニタの識別子、`rect` はモニタ相対の範囲。
+/// 保存先とファイル名テンプレートは全体設定のものを初期値にし、撮影後は保存だけする。
+pub fn new_region(settings: &Settings, base: &str, monitor: &str, rect: Rect) -> Region {
+    let used = |name: &str| settings.regions.iter().any(|r| r.name == name);
+    let name = (1..)
+        .map(|n: u64| format!("{base} {n}"))
+        .find(|name| !used(name))
+        .expect("some number is unused");
+    Region {
+        name,
+        hotkey: None,
+        monitor: monitor.to_owned(),
+        rect,
+        save_dir: settings.general.save_dir.clone(),
+        file_name_template: settings.general.file_name_template.clone(),
+        save: true,
+        scrap: false,
+    }
+}
+
 /// 全体設定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct General {
@@ -1861,5 +1882,61 @@ width = 0
         );
         assert_eq!(names(&settings), vec!["ダッシュボード"]);
         assert_eq!(settings.regions[0].rect, Rect::new(0, 0, 800, 600));
+    }
+
+    fn named(names: &[&str]) -> Settings {
+        let region = |name: &str| Region {
+            name: name.to_owned(),
+            hotkey: None,
+            monitor: "m".to_owned(),
+            rect: Rect::new(0, 0, 10, 10),
+            save_dir: None,
+            file_name_template: DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned(),
+            save: true,
+            scrap: false,
+        };
+        Settings {
+            regions: names.iter().map(|n| region(n)).collect(),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn registered_regions_are_named_with_the_smallest_unused_number() {
+        let name =
+            |names: &[&str]| new_region(&named(names), "領域", "m", Rect::new(0, 0, 1, 1)).name;
+        assert_eq!(name(&[]), "領域 1");
+        assert_eq!(name(&["領域 1", "領域 2"]), "領域 3");
+        // 消した番号（欠番）は埋める
+        assert_eq!(name(&["領域 1", "領域 3"]), "領域 2");
+        assert_eq!(name(&["領域 2", "領域 3"]), "領域 1");
+        // 手で付けた名前は数えない。同じ名前だけを避ける
+        assert_eq!(name(&["ダッシュボード", "領域 01", "領域1"]), "領域 1");
+    }
+
+    #[test]
+    fn a_registered_region_starts_from_the_general_save_dir_and_template_and_only_saves() {
+        let mut settings = named(&[]);
+        settings.general.save_dir = Some(PathBuf::from(r"D:\shots"));
+        settings.general.file_name_template = "cap_{seq:3}".to_owned();
+        let region = new_region(
+            &settings,
+            "領域",
+            r"\\?\DISPLAY#AUS",
+            Rect::new(10, 20, 110, 70),
+        );
+        assert_eq!(
+            region,
+            Region {
+                name: "領域 1".to_owned(),
+                hotkey: None,
+                monitor: r"\\?\DISPLAY#AUS".to_owned(),
+                rect: Rect::new(10, 20, 110, 70),
+                save_dir: Some(PathBuf::from(r"D:\shots")),
+                file_name_template: "cap_{seq:3}".to_owned(),
+                save: true,
+                scrap: false,
+            }
+        );
     }
 }

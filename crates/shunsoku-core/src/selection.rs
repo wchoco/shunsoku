@@ -15,6 +15,8 @@
 //! - 矢印で動かすカーソルは、どれかのモニタの画素に留める（隙間や画面の外には出ない）。
 //! - ウィンドウの一覧（`WindowInfo`）も Win32 層が集めて渡す。`Shift` を押している間はカーソルの下の
 //!   ウィンドウ（`Ctrl` も押していれば部品）をハイライトし、クリックか `Enter` でそれを選ぶ（`chosen_window`）。
+//! - 定型領域の登録（`registering`）は常に精密モードで、`Tab` は効かない。範囲は 1 枚のモニタの中に限り、
+//!   ウィンドウを選んだら、その矩形をモニタの中に切り詰めて調整に入る。
 
 use crate::geometry::{Point, Rect};
 
@@ -224,6 +226,8 @@ pub struct Selection {
     adjusted: Option<Rect>,
     /// 調整の状態でつかんでいるもの。左ボタンを押している間だけ Some。
     grab: Option<Grab>,
+    /// 定型領域の登録（`registering`）。
+    registering: bool,
 }
 
 /// ウィンドウのハイライトに使う状態。
@@ -278,6 +282,7 @@ impl Selection {
             crosshair: false,
             adjusted: None,
             grab: None,
+            registering: false,
         }
     }
 
@@ -306,7 +311,20 @@ impl Selection {
     }
 
     /// ハイライトしていたものを撮ることにして確定する。何もハイライトしていなければ何もしない。
+    /// 定型領域の登録では、その矩形を重なる面積が最も大きいモニタの中に切り詰めて調整に入る。
     fn choose_window(&mut self, highlight: Option<Highlight>) {
+        if self.registering {
+            let trimmed = highlight.and_then(|h| {
+                split(h.rect, &self.monitors)
+                    .into_iter()
+                    .max_by_key(|part| u64::from(part.rect.width()) * u64::from(part.rect.height()))
+                    .map(|part| part.rect)
+            });
+            if let Some(rect) = trimmed {
+                self.settle(rect);
+            }
+            return;
+        }
         if let Some(highlight) = highlight {
             self.windows.chosen = Some(highlight);
             self.anchor = None;
@@ -315,9 +333,26 @@ impl Selection {
     }
 
     /// 開いたときのモード（設定の既定のモード）。
+    /// 定型領域の登録では設定によらず精密モード。
     pub fn with_mode(mut self, mode: Mode) -> Selection {
-        self.mode = mode;
+        if !self.registering {
+            self.mode = mode;
+        }
         self
+    }
+
+    /// 定型領域の登録の画面にする。常に精密モードで、`Tab` は効かない。範囲は 1 枚のモニタの中に限り、
+    /// ウィンドウを選んだら、その矩形（モニタをまたげば重なる面積が最も大きいモニタの中に切り詰めたもの）で
+    /// 調整に入る。確定すると `State::Confirmed` になり、`rect` が登録する範囲（スクリーン座標）。
+    pub fn registering(mut self) -> Selection {
+        self.registering = true;
+        self.mode = Mode::Precise;
+        self
+    }
+
+    /// 定型領域の登録の画面か（`registering`）。
+    pub fn is_registering(&self) -> bool {
+        self.registering
     }
 
     /// 通常モードでも十字線を出す（設定）。精密モードでは設定によらず出す。
@@ -391,6 +426,8 @@ impl Selection {
                     self.settle(rect);
                 }
             }
+            // 定型領域は 1 枚のモニタの中に限る
+            Input::SelectAllMonitors if self.registering => {}
             Input::SelectAllMonitors => {
                 let all = self.monitors.iter().map(|m| m.rect).reduce(|a, b| {
                     Rect::new(
@@ -423,6 +460,9 @@ impl Selection {
     }
 
     fn toggle_mode(&mut self) {
+        if self.registering {
+            return;
+        }
         self.mode = match self.mode {
             Mode::Normal => Mode::Precise,
             Mode::Precise => Mode::Normal,
@@ -584,8 +624,11 @@ impl Selection {
         out
     }
 
-    /// 全モニタを囲む矩形。
+    /// 範囲を動かせる・広げられる矩形。定型領域の登録では範囲のあるモニタ、ほかは全モニタを囲む矩形。
     fn bounds(&self) -> Rect {
+        if let Some(home) = self.home() {
+            return home;
+        }
         self.monitors
             .iter()
             .map(|m| m.rect)
@@ -600,7 +643,17 @@ impl Selection {
             .unwrap_or_default()
     }
 
-    /// 大きさを変えずに、`rect` を全モニタを囲む矩形の中に戻す。
+    /// 定型領域の登録で、範囲を収めるモニタ。始点（調整の状態なら範囲の左上）のあるモニタ。
+    /// 登録でなければ、何も選んでいなければ None。
+    fn home(&self) -> Option<Rect> {
+        if !self.registering {
+            return None;
+        }
+        let at = self.adjusted.map(|r| r.origin()).or(self.anchor)?;
+        self.monitor_at(at).map(|m| m.rect)
+    }
+
+    /// 大きさを変えずに、`rect` を範囲を動かせる矩形（`bounds`）の中に戻す。
     fn keep_inside(&self, rect: Rect) -> Rect {
         let b = self.bounds();
         let dx = if rect.left < b.left {
@@ -673,12 +726,17 @@ impl Selection {
         }
         let a = self.anchor?;
         let c = self.cursor;
-        Some(Rect::new(
+        let rect = Rect::new(
             a.x.min(c.x),
             a.y.min(c.y),
             a.x.max(c.x) + 1,
             a.y.max(c.y) + 1,
-        ))
+        );
+        // 定型領域の登録では、始点のあるモニタの外にははみ出さない
+        match self.home() {
+            Some(home) => rect.intersect(&home).or(Some(rect)),
+            None => Some(rect),
+        }
     }
 
     /// カーソルの画素。
@@ -1503,5 +1561,154 @@ mod tests {
         start_drag(&mut s);
         assert_eq!(s.state(), State::Cancelled);
         assert_eq!(s.rect(), None);
+    }
+
+    /// 定型領域の登録: 1920×1080 の 2 枚を横に並べる（左 96 DPI、右 144 DPI）。
+    fn registering() -> Selection {
+        Selection::new(
+            vec![
+                MonitorInfo {
+                    rect: Rect::new(0, 0, 1920, 1080),
+                    dpi: 96,
+                },
+                MonitorInfo {
+                    rect: Rect::new(1920, 0, 3840, 1080),
+                    dpi: 144,
+                },
+            ],
+            p(0, 0),
+        )
+        .registering()
+    }
+
+    #[test]
+    fn registering_always_uses_precise_mode_and_tab_does_nothing() {
+        let mut s = registering();
+        assert_eq!(s.mode(), Mode::Precise);
+        s.handle(Input::ToggleMode);
+        assert_eq!(s.mode(), Mode::Precise);
+        // 調整の状態でも効かない
+        s.handle(Input::SelectMonitor);
+        assert_eq!(s.state(), State::Adjusting);
+        s.handle(Input::ToggleMode);
+        assert_eq!(s.mode(), Mode::Precise);
+        // 通常モードを既定にしていても精密モードで開く
+        let s = Selection::new(Vec::new(), p(0, 0))
+            .with_mode(Mode::Normal)
+            .registering();
+        assert_eq!(s.mode(), Mode::Precise);
+    }
+
+    #[test]
+    fn registering_keeps_the_range_inside_the_monitor_where_it_started() {
+        let mut s = registering();
+        // 左のモニタから右のモニタへ引いても、左のモニタの中で止まる
+        s.handle(Input::Press {
+            button: Button::Left,
+            at: p(1800, 100),
+        });
+        s.handle(Input::Move { at: p(2100, 199) });
+        assert_eq!(s.rect(), Some(Rect::new(1800, 100, 1920, 200)));
+        s.handle(Input::Release {
+            button: Button::Left,
+            at: p(2100, 199),
+        });
+        assert_eq!(s.state(), State::Adjusting);
+        assert_eq!(s.rect(), Some(Rect::new(1800, 100, 1920, 200)));
+        // 調整でも、動かす・広げるのはそのモニタの中まで
+        s.handle(Input::Arrow {
+            direction: Direction::Right,
+            shift: true,
+        });
+        assert_eq!(s.rect(), Some(Rect::new(1800, 100, 1920, 200)));
+        s.handle(Input::Press {
+            button: Button::Left,
+            at: p(1850, 150),
+        });
+        s.handle(Input::Move { at: p(2850, 150) });
+        assert_eq!(s.rect(), Some(Rect::new(1800, 100, 1920, 200)));
+        s.handle(Input::Release {
+            button: Button::Left,
+            at: p(2850, 150),
+        });
+        s.handle(Input::Press {
+            button: Button::Left,
+            at: p(1800, 100),
+        });
+        s.handle(Input::Move { at: p(1500, -50) });
+        assert_eq!(s.rect(), Some(Rect::new(1500, 0, 1920, 200)));
+        s.handle(Input::Release {
+            button: Button::Left,
+            at: p(1500, -50),
+        });
+        // 全モニタを囲む範囲は選べない
+        s.handle(Input::Escape);
+        s.handle(Input::Move { at: p(2000, 10) });
+        s.handle(Input::SelectAllMonitors);
+        assert_eq!(s.state(), State::Idle);
+        s.handle(Input::SelectMonitor);
+        assert_eq!(s.rect(), Some(Rect::new(1920, 0, 3840, 1080)));
+        s.handle(Input::Enter);
+        assert_eq!(s.state(), State::Confirmed);
+        assert_eq!(s.rect(), Some(Rect::new(1920, 0, 3840, 1080)));
+    }
+
+    fn window(id: isize, rect: Rect) -> WindowInfo {
+        WindowInfo {
+            id: WindowId(id),
+            rect,
+            name: format!("window {id}"),
+            parent: None,
+            kind: WindowKind::Normal,
+        }
+    }
+
+    #[test]
+    fn registering_a_window_trims_it_to_the_monitor_it_overlaps_most_and_starts_adjusting() {
+        let mut s = registering();
+        s.set_windows(vec![
+            // 右のモニタに多く重なる（左 100 列、右 300 列）。上と下は画面の外にはみ出す
+            window(1, Rect::new(1820, -20, 2220, 1100)),
+            window(2, Rect::new(100, 100, 500, 400)),
+        ]);
+        s.handle(Input::Move { at: p(1850, 500) });
+        s.handle(Input::Modifiers {
+            shift: true,
+            ctrl: false,
+        });
+        s.handle(Input::Press {
+            button: Button::Left,
+            at: p(1850, 500),
+        });
+        let state = s.handle(Input::Release {
+            button: Button::Left,
+            at: p(1850, 500),
+        });
+        assert_eq!(state, State::Adjusting);
+        assert_eq!(s.rect(), Some(Rect::new(1920, 0, 2220, 1080)));
+        assert_eq!(s.chosen_window(), None);
+        // 調整してから Enter で登録する範囲が決まる
+        s.handle(Input::Modifiers {
+            shift: false,
+            ctrl: false,
+        });
+        s.handle(Input::ResizeArrow {
+            direction: Direction::Left,
+            shift: true,
+        });
+        assert_eq!(s.handle(Input::Enter), State::Confirmed);
+        assert_eq!(s.rect(), Some(Rect::new(1920, 0, 2210, 1080)));
+        assert_eq!(s.chosen_window(), None);
+
+        // Shift+Enter でも同じ
+        let mut s = registering();
+        s.set_windows(vec![window(2, Rect::new(100, 100, 500, 400))]);
+        s.handle(Input::Move { at: p(200, 200) });
+        s.handle(Input::Modifiers {
+            shift: true,
+            ctrl: false,
+        });
+        assert_eq!(s.handle(Input::Enter), State::Adjusting);
+        assert_eq!(s.rect(), Some(Rect::new(100, 100, 500, 400)));
     }
 }
