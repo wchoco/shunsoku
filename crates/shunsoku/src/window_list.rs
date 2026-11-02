@@ -3,7 +3,8 @@
 //! - 並びは Z オーダーの手前から奥（`EnumWindows`）。最上位のウィンドウのあとに、その子孫を
 //!   `EnumChildWindows` の順（兄弟の間は手前から奥）で続ける。
 //! - 見えないもの・最小化したもの・クロークされたもの（別の仮想デスクトップ、裏の UWP）・
-//!   クリックが素通りするもの（`WS_EX_TRANSPARENT`）・範囲選択の画面そのものは入れない。
+//!   クリックが素通りするもの（`WS_EX_TRANSPARENT`）・範囲選択の画面そのもの・デスクトップ（全モニタを
+//!   覆う `Progman` / `WorkerW`）は入れない。
 //! - 最上位のウィンドウの矩形は WGC が撮る範囲（`DWMWA_EXTENDED_FRAME_BOUNDS`）にする。
 //! - 名前は `InternalGetWindowText` で読む（`GetWindowTextW` と違い、応答しないウィンドウで止まらない）。
 //!   部品で空なら、クラス名にする。
@@ -27,6 +28,8 @@ const OVERLAY_CLASS: &str = "shunsoku.overlay";
 const SCRAP_CLASS: &str = "shunsoku.scrap";
 /// タスクバー（メインのモニタと、ほかのモニタ）。
 const TASKBAR_CLASSES: [&str; 2] = ["Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+/// デスクトップ（壁紙とアイコン）。全モニタを覆うので、ハイライトの対象にしない。
+const DESKTOP_CLASSES: [&str; 2] = ["Progman", "WorkerW"];
 
 /// いまのウィンドウの一覧を集める。
 pub fn collect() -> Vec<WindowInfo> {
@@ -55,7 +58,7 @@ fn top_level(hwnd: HWND) -> Option<WindowInfo> {
         return None;
     }
     let class = class_name(hwnd);
-    if class == OVERLAY_CLASS {
+    if class == OVERLAY_CLASS || DESKTOP_CLASSES.contains(&class.as_str()) {
         return None;
     }
     let rect = window_bounds(hwnd);
