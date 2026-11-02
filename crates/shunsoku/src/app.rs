@@ -1961,18 +1961,19 @@ fn capture_active_window() {
             app.gpu.primary_device(),
             app.module,
             Appearance::from(app.settings.scrap),
+            app.settings.general.capture_cursor,
         )),
         _ => None,
     })
     .flatten();
-    let Some((request, device, module, appearance)) = taken else {
+    let Some((request, device, module, appearance, cursor)) = taken else {
         return;
     };
     let grabbed = if hwnd.is_invalid() {
         Err("no active window".to_owned())
     } else {
         device.map_err(|e| e.to_string()).and_then(|device| {
-            crate::window_grab::grab_window(&device, hwnd, false).map_err(|e| e.to_string())
+            crate::window_grab::grab_window(&device, hwnd, cursor).map_err(|e| e.to_string())
         })
     };
     let shot = match grabbed {
@@ -2020,7 +2021,10 @@ fn open_overlay() {
     let started = Instant::now();
     // 取得のスレッドは App に触らないので、借りたまま待ってよい
     let grabbed = with_app(|app| {
-        matches!(app.capture, Capture::Waiting(_)).then(|| (app.gpu.grab(), app.module))
+        matches!(app.capture, Capture::Waiting(_)).then(|| {
+            let cursor = app.settings.general.capture_cursor;
+            (app.gpu.grab(cursor), app.module)
+        })
     })
     .flatten();
     let Some((grabbed, module)) = grabbed else {

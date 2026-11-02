@@ -114,11 +114,9 @@ impl Cursor {
                     continue;
                 };
                 let under: [u8; 4] = [px[0], px[1], px[2], px[3]];
-                let out = self.shape.over(
-                    (x - self.at.x) as usize,
-                    (y - self.at.y) as usize,
-                    under,
-                );
+                let out =
+                    self.shape
+                        .over((x - self.at.x) as usize, (y - self.at.y) as usize, under);
                 px.copy_from_slice(&out);
             }
         }
