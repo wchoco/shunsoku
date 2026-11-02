@@ -50,6 +50,15 @@ pub fn encode_request(request: &Request) -> String {
                     }
                     w.field("rect", &rect_value(rect));
                 }
+                Target::Region { name } => {
+                    w.field("target", "region");
+                    w.field("name", name);
+                }
+                Target::Select => w.field("target", "select"),
+                Target::Active { delay } => {
+                    w.field("target", "active");
+                    w.field("delay", &delay.to_string());
+                }
             }
             let output = &capture.output;
             match &output.save {
@@ -80,6 +89,13 @@ pub fn decode_request(text: &str) -> Result<Request, DecodeError> {
                     let rect = parse_rect(r.take("rect")?)?;
                     Target::Rect { monitor, rect }
                 }
+                "region" => Target::Region {
+                    name: r.take("name")?.to_owned(),
+                },
+                "select" => Target::Select,
+                "active" => Target::Active {
+                    delay: parse_number(r.take("delay")?)?,
+                },
                 other => return Err(malformed(&format!("unknown target {other}"))),
             };
             let save = match r.take("save")? {
@@ -422,6 +438,26 @@ mod tests {
                     rect: Rect::new(0, 0, 1, 1),
                 },
                 output,
+            });
+            let wire = encode_request(&request);
+            assert_eq!(decode_request(&wire), Ok(request));
+        }
+    }
+
+    #[test]
+    fn region_select_and_active_requests_survive_a_round_trip() {
+        let targets = [
+            Target::Region {
+                name: "領域 1\\a\nb".to_owned(),
+            },
+            Target::Select,
+            Target::Active { delay: 0 },
+            Target::Active { delay: 60 },
+        ];
+        for target in targets {
+            let request = Request::Capture(Capture {
+                target,
+                output: Output::default(),
             });
             let wire = encode_request(&request);
             assert_eq!(decode_request(&wire), Ok(request));

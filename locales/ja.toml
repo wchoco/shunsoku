@@ -101,6 +101,8 @@ no_such_monitor = "その番号のモニタはありません（番号は shunso
 no_main_monitor = "メインモニタが見つかりません。"
 out_of_monitor = "範囲がモニタからはみ出しています。"
 unreadable_monitor = "このモニタの画面はそのまま出せません（回転・HDR のモニタなど）。"
+cancelled = "範囲選択が取り消されました。"
+no_active_window = "アクティブウィンドウがありません。"
 
 [copy]
 failed = "クリップボードにコピーできませんでした。"
