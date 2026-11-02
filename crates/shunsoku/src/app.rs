@@ -153,6 +153,10 @@ const TIMER_CAPTURE_DELAY: usize = 1;
 /// shunsoku のメニューが消えきるのを待って定型領域キャプチャを進め直すタイマーの番号（メッセージ専用
 /// ウィンドウの WM_TIMER）。待っている依頼（`Capture::Waiting`）は `TIMER_CAPTURE_DELAY` で進め直す。
 const TIMER_REGION_RETRY: usize = 2;
+/// App を借りられずに進められなかった CLI の依頼を進め直すタイマーの番号（メッセージ専用ウィンドウの
+/// WM_TIMER）と間隔。
+const TIMER_PIPE_RETRY: usize = 3;
+const PIPE_RETRY_MS: u32 = 50;
 /// メニューが消えきったかを確かめ直す間隔。
 const MENU_RETRY_MS: u32 = 30;
 /// メニューが消えきるのを待つ回数の上限。超えたらそのまま撮る。
@@ -503,7 +507,12 @@ pub fn run() -> i32 {
     let message_window = app.windows.message;
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     // 依頼が届くのは App を置いてから
-    match pipe_server::start(message_window, WM_APP_PIPE, text("job.panicked").to_owned()) {
+    match pipe_server::start(
+        message_window,
+        WM_APP_PIPE,
+        text("job.panicked").to_owned(),
+        text("cli.timed_out").to_owned(),
+    ) {
         Ok((server, replier)) => {
             let _ = REPLIER.set(replier);
             with_app(|app| app.pipe = Some(server));
@@ -789,7 +798,15 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             Some(LRESULT(0))
         }
         WM_APP_PIPE => {
-            on_pipe_requests();
+            on_pipe_requests(hwnd);
+            Some(LRESULT(0))
+        }
+        WM_TIMER if wparam.0 == TIMER_PIPE_RETRY => {
+            // SAFETY: 自分のタイマーを止める
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_PIPE_RETRY);
+            }
+            on_pipe_requests(hwnd);
             Some(LRESULT(0))
         }
         WM_HOTKEY => {
@@ -2301,8 +2318,17 @@ fn take_capture() {
 }
 
 /// `WM_APP_PIPE`: 届いている CLI の依頼を進める。範囲選択の画面を開いている間に届いたものは失敗として返し、
-/// `delay` を待っている間に届いたものは待たせる（終えたら `end_capture` が起こす）。
-fn on_pipe_requests() {
+/// `delay` を待っている間に届いたものは待たせる（終えたら `end_capture` が起こす）。CLI が待つのをやめた
+/// 依頼（切った・待ちきれなかった）は取りやめる。App を借りられなければ、少し後に進め直す。
+fn on_pipe_requests(message_window: HWND) {
+    if APP.with(|cell| cell.try_borrow_mut().is_err()) {
+        // SAFETY: 自分のウィンドウのタイマー
+        if unsafe { SetTimer(Some(message_window), TIMER_PIPE_RETRY, PIPE_RETRY_MS, None) } == 0 {
+            log::warn!("could not start the pipe retry timer");
+        }
+        return;
+    }
+    abandon_unwaited_capture(message_window);
     loop {
         let next = with_app(|app| {
             if matches!(app.capture, Capture::Waiting(_)) {
@@ -2318,6 +2344,12 @@ fn on_pipe_requests() {
         let Some((request, selecting)) = next else {
             return;
         };
+        if let Some(to) = request.reply
+            && !cli_waiting(to)
+        {
+            log::info!("CLI request {} is no longer waited for; dropped", to.0);
+            continue;
+        }
         if selecting {
             log::info!("CLI request while the overlay is open; rejected");
             reply_failed(request.reply, text("cli.selecting"));
@@ -2326,6 +2358,37 @@ fn on_pipe_requests() {
             submit(request);
         }
     }
+}
+
+/// 進めている依頼の CLI が待つのをやめていたら（切った・待ちきれなかった）、依頼を取りやめる。
+/// 範囲選択の画面を開いていれば閉じ、`delay` を待っていればタイマーを止める。
+fn abandon_unwaited_capture(message_window: HWND) {
+    let abandoned = with_app(|app| {
+        let (reply, selecting) = match &app.capture {
+            Capture::Idle => return None,
+            Capture::Waiting(request) => (request.reply?, false),
+            Capture::Selecting { request, .. } => (request.reply?, true),
+        };
+        (!cli_waiting(reply)).then_some(selecting)
+    })
+    .flatten();
+    match abandoned {
+        Some(true) => close_overlay("the CLI stopped waiting"),
+        Some(false) => {
+            log::info!("the CLI stopped waiting; the capture is abandoned");
+            // SAFETY: 自分のウィンドウのタイマーを止める（`delay`・メニューを待つタイマー）
+            unsafe {
+                let _ = KillTimer(Some(message_window), TIMER_CAPTURE_DELAY);
+            }
+            end_capture();
+        }
+        None => {}
+    }
+}
+
+/// `to` の依頼に、まだ応答を待っている CLI がいるか。
+fn cli_waiting(to: ReplyTo) -> bool {
+    REPLIER.get().is_none_or(|replier| replier.is_waiting(to))
 }
 
 /// `capture rect`: 範囲選択の画面を出さずに、決まった範囲を撮って出力する。

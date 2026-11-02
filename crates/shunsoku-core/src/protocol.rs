@@ -3,6 +3,7 @@
 use crate::cli_args::{Capture, Output, Save, Target};
 use crate::geometry::Rect;
 use crate::monitors::Monitor;
+use std::time::Duration;
 
 /// プロトコルのバージョン。形式を変えたら上げる。互換性は保たず、違えば断る。
 pub const VERSION: u32 = 2;
@@ -14,6 +15,31 @@ pub const MAX_MESSAGE: usize = 64 * 1024;
 /// 常駐本体とは別のパイプにする。開けるのを現在のユーザーに限るのはセキュリティ記述子の役目（`pipe_server`）。
 pub fn pipe_name(session: u32, user_sid: &str) -> String {
     format!(r"\\.\pipe\shunsoku-{session}-{user_sid}")
+}
+
+/// 常駐本体が `capture` の依頼の応答を待つ時間の上限（届いてから）。過ぎたら依頼を取りやめ、失敗として返す
+/// （CLI が待ち続けないように）。
+pub fn reply_timeout(capture: &Capture) -> Duration {
+    /// ユーザーを待たない撮影（と `delay`）にかかる時間の上限。
+    const UNATTENDED: Duration = Duration::from_secs(60);
+    /// 範囲選択の画面でユーザーが選び終えるのを待つ時間の上限。
+    const SELECTING: Duration = Duration::from_secs(10 * 60);
+    match capture.target {
+        Target::Rect { .. } | Target::Region { .. } => UNATTENDED,
+        Target::Active { delay } => UNATTENDED + Duration::from_secs(delay.into()),
+        Target::Select => SELECTING,
+    }
+}
+
+/// CLI が応答を待つ時間の上限（依頼を書いてから）。常駐本体が取りやめて返す応答を受け取れるよう、
+/// `reply_timeout` より少し長く待つ。過ぎたら常駐本体が応答しないものとして終わる。
+pub fn client_timeout(request: &Request) -> Duration {
+    /// 常駐本体が取りやめてから応答が届くまでの余裕（`monitors` はその場で答えるので、これだけ待つ）。
+    const MARGIN: Duration = Duration::from_secs(10);
+    match request {
+        Request::Capture(capture) => reply_timeout(capture) + MARGIN,
+        Request::Monitors => MARGIN,
+    }
 }
 
 /// 依頼。
@@ -410,6 +436,49 @@ mod tests {
             },
             output: Output::default(),
         })
+    }
+
+    fn capture(target: Target) -> Capture {
+        Capture {
+            target,
+            output: Output::default(),
+        }
+    }
+
+    #[test]
+    fn a_capture_without_the_user_is_given_up_after_a_minute() {
+        let rect = capture(Target::Rect {
+            monitor: None,
+            rect: Rect::new(0, 0, 10, 10),
+        });
+        let region = capture(Target::Region {
+            name: "a".to_owned(),
+        });
+        assert_eq!(reply_timeout(&rect), Duration::from_secs(60));
+        assert_eq!(reply_timeout(&region), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_delay_is_waited_on_top_of_the_minute() {
+        let active = capture(Target::Active { delay: 30 });
+        assert_eq!(reply_timeout(&active), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn a_selection_waits_ten_minutes_for_the_user() {
+        assert_eq!(
+            reply_timeout(&capture(Target::Select)),
+            Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn the_cli_waits_a_little_longer_than_the_resident_gives_up() {
+        let select = Request::Capture(capture(Target::Select));
+        let active = Request::Capture(capture(Target::Active { delay: 5 }));
+        assert_eq!(client_timeout(&select), Duration::from_secs(610));
+        assert_eq!(client_timeout(&active), Duration::from_secs(75));
+        assert_eq!(client_timeout(&Request::Monitors), Duration::from_secs(10));
     }
 
     #[test]

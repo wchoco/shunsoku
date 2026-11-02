@@ -58,7 +58,8 @@ fn run() -> i32 {
             return EXIT_ARGS;
         }
     };
-    let reply = match pipe::exchange(&protocol::encode_request(&request)) {
+    let timeout = protocol::client_timeout(&request);
+    let reply = match pipe::exchange(&protocol::encode_request(&request), timeout) {
         Ok(reply) => reply,
         Err(failure) => {
             error(&failure.message);
@@ -105,6 +106,7 @@ impl Failure {
 #[cfg(windows)]
 mod pipe {
     use std::os::windows::ffi::OsStrExt;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use shunsoku_core::protocol::{self, MAX_MESSAGE};
@@ -144,6 +146,9 @@ mod pipe {
 
     struct Pipe(HANDLE);
 
+    // SAFETY: パイプのハンドルはどのスレッドからでも使える。持つのは 1 つのスレッドだけ
+    unsafe impl Send for Pipe {}
+
     impl Drop for Pipe {
         fn drop(&mut self) {
             // SAFETY: 開いたハンドルを 1 回だけ閉じる
@@ -153,8 +158,8 @@ mod pipe {
         }
     }
 
-    /// 依頼を書いて、応答を読む。
-    pub(super) fn exchange(request: &str) -> Result<String, Failure> {
+    /// 依頼を書いて、応答を読む。`timeout` を過ぎても応答がなければ、待つのをやめる。
+    pub(super) fn exchange(request: &str, timeout: Duration) -> Result<String, Failure> {
         let session = pipe_identity::current_session()
             .map_err(|e| Failure::unavailable(format!("セッションを調べられません: {e}")))?;
         let sid = pipe_identity::current_user_sid()
@@ -173,6 +178,25 @@ mod pipe {
         // SAFETY: 書く中身はこの関数の中で生きている
         unsafe { WriteFile(pipe.0, Some(request.as_bytes()), None, None) }
             .map_err(|e| Failure::unavailable(format!("常駐本体に依頼できません: {e}")))?;
+        // 読むのは別のスレッドにして、時間で待つのをやめられるようにする。やめたら読むスレッドは放っておく
+        // （プロセスを終えれば終わる）。パイプは読むスレッドが持ち、読み終えてから閉じる
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(read_reply(&pipe));
+        });
+        receiver.recv_timeout(timeout).unwrap_or_else(|_| {
+            Err(Failure {
+                code: 1,
+                message: format!(
+                    "常駐本体から {} 秒待っても応答がありません",
+                    timeout.as_secs()
+                ),
+            })
+        })
+    }
+
+    /// 応答を読む。
+    fn read_reply(pipe: &Pipe) -> Result<String, Failure> {
         let mut buffer = vec![0u8; MAX_MESSAGE];
         let mut read = 0u32;
         // SAFETY: buffer と read はこの関数の中で生きている
@@ -319,7 +343,10 @@ mod pipe {
 mod pipe {
     use super::Failure;
 
-    pub(super) fn exchange(_request: &str) -> Result<String, Failure> {
+    pub(super) fn exchange(
+        _request: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<String, Failure> {
         Err(Failure::unavailable(
             "shunsoku-cli は Windows でだけ動きます",
         ))

@@ -27,6 +27,7 @@ pub const USAGE: &str = "\
       定型領域を撮ります。--out を省いた保存は、その領域の保存先とファイル名テンプレートです（領域の撮影後の動作は見ません）。
   shunsoku-cli capture select [出力のオプション]
       範囲選択の画面を出し、選び終えたら撮ります。Esc で取り消すと終了コード 4 です。
+      10 分たっても選び終えなければ、取りやめて終了コード 1 です。
   shunsoku-cli capture active [--delay <秒>] [出力のオプション]
       アクティブウィンドウを撮ります。--delay（0〜60 秒）で、撮る前に待ちます。
   shunsoku-cli monitors
