@@ -9,8 +9,9 @@
 
 use std::time::{Duration, Instant};
 
+use shunsoku_core::capture::window::visible_bounds;
 use shunsoku_core::geometry::{Rect, Size};
-use shunsoku_core::image::Image;
+use shunsoku_core::image::{Fragment, Image};
 
 use windows::Foundation::Metadata::ApiInformation;
 use windows::Graphics::Capture::{
@@ -31,6 +32,8 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 use windows::core::{Error, HSTRING, Interface, Result, factory, h};
+
+use crate::grab::{Gpu, GrabError};
 
 /// 最初のフレームを待つ時間の上限。
 const FRAME_TIMEOUT: Duration = Duration::from_secs(1);
@@ -185,4 +188,34 @@ fn window_bounds(hwnd: HWND) -> Rect {
         }
     }
     Rect::new(r.left, r.top, r.right, r.bottom)
+}
+
+/// WGC で撮れなかったウィンドウ（UAC で昇格したウィンドウなど）の後退: ウィンドウの矩形のうちモニタに
+/// 写っている部分を Desktop Duplication で撮る（spec #34、#64）。他のウィンドウに隠れた部分は、
+/// 隠しているウィンドウが写る。どのモニタにも重ならなければ Ok(None)。
+pub fn grab_visible(
+    gpu: &mut Gpu,
+    hwnd: HWND,
+) -> std::result::Result<Option<WindowShot>, GrabError> {
+    let shots = gpu.grab()?;
+    let monitors: Vec<Rect> = shots
+        .iter()
+        .map(|s| Rect::new(s.rect.left, s.rect.top, s.rect.right, s.rect.bottom))
+        .collect();
+    let Some(rect) = visible_bounds(window_bounds(hwnd), &monitors) else {
+        return Ok(None);
+    };
+    let fragments: Vec<Fragment> = shots
+        .iter()
+        .filter_map(|shot| match shot.read_back(rect) {
+            Ok(fragment) => fragment,
+            Err(e) => {
+                // 撮れなかったモニタの部分は透明になる
+                log::warn!("could not read back a monitor for the window: {e}");
+                None
+            }
+        })
+        .collect();
+    let image = Image::compose(rect, &fragments);
+    Ok(Some(WindowShot { rect, image }))
 }
