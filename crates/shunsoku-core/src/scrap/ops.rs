@@ -1085,6 +1085,18 @@ pub struct Folder {
     pub entries: Vec<MenuEntry>,
 }
 
+impl Folder {
+    /// 中の操作が 1 つでも実行できるか。false なら親の項目をグレー表示にする。
+    pub fn is_enabled(&self) -> bool {
+        self.entries.iter().any(|entry| match entry {
+            MenuEntry::Item(item) => item.enabled,
+            MenuEntry::Submenu(submenu) => submenu.enabled,
+            MenuEntry::Folder(folder) => folder.is_enabled(),
+            MenuEntry::Separator => false,
+        })
+    }
+}
+
 /// メニューで子メニューにまとめる操作（文言のキー、操作の id）。まとめた操作は、最初の操作の位置に並ぶ。
 const FOLDERS: &[(&str, &[OperationId])] =
     &[("scrap.op.appearance", &["opacity", "border", "shadow"])];
@@ -1490,6 +1502,24 @@ mod tests {
             assert_eq!(enabled, id == "annotate", "{id}");
             assert_eq!(checked, id == "annotate", "{id}");
         }
+    }
+
+    #[test]
+    fn the_appearance_folder_is_greyed_out_while_editing() {
+        let shortcuts = Shortcuts::new(OPERATIONS, &ShortcutOverrides::new());
+        let mut model = scrap();
+        let folder = |model: &ScrapModel| -> Folder {
+            menu(OPERATIONS, model, &shortcuts, &Appearance::default())
+                .into_iter()
+                .find_map(|entry| match entry {
+                    MenuEntry::Folder(folder) => Some(folder),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(folder(&model).is_enabled());
+        execute(op("annotate"), &mut model, &editing_context());
+        assert!(!folder(&model).is_enabled());
     }
 
     #[test]

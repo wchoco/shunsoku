@@ -2041,7 +2041,7 @@ fn scrap_menu_entries(
             },
             MenuEntry::Folder(folder) => menu::Entry::Submenu {
                 label: text(folder.label_key).into(),
-                enabled: true,
+                enabled: folder.is_enabled(),
                 items: scrap_menu_entries(&folder.entries, commands),
             },
             MenuEntry::Separator => menu::Entry::Separator,
@@ -3756,6 +3756,8 @@ fn on_settings_changed() {
         app.mouse = keymap.mouse;
         let unset =
             app.settings.hotkeys.select_capture.is_some() && new.hotkeys.select_capture.is_none();
+        app.carryover
+            .settings_changed(&app.settings.annotation, &new.annotation);
         app.settings = new;
         apply_changes(app, &changes);
         settings_notice(
