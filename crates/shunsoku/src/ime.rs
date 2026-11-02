@@ -7,6 +7,7 @@
 //!   その位置はキャレットに合わせる（`place`）。
 //! - どれも `App` を借りずに呼ぶ（IME がスクラップのウィンドウにメッセージを送り返すことがあるため）。
 
+use shunsoku_core::annotate::Composition;
 use shunsoku_core::geometry::Rect;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::UI::Input::Ime::{
@@ -15,13 +16,6 @@ use windows::Win32::UI::Input::Ime::{
     ImmAssociateContextEx, ImmGetCompositionStringW, ImmGetContext, ImmNotifyIME,
     ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow, NI_COMPOSITIONSTR,
 };
-
-/// 変換中の文字と、その中のキャレットの位置（UTF-16 の単位）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Composition {
-    pub text: String,
-    pub cursor: usize,
-}
 
 /// `WM_IME_COMPOSITION` で変わったもの。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

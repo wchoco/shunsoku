@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, Result, w};
 
-use crate::scrap_window;
+use crate::layered;
 
 /// ツールバーのウィンドウのクラス名。
 const CLASS_NAME: PCWSTR = w!("shunsoku.toolbar");
@@ -80,7 +80,7 @@ impl ToolbarWindow {
 
     /// `source` の中身を `rect`（スクリーン座標）に出す。いつも不透明。
     pub fn present(&self, source: HDC, rect: Rect) -> Result<()> {
-        scrap_window::present_layered(self.hwnd, source, rect, 100)
+        layered::present(self.hwnd, source, rect, 100)
     }
 
     /// 大きさを変えずに、左上を `rect` の左上に動かす（中身は描き直さない）。

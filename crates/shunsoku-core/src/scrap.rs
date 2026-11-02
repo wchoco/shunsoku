@@ -14,12 +14,14 @@
 
 pub mod ops;
 
-use crate::annotate::{Annotation, Annotations, EditInput, EditOutput, EditState, Style, View};
+use crate::annotate::{
+    Annotation, Annotations, EditContext, EditInput, EditOutput, EditState, Style, View,
+};
 use crate::geometry::{Point, Rect, Size};
 use crate::image::Image;
 use crate::settings::{DpiScaling, ScrapAppearance};
 
-/// 書き込みの当たり判定の、線の外の広さ（画面の物理ピクセル）。
+/// 書き込みの当たり判定の、線の外の広さ（96 DPI での画面の画素。モニタの DPI で換算する）。
 const HIT_SLOP: u32 = 4;
 
 /// スクラップの表示のモード。
@@ -539,28 +541,30 @@ impl ScrapModel {
     /// `Mode::Normal` に戻す。編集モードでなければ何もせず、空を返す。
     pub fn edit_input(&mut self, input: EditInput) -> Vec<EditOutput> {
         let input = input.map_point(|at| self.image_pixel_at(at));
-        let slop = self.hit_slop();
-        let visible = self.visible_area();
+        let cx = EditContext {
+            hit_slop: self.hit_slop(),
+            visible: Some(self.visible_area()),
+        };
         let Mode::Editing(state) = &mut self.mode else {
             return vec![];
         };
-        state.set_hit_slop(slop);
-        state.set_visible(visible);
-        let outputs = state.input(input, &mut self.annotations);
+        let outputs = state.input_in(input, &mut self.annotations, &cx);
         if outputs.contains(&EditOutput::Left) {
             self.mode = Mode::Normal;
         }
         outputs
     }
 
-    /// 書き込みの当たり判定を、線の太さの外にどれだけ広げるか（元の画像の画素）。画面で `HIT_SLOP` の物理
-    /// ピクセルになるようにする（縮小していれば広く、拡大していれば狭い）。
+    /// 書き込みの当たり判定を、線の太さの外にどれだけ広げるか（元の画像の画素）。画面で `HIT_SLOP` を
+    /// モニタの DPI で換算した物理ピクセルになるようにする（縮小していれば広く、拡大していれば狭い）。
     fn hit_slop(&self) -> u32 {
+        let dpi = self.dpi.unwrap_or(BASE_DPI);
+        let screen = f64::from(HIT_SLOP) * f64::from(dpi) / f64::from(BASE_DPI);
         let scale = self.annotation_view().scale_x;
         if scale <= 0.0 {
-            return HIT_SLOP;
+            return screen.ceil() as u32;
         }
-        (f64::from(HIT_SLOP) / scale).ceil() as u32
+        (screen / scale).ceil() as u32
     }
 
     /// 編集モードで選んでいる書き込み。選択の印を描くのに使う。
@@ -1877,6 +1881,32 @@ mod tests {
     }
 
     #[test]
+    fn the_hit_slop_is_4px_at_96_dpi_and_grows_with_the_monitor_dpi() {
+        // 太さ 2（半分は 1）の横線から 7 画素離れた所。96 DPI では当たりは 1 + 4 で外れ、144 DPI では 1 + 6 で当たる
+        for (dpi, hit) in [(96, false), (144, true)] {
+            let mut scrap = ScrapModel::new(Point::new(100, 50), Size::new(300, 200));
+            scrap.set_dpi(dpi, DpiScaling::KeepApparentSize, ZoomAnchor::Center);
+            let o = scrap.image_rect().origin();
+            let at = |x: i32, y: i32| Point::new(o.x + x, o.y + y);
+            scrap.start_editing(Style {
+                color: Rgb(0, 0, 0),
+                width: 2,
+            });
+            scrap.edit_input(EditInput::Pick(Pick::Tool(Tool::Line)));
+            scrap.edit_input(EditInput::Press(at(10, 50)));
+            scrap.edit_input(EditInput::Move {
+                at: at(100, 50),
+                shift: false,
+            });
+            scrap.edit_input(EditInput::Release);
+            scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x56))));
+            scrap.edit_input(EditInput::Press(at(50, 57)));
+            scrap.edit_input(EditInput::Release);
+            assert_eq!(scrap.selected_annotation().is_some(), hit, "{dpi} dpi");
+        }
+    }
+
+    #[test]
     fn after_leaving_and_coming_back_the_select_tool_picks_moves_recolours_and_deletes() {
         let mut scrap = ScrapModel::new(Point::new(100, 50), Size::new(300, 200));
         scrap.set_zoom(50, ZoomAnchor::Center);
@@ -2189,10 +2219,13 @@ mod tests {
         let shift_right = EditInput::Key(Chord::plain(Key::known(0x27)).shift());
         // 左の辺の外側（太さの半分）が 8 なので、10 画素ずつ 10 回で範囲 (0, 0)〜(100, 100) の外に出る
         for _ in 0..9 {
-            scrap.edit_input(shift_right);
+            scrap.edit_input(shift_right.clone());
             assert!(scrap.selected_annotation().is_some());
         }
-        assert_eq!(scrap.edit_input(shift_right), vec![EditOutput::Redraw]);
+        assert_eq!(
+            scrap.edit_input(shift_right.clone()),
+            vec![EditOutput::Redraw]
+        );
         assert_eq!(scrap.annotations().items().len(), 3);
         assert_eq!(scrap.annotations_to_draw().len(), 1);
         // 隠れたものは選択から外れ、矢印キーも Delete も効かない

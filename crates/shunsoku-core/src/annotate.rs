@@ -611,14 +611,32 @@ pub struct EditState {
     selected: Option<usize>,
     /// 選んだ書き込みをドラッグで動かしている間（押してから離すまで）。
     grab: Option<Grab>,
-    /// 当たり判定を線の太さの外に広げる画素数（`Annotation::hits` の `slop`）。
-    hit_slop: u32,
     /// これから打つ文字の書体と大きさ。入ったときは設定の `[annotation]` の値。
     pub font: Font,
     /// 打っている文字（文字の道具でクリックしてから確定するまで）。
-    typing: Option<Typing>,
-    /// 見えている範囲（元の画像の画素）。外にある書き込みは選ばない。None なら絞らない。
-    visible: Option<Rect>,
+    typing: Option<Box<Typing>>,
+}
+
+/// 編集モードへの入力 1 回の間の、スクラップの表示から決まる値（`ScrapModel::edit_input` が入れる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EditContext {
+    /// 当たり判定を線の太さの外に広げる画素数（`Annotation::hits` の `slop`、元の画像の画素）。表示の倍率から
+    /// 決める（画面での広さを揃えるため）。
+    pub hit_slop: u32,
+    /// 見えている範囲（元の画像の画素。トリムの範囲か画像全体）。外にある書き込みは選ばない。None なら絞らない。
+    pub visible: Option<Rect>,
+}
+
+impl EditContext {
+    /// 書き込み `a` が見えている範囲に映るか（範囲を絞っていなければ常に映る）。
+    fn shows(&self, a: &Annotation) -> bool {
+        self.visible.is_none_or(|area| a.is_visible_in(area))
+    }
+
+    /// `at` が書き込み `a` に当たるか（見えていないものには当たらない）。
+    fn hits(&self, a: &Annotation, at: Point) -> bool {
+        self.shows(a) && a.hits(at, self.hit_slop)
+    }
 }
 
 /// 打っている文字。
@@ -632,9 +650,48 @@ struct Typing {
     style: Style,
     /// 打ち直している書き込みの位置。新しく打つなら None。
     retyping: Option<usize>,
+    /// 日本語入力の変換中の文字。打った文字の続きに描く。
+    composition: Option<Composition>,
+    /// `WM_CHAR` で来たサロゲート ペアの前半（後半が来たら 1 文字にして打つ）。
+    high_surrogate: Option<u16>,
+}
+
+/// 日本語入力の変換中の文字と、その中のキャレットの位置（UTF-16 の単位）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Composition {
+    pub text: String,
+    pub cursor: usize,
 }
 
 impl Typing {
+    /// 文字 `c` を打つ。制御文字は捨てる。
+    fn push(&mut self, c: char) -> Vec<EditOutput> {
+        if c.is_control() {
+            return vec![];
+        }
+        self.text.push(c);
+        vec![EditOutput::Redraw]
+    }
+
+    /// `WM_CHAR` の UTF-16 の 1 単位を打つ。サロゲート ペアは 2 つ揃ってから 1 文字にし、揃わないものは捨てる。
+    fn push_utf16(&mut self, unit: u16) -> Vec<EditOutput> {
+        let c = match unit {
+            0xD800..=0xDBFF => {
+                self.high_surrogate = Some(unit);
+                return vec![];
+            }
+            0xDC00..=0xDFFF => match self.high_surrogate.take() {
+                Some(high) => char::decode_utf16([high, unit]).next().and_then(|c| c.ok()),
+                None => None,
+            },
+            _ => {
+                self.high_surrogate = None;
+                char::from_u32(u32::from(unit))
+            }
+        };
+        c.map_or_else(Vec::new, |c| self.push(c))
+    }
+
     fn annotation(&self) -> Annotation {
         Annotation {
             shape: Shape::Text {
@@ -664,10 +721,8 @@ impl EditState {
             draft: None,
             selected: None,
             grab: None,
-            hit_slop: 0,
             font: Font::default(),
             typing: None,
-            visible: None,
         }
     }
 
@@ -678,7 +733,12 @@ impl EditState {
 
     /// 打っている文字（打った分だけ。空のこともある）。描くのと、日本語入力の窓の場所を決めるのに使う。
     pub fn typing(&self) -> Option<Annotation> {
-        self.typing.as_ref().map(Typing::annotation)
+        self.typing.as_deref().map(Typing::annotation)
+    }
+
+    /// 日本語入力の変換中の文字（打っている文字の続きに描く）。
+    pub fn composition(&self) -> Option<&Composition> {
+        self.typing.as_ref()?.composition.as_ref()
     }
 
     /// 打ち直している書き込みの位置（`Annotations::items` の添え字）。打ち終えるまで、元のものは描かない。
@@ -686,27 +746,12 @@ impl EditState {
         self.typing.as_ref()?.retyping
     }
 
-    /// 当たり判定の広さ（元の画像の画素）。`ScrapModel` が表示の倍率から決める（画面での広さを揃えるため）。
-    pub(crate) fn set_hit_slop(&mut self, slop: u32) {
-        self.hit_slop = slop;
-    }
-
-    /// 見えている範囲（元の画像の画素）。`ScrapModel` がトリムの範囲（なければ画像全体）を入れる。
-    pub(crate) fn set_visible(&mut self, area: Rect) {
-        self.visible = Some(area);
-    }
-
-    /// 書き込み `a` が見えている範囲に映るか（範囲を絞っていなければ常に映る）。
-    fn is_visible(&self, a: &Annotation) -> bool {
-        self.visible.is_none_or(|area| a.is_visible_in(area))
-    }
-
     /// 選んでいる書き込みが見えている範囲の外へ出たら、選択を外す（見えないものを動かしたり消したりしないため）。
-    fn drop_hidden_selection(&mut self, annotations: &Annotations) {
+    fn drop_hidden_selection(&mut self, annotations: &Annotations, cx: &EditContext) {
         let hidden = self
             .selected
             .and_then(|i| annotations.items().get(i))
-            .is_some_and(|a| !self.is_visible(a));
+            .is_some_and(|a| !cx.shows(a));
         if hidden {
             self.selected = None;
             self.grab = None;
@@ -728,21 +773,74 @@ impl EditState {
     }
 
     /// 入力を受けて、`annotations` を変える。座標は元の画像の画素（`ScrapModel::edit_input` が直したもの）。
+    /// 文字を打っている間に、文字・日本語入力・カーソルの移動のほかの入力が来たら、変換中の文字を確定したことに
+    /// してから受ける（`EditOutput::CompositionTaken`）。当たり判定は広げず、見えている範囲は絞らない
+    /// （`EditContext::default()` の `input_in`）。
     pub fn input(&mut self, input: EditInput, annotations: &mut Annotations) -> Vec<EditOutput> {
-        if self.typing.is_some()
-            && let Some(outputs) = self.type_input(input, annotations)
-        {
-            return outputs;
+        self.input_in(input, annotations, &EditContext::default())
+    }
+
+    /// `input` の、当たり判定の広さと見えている範囲を `cx` にしたもの。
+    pub fn input_in(
+        &mut self,
+        input: EditInput,
+        annotations: &mut Annotations,
+        cx: &EditContext,
+    ) -> Vec<EditOutput> {
+        let mut outputs = self.take_composition(&input);
+        let input = match self.type_input(input, annotations, cx) {
+            Ok(typed) => {
+                outputs.extend(typed);
+                return outputs;
+            }
+            Err(input) => input,
+        };
+        outputs.extend(self.input_not_typing(input, annotations, cx));
+        outputs
+    }
+
+    /// `input` の前に、変換中の文字を打った文字に入れる（`input` のとき）。
+    fn take_composition(&mut self, input: &EditInput) -> Vec<EditOutput> {
+        if matches!(
+            input,
+            EditInput::Char(_)
+                | EditInput::Utf16(_)
+                | EditInput::Composition { .. }
+                | EditInput::Move { .. }
+                | EditInput::Release
+        ) {
+            return vec![];
         }
+        let Some(typing) = self.typing.as_mut() else {
+            return vec![];
+        };
+        let Some(composition) = typing.composition.take() else {
+            return vec![];
+        };
+        for c in composition.text.chars() {
+            typing.push(c);
+        }
+        vec![EditOutput::CompositionTaken]
+    }
+
+    /// 文字を打っていないときの入力（打っている間でも、打つ文字への入力でないもの）。
+    fn input_not_typing(
+        &mut self,
+        input: EditInput,
+        annotations: &mut Annotations,
+        cx: &EditContext,
+    ) -> Vec<EditOutput> {
         match input {
             EditInput::Press(at) if self.tool == Tool::Text => self.start_typing(at, None),
-            EditInput::Press(at) if self.tool == Tool::Select => self.select_at(at, annotations),
+            EditInput::Press(at) if self.tool == Tool::Select => {
+                self.select_at(at, annotations, cx)
+            }
             EditInput::Press(at) => {
                 self.draft = Some(Draft::new(at));
                 vec![]
             }
             EditInput::Move { at, .. } if self.grab.is_some() => {
-                self.drag_selected(at, annotations)
+                self.drag_selected(at, annotations, cx)
             }
             EditInput::Move { at, shift } => match &mut self.draft {
                 Some(draft) if (draft.to, draft.shift) != (at, shift) => {
@@ -756,10 +854,10 @@ impl EditState {
                 self.commit(annotations)
             }
             EditInput::Pick(pick) => self.pick(pick, annotations),
-            EditInput::Char(_) => vec![],
-            EditInput::DoubleClick(at) => match self.text_at(at, annotations) {
+            EditInput::Char(_) | EditInput::Utf16(_) | EditInput::Composition { .. } => vec![],
+            EditInput::DoubleClick(at) => match self.text_at(at, annotations, cx) {
                 Some(index) => self.retype(index, annotations),
-                None => self.input(EditInput::Press(at), annotations),
+                None => self.input_in(EditInput::Press(at), annotations, cx),
             },
             EditInput::Key(chord) if chord == ESCAPE => {
                 let mut outputs = self.commit(annotations);
@@ -780,7 +878,7 @@ impl EditState {
             }
             EditInput::Key(chord) => {
                 if let Some((dx, dy)) = nudge(chord) {
-                    return self.nudge(dx, dy, annotations);
+                    return self.nudge(dx, dy, annotations, cx);
                 }
                 match Tool::from_key(chord) {
                     Some(tool) => self.pick(Pick::Tool(tool), annotations),
@@ -795,19 +893,26 @@ impl EditState {
         }
     }
 
-    /// 文字を打っている間の入力。打つ文字への入力ならその結果を、ほかの入力と同じに扱うなら None を返す
-    /// （打っている文字は先に確定してある）。
+    /// 文字を打っている間の入力。打つ文字への入力ならその結果を、ほかの入力と同じに扱うなら（打っていない
+    /// ときも）`input` をそのまま返す。
     fn type_input(
         &mut self,
         input: EditInput,
         annotations: &mut Annotations,
-    ) -> Option<Vec<EditOutput>> {
-        let typing = self.typing.as_mut()?;
-        let inside = |at: Point, slop: u32| typing.annotation().hits(at, slop);
+        cx: &EditContext,
+    ) -> Result<Vec<EditOutput>, EditInput> {
+        let Some(typing) = self.typing.as_mut() else {
+            return Err(input);
+        };
+        let inside = |at: Point| typing.annotation().hits(at, cx.hit_slop);
         let outputs = match input {
-            EditInput::Char(c) if c.is_control() => vec![],
-            EditInput::Char(c) => {
-                typing.text.push(c);
+            EditInput::Char(c) => typing.push(c),
+            EditInput::Utf16(unit) => typing.push_utf16(unit),
+            EditInput::Composition { result, composing } => {
+                for c in result.chars() {
+                    typing.push(c);
+                }
+                typing.composition = composing;
                 vec![EditOutput::Redraw]
             }
             EditInput::Key(chord) if chord == ESCAPE => self.finish_typing(annotations),
@@ -819,13 +924,17 @@ impl EditState {
                 Some(_) => vec![EditOutput::Redraw],
                 None => vec![],
             },
-            // 元に戻す・やり直すは、確定してから（描きかけと同じ）
-            EditInput::Key(chord) if chord == UNDO || REDO.contains(&chord) => return None,
+            // 元に戻す・やり直すは、ツールバーのものと同じに確定してから（打ち直している位置が履歴でずれないため）
+            EditInput::Key(chord) if chord == UNDO || REDO.contains(&chord) => {
+                let mut outputs = self.finish_typing(annotations);
+                outputs.extend(self.input_in(input, annotations, cx));
+                outputs
+            }
             // ほかのキー（数字キーの道具、矢印、Delete など）は、打つ間は受けない
             EditInput::Key(_) => vec![],
-            EditInput::Press(at) if inside(at, self.hit_slop) => vec![],
+            EditInput::Press(at) if inside(at) => vec![],
             // 打った文字の上のダブルクリックは、単語を選んだりせず何もしない
-            EditInput::DoubleClick(at) if !typing.text.is_empty() && inside(at, self.hit_slop) => {
+            EditInput::DoubleClick(at) if !typing.text.is_empty() && inside(at) => {
                 vec![]
             }
             // 外のクリックは確定だけ（そこから描いたり選んだりはしない）
@@ -841,7 +950,7 @@ impl EditState {
                 vec![EditOutput::Redraw, EditOutput::Picked(Pick::FontSize(size))]
             }
             EditInput::Move { .. } | EditInput::Release | EditInput::Pick(Pick::Width(_)) => {
-                return None;
+                return Err(input);
             }
             EditInput::DoubleClick(_)
             | EditInput::Pick(Pick::Tool(_))
@@ -850,11 +959,11 @@ impl EditState {
             | EditInput::Redo
             | EditInput::Leave => {
                 let mut outputs = self.finish_typing(annotations);
-                outputs.extend(self.input(input, annotations));
+                outputs.extend(self.input_in(input, annotations, cx));
                 outputs
             }
         };
-        Some(outputs)
+        Ok(outputs)
     }
 
     /// `at` から文字を打ち始める。打ち直すなら `retyping` に元の書き込みの位置とその書き込みを渡す。
@@ -866,7 +975,7 @@ impl EditState {
         self.draft = None;
         self.grab = None;
         self.selected = None;
-        self.typing = Some(match retyping {
+        self.typing = Some(Box::new(match retyping {
             Some((
                 index,
                 Annotation {
@@ -879,6 +988,8 @@ impl EditState {
                 font: font.clone(),
                 style: *style,
                 retyping: Some(index),
+                composition: None,
+                high_surrogate: None,
             },
             _ => Typing {
                 at,
@@ -886,8 +997,10 @@ impl EditState {
                 font: self.font.clone(),
                 style: self.style,
                 retyping: None,
+                composition: None,
+                high_surrogate: None,
             },
-        });
+        }));
         vec![EditOutput::TypingStarted, EditOutput::Redraw]
     }
 
@@ -905,10 +1018,11 @@ impl EditState {
     }
 
     /// `at` にある文字の書き込みのうち、いちばん上のもの。
-    fn text_at(&self, at: Point, annotations: &Annotations) -> Option<usize> {
-        annotations.items().iter().rposition(|a| {
-            matches!(a.shape, Shape::Text { .. }) && self.is_visible(a) && a.hits(at, self.hit_slop)
-        })
+    fn text_at(&self, at: Point, annotations: &Annotations, cx: &EditContext) -> Option<usize> {
+        annotations
+            .items()
+            .iter()
+            .rposition(|a| matches!(a.shape, Shape::Text { .. }) && cx.hits(a, at))
     }
 
     /// 打っている文字を確定する。空（空白だけ）なら何も残さず、打ち直していたなら元のものを消す。
@@ -994,11 +1108,13 @@ impl EditState {
     }
 
     /// `at` にある書き込みのうち、いちばん上のものを選ぶ。何もなければ選択を外す。
-    fn select_at(&mut self, at: Point, annotations: &Annotations) -> Vec<EditOutput> {
-        let hit = annotations
-            .items()
-            .iter()
-            .rposition(|a| self.is_visible(a) && a.hits(at, self.hit_slop));
+    fn select_at(
+        &mut self,
+        at: Point,
+        annotations: &Annotations,
+        cx: &EditContext,
+    ) -> Vec<EditOutput> {
+        let hit = annotations.items().iter().rposition(|a| cx.hits(a, at));
         self.grab = hit.map(|_| Grab {
             last: at,
             moved: false,
@@ -1011,7 +1127,12 @@ impl EditState {
     }
 
     /// 選んだ書き込みのドラッグでカーソルが `at` に動いた。動いた分だけずらす。
-    fn drag_selected(&mut self, at: Point, annotations: &mut Annotations) -> Vec<EditOutput> {
+    fn drag_selected(
+        &mut self,
+        at: Point,
+        annotations: &mut Annotations,
+        cx: &EditContext,
+    ) -> Vec<EditOutput> {
         let (Some(index), Some(grab)) = (self.selected, self.grab) else {
             return vec![];
         };
@@ -1026,7 +1147,7 @@ impl EditState {
             annotations.translate(index, dx, dy)
         };
         self.grab = Some(Grab { last: at, moved });
-        self.drop_hidden_selection(annotations);
+        self.drop_hidden_selection(annotations, cx);
         vec![EditOutput::Redraw]
     }
 
@@ -1060,14 +1181,20 @@ impl EditState {
     }
 
     /// 選んだ書き込みを矢印キーで `(dx, dy)` 画素ずらす。選んでいなければ受けない。
-    fn nudge(&mut self, dx: i32, dy: i32, annotations: &mut Annotations) -> Vec<EditOutput> {
+    fn nudge(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        annotations: &mut Annotations,
+        cx: &EditContext,
+    ) -> Vec<EditOutput> {
         let Some(index) = self.selected else {
             return vec![];
         };
         if !annotations.translate(index, dx, dy) {
             return vec![];
         }
-        self.drop_hidden_selection(annotations);
+        self.drop_hidden_selection(annotations, cx);
         vec![EditOutput::Redraw]
     }
 
@@ -1156,7 +1283,7 @@ const ENTER: [Chord; 2] = [
 
 /// 書き込みの編集モードへの入力。座標は、`ScrapModel::edit_input` に渡すときはスクリーン座標（物理ピクセル）、
 /// `EditState::input` が受けるときは元の画像の画素。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditInput {
     /// 左ボタンを押した。
     Press(Point),
@@ -1172,8 +1299,16 @@ pub enum EditInput {
     Key(Chord),
     /// ツールバーで道具・色・太さを選んだ（数字キーで道具を選ぶのは `Key`）。
     Pick(Pick),
-    /// 文字を打った（`WM_CHAR` と、日本語入力で確定した文字）。打っている間だけ受け、制御文字は捨てる。
+    /// 文字を打った。打っている間だけ受け、制御文字は捨てる。
     Char(char),
+    /// `WM_CHAR` の UTF-16 の 1 単位。サロゲート ペアは 2 つ揃ってから 1 文字として打つ。ほかは `Char` と同じ。
+    Utf16(u16),
+    /// 日本語入力の変換が進んだ（`WM_IME_COMPOSITION`）か終わった（`WM_IME_ENDCOMPOSITION`、どちらも None）。
+    /// 確定した文字 `result` を打ち、変換中の文字を `composing` にする。打っている間だけ受ける。
+    Composition {
+        result: String,
+        composing: Option<Composition>,
+    },
     /// ツールバーの削除を押した（`Delete` と `Backspace` は `Key`）。選んだ書き込みを消す。
     Delete,
     /// ツールバーの元に戻すを押した（`Ctrl+Z` は `Key`）。
@@ -1209,6 +1344,8 @@ pub enum EditOutput {
     TypingStarted,
     /// 文字を打ち終えた（日本語入力を止め、変換中の文字は捨てる）。
     TypingEnded,
+    /// 変換中の文字を確定したことにして、打った文字に入れた（日本語入力の側の変換中の文字を捨てる）。
+    CompositionTaken,
     /// 道具・色・太さを（ツールバーか数字キーで）選んだ。ツールバーを描き直し、`Carryover::record` で次の
     /// 編集モードに引き継ぐ。
     Picked(Pick),
@@ -2606,6 +2743,269 @@ mod tests {
         assert_eq!(shapes(&annotations), vec![text(p(10, 10), "ab", 16)]);
         state.input(undo(), &mut annotations);
         assert!(annotations.is_empty());
+    }
+
+    /// 文字の道具で `at` をクリックして打ち始める。
+    fn start_typing_at(state: &mut EditState, annotations: &mut Annotations, at: Point) {
+        state.input(digit(5), annotations);
+        click(state, annotations, at);
+    }
+
+    fn composing(text: &str, cursor: usize) -> EditInput {
+        EditInput::Composition {
+            result: String::new(),
+            composing: Some(Composition {
+                text: text.to_owned(),
+                cursor,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_surrogate_pair_from_wm_char_is_typed_as_one_character() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        start_typing_at(&mut state, &mut annotations, p(10, 10));
+        // 😀 は U+1F600（D83D DE00）。前半だけでは何も打たない
+        assert_eq!(
+            state.input(EditInput::Utf16(0xD83D), &mut annotations),
+            vec![]
+        );
+        assert_eq!(
+            state.input(EditInput::Utf16(0xDE00), &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        // 前半のない後半と、後半の来なかった前半は捨てる
+        state.input(EditInput::Utf16(0xDE00), &mut annotations);
+        state.input(EditInput::Utf16(0xD83D), &mut annotations);
+        state.input(EditInput::Utf16(u16::from(b'a')), &mut annotations);
+        assert_eq!(
+            state.typing().map(|a| a.shape),
+            Some(text(p(10, 10), "\u{1F600}a", 16))
+        );
+    }
+
+    #[test]
+    fn wm_char_is_not_taken_unless_typing() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        assert_eq!(
+            state.input(EditInput::Utf16(u16::from(b'a')), &mut annotations),
+            vec![]
+        );
+        assert_eq!(
+            state.input(EditInput::Utf16(0xD83D), &mut annotations),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn the_ime_composition_is_drawn_after_the_text_and_its_result_is_typed() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        start_typing_at(&mut state, &mut annotations, p(10, 10));
+        chars(&mut state, &mut annotations, "a");
+        assert_eq!(
+            state.input(composing("にほ", 2), &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(
+            state.composition(),
+            Some(&Composition {
+                text: "にほ".to_owned(),
+                cursor: 2,
+            })
+        );
+        // 変換中の文字は、打った文字にはまだ入らない
+        assert_eq!(
+            state.typing().map(|a| a.shape),
+            Some(text(p(10, 10), "a", 16))
+        );
+        // 確定した文字を打ち、続けて変換している文字に替える
+        state.input(
+            EditInput::Composition {
+                result: "日本".to_owned(),
+                composing: Some(Composition {
+                    text: "ご".to_owned(),
+                    cursor: 1,
+                }),
+            },
+            &mut annotations,
+        );
+        assert_eq!(
+            state.typing().map(|a| a.shape),
+            Some(text(p(10, 10), "a日本", 16))
+        );
+        assert_eq!(state.composition().map(|c| c.text.as_str()), Some("ご"));
+        // 変換を終えた（WM_IME_ENDCOMPOSITION）
+        state.input(
+            EditInput::Composition {
+                result: String::new(),
+                composing: None,
+            },
+            &mut annotations,
+        );
+        assert_eq!(state.composition(), None);
+        state.input(key(ESC), &mut annotations);
+        assert_eq!(shapes(&annotations), vec![text(p(10, 10), "a日本", 16)]);
+    }
+
+    #[test]
+    fn the_ime_composition_is_ignored_unless_typing() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        assert_eq!(state.input(composing("あ", 1), &mut annotations), vec![]);
+        assert_eq!(state.composition(), None);
+    }
+
+    #[test]
+    fn other_inputs_while_composing_take_the_composition_as_typed_first() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        start_typing_at(&mut state, &mut annotations, p(10, 10));
+        chars(&mut state, &mut annotations, "a");
+        state.input(composing("あ", 1), &mut annotations);
+        // カーソルの移動と文字はそのまま（変換は続く）
+        state.input(
+            EditInput::Move {
+                at: p(300, 300),
+                shift: false,
+            },
+            &mut annotations,
+        );
+        assert!(state.composition().is_some());
+        // 色を選ぶと、変換中の文字を確定したことにしてから色を変える。IME の側の残りは捨てさせる
+        assert_eq!(
+            state.input(EditInput::Pick(Pick::Color(Rgb(0, 0, 0))), &mut annotations),
+            vec![
+                EditOutput::CompositionTaken,
+                EditOutput::Redraw,
+                EditOutput::Picked(Pick::Color(Rgb(0, 0, 0)))
+            ]
+        );
+        assert_eq!(state.composition(), None);
+        assert_eq!(
+            state.typing().map(|a| a.shape),
+            Some(text(p(10, 10), "aあ", 16))
+        );
+        // 外のクリックで確定すると、変換中の文字も書き込みに入る
+        state.input(composing("い", 1), &mut annotations);
+        let outputs = click(&mut state, &mut annotations, p(300, 300));
+        assert_eq!(outputs.first(), Some(&EditOutput::CompositionTaken));
+        assert!(outputs.contains(&EditOutput::TypingEnded));
+        assert_eq!(shapes(&annotations), vec![text(p(10, 10), "aあい", 16)]);
+    }
+
+    #[test]
+    fn leaving_while_composing_keeps_the_composition() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        start_typing_at(&mut state, &mut annotations, p(10, 10));
+        state.input(composing("かな", 2), &mut annotations);
+        let outputs = state.input(EditInput::Leave, &mut annotations);
+        assert!(outputs.contains(&EditOutput::Left));
+        assert_eq!(shapes(&annotations), vec![text(p(10, 10), "かな", 16)]);
+    }
+
+    #[test]
+    fn ctrl_z_while_typing_again_keeps_the_text_and_undoes_what_came_before() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        let line = Shape::Line {
+            from: p(0, 100),
+            to: p(50, 100),
+        };
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(0, 100),
+            p(50, 100),
+        );
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(10, 10));
+        chars(&mut state, &mut annotations, "ab");
+        state.input(key(ESC), &mut annotations);
+        // 線を消すと、文字が 0 番目に詰まる。その文字を打ち直す
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(25, 100));
+        state.input(key(0x2E), &mut annotations);
+        state.input(EditInput::DoubleClick(p(11, 12)), &mut annotations);
+        assert_eq!(state.retyping(), Some(0));
+        chars(&mut state, &mut annotations, "c");
+        // Ctrl+Z は打ち直しを確定してから戻す（ツールバーの元に戻すと同じ）。戻るのは打ち直しの 1 件
+        assert_eq!(
+            state.input(undo(), &mut annotations),
+            vec![
+                EditOutput::Redraw,
+                EditOutput::TypingEnded,
+                EditOutput::Redraw
+            ]
+        );
+        assert!(!state.is_typing());
+        assert_eq!(shapes(&annotations), vec![text(p(10, 10), "ab", 16)]);
+        // もう 1 回で線が戻る。文字が線を上書きしない
+        state.input(undo(), &mut annotations);
+        assert_eq!(shapes(&annotations), vec![line, text(p(10, 10), "ab", 16)]);
+    }
+
+    #[test]
+    fn ctrl_z_while_typing_again_without_changes_undoes_what_came_before() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        let line = Shape::Line {
+            from: p(0, 100),
+            to: p(50, 100),
+        };
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(0, 100),
+            p(50, 100),
+        );
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(10, 10));
+        chars(&mut state, &mut annotations, "ab");
+        state.input(key(ESC), &mut annotations);
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(25, 100));
+        state.input(key(0x2E), &mut annotations);
+        state.input(EditInput::DoubleClick(p(11, 12)), &mut annotations);
+        assert_eq!(state.retyping(), Some(0));
+        // 何も変えずに Ctrl+Z。消した線が 0 番目に戻り、打ち直していた文字はそのまま残る
+        state.input(undo(), &mut annotations);
+        assert!(!state.is_typing());
+        assert_eq!(
+            shapes(&annotations),
+            vec![line.clone(), text(p(10, 10), "ab", 16)]
+        );
+        // 確定のあとの Esc などで線が文字に置き換わらない
+        state.input(key(ESC), &mut annotations);
+        assert_eq!(shapes(&annotations), vec![line, text(p(10, 10), "ab", 16)]);
+    }
+
+    #[test]
+    fn ctrl_y_and_ctrl_shift_z_while_typing_commit_the_text_first() {
+        for redo_key in [
+            redo(),
+            EditInput::Key(Chord::plain(Key::known(Z)).ctrl().shift()),
+        ] {
+            let mut state = EditState::new(BLUE);
+            let mut annotations = Annotations::default();
+            state.input(digit(5), &mut annotations);
+            click(&mut state, &mut annotations, p(10, 10));
+            chars(&mut state, &mut annotations, "ab");
+            state.input(key(ESC), &mut annotations);
+            state.input(undo(), &mut annotations);
+            assert!(annotations.is_empty());
+            click(&mut state, &mut annotations, p(50, 50));
+            chars(&mut state, &mut annotations, "c");
+            state.input(redo_key, &mut annotations);
+            assert!(!state.is_typing());
+            // 打った文字が確定して、やり直しの先は捨てられる
+            assert_eq!(shapes(&annotations), vec![text(p(50, 50), "c", 16)]);
+        }
     }
 
     #[test]
