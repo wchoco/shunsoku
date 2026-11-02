@@ -2387,15 +2387,27 @@ fn capture_active_window() {
             crate::window_grab::grab_window(&device, hwnd, cursor).map_err(|e| e.to_string())
         })
     };
-    let shot = match grabbed {
-        Ok(shot) => shot,
+    let (shot, partial) = match grabbed {
+        Ok(shot) => (shot, false),
         Err(e) => {
             log::warn!("could not capture the active window: {e}");
-            end_capture();
-            notify_user(notify::Level::Error, text("capture.failed"));
-            return;
+            // UAC で昇格したウィンドウなど、WGC で撮れないときは見えている部分だけを撮る（#64）
+            match (!hwnd.is_invalid())
+                .then(|| grab_visible_part(hwnd, cursor))
+                .flatten()
+            {
+                Some(shot) => (shot, true),
+                None => {
+                    end_capture();
+                    notify_user(notify::Level::Error, text("capture.failed"));
+                    return;
+                }
+            }
         }
     };
+    if partial {
+        notify_user(notify::Level::Warning, text("capture.window_partial"));
+    }
     log::info!(
         "captured window {}x{} at ({}, {}) in {:.1} ms",
         shot.rect.width(),
@@ -2425,6 +2437,26 @@ fn capture_active_window() {
         }
         Err(e) => log::error!("could not open a scrap: {e}"),
     }
+}
+
+/// WGC で撮れなかったウィンドウの、モニタに写っている部分を Desktop Duplication で撮る。撮れなければ None。
+fn grab_visible_part(hwnd: HWND, cursor: bool) -> Option<crate::window_grab::WindowShot> {
+    // 取得のスレッドは App に触らないので、借りたまま待ってよい
+    let grabbed = with_app(|app| crate::window_grab::grab_visible(&mut app.gpu, hwnd, cursor))?;
+    let shot = match grabbed {
+        Ok(Some(shot)) => Some(shot),
+        Ok(None) => {
+            log::warn!("the active window is on no monitor");
+            None
+        }
+        Err(e) => {
+            log::warn!("could not grab the screen for the active window: {e}");
+            None
+        }
+    };
+    // 範囲選択の画面と同じく、取得で使った一時的なメモリを返す
+    with_app(|app| app.gpu.trim());
+    shot
 }
 
 /// 待っている依頼の画面を取得して、範囲選択の画面を出す。
