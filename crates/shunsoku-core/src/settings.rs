@@ -2,7 +2,8 @@
 //!
 //! - `load` は項目ごとに値を取り出す。不正な項目はその項目だけ既定値にし、項目名を `SettingsIssue` に載せる。
 //!   知らないキーは無視する。ファイル全体が TOML として読めなければ、すべて既定値にする。
-//! - ファイルは書き換えない（`write` は M3）。
+//! - アプリから書き戻すときは `write`（`settings/write.rs`）で変わった項目だけを書き換え、手で書いたコメントと
+//!   並び順を残す。自分で書いた直後の中身を監視が拾ったら、`OwnWrites` で見分けて読み込み直さない。
 //! - 読み込み直しでは `diff` で変わった部分を調べ、`app` が変わったものだけを反映し直す。
 //! - キーの重なりは `keymap` で見つける。同じ範囲（ホットキー同士、ショートカット同士）の重なりは `assign` の
 //!   規則で両方を無効にし、ホットキーとショートカットの重なりは警告だけにする。
@@ -48,6 +49,9 @@ use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OperationDescriptor, Shortcuts};
+
+mod write;
+pub use write::{OwnWrites, rewrite, write};
 
 /// 対応している設定ファイルの形式の版。
 pub const VERSION: i64 = 1;

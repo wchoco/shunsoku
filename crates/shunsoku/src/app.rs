@@ -25,7 +25,8 @@
 //!   実行する。操作が返す `Effect` を実行するのはここ（`run_scrap_operation`）。操作を足すときは core の表に
 //!   行を足し、新しい `Effect` があればそこに足す。
 //! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
-//!   読み込み直す。ファイルは作らず、書き換えない。読み込み直しでは core の `settings::diff` で変わった部分を調べ、
+//!   読み込み直す。アプリから書き戻すときは `write_settings` で変わった項目だけを書き、書いた直後の中身を監視が
+//!   拾っても読み込み直さない（`App::own_writes`）。読み込み直しでは core の `settings::diff` で変わった部分を調べ、
 //!   ホットキーの登録し直し・スクラップの描き直しなど、変わったものだけを反映する（`on_settings_changed`）。
 //!   保存先・ファイル名テンプレート・通知のオン/オフは、使うときに `App::settings` から読むので、次から効く。
 //!   キーの割り当てと重なりは core の `settings::keymap` で決める。
@@ -158,6 +159,8 @@ struct App {
     settings_path: Option<PathBuf>,
     /// 設定ファイルの監視が知らせを入れる口。
     settings_events: mpsc::Receiver<settings_watch::Event>,
+    /// 自分で書いた設定ファイルの中身（`write_settings`）。監視が拾っても読み込み直さない。
+    own_writes: settings::OwnWrites,
     /// スクラップ操作のショートカットの対応表（表の既定値に `settings.shortcuts` を重ねたもの）。
     shortcuts: Shortcuts,
     /// スクラップ操作のマウスの対応表（表の既定値に `settings.mouse` を重ねたもの）。
@@ -586,6 +589,7 @@ fn start(
         settings,
         settings_path,
         settings_events,
+        own_writes: settings::OwnWrites::default(),
         shortcuts: keymap.shortcuts,
         mouse: keymap.mouse,
         capture: Capture::Idle,
@@ -2147,6 +2151,43 @@ fn read_settings(path: Option<&Path>) -> (Settings, Vec<SettingsIssue>) {
     (settings, issues)
 }
 
+/// 設定ファイルに `new` を書き戻す。変わった項目だけを書き換え、手で書いたコメントと並び順は残す
+/// （`settings::rewrite`）。ファイルがなければ作る。
+///
+/// - 書いた中身を `App::own_writes` に覚え、監視が拾っても読み込み直さない。そのため、書けたら
+///   `App::settings` を `new` にする。ホットキーなど、使うときに読むのでは足りないものの反映は呼び出し側で行う。
+/// - 今のファイルが TOML として読めなければ、上書きせずにエラーを返す（手で書いた中身を消さないため）。
+/// - 書きかけの中身を監視に読まれないよう、隣の一時ファイルに書いてから名前を変える。
+#[expect(dead_code, reason = "定型領域の登録（#72）から呼ぶ")]
+fn write_settings(app: &mut App, new: &Settings) -> std::result::Result<(), String> {
+    let path = app
+        .settings_path
+        .clone()
+        .ok_or_else(|| "APPDATA is not set".to_owned())?;
+    let src = match std::fs::read_to_string(&path) {
+        Ok(src) => src,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    let text = settings::rewrite(&src, new)
+        .ok_or_else(|| format!("{} is not TOML; not overwriting it", path.display()))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    // 名前を変える前に覚える（監視の知らせは UI スレッドのこの関数が返ってから処理されるが、念のため）
+    app.own_writes.wrote(&text);
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        app.own_writes.forget();
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    log::info!("settings written to {}", path.display());
+    app.settings = new.clone();
+    Ok(())
+}
+
 fn log_issues(issues: &[SettingsIssue]) {
     for issue in issues {
         log::warn!("settings issue: {issue:?}");
@@ -2166,6 +2207,7 @@ fn log_failed(failed: &[hotkey::Failed]) {
 
 /// `WM_APP_SETTINGS`: 設定ファイルの監視の知らせを受け、読み込み直した設定を反映する。
 ///
+/// - 中身が自分で書いた直後のもの（`write_settings`）なら、読み込み直さず、通知もしない。
 /// - TOML として読めなければ、直前の有効な設定のまま動き、エラーを通知する（`settings::reload`）。
 /// - `settings::diff` で変わったものだけを反映する: ホットキーの登録し直し、浮かべているスクラップの描き直し、
 ///   ログのレベル。ショートカットの対応表は毎回作り直す（右クリックメニューは開くたびにこれから作る）。
@@ -2191,6 +2233,17 @@ fn on_settings_changed() {
         return;
     };
     let notice = with_app(|app| {
+        let own = match &content {
+            settings_watch::Content::Text(src) => app.own_writes.is_own(src),
+            settings_watch::Content::Missing | settings_watch::Content::Unreadable(_) => {
+                app.own_writes.forget();
+                false
+            }
+        };
+        if own {
+            log::info!("settings file changed by shunsoku itself; not reloading");
+            return None;
+        }
         let current = &app.settings;
         let (new, mut issues) = match content {
             settings_watch::Content::Missing => settings::reload(current, None),
