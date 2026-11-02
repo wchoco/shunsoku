@@ -21,6 +21,7 @@
 //! trash_limit = 10                             # ごみ箱の上限（0〜100 件）。0 なら閉じたらすぐに破棄
 //! dpi_scaling = "keep_pixels"                  # DPI の違うモニタへ動かしたとき: keep_pixels（画素を等倍に保つ）
 //!                                              #   / keep_apparent_size（見かけの大きさを保つ）
+//! capture_cursor = false                       # キャプチャにマウスカーソルを写す（全方式で共通）
 //!
 //! [hotkeys]
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
@@ -102,6 +103,8 @@ pub struct General {
     pub trash_limit: u8,
     /// DPI の違うモニタへスクラップを動かしたときの見え方。
     pub dpi_scaling: DpiScaling,
+    /// キャプチャにマウスカーソルを写す。全方式（範囲選択・ウィンドウ・定型領域・CLI）で共通。
+    pub capture_cursor: bool,
 }
 
 impl Default for General {
@@ -112,6 +115,7 @@ impl Default for General {
             notifications: true,
             trash_limit: DEFAULT_TRASH_LIMIT,
             dpi_scaling: DpiScaling::default(),
+            capture_cursor: false,
         }
     }
 }
@@ -496,6 +500,9 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     if let Some(scaling) = r.value(general, "general", "dpi_scaling", dpi_scaling) {
         s.general.dpi_scaling = scaling;
     }
+    if let Some(on) = r.value(general, "general", "capture_cursor", Item::as_bool) {
+        s.general.capture_cursor = on;
+    }
 
     let hotkeys = r.table(root, "hotkeys");
     for action in HotkeyAction::ALL {
@@ -742,6 +749,7 @@ file_name_template = "cap_{datetime:yyyy}"
 notifications = false
 trash_limit = 3
 dpi_scaling = "keep_apparent_size"
+capture_cursor = true
 
 [hotkeys]
 select_capture = "Win+Shift+PrintScreen"
@@ -772,6 +780,7 @@ shadow = false
                     notifications: false,
                     trash_limit: 3,
                     dpi_scaling: DpiScaling::KeepApparentSize,
+                    capture_cursor: true,
                 },
                 hotkeys: Hotkeys {
                     select_capture: Some(chord("Win+Shift+PrintScreen")),
@@ -915,6 +924,17 @@ shadow = 1
             assert_eq!(issues, vec![invalid("general.trash_limit")], "{value}");
             assert_eq!(settings.general.trash_limit, 10, "{value}");
         }
+    }
+
+    #[test]
+    fn capturing_the_cursor_defaults_to_off_and_a_non_bool_falls_back_to_it() {
+        assert!(!load("version = 1\n").0.general.capture_cursor);
+        let (settings, issues) = load("version = 1\n[general]\ncapture_cursor = true\n");
+        assert_eq!(issues, vec![]);
+        assert!(settings.general.capture_cursor);
+        let (settings, issues) = load("version = 1\n[general]\ncapture_cursor = \"yes\"\n");
+        assert_eq!(issues, vec![invalid("general.capture_cursor")]);
+        assert!(!settings.general.capture_cursor);
     }
 
     #[test]

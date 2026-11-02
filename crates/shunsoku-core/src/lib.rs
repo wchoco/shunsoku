@@ -2,6 +2,7 @@
 
 pub mod capture;
 pub mod cli_args;
+pub mod cursor;
 pub mod geometry;
 pub mod i18n;
 pub mod image;
