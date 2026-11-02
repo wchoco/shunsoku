@@ -1384,6 +1384,32 @@ mod tests {
     }
 
     #[test]
+    fn edit_mode_starts_with_the_drawing_tool_used_last_on_any_scrap() {
+        let defaults = editing_context();
+        let mut carryover = Carryover::default();
+        let mut first = scrap();
+        let context = OpContext {
+            carryover,
+            ..defaults
+        };
+        execute(op("annotate"), &mut first, &context);
+        assert_eq!(first.edit_state().map(|s| s.tool), Some(Tool::Rect));
+        // ツールバーで楕円、続けて数字キーの 4 で線
+        carryover.record(&first.edit_input(EditInput::Pick(Pick::Tool(Tool::Ellipse))));
+        let four = Chord::plain(Key::known(0x34));
+        carryover.record(&first.edit_input(EditInput::Key(four)));
+        execute(op("annotate"), &mut first, &context);
+
+        let mut second = scrap();
+        let context = OpContext {
+            carryover,
+            ..defaults
+        };
+        execute(op("annotate"), &mut second, &context);
+        assert_eq!(second.edit_state().map(|s| s.tool), Some(Tool::Line));
+    }
+
+    #[test]
     fn only_the_width_carries_over_when_only_the_width_was_chosen() {
         let mut carryover = Carryover::default();
         carryover.record(&[EditOutput::Picked(Pick::Width(2))]);

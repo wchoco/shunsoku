@@ -10,10 +10,6 @@ shunsoku-core = { path = "../shunsoku-core" }
 shunsoku-pipe-identity = { path = "../shunsoku-pipe-identity" }
 log = "0.4.35"
 
-# Direct2D の点（`Vector2`）。windows が使うのと同じ版（lockfile に載っている）。
-[target.'cfg(windows)'.dependencies]
-windows-numerics = "0.3.1"
-
 # Win32 層は Windows でだけ組む。Linux では `cargo test -p shunsoku-core` と
 # `--target x86_64-pc-windows-msvc` の clippy で確かめる。
 [target.'cfg(windows)'.dependencies.windows]
@@ -59,3 +55,7 @@ features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+# Direct2D の点（`D2D_POINT_2F` = `Vector2`）の型。`windows` は再公開しないので、同じ版を直接使う。
+[target.'cfg(windows)'.dependencies.windows-numerics]
+version = "0.3.1"

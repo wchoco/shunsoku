@@ -76,7 +76,12 @@ impl ToolSlot {
     pub fn tool(self) -> Option<Tool> {
         match self {
             ToolSlot::Rect => Some(Tool::Rect),
-            _ => None,
+            ToolSlot::Ellipse => Some(Tool::Ellipse),
+            ToolSlot::Arrow => Some(Tool::Arrow),
+            ToolSlot::Line => Some(Tool::Line),
+            ToolSlot::Freehand => Some(Tool::Freehand),
+            // 選択（#86）と文字（#87）
+            ToolSlot::Select | ToolSlot::Text => None,
         }
     }
 }
@@ -299,6 +304,15 @@ mod tests {
         assert!(!Button::Color(PALETTE[0]).is_current(&state));
         assert!(Button::Width(5).is_current(&state));
         assert!(!Button::Width(3).is_current(&state));
+        assert_eq!(
+            Button::Tool(ToolSlot::Freehand).pick(),
+            Some(Pick::Tool(Tool::Freehand))
+        );
+        assert!(!Button::Tool(ToolSlot::Ellipse).is_current(&state));
+        // 選択（#86）と文字（#87）はまだない
+        assert!(!Button::Tool(ToolSlot::Select).is_enabled());
+        assert!(!Button::Tool(ToolSlot::Text).is_enabled());
+        assert!(Button::Tool(ToolSlot::Arrow).is_enabled());
         assert_eq!(Button::Done.pick(), None);
         assert_eq!(Button::Grip.pick(), None);
         assert!(Button::Done.is_enabled() && Button::Grip.is_enabled());

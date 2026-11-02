@@ -18,23 +18,24 @@
 use std::ffi::c_void;
 
 use shunsoku_core::annotate::toolbar::{Button, Layout, ToolSlot};
-use shunsoku_core::annotate::{Annotation, EditState, Shape, View};
+use shunsoku_core::annotate::{Annotation, EditState, Shape, View, arrow_head};
 use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::image::Image;
 use shunsoku_core::scrap::{Appearance, SHADOW_WIDTH};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_HOLLOW,
-    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Brush, ID2D1DCRenderTarget,
-    ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush,
+    D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_LINE_JOIN_ROUND,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
+    ID2D1Brush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush,
+    ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -47,6 +48,7 @@ use windows::Win32::Graphics::Gdi::{
     DeleteDC, DeleteObject, GdiFlush, HBITMAP, HDC, HGDIOBJ, SelectObject,
 };
 use windows::core::{Result, w};
+use windows_numerics::Vector2;
 
 /// 影の濃さ（いちばん内側の不透明度）。外側ほど薄くする。
 const SHADOW_ALPHA: f32 = 0.22;
@@ -400,7 +402,8 @@ fn draw_image(target: &ID2D1RenderTarget, image: &Image, dest: Rect) -> Result<(
 }
 
 /// 書き込みを、`image_rect` の左上を原点に `layer.view` で置いて描く。画像の矩形の外（トリムで隠した部分など）は
-/// 描かない。線は画素の中心を通るので、奇数の太さを等倍で描くと画素に揃う。
+/// 描かない。線は画素の中心を通るので、奇数の太さを等倍で描くと画素に揃う。線・矢印・フリーハンドの端と
+/// 折れ目は丸める。矢印の頭（core の `arrow_head`）は塗りつぶした三角形で、軸は頭の底辺まで引く。
 fn draw_annotations(
     target: &ID2D1RenderTarget,
     layer: AnnotationLayer,
@@ -412,40 +415,126 @@ fn draw_annotations(
     let (dx, dy) = (f64::from(image_rect.left), f64::from(image_rect.top));
     let at = |p: Point| {
         let (x, y) = layer.view.point(p);
-        ((x + dx) as f32, (y + dy) as f32)
+        (x + dx, y + dy)
     };
     // SAFETY: BeginDraw と EndDraw の間で呼ぶ。Push と Pop は対にする
     unsafe {
         target.PushAxisAlignedClip(&to_rect_f(image_rect), D2D1_ANTIALIAS_MODE_ALIASED);
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         let drawn = (|| {
+            let factory = target.GetFactory()?;
+            let round = factory.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    dashCap: D2D1_CAP_STYLE_ROUND,
+                    lineJoin: D2D1_LINE_JOIN_ROUND,
+                    miterLimit: 10.0,
+                    ..Default::default()
+                },
+                None,
+            )?;
             let brush = target.CreateSolidColorBrush(&rgb(0, 1.0), None)?;
+            let pen = Pen {
+                target,
+                factory: &factory,
+                brush: &brush,
+                round: &round,
+            };
             for annotation in layer.annotations {
                 let shunsoku_core::settings::Rgb(r, g, b) = annotation.style.color;
                 brush.SetColor(&rgb(
                     (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
                     1.0,
                 ));
-                let width = layer.view.width(annotation.style.width) as f32;
-                match annotation.shape {
-                    Shape::Rect { from, to } => {
-                        let (x0, y0) = at(from);
-                        let (x1, y1) = at(to);
-                        let rect = D2D_RECT_F {
-                            left: x0.min(x1),
-                            top: y0.min(y1),
-                            right: x0.max(x1),
-                            bottom: y0.max(y1),
-                        };
-                        target.DrawRectangle(&rect, &brush, width, None);
-                    }
-                }
+                let width = layer.view.width(annotation.style.width);
+                pen.draw(&annotation.shape, &at, width)?;
             }
             Ok(())
         })();
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
         target.PopAxisAlignedClip();
         drawn
+    }
+}
+
+/// 書き込みを 1 つずつ描く道具一式。BeginDraw と EndDraw の間だけ使う。
+struct Pen<'a> {
+    target: &'a ID2D1RenderTarget,
+    factory: &'a ID2D1Factory,
+    brush: &'a ID2D1SolidColorBrush,
+    /// 端と折れ目を丸める線の形。
+    round: &'a ID2D1StrokeStyle,
+}
+
+impl Pen<'_> {
+    /// `shape` を描く。`at` は元の画像の画素 → 描く先の座標、`width` は描く先での太さ。
+    fn draw(&self, shape: &Shape, at: &dyn Fn(Point) -> (f64, f64), width: f64) -> Result<()> {
+        let (target, brush) = (self.target, self.brush);
+        let stroke = width as f32;
+        // SAFETY: Pen は BeginDraw と EndDraw の間だけ作られる（draw_annotations）
+        unsafe {
+            match shape {
+                Shape::Rect { from, to } => {
+                    let ((x0, y0), (x1, y1)) = (at(*from), at(*to));
+                    let rect = D2D_RECT_F {
+                        left: x0.min(x1) as f32,
+                        top: y0.min(y1) as f32,
+                        right: x0.max(x1) as f32,
+                        bottom: y0.max(y1) as f32,
+                    };
+                    target.DrawRectangle(&rect, brush, stroke, None);
+                }
+                Shape::Ellipse { from, to } => {
+                    let ((x0, y0), (x1, y1)) = (at(*from), at(*to));
+                    let ellipse = D2D1_ELLIPSE {
+                        point: vec2(((x0 + x1) / 2.0, (y0 + y1) / 2.0)),
+                        radiusX: ((x1 - x0).abs() / 2.0) as f32,
+                        radiusY: ((y1 - y0).abs() / 2.0) as f32,
+                    };
+                    target.DrawEllipse(&ellipse, brush, stroke, None);
+                }
+                Shape::Line { from, to } => {
+                    target.DrawLine(vec2(at(*from)), vec2(at(*to)), brush, stroke, self.round);
+                }
+                Shape::Arrow { from, to } => {
+                    let (from, to) = (at(*from), at(*to));
+                    let Some(head) = arrow_head(from, to, width) else {
+                        return Ok(());
+                    };
+                    target.DrawLine(vec2(from), vec2(head.base), brush, stroke, self.round);
+                    let path = self.factory.CreatePathGeometry()?;
+                    let sink = path.Open()?;
+                    sink.BeginFigure(vec2(head.tip), D2D1_FIGURE_BEGIN_FILLED);
+                    sink.AddLines(&[vec2(head.left), vec2(head.right)]);
+                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink.Close()?;
+                    target.FillGeometry(&path, brush, None);
+                }
+                Shape::Freehand { points } => {
+                    let Some((first, rest)) = points.split_first() else {
+                        return Ok(());
+                    };
+                    let path = self.factory.CreatePathGeometry()?;
+                    let sink = path.Open()?;
+                    sink.BeginFigure(vec2(at(*first)), D2D1_FIGURE_BEGIN_HOLLOW);
+                    let rest: Vec<Vector2> = rest.iter().map(|p| vec2(at(*p))).collect();
+                    sink.AddLines(&rest);
+                    sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                    sink.Close()?;
+                    target.DrawGeometry(&path, brush, stroke, self.round);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Direct2D の点。
+fn vec2((x, y): (f64, f64)) -> Vector2 {
+    Vector2 {
+        X: x as f32,
+        Y: y as f32,
     }
 }
 
@@ -607,7 +696,7 @@ fn draw_toolbar_button(
     let (left, top) = (rect.left as f32 + inset, rect.top as f32 + inset);
     let width = rect.width() as f32 - inset * 2.0;
     let height = rect.height() as f32 - inset * 2.0;
-    let at = |u: f32, v: f32| windows_numerics::Vector2 {
+    let at = |u: f32, v: f32| Vector2 {
         X: left + u * width,
         Y: top + v * height,
     };
@@ -696,8 +785,8 @@ fn draw_toolbar_button(
                 // 太さはスクラップの画素なので、DPI の倍率だけを掛けた太さの線で見せる
                 let thick = (w as f32 * scale).min(height);
                 let y = top + height / 2.0;
-                let from = windows_numerics::Vector2 { X: left, Y: y };
-                let to = windows_numerics::Vector2 {
+                let from = Vector2 { X: left, Y: y };
+                let to = Vector2 {
                     X: left + width,
                     Y: y,
                 };
@@ -721,7 +810,7 @@ fn draw_toolbar_button(
                 for dx in [-0.5, 0.5] {
                     for dy in [-1.0, 0.0, 1.0] {
                         let ellipse = D2D1_ELLIPSE {
-                            point: windows_numerics::Vector2 {
+                            point: Vector2 {
                                 X: cx + dx * step,
                                 Y: cy + dy * step,
                             },
@@ -741,7 +830,7 @@ fn draw_toolbar_button(
 fn polyline(
     target: &ID2D1RenderTarget,
     factory: &ID2D1Factory,
-    points: &[windows_numerics::Vector2],
+    points: &[Vector2],
     closed: bool,
     brush: &ID2D1Brush,
     stroke: f32,
