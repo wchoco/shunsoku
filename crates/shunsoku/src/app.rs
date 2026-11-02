@@ -256,6 +256,8 @@ struct Saved {
     result: std::result::Result<(), String>,
     /// 結果を返す先（CLI の依頼の保存だけ）。
     reply: Option<ReplyTo>,
+    /// 結果をトレイ通知で知らせる（CLI の `--quiet` なら false）。
+    notify: bool,
 }
 
 /// 保存に失敗したときに浮かべるスクラップの位置（スクリーン座標）と画像。フォーカスは移さない。
@@ -1603,7 +1605,7 @@ fn copy_to_clipboard(image: &Image) {
 /// 失敗してもスクラップはそのまま残る。
 fn save_default(image: Image) {
     if let Some(path) = default_destination() {
-        start_save(path, image, save::Overwrite::Deny, None, None);
+        start_save(path, image, save::Overwrite::Deny, None, None, true);
     }
 }
 
@@ -1615,7 +1617,7 @@ fn save_as(owner: HWND, image: Image) {
     };
     // モーダルなので App を借りずに呼ぶ
     match save::ask_path(owner, &proposed, text("save.png_filter")) {
-        Ok(Some(path)) => start_save(path, image, save::Overwrite::Allow, None, None),
+        Ok(Some(path)) => start_save(path, image, save::Overwrite::Allow, None, None, true),
         Ok(None) => log::info!("save as cancelled"),
         Err(e) => {
             log::error!("could not show the save dialog: {e}");
@@ -1686,13 +1688,14 @@ fn resolve_destination(
 }
 
 /// `path` に PNG を書く仕事を裏のスレッドで始める。結果は `WM_APP_SAVED` で受ける。失敗したら `fallback` を
-/// スクラップとして浮かべる。`reply` があれば、結果を CLI にも返す。
+/// スクラップとして浮かべる。`reply` があれば、結果を CLI にも返す。`notify` が false なら結果を通知しない。
 fn start_save(
     path: PathBuf,
     image: Image,
     overwrite: save::Overwrite,
     fallback: Option<Fallback>,
     reply: Option<ReplyTo>,
+    notify: bool,
 ) {
     let Some((sender, message_window)) = with_app(|app| (app.saves.0.clone(), app.windows.message))
     else {
@@ -1724,6 +1727,7 @@ fn start_save(
                 path: job_path,
                 result,
                 reply,
+                notify,
             });
             // SAFETY: UI スレッドのメッセージ専用ウィンドウに送るだけ。もう壊れていれば失敗するだけ
             let _ = unsafe {
@@ -1738,7 +1742,9 @@ fn start_save(
     if let Err(e) = spawned {
         log::error!("could not start the save thread: {e}");
         let fallback = forget_pending_save(&path);
-        save_failed(Some(&path), &e.to_string());
+        if notify {
+            save_failed(Some(&path), &e.to_string());
+        }
         if let Some(fallback) = fallback {
             float_scrap(fallback.at, fallback.image, false);
         }
@@ -1767,7 +1773,7 @@ fn on_saved() {
             Ok(()) => {
                 log::info!("saved {}", saved.path.display());
                 let body = format!("{}\n{}", text("save.saved"), saved.path.display());
-                if notify_user(notify::Level::Success, &body) {
+                if saved.notify && notify_user(notify::Level::Success, &body) {
                     let folder = saved.path.parent().map(Path::to_path_buf);
                     with_app(|app| app.notice_folder = folder);
                 }
@@ -1784,7 +1790,9 @@ fn on_saved() {
             }
             Err(e) => {
                 log::error!("could not save {}: {e}", saved.path.display());
-                if saved.reply.is_some() {
+                if !saved.notify {
+                    // CLI の --quiet: 通知しない
+                } else if saved.reply.is_some() {
                     // CLI の依頼はスクラップを出さないので、保存の失敗の通知の「スクラップは残っています」は使わない
                     notify_user(
                         notify::Level::Error,
@@ -2300,42 +2308,118 @@ fn capture_rect(monitor: Option<u32>, rect: Rect) {
         area.top,
         started.elapsed().as_secs_f64() * 1000.0
     );
-    // `from_cli` の依頼は保存だけ。スクラップ・コピーなどほかの出力は #74 で足す
-    if request.outputs.save.is_none() {
-        if let Some(to) = request.reply {
-            reply(to, Response::Captured { path: None });
+    output_rect(request, area, image);
+}
+
+/// `capture rect` で撮った画像を、依頼の出力（コピー → スクラップ → 保存の順）に出して CLI に応答する。
+/// どれかに失敗したら、その先は出さずにキャプチャの失敗として返す。保存に失敗してもスクラップには逃がさない。
+fn output_rect(request: CaptureRequest, area: Rect, image: Image) {
+    let CaptureRequest {
+        outputs,
+        notify,
+        reply: reply_to,
+        ..
+    } = request;
+    let failed = |reason: &str| {
+        if notify {
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{reason}", text("capture.failed")),
+            );
         }
-        return;
+        reply_failed(reply_to, reason);
+    };
+    if outputs.copy {
+        let Some(owner) = with_app(|app| app.windows.message) else {
+            failed(text("job.panicked"));
+            return;
+        };
+        if let Err(e) = clipboard::copy(owner, &image) {
+            log::error!("could not copy to the clipboard: {e}");
+            failed(&format!("{}\n{e}", text("copy.failed")));
+            return;
+        }
+        log::info!("copied {}x{} to the clipboard", area.width(), area.height());
     }
-    match resolve_default_destination() {
-        Ok(path) => start_save(path, image, save::Overwrite::Deny, None, request.reply),
-        Err((dir, reason)) => {
-            let mut body = format!("{}\n{reason}", text("capture.failed"));
-            if let Some(dir) = dir {
-                body.push('\n');
-                body.push_str(&dir.display().to_string());
+    if outputs.scrap {
+        let Some((module, appearance)) =
+            with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
+        else {
+            failed(text("job.panicked"));
+            return;
+        };
+        // ウィンドウを作るとメッセージが届くので、App を借りずに作る
+        let model = ScrapModel::new(area.origin(), image.size());
+        match open_scrap(
+            module,
+            model,
+            image.clone(),
+            &appearance,
+            outputs.focus_scrap,
+        ) {
+            Ok(scrap) => {
+                if with_app(|app| app.scraps.push(scrap)).is_none() {
+                    log::warn!("could not keep the scrap");
+                }
             }
-            notify_user(notify::Level::Error, &body);
-            reply_failed(request.reply, &reason);
+            Err(e) => {
+                log::error!("could not open a scrap: {e}");
+                failed(&e.to_string());
+                return;
+            }
         }
     }
+    let (path, overwrite) = match outputs.save {
+        None => {
+            if let Some(to) = reply_to {
+                reply(to, Response::Captured { path: None });
+            }
+            return;
+        }
+        Some(request::SaveTarget::File(path)) => (path, save::Overwrite::Allow),
+        Some(target) => {
+            let resolved = match target {
+                request::SaveTarget::Region {
+                    dir,
+                    file_name_template,
+                    name,
+                } => resolve_destination(dir, &file_name_template, &name),
+                _ => resolve_default_destination(),
+            };
+            match resolved {
+                Ok(path) => (path, save::Overwrite::Deny),
+                Err((dir, reason)) => {
+                    let mut reason = reason;
+                    if let Some(dir) = dir {
+                        reason.push('\n');
+                        reason.push_str(&dir.display().to_string());
+                    }
+                    failed(&reason);
+                    return;
+                }
+            }
+        }
+    };
+    start_save(path, image, overwrite, None, reply_to, notify);
 }
 
 /// 待っている依頼を失敗で終える。CLI の依頼なら理由を返す。
 fn fail_capture(reason: &str) {
-    let reply_to = with_app(|app| match std::mem::take(&mut app.capture) {
-        Capture::Waiting(request) => request.reply,
+    let (reply_to, notify) = with_app(|app| match std::mem::take(&mut app.capture) {
+        Capture::Waiting(request) => (request.reply, request.notify),
         other => {
             app.capture = other;
-            None
+            (None, true)
         }
     })
-    .flatten();
+    .unwrap_or((None, true));
     end_capture();
-    notify_user(
-        notify::Level::Error,
-        &format!("{}\n{reason}", text("capture.failed")),
-    );
+    if notify {
+        notify_user(
+            notify::Level::Error,
+            &format!("{}\n{reason}", text("capture.failed")),
+        );
+    }
     reply_failed(reply_to, reason);
 }
 
@@ -2839,6 +2923,7 @@ fn capture_region(request: CaptureRequest) {
                     save::Overwrite::Deny,
                     fallback,
                     request.reply,
+                    request.notify,
                 );
             }
             None if fallback => float_scrap(at, image.clone(), false),
@@ -2854,6 +2939,7 @@ fn capture_region(request: CaptureRequest) {
 fn save_destination(target: &SaveTarget) -> Option<PathBuf> {
     match target {
         SaveTarget::Default => default_destination(),
+        SaveTarget::File(path) => Some(path.clone()),
         SaveTarget::Region {
             dir,
             file_name_template,
