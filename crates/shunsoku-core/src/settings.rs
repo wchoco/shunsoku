@@ -25,6 +25,7 @@
 //! [hotkeys]
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
 //! restore_last = "Ctrl+Shift+Z"                # 最後に閉じたものを復元。既定は空で、必須ではない
+//! active_window_capture = "Ctrl+Shift+W"       # アクティブウィンドウのキャプチャ。既定は空で、必須ではない
 //!
 //! [shortcuts]                                  # スクラップ操作の id ごとの上書き。"" は割り当てなし
 //! copy = "Ctrl+Shift+C"
@@ -116,17 +117,24 @@ pub enum HotkeyAction {
     SelectCapture,
     /// 最後に閉じたスクラップをごみ箱から復元する。任意（空でも通知しない）。
     RestoreLast,
+    /// アクティブウィンドウのキャプチャ。任意（空でも通知しない）。
+    ActiveWindowCapture,
 }
 
 impl HotkeyAction {
     /// すべて。
-    pub const ALL: [HotkeyAction; 2] = [HotkeyAction::SelectCapture, HotkeyAction::RestoreLast];
+    pub const ALL: [HotkeyAction; 3] = [
+        HotkeyAction::SelectCapture,
+        HotkeyAction::RestoreLast,
+        HotkeyAction::ActiveWindowCapture,
+    ];
 
     /// `[hotkeys]` の中のキー。
     pub fn key(self) -> &'static str {
         match self {
             HotkeyAction::SelectCapture => "select_capture",
             HotkeyAction::RestoreLast => "restore_last",
+            HotkeyAction::ActiveWindowCapture => "active_window_capture",
         }
     }
 }
@@ -136,6 +144,7 @@ impl HotkeyAction {
 pub struct Hotkeys {
     pub select_capture: Option<Chord>,
     pub restore_last: Option<Chord>,
+    pub active_window_capture: Option<Chord>,
 }
 
 impl Hotkeys {
@@ -144,6 +153,7 @@ impl Hotkeys {
         match action {
             HotkeyAction::SelectCapture => self.select_capture,
             HotkeyAction::RestoreLast => self.restore_last,
+            HotkeyAction::ActiveWindowCapture => self.active_window_capture,
         }
     }
 
@@ -160,6 +170,7 @@ impl Hotkeys {
         match action {
             HotkeyAction::SelectCapture => &mut self.select_capture,
             HotkeyAction::RestoreLast => &mut self.restore_last,
+            HotkeyAction::ActiveWindowCapture => &mut self.active_window_capture,
         }
     }
 }
@@ -734,6 +745,7 @@ shadow = false
                 hotkeys: Hotkeys {
                     select_capture: Some(chord("Win+Shift+PrintScreen")),
                     restore_last: Some(chord("Ctrl+Alt+Z")),
+                    active_window_capture: None,
                 },
                 shortcuts: BTreeMap::from([
                     ("close".to_owned(), None),
@@ -1075,6 +1087,7 @@ a = 1
         let hotkeys = Hotkeys {
             select_capture: Some(chord("Ctrl+Alt+S")),
             restore_last: None,
+            active_window_capture: None,
         };
         let assigned = hotkeys.assign();
         assert_eq!(
@@ -1102,6 +1115,31 @@ a = 1
         assert_eq!(
             settings.hotkeys.assign().bound,
             BTreeMap::from([(chord("Ctrl+Alt+Z"), HotkeyAction::RestoreLast)])
+        );
+    }
+
+    #[test]
+    fn active_window_capture_hotkey_is_unset_by_default() {
+        let (settings, issues) = load("version = 1\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.hotkeys.get(HotkeyAction::ActiveWindowCapture),
+            None
+        );
+    }
+
+    #[test]
+    fn active_window_capture_hotkey_is_read_and_assigned() {
+        let (settings, issues) =
+            load("version = 1\n[hotkeys]\nactive_window_capture = \"Ctrl+Alt+W\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.hotkeys.get(HotkeyAction::ActiveWindowCapture),
+            Some(chord("Ctrl+Alt+W"))
+        );
+        assert_eq!(
+            settings.hotkeys.assign().bound,
+            BTreeMap::from([(chord("Ctrl+Alt+W"), HotkeyAction::ActiveWindowCapture)])
         );
     }
 

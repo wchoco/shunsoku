@@ -39,6 +39,8 @@ mod trash_store;
 mod tray;
 #[cfg(windows)]
 mod wide;
+#[cfg(windows)]
+mod window_grab;
 
 #[cfg(windows)]
 fn main() {
