@@ -1613,21 +1613,28 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
 
 /// `Effect::CopyToClipboard`: 画像をクリップボードに置く。失敗したらエラーの通知を出す。
 fn copy_to_clipboard(image: &Image) {
+    if let Err(reason) = copy_image(image) {
+        notify_user(notify::Level::Error, &reason);
+    }
+}
+
+/// 画像をクリップボードに置く。失敗したら通知に出す理由を返す（通知はしない）。
+fn copy_image(image: &Image) -> std::result::Result<(), String> {
     let Some(owner) = with_app(|app| app.windows.message) else {
-        return;
+        return Err(text("job.panicked").to_owned());
     };
     match clipboard::copy(owner, image) {
-        Ok(()) => log::info!(
-            "copied {}x{} to the clipboard",
-            image.width(),
-            image.height()
-        ),
+        Ok(()) => {
+            log::info!(
+                "copied {}x{} to the clipboard",
+                image.width(),
+                image.height()
+            );
+            Ok(())
+        }
         Err(e) => {
             log::error!("could not copy to the clipboard: {e}");
-            notify_user(
-                notify::Level::Error,
-                &format!("{}\n{e}", text("copy.failed")),
-            );
+            Err(format!("{}\n{e}", text("copy.failed")))
         }
     }
 }
@@ -1778,7 +1785,7 @@ fn start_save(
             save_failed(Some(&path), &e.to_string());
         }
         if let Some(fallback) = fallback {
-            float_scrap(fallback.at, fallback.image, false);
+            let _ = float_scrap(fallback.at, fallback.image, false);
         }
         reply_failed(reply, &e.to_string());
     }
@@ -1837,7 +1844,7 @@ fn on_saved() {
                 let path = std::path::absolute(&saved.path).unwrap_or(saved.path);
                 reply_failed(saved.reply, &format!("{}: {e}", path.display()));
                 if let Some(fallback) = fallback {
-                    float_scrap(fallback.at, fallback.image, false);
+                    let _ = float_scrap(fallback.at, fallback.image, false);
                 }
             }
         }
@@ -2062,20 +2069,14 @@ fn finish_selection() {
             request,
             overlay,
             selection,
-        } => Some((
-            request,
-            overlay,
-            selection,
-            app.module,
-            Appearance::from(app.settings.scrap),
-        )),
+        } => Some((request, overlay, selection)),
         other => {
             app.capture = other;
             None
         }
     })
     .flatten();
-    let Some((request, overlay, selection, module, appearance)) = taken else {
+    let Some((request, overlay, selection)) = taken else {
         return;
     };
     if selection.is_registering() {
@@ -2125,40 +2126,10 @@ fn finish_selection() {
         fragments.len()
     );
 
-    if request.reply.is_some() {
-        // スクラップを前面にしてから範囲選択の画面を閉じる（前面にする権利を失わないように）
-        output_rect(request, rect, image);
-        drop(overlay);
-        end_capture();
-        log::info!("overlay closed");
-        return;
-    }
-    // ウィンドウを作るとメッセージが届くので、App を借りずに作る。前面にする権利を失わないよう、
-    // スクラップを前面にしてから範囲選択の画面を閉じる
-    let scrap = if request.outputs.scrap {
-        let focus = request.outputs.focus_scrap;
-        let model = ScrapModel::new(rect.origin(), image.size());
-        match open_scrap(module, model, image, &appearance, focus) {
-            Ok(scrap) => Some(scrap),
-            Err(e) => {
-                log::error!("could not open a scrap: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // スクラップを前面にしてから範囲選択の画面を閉じる（前面にする権利を失わないように）
+    output(request, rect, image);
     drop(overlay);
     end_capture();
-    if let Some(scrap) = scrap {
-        let rejected = with_app(|app| {
-            app.scraps.push(scrap);
-        });
-        if rejected.is_none() {
-            log::warn!("could not keep the scrap");
-        }
-        perf::mark(Mark::ScrapShown);
-    }
     log::info!("overlay closed");
 }
 
@@ -2471,19 +2442,26 @@ fn capture_rect(monitor: Option<u32>, rect: Rect) {
         area.top,
         started.elapsed().as_secs_f64() * 1000.0
     );
-    output_rect(request, area, image);
+    output(request, area, image);
 }
 
-/// CLI の依頼で撮った画像（`area` はスクリーン座標の位置）を、依頼の出力（コピー → スクラップ → 保存の順）に出して CLI に応答する。
-/// どれかに失敗したら、その先は出さずにキャプチャの失敗として返す。保存に失敗してもスクラップには逃がさない。
-fn output_rect(request: CaptureRequest, area: Rect, image: Image) {
+/// 撮った画像（`area` はスクリーン座標の位置）を、依頼の出力（コピー → スクラップ → 保存の順）に出す。
+/// 撮り方（範囲選択・ウィンドウ・定型領域・`capture rect`）にかかわらず、ここで出す。
+///
+/// - 失敗として返す依頼（`OnSaveFailure::Fail`、CLI）は、どれかに失敗したらその先は出さず、失敗を通知して
+///   CLI に返す。保存に失敗してもスクラップには逃がさない。保存の結果は `on_saved` が返す。
+/// - そうでない依頼（ホットキー・トレイ）は、失敗を通知して残りを出す。保存に失敗したら、スクラップを
+///   出していなければスクラップに逃がす。
+fn output(request: CaptureRequest, area: Rect, image: Image) {
+    let strict = request.on_save_failure == OnSaveFailure::Fail;
     let CaptureRequest {
         outputs,
         notify,
         reply: reply_to,
         ..
     } = request;
-    let failed = |reason: &str| {
+    // 失敗として返す依頼の失敗
+    let fail = |reason: &str| {
         if notify {
             notify_user(
                 notify::Level::Error,
@@ -2492,78 +2470,61 @@ fn output_rect(request: CaptureRequest, area: Rect, image: Image) {
         }
         reply_failed(reply_to, reason);
     };
-    if outputs.copy {
-        let Some(owner) = with_app(|app| app.windows.message) else {
-            failed(text("job.panicked"));
-            return;
-        };
-        if let Err(e) = clipboard::copy(owner, &image) {
-            log::error!("could not copy to the clipboard: {e}");
-            failed(&format!("{}\n{e}", text("copy.failed")));
+    if outputs.copy
+        && let Err(reason) = copy_image(&image)
+    {
+        if strict {
+            fail(&reason);
             return;
         }
-        log::info!("copied {}x{} to the clipboard", area.width(), area.height());
+        if notify {
+            notify_user(notify::Level::Error, &reason);
+        }
     }
     if outputs.scrap {
-        let Some((module, appearance)) =
-            with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
-        else {
-            failed(text("job.panicked"));
-            return;
-        };
-        // ウィンドウを作るとメッセージが届くので、App を借りずに作る
-        let model = ScrapModel::new(area.origin(), image.size());
-        match open_scrap(
-            module,
-            model,
-            image.clone(),
-            &appearance,
-            outputs.focus_scrap,
-        ) {
-            Ok(scrap) => {
-                if with_app(|app| app.scraps.push(scrap)).is_none() {
-                    log::warn!("could not keep the scrap");
-                }
-            }
-            Err(e) => {
-                log::error!("could not open a scrap: {e}");
-                failed(&e.to_string());
+        match float_scrap(area.origin(), image.clone(), outputs.focus_scrap) {
+            Ok(()) => perf::mark(Mark::ScrapShown),
+            Err(reason) if strict => {
+                fail(&reason);
                 return;
+            }
+            Err(_) => {}
+        }
+    }
+    let Some(target) = outputs.save else {
+        if let Some(to) = reply_to {
+            reply(to, Response::Captured { path: None });
+        }
+        return;
+    };
+    // 決まったファイル（CLI の --out）だけ上書きする
+    let overwrite = match target {
+        SaveTarget::File(_) => save::Overwrite::Allow,
+        _ => save::Overwrite::Deny,
+    };
+    let fallback = (!strict && !outputs.scrap).then(|| Fallback {
+        at: area.origin(),
+        image: image.clone(),
+    });
+    match resolve_save_target(target) {
+        Ok(path) => start_save(path, image, overwrite, fallback, reply_to, notify),
+        Err((dir, reason)) if strict => {
+            let mut reason = reason;
+            if let Some(dir) = dir {
+                reason.push('\n');
+                reason.push_str(&dir.display().to_string());
+            }
+            fail(&reason);
+        }
+        Err((dir, reason)) => {
+            if notify {
+                save_failed(dir.as_deref(), &reason);
+            }
+            if let Some(fallback) = fallback {
+                let _ = float_scrap(fallback.at, fallback.image, false);
             }
         }
     }
-    let (path, overwrite) = match outputs.save {
-        None => {
-            if let Some(to) = reply_to {
-                reply(to, Response::Captured { path: None });
-            }
-            return;
-        }
-        Some(request::SaveTarget::File(path)) => (path, save::Overwrite::Allow),
-        Some(target) => {
-            let resolved = match target {
-                request::SaveTarget::Region {
-                    dir,
-                    file_name_template,
-                    name,
-                } => resolve_destination(dir, &file_name_template, &name),
-                _ => resolve_default_destination(),
-            };
-            match resolved {
-                Ok(path) => (path, save::Overwrite::Deny),
-                Err((dir, reason)) => {
-                    let mut reason = reason;
-                    if let Some(dir) = dir {
-                        reason.push('\n');
-                        reason.push_str(&dir.display().to_string());
-                    }
-                    failed(&reason);
-                    return;
-                }
-            }
-        }
-    };
-    start_save(path, image, overwrite, None, reply_to, notify);
 }
 
 /// 待っている依頼の、結果を返す先（CLI の依頼だけ）。
@@ -2632,14 +2593,12 @@ fn capture_window(hwnd: HWND, crop: Option<Rect>) {
         Capture::Waiting(request) => Some((
             request.clone(),
             app.gpu.primary_device(),
-            app.module,
-            Appearance::from(app.settings.scrap),
             app.settings.general.capture_cursor,
         )),
         _ => None,
     })
     .flatten();
-    let Some((request, device, module, appearance, cursor)) = taken else {
+    let Some((request, device, cursor)) = taken else {
         return;
     };
     let grabbed = if hwnd.is_invalid() {
@@ -2696,30 +2655,7 @@ fn capture_window(hwnd: HWND, crop: Option<Rect>) {
         started.elapsed().as_secs_f64() * 1000.0
     );
     end_capture();
-    if request.reply.is_some() {
-        output_rect(request, shot.rect, shot.image);
-        return;
-    }
-    if !request.outputs.scrap {
-        return;
-    }
-    // ウィンドウを作るとメッセージが届くので、App を借りずに作る
-    let model = ScrapModel::new(shot.rect.origin(), shot.image.size());
-    match open_scrap(
-        module,
-        model,
-        shot.image,
-        &appearance,
-        request.outputs.focus_scrap,
-    ) {
-        Ok(scrap) => {
-            if with_app(|app| app.scraps.push(scrap)).is_none() {
-                log::warn!("could not keep the scrap");
-            }
-            perf::mark(Mark::ScrapShown);
-        }
-        Err(e) => log::error!("could not open a scrap: {e}"),
-    }
+    output(request, shot.rect, shot.image);
 }
 
 /// WGC で撮れなかったウィンドウの、モニタに写っている部分を Desktop Duplication で撮る。撮れなければ None。
@@ -3197,39 +3133,7 @@ fn capture_region(request: CaptureRequest) {
         at.y
     );
 
-    if request.reply.is_some() {
-        output_rect(request, Rect::from_origin_size(at, image.size()), image);
-        return;
-    }
-    let outputs = &request.outputs;
-    if outputs.copy {
-        copy_to_clipboard(&image);
-    }
-    // スクラップを出すときは、保存に失敗してもスクラップが残るので、逃がすスクラップは要らない
-    let fallback = request.on_save_failure == OnSaveFailure::FallbackToScrap && !outputs.scrap;
-    if let Some(target) = &outputs.save {
-        match save_destination(target) {
-            Some(path) => {
-                let fallback = fallback.then(|| Fallback {
-                    at,
-                    image: image.clone(),
-                });
-                start_save(
-                    path,
-                    image.clone(),
-                    save::Overwrite::Deny,
-                    fallback,
-                    request.reply,
-                    request.notify,
-                );
-            }
-            None if fallback => float_scrap(at, image.clone(), false),
-            None => {}
-        }
-    }
-    if outputs.scrap {
-        float_scrap(at, image, outputs.focus_scrap);
-    }
+    output(request, Rect::from_origin_size(at, image.size()), image);
 }
 
 /// 範囲選択の画面で決めた範囲（スクリーン座標）を、定型領域として設定ファイルの `[[regions]]` に足す。
@@ -3278,25 +3182,28 @@ fn register_region(rect: Rect) {
     }
 }
 
-/// 保存先: `target` の保存先に、`target` のファイル名テンプレートで付けた重ならない名前。
-fn save_destination(target: &SaveTarget) -> Option<PathBuf> {
+/// 保存先を決める: `target` の保存先に、`target` のファイル名テンプレートで付けた重ならない名前（決まった
+/// ファイルならそのまま）。決められなければ、（あれば）フォルダと理由を返す。通知はしない。
+fn resolve_save_target(
+    target: SaveTarget,
+) -> std::result::Result<PathBuf, (Option<PathBuf>, String)> {
     match target {
-        SaveTarget::Default => default_destination(),
-        SaveTarget::File(path) => Some(path.clone()),
+        SaveTarget::Default => resolve_default_destination(),
+        SaveTarget::File(path) => Ok(path),
         SaveTarget::Region {
             dir,
             file_name_template,
             name,
-        } => destination_in(dir.clone(), file_name_template, name),
+        } => resolve_destination(dir, &file_name_template, &name),
     }
 }
 
-/// 画像をスクラップとして `at`（スクリーン座標）に等倍で浮かべ、`App::scraps` に入れる。
-fn float_scrap(at: Point, image: Image, focus: bool) {
+/// 画像をスクラップとして `at`（スクリーン座標）に等倍で浮かべ、`App::scraps` に入れる。出せなければ理由を返す。
+fn float_scrap(at: Point, image: Image, focus: bool) -> std::result::Result<(), String> {
     let Some((module, appearance)) =
         with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
     else {
-        return;
+        return Err(text("job.panicked").to_owned());
     };
     // ウィンドウを作るとメッセージが届くので、App を借りずに作る
     let model = ScrapModel::new(at, image.size());
@@ -3305,8 +3212,12 @@ fn float_scrap(at: Point, image: Image, focus: bool) {
             if with_app(|app| app.scraps.push(scrap)).is_none() {
                 log::warn!("could not keep the scrap");
             }
+            Ok(())
         }
-        Err(e) => log::error!("could not open a scrap: {e}"),
+        Err(e) => {
+            log::error!("could not open a scrap: {e}");
+            Err(e.to_string())
+        }
     }
 }
 
