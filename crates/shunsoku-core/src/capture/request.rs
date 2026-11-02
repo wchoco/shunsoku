@@ -5,6 +5,7 @@
 //! の 1 本の流れで進める。発生源を足すときは `Source` に 1 つ足し、ここで対応する依頼を返す。
 //! CLI からの依頼は `CaptureRequest::from_cli` で作り、結果を返す先（`reply`）を持たせる（ADR-0003）。
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cli_args;
@@ -59,8 +60,10 @@ pub struct Outputs {
 /// 保存先。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveTarget {
-    /// 全体設定の保存先とファイル名テンプレート。
+    /// 全体設定の保存先とファイル名テンプレート。同名があれば連番を付ける。
     Default,
+    /// 決まったファイル（CLI の `--out`）。あれば上書きする。
+    File(PathBuf),
 }
 
 /// 保存に失敗したときにどうするか。
@@ -97,22 +100,30 @@ impl CaptureRequest {
         }
     }
 
-    /// CLI の `capture` から依頼を作る。既定は保存だけで、保存に失敗したらスクラップに逃がさず失敗として返す。
+    /// CLI の `capture` から依頼を作る。既定は保存だけで、ほかの出力はオプションで足す。`--scrap` のときだけ
+    /// スクラップにフォーカスを移す。保存に失敗したら、`--scrap` の有無にかかわらずスクラップに逃がさず失敗として返す。
+    /// `--quiet` ならトレイ通知を出さない。
     pub fn from_cli(capture: &cli_args::Capture, reply: ReplyTo) -> CaptureRequest {
         let method = match capture.target {
             cli_args::Target::Rect { monitor, rect } => CaptureMethod::Rect { monitor, rect },
         };
+        let output = &capture.output;
+        let save = match &output.save {
+            cli_args::Save::Default => Some(SaveTarget::Default),
+            cli_args::Save::To(path) => Some(SaveTarget::File(PathBuf::from(path))),
+            cli_args::Save::No => None,
+        };
         CaptureRequest {
             method,
             outputs: Outputs {
-                save: Some(SaveTarget::Default),
-                scrap: false,
-                copy: false,
-                focus_scrap: false,
+                save,
+                scrap: output.scrap,
+                copy: output.copy,
+                focus_scrap: output.scrap,
             },
             on_save_failure: OnSaveFailure::Fail,
             delay: Duration::ZERO,
-            notify: true,
+            notify: !output.quiet,
             reply: Some(reply),
         }
     }
@@ -137,6 +148,7 @@ impl CaptureRequest {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use super::*;
@@ -197,6 +209,7 @@ mod tests {
                 monitor: Some(2),
                 rect,
             },
+            output: cli_args::Output::default(),
         };
         let request = CaptureRequest::from_cli(&capture, ReplyTo(7));
         assert_eq!(
@@ -218,6 +231,78 @@ mod tests {
                 reply: Some(ReplyTo(7)),
             }
         );
+    }
+
+    fn cli_outputs(output: cli_args::Output) -> (Outputs, bool) {
+        let capture = cli_args::Capture {
+            target: cli_args::Target::Rect {
+                monitor: None,
+                rect: Rect::new(0, 0, 1, 1),
+            },
+            output,
+        };
+        let request = CaptureRequest::from_cli(&capture, ReplyTo(1));
+        // 出力を何にしても、保存に失敗したらスクラップに逃がさない
+        assert_eq!(request.on_save_failure, OnSaveFailure::Fail);
+        (request.outputs, request.notify)
+    }
+
+    #[test]
+    fn cli_scrap_shows_a_focused_scrap_besides_saving() {
+        let (outputs, _) = cli_outputs(cli_args::Output {
+            scrap: true,
+            ..cli_args::Output::default()
+        });
+        assert_eq!(
+            outputs,
+            Outputs {
+                save: Some(SaveTarget::Default),
+                scrap: true,
+                copy: false,
+                focus_scrap: true,
+            }
+        );
+    }
+
+    #[test]
+    fn cli_copy_and_no_save_copy_without_saving_or_moving_focus() {
+        let (outputs, _) = cli_outputs(cli_args::Output {
+            save: cli_args::Save::No,
+            copy: true,
+            ..cli_args::Output::default()
+        });
+        assert_eq!(
+            outputs,
+            Outputs {
+                save: None,
+                scrap: false,
+                copy: true,
+                focus_scrap: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cli_out_saves_to_that_file() {
+        let (outputs, _) = cli_outputs(cli_args::Output {
+            save: cli_args::Save::To(r"C:\shots\a.png".to_owned()),
+            ..cli_args::Output::default()
+        });
+        assert_eq!(
+            outputs.save,
+            Some(SaveTarget::File(PathBuf::from(r"C:\shots\a.png")))
+        );
+    }
+
+    #[test]
+    fn cli_quiet_turns_off_the_notifications() {
+        let (_, notify) = cli_outputs(cli_args::Output::default());
+        assert!(notify);
+        let (_, notify) = cli_outputs(cli_args::Output {
+            quiet: true,
+            ..cli_args::Output::default()
+        });
+        assert!(!notify);
     }
 
     #[test]

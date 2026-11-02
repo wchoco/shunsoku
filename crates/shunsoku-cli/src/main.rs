@@ -37,7 +37,20 @@ fn run() -> i32 {
             println!("shunsoku-cli {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        Ok(Command::Capture(capture)) => Request::Capture(capture),
+        Ok(Command::Capture(mut capture)) => {
+            // 常駐本体は作業フォルダが違うので、--out の相対パスはここで絶対パスにする
+            if let cli_args::Save::To(path) = &mut capture.output.save {
+                let absolute = std::path::absolute(&*path)
+                    .ok()
+                    .and_then(|absolute| absolute.into_os_string().into_string().ok());
+                let Some(absolute) = absolute else {
+                    error(&format!("--out のパスを絶対パスにできません: {path}"));
+                    return EXIT_ARGS;
+                };
+                *path = absolute;
+            }
+            Request::Capture(capture)
+        }
         Ok(Command::Monitors) => Request::Monitors,
         Err(e) => {
             error(&e.0);
