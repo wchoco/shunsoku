@@ -38,6 +38,10 @@
 //! border_width = 1                             # 1〜16（px）
 //! border_color = "#808080"
 //! shadow = true
+//!
+//! [selection]                                  # 範囲選択の画面
+//! mode = "normal"                              # 開いたときのモード: normal / precise
+//! crosshair = false                            # 通常モードでも十字線を出す（精密モードでは常に出す）
 //! ```
 
 use std::collections::BTreeMap;
@@ -47,6 +51,7 @@ use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OperationDescriptor, Shortcuts};
+use crate::selection::Mode;
 
 /// 対応している設定ファイルの形式の版。
 pub const VERSION: i64 = 1;
@@ -74,6 +79,7 @@ pub struct Settings {
     pub shortcuts: ShortcutOverrides,
     pub mouse: MouseOverrides,
     pub scrap: ScrapAppearance,
+    pub selection: SelectionScreen,
     /// ログのレベル（隠し項目）。
     pub log_level: LogLevel,
 }
@@ -213,6 +219,15 @@ impl Default for Border {
 /// 色。設定ファイルでは `#RRGGBB` で書く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
+
+/// 範囲選択の画面（`[selection]`）。開くたびに読む。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SelectionScreen {
+    /// 開いたときのモード。`Tab` での切り替えはその回だけで、次に開いたらこれに戻る。
+    pub mode: Mode,
+    /// 通常モードでも十字線を出す。精密モードでは設定によらず出す。
+    pub crosshair: bool,
+}
 
 /// DPI の違うモニタへスクラップを動かしたときの見え方（`[general] dpi_scaling`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -509,6 +524,14 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
         s.scrap.shadow = on;
     }
 
+    let selection = r.table(root, "selection");
+    if let Some(mode) = r.value(selection, "selection", "mode", selection_mode) {
+        s.selection.mode = mode;
+    }
+    if let Some(on) = r.value(selection, "selection", "crosshair", Item::as_bool) {
+        s.selection.crosshair = on;
+    }
+
     (s, r.issues)
 }
 
@@ -625,6 +648,14 @@ fn rgb(item: &Item) -> Option<Rgb> {
     }
     let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
     Some(Rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
+fn selection_mode(item: &Item) -> Option<Mode> {
+    match item.as_str()? {
+        "normal" => Some(Mode::Normal),
+        "precise" => Some(Mode::Precise),
+        _ => None,
+    }
 }
 
 fn dpi_scaling(item: &Item) -> Option<DpiScaling> {
@@ -745,6 +776,7 @@ shadow = false
                     },
                     shadow: false,
                 },
+                selection: SelectionScreen::default(),
                 log_level: LogLevel::Debug,
             }
         );
@@ -895,6 +927,38 @@ shadow = 1
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn the_selection_screen_defaults_to_normal_mode_without_crosshair() {
+        let (settings, _) = load("version = 1\n");
+        assert_eq!(settings.selection.mode, Mode::Normal);
+        assert!(!settings.selection.crosshair);
+        let (settings, issues) =
+            load("version = 1\n[selection]\nmode = \"precise\"\ncrosshair = true\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.selection.mode, Mode::Precise);
+        assert!(settings.selection.crosshair);
+        let (settings, issues) = load("version = 1\n[selection]\nmode = \"normal\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.selection.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn invalid_selection_screen_items_fall_back_to_the_defaults_and_are_named() {
+        for value in ["\"Precise\"", "\"fine\"", "\"\"", "true", "1"] {
+            let (settings, issues) = load(&format!("version = 1\n[selection]\nmode = {value}\n"));
+            assert_eq!(issues, vec![invalid("selection.mode")], "{value}");
+            assert_eq!(settings.selection.mode, Mode::Normal, "{value}");
+        }
+        for value in ["\"true\"", "1"] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[selection]\ncrosshair = {value}\n"));
+            assert_eq!(issues, vec![invalid("selection.crosshair")], "{value}");
+            assert!(!settings.selection.crosshair, "{value}");
+        }
+        let (_, issues) = load("version = 1\nselection = 1\n");
+        assert_eq!(issues, vec![invalid("selection")]);
     }
 
     #[test]

@@ -139,3 +139,12 @@ border_width = 1
 border_color = "#808080"
 # 影を出すかどうか（true / false）。
 shadow = true
+
+[selection]
+# 範囲選択の画面。
+# 開いたときのモード。次のどちらか。範囲選択の画面で Tab を押すと切り替わります（その回だけ）。
+#   normal   通常モード。ドラッグを離した時点で撮る
+#   precise  精密モード。離したあと、つまみ・ドラッグ・矢印で範囲を調整し、Enter かダブルクリックで撮る
+mode = "normal"
+# 通常モードでも十字線を出すかどうか（true / false）。精密モードでは常に出します。
+crosshair = false
