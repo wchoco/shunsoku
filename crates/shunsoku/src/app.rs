@@ -52,7 +52,7 @@ use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
 use shunsoku_core::capture::request::{CaptureRequest, Source};
-use shunsoku_core::geometry::{Point, Size};
+use shunsoku_core::geometry::Point;
 use shunsoku_core::i18n::Catalog;
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
@@ -296,7 +296,7 @@ impl Scrap {
 
 /// スクラップの中身を描いて、ウィンドウを `model` の矩形（`ScrapModel::window_rect`）に出す。`appearance` は全体の
 /// 見た目の既定値で、スクラップごとの上書きを重ねて描く。
-/// コンパクト表示のときは、画像の代わりに `COMPACT_FACE` の色で正方形を塗る（中身は隠す）。
+/// コンパクト表示のときは、画像のうち `ScrapModel::compact_view` の部分を正方形に引き伸ばして描く。
 ///
 /// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
 /// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
@@ -315,12 +315,13 @@ fn paint_scrap(
         Some(painter) => painter,
         None => render::Renderer::new()?,
     };
-    let face;
-    let image = if model.is_compact() {
-        face = compact_face();
-        &face
-    } else {
-        image
+    let view;
+    let image = match model.compact_view() {
+        Some(rect) => {
+            view = image.crop(rect);
+            &view
+        }
+        None => image,
     };
     let display = model.image_rect().size();
     let trim = model.is_trimming().then(|| render::TrimOverlay {
@@ -334,17 +335,6 @@ fn paint_scrap(
     *renderer = Some(painter);
     // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
     window.present(canvas.dc(), rect, appearance.opacity)
-}
-
-/// コンパクト表示の正方形の色（BGRA）。
-const COMPACT_FACE: [u8; 4] = [0x50, 0x50, 0x50, 0xFF];
-
-/// コンパクト表示の正方形に引き伸ばして描く 1 画素の画像。
-fn compact_face() -> Image {
-    Image::from_bgra(Size::new(1, 1), COMPACT_FACE.to_vec()).unwrap_or_else(|| {
-        // 長さは合っているので起こらない
-        Image::transparent(Size::new(1, 1))
-    })
 }
 
 struct Windows {

@@ -104,6 +104,8 @@ struct CompactOrigin {
     expanded: Point,
     /// 畳んだ直後の正方形の左上。
     square: Point,
+    /// 正方形に映す部分の中心（表示する画像の画素）。畳んだときに正方形の中心の下にあった画素。
+    focus: Point,
 }
 
 /// 拡大縮小の基準点。この点の下にある画像の画素が、倍率を変えても同じ画面上の位置に残る。
@@ -194,9 +196,20 @@ impl ScrapModel {
         };
         let half = (self.compact_side() / 2) as i32;
         let square = Point::new(center.x.saturating_sub(half), center.y.saturating_sub(half));
+        let unscale = |at: i32, from: i32| {
+            let offset = i64::from(at) - i64::from(from);
+            (offset * 100)
+                .div_euclid(i64::from(self.zoom))
+                .clamp(0, i64::from(i32::MAX)) as i32
+        };
+        let focus = Point::new(
+            unscale(center.x, self.position.x),
+            unscale(center.y, self.position.y),
+        );
         self.compact = Some(CompactOrigin {
             expanded: self.position,
             square,
+            focus,
         });
         self.position = square;
         true
@@ -204,7 +217,10 @@ impl ScrapModel {
 
     /// コンパクト表示から広げる。畳む前の位置に、畳んだあとに動かした分だけずらして戻す。畳んでいなければ false。
     pub fn leave_compact(&mut self) -> bool {
-        let Some(CompactOrigin { expanded, square }) = self.compact.take() else {
+        let Some(CompactOrigin {
+            expanded, square, ..
+        }) = self.compact.take()
+        else {
             return false;
         };
         let p = self.position;
@@ -497,6 +513,25 @@ impl ScrapModel {
             (i64::from(from) + sign * offset).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
         };
         Point::new(shift(self.position.x, by.x), shift(self.position.y, by.y))
+    }
+
+    /// コンパクト表示の正方形に映す部分（表示する画像の画素）。畳んだときに正方形の下にあった部分で、
+    /// 大きさはいまの倍率で正方形を埋める分。画像からはみ出さないようにずらし、画像より大きければ画像の
+    /// 短い辺の正方形にする。畳んでいなければ None。
+    pub fn compact_view(&self) -> Option<Rect> {
+        let focus = self.compact?.focus;
+        let shown = self.shown_size();
+        let zoom = u64::from(self.zoom);
+        let side = (u64::from(self.compact_side()) * 100 + zoom / 2) / zoom;
+        let side = u32::try_from(side)
+            .unwrap_or(u32::MAX)
+            .clamp(1, shown.width.min(shown.height).max(1));
+        let place = |center: i32, length: u32| {
+            let from = i64::from(center) - i64::from(side / 2);
+            from.clamp(0, i64::from(length.saturating_sub(side))) as i32
+        };
+        let origin = Point::new(place(focus.x, shown.width), place(focus.y, shown.height));
+        Some(Rect::from_origin_size(origin, Size::new(side, side)))
     }
 
     /// 画像を出す矩形（スクリーン座標）。大きさは倍率を掛けた表示の大きさ。畳んでいる間は正方形。
@@ -1260,6 +1295,39 @@ mod tests {
         // 畳んだまま畳んでも変わらない
         assert!(!scrap.enter_compact(ZoomAnchor::Center));
         assert_eq!(scrap.image_rect(), Rect::new(18, 118, 82, 182));
+    }
+
+    #[test]
+    fn the_square_shows_the_part_of_the_image_around_where_it_was_folded() {
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        assert_eq!(scrap.compact_view(), None);
+        // カーソルの下は画像の (110, 60)。そのまわりの 64 画素四方
+        scrap.enter_compact(ZoomAnchor::At(Point::new(10, 110)));
+        assert_eq!(scrap.compact_view(), Some(Rect::new(78, 28, 142, 92)));
+        // 畳んだまま動かしても、映す部分は変わらない
+        scrap.position = Point::new(500, 500);
+        assert_eq!(scrap.compact_view(), Some(Rect::new(78, 28, 142, 92)));
+    }
+
+    #[test]
+    fn the_part_shown_in_the_square_stays_inside_the_image() {
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.enter_compact(ZoomAnchor::At(Point::new(2, 199)));
+        assert_eq!(scrap.compact_view(), Some(Rect::new(0, 136, 64, 200)));
+    }
+
+    #[test]
+    fn the_part_shown_in_the_square_follows_the_zoom() {
+        // 200% なら 32 画素四方を映す
+        let mut scrap = ScrapModel::new(Point::new(0, 0), Size::new(300, 200));
+        scrap.set_zoom(200, ZoomAnchor::At(Point::new(0, 0)));
+        scrap.enter_compact(ZoomAnchor::At(Point::new(200, 200)));
+        assert_eq!(scrap.compact_view(), Some(Rect::new(84, 84, 116, 116)));
+        // 縮小していて正方形が画像より大きければ、画像の短い辺の正方形にする
+        let mut small = ScrapModel::new(Point::new(0, 0), Size::new(100, 40));
+        small.set_zoom(50, ZoomAnchor::At(Point::new(0, 0)));
+        small.enter_compact(ZoomAnchor::Center);
+        assert_eq!(small.compact_view(), Some(Rect::new(30, 0, 70, 40)));
     }
 
     #[test]
