@@ -664,14 +664,11 @@ fn regions(root: &dyn TableLike, r: &mut Reader) -> Vec<Region> {
         return Vec::new();
     };
     read_regions(tables, r)
-        .into_iter()
-        .map(|(_, region)| region)
-        .collect()
 }
 
-/// `[[regions]]` の要素のうち読み込みで残る定型領域と、その要素の位置（0 から）。
-fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(usize, Region)> {
-    let mut regions: Vec<(usize, Region)> = Vec::new();
+/// `[[regions]]` の要素のうち読み込みで残る定型領域。
+fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<Region> {
+    let mut regions: Vec<Region> = Vec::new();
     for (i, table) in tables.iter().enumerate() {
         let path = format!("regions[{}]", i + 1);
         let t: Option<&dyn TableLike> = Some(table);
@@ -692,23 +689,20 @@ fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(usize
         let (Some(name), Some(monitor), Some(rect)) = (name, monitor, rect) else {
             continue;
         };
-        if regions.iter().any(|(_, region)| region.name == name) {
+        if regions.iter().any(|region| region.name == name) {
             r.invalid(format!("{path}.name"));
             continue;
         }
-        regions.push((
-            i,
-            Region {
-                name,
-                hotkey,
-                monitor,
-                rect,
-                save_dir,
-                file_name_template,
-                save,
-                scrap,
-            },
-        ));
+        regions.push(Region {
+            name,
+            hotkey,
+            monitor,
+            rect,
+            save_dir,
+            file_name_template,
+            save,
+            scrap,
+        });
     }
     regions
 }
