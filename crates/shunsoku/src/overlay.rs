@@ -8,7 +8,8 @@
 //! - ウィンドウ プロシージャは `app` が持つ（Win32 層のモジュールは `app` を通してつながる）。
 //! - 画面は暗くしない。範囲を選んでいる間は、固定された画面をバックバッファに写したうえに Direct2D で
 //!   範囲のすぐ外側に細い枠（内側が白、外側が黒の 1 物理ピクセルずつ。どんな背景でも見えるように）を描き、
-//!   範囲の左上の外側にサイズを出す。Direct2D の資源は初めて範囲を描くときに作る（開くまでの時間を
+//!   範囲の左上の外側にサイズを出す。ウィンドウをハイライトしている間は、範囲の代わりにその矩形を
+//!   半透明の青で塗って内側に枠を描き、名前とサイズを出す。Direct2D の資源は初めて範囲を描くときに作る（開くまでの時間を
 //!   延ばさないため）。Direct2D の座標は 1 DIP = 1 物理ピクセル。
 //! - drop で Direct2D の描画先、スワップチェーンの順に解放してからウィンドウを壊す。そのあと
 //!   `grab::Gpu::trim` を呼ぶ。
@@ -84,6 +85,22 @@ const LABEL_TEXT: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 1.0,
 };
+/// ハイライトの枠の色（Windows の既定のアクセントに近い青）。
+const HIGHLIGHT_FRAME: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.0,
+    g: 0.47,
+    b: 0.84,
+    a: 1.0,
+};
+/// ハイライトの中に重ねる色。
+const HIGHLIGHT_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.0,
+    g: 0.47,
+    b: 0.84,
+    a: 0.15,
+};
+/// ハイライトの枠の太さ（DPI 100% のときの物理ピクセル。DPI に合わせて太くする）。
+const HIGHLIGHT_WIDTH: f32 = 3.0;
 /// サイズの表示の文字の大きさ・余白・範囲との間（DPI 100% のときの物理ピクセル。DPI に合わせて大きくする）。
 const LABEL_FONT_SIZE: f32 = 12.0;
 const LABEL_PADDING_X: f32 = 6.0;
@@ -138,6 +155,8 @@ struct D2dTarget {
     frame_outer: ID2D1SolidColorBrush,
     label_back: ID2D1SolidColorBrush,
     label_text: ID2D1SolidColorBrush,
+    highlight_frame: ID2D1SolidColorBrush,
+    highlight_fill: ID2D1SolidColorBrush,
     _target: ID2D1Bitmap1,
     context: ID2D1DeviceContext,
 }
@@ -190,7 +209,7 @@ impl Overlay {
         }
         // まだ範囲はないので Direct2D は作らない
         for view in &mut overlay.monitors {
-            if let Err(e) = view.draw(None, None, None) {
+            if let Err(e) = view.draw(None, None, None, None) {
                 log::warn!("could not draw the overlay: {e}");
             }
         }
@@ -223,15 +242,30 @@ impl Overlay {
     /// 全モニタのウィンドウを描き直す。範囲がなければ固定された画面をそのまま出し、
     /// 範囲があればその枠とサイズを出す。
     pub fn redraw(&mut self, selection: &Selection) {
-        let rect = selection.rect();
-        let label = match rect {
-            Some(rect) => self.label(selection, rect).unwrap_or_else(|e| {
+        // ハイライトしていれば、範囲の代わりにハイライトの枠と名前とサイズを出す
+        let highlight = selection.highlight();
+        let rect = if highlight.is_some() {
+            None
+        } else {
+            selection.rect()
+        };
+        let text = match (&highlight, rect) {
+            (Some(highlight), _) => Some((
+                highlight.label(),
+                highlight_label_at(selection, highlight.rect),
+            )),
+            (None, Some(rect)) => selection.size_label().map(|text| (text, rect)),
+            (None, None) => None,
+        };
+        let label = match text {
+            Some((text, at)) => self.label(selection, text, at).unwrap_or_else(|e| {
                 log::warn!("could not lay out the size label: {e}");
                 None
             }),
             None => None,
         };
-        let factory = match rect {
+        let highlight = highlight.map(|h| h.rect);
+        let factory = match rect.or(highlight) {
             Some(_) => match self.painter() {
                 Ok(painter) => Some(painter.factory.clone()),
                 Err(e) => {
@@ -242,7 +276,7 @@ impl Overlay {
             None => None,
         };
         for view in &mut self.monitors {
-            if let Err(e) = view.draw(factory.as_ref(), rect, label.as_ref()) {
+            if let Err(e) = view.draw(factory.as_ref(), rect, highlight, label.as_ref()) {
                 log::warn!("could not draw the overlay: {e}");
             }
         }
@@ -256,12 +290,9 @@ impl Overlay {
         }
     }
 
-    /// サイズの表示を、範囲の左上があるモニタの DPI の大きさで、範囲の左上の外側に置く。
-    /// そのモニタの上にはみ出すなら、範囲の内側の左上に置く。
-    fn label(&mut self, selection: &Selection, rect: Rect) -> Result<Option<Label>> {
-        let Some(text) = selection.size_label() else {
-            return Ok(None);
-        };
+    /// サイズの表示（`text`）を、範囲の左上があるモニタの DPI の大きさで、範囲の左上の外側に置く。
+    /// そのモニタの上にはみ出すなら、範囲の内側の左上に置く。右にはみ出すなら、モニタの右端に寄せる。
+    fn label(&mut self, selection: &Selection, text: String, rect: Rect) -> Result<Option<Label>> {
         let monitor = selection
             .monitors()
             .iter()
@@ -286,7 +317,12 @@ impl Overlay {
         let gap = LABEL_GAP * scale;
         let width = metrics.width.ceil() + pad_x * 2.0;
         let height = metrics.height.ceil() + pad_y * 2.0;
-        let left = rect.left as f32;
+        let mut left = rect.left as f32;
+        if let Some(m) = monitor {
+            left = left
+                .min(m.rect.right as f32 - width)
+                .max(m.rect.left as f32);
+        }
         let mut top = rect.top as f32 - gap - height;
         if monitor.is_some_and(|m| top < m.rect.top as f32) {
             top = rect.top as f32 + gap;
@@ -374,16 +410,21 @@ impl Painter {
 impl MonitorView {
     /// 固定された画面を写し、範囲（`rect`）があれば範囲の枠とサイズを出す。
     /// `factory` がなければ範囲は描かない。
+    /// `highlight` があれば、範囲の代わりにハイライトの枠を出す。
     fn draw(
         &mut self,
         factory: Option<&ID2D1Factory1>,
         rect: Option<Rect>,
+        highlight: Option<Rect>,
         label: Option<&Label>,
     ) -> Result<()> {
         self.copy_shot()?;
-        if let (Some(factory), Some(rect)) = (factory, rect)
-            && let Err(e) = self.draw_selection(factory, rect, label)
-        {
+        let drawn = match (factory, rect, highlight) {
+            (Some(factory), _, Some(highlight)) => self.draw_highlight(factory, highlight, label),
+            (Some(factory), Some(rect), None) => self.draw_selection(factory, rect, label),
+            _ => Ok(()),
+        };
+        if let Err(e) = drawn {
             // 描画先を作り直せば直ることがある（D2DERR_RECREATE_TARGET など）。次に描くときに作り直す
             log::warn!("could not draw the selection: {e}");
             if let Some(surface) = &mut self.surface {
@@ -443,6 +484,70 @@ impl MonitorView {
                 {
                     context.FillRectangle(&local(&to_rect_f(band)), brush);
                 }
+            }
+            if let Some(label) = label {
+                context.FillRectangle(&local(&label.back), &d2d.label_back);
+                context.DrawText(
+                    &label.text,
+                    &label.format,
+                    &local(&label.text_rect),
+                    &d2d.label_text,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+            context.EndDraw(None, None)
+        }
+    }
+
+    /// ハイライトの枠と、名前とサイズを出す。枠はハイライトの内側に描く（最大化したウィンドウでも
+    /// モニタの端で見えるように）。中は薄く色を付ける。
+    fn draw_highlight(
+        &mut self,
+        factory: &ID2D1Factory1,
+        rect: Rect,
+        label: Option<&Label>,
+    ) -> Result<()> {
+        let monitor = to_rect(self.shot.rect);
+        let width = (HIGHLIGHT_WIDTH * self.shot.dpi as f32 / 96.0)
+            .round()
+            .max(1.0) as i32;
+        let Some(surface) = &mut self.surface else {
+            return Ok(());
+        };
+        if surface.d2d.is_none() {
+            surface.d2d = Some(D2dTarget::new(
+                factory,
+                &self.shot.device,
+                &surface.swap_chain,
+            )?);
+        }
+        let Some(d2d) = &surface.d2d else {
+            return Ok(());
+        };
+        let (ox, oy) = (monitor.left as f32, monitor.top as f32);
+        let local = |r: &D2D_RECT_F| D2D_RECT_F {
+            left: r.left - ox,
+            top: r.top - oy,
+            right: r.right - ox,
+            bottom: r.bottom - oy,
+        };
+        let inner = rect.inflate(-width);
+        let context = &d2d.context;
+        // SAFETY: このモニタのバックバッファに描く。UI スレッドで呼ぶ
+        unsafe {
+            context.BeginDraw();
+            context.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            if let Some(fill) = rect.intersect(&monitor) {
+                context.FillRectangle(&local(&to_rect_f(fill)), &d2d.highlight_fill);
+            }
+            let bands = if inner.is_empty() {
+                vec![rect]
+            } else {
+                ring(rect, inner).to_vec()
+            };
+            for band in bands.iter().filter_map(|b| b.intersect(&monitor)) {
+                context.FillRectangle(&local(&to_rect_f(band)), &d2d.highlight_frame);
             }
             if let Some(label) = label {
                 context.FillRectangle(&local(&label.back), &d2d.label_back);
@@ -557,11 +662,24 @@ impl D2dTarget {
                 frame_outer: context.CreateSolidColorBrush(&FRAME_OUTER, None)?,
                 label_back: context.CreateSolidColorBrush(&LABEL_BACK, None)?,
                 label_text: context.CreateSolidColorBrush(&LABEL_TEXT, None)?,
+                highlight_frame: context.CreateSolidColorBrush(&HIGHLIGHT_FRAME, None)?,
+                highlight_fill: context.CreateSolidColorBrush(&HIGHLIGHT_FILL, None)?,
                 _target: target,
                 context,
             })
         }
     }
+}
+
+/// ハイライトの名前とサイズを置く基準の矩形。ハイライトのうちカーソルのあるモニタに見えている部分
+/// （モニタをまたぐウィンドウや、画面の外にはみ出したウィンドウでも見えるように）。
+fn highlight_label_at(selection: &Selection, rect: Rect) -> Rect {
+    selection
+        .monitors()
+        .iter()
+        .find(|m| m.rect.contains(selection.cursor()))
+        .and_then(|m| m.rect.intersect(&rect))
+        .unwrap_or(rect)
 }
 
 /// `outer` から `inner`（`outer` の内側）を除いた輪を、上・下・左・右の 4 つの帯で返す。

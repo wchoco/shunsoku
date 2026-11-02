@@ -6,8 +6,14 @@
 //! - キーボードの操作（矢印・`Space`・`Ctrl+A`・`Ctrl+Shift+A`）もここで状態に変える。Win32 層はキーを
 //!   `Input` にして渡し、矢印で動いた `cursor` に実際のマウスのカーソルを合わせるだけにする。
 //! - 矢印で動かすカーソルは、どれかのモニタの画素に留める（隙間や画面の外には出ない）。
+//! - ウィンドウの一覧（`WindowInfo`）も Win32 層が集めて渡す。`Shift` を押している間はカーソルの下の
+//!   ウィンドウ（`Ctrl` も押していれば部品）をハイライトし、クリックか `Enter` でそれを選ぶ（`chosen_window`）。
 
 use crate::geometry::{Point, Rect};
+
+mod highlight;
+
+pub use highlight::{Highlight, WindowId, WindowInfo, WindowKind};
 
 /// 1 枚のモニタ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +72,13 @@ pub enum Input {
     SelectMonitor,
     /// `Ctrl+Shift+A`。全モニタを囲む矩形を選んで確定する（モニタの隙間は撮るときに透明になる）。
     SelectAllMonitors,
+    /// Shift と Ctrl の押し下げの状態が変わった。Shift でウィンドウを、Shift+Ctrl で部品をハイライトする。
+    Modifiers {
+        shift: bool,
+        ctrl: bool,
+    },
+    /// `Enter`。ハイライトしていれば、そのウィンドウを撮るものに決める。
+    Enter,
 }
 
 /// 状態。
@@ -90,6 +103,19 @@ pub struct Selection {
     anchor: Option<Point>,
     /// カーソルの画素。キーボードで動かす操作もこれを動かす。
     cursor: Point,
+    /// ウィンドウのハイライト（`highlight`）。
+    windows: Windows,
+}
+
+/// ウィンドウのハイライトに使う状態。
+#[derive(Debug, Clone, Default)]
+struct Windows {
+    /// 開いた時点のウィンドウの一覧（Z オーダーの手前から奥）。
+    list: Vec<WindowInfo>,
+    shift: bool,
+    ctrl: bool,
+    /// ハイライトから撮るウィンドウに決まった（`State::Confirmed`）。
+    chosen: Option<Highlight>,
 }
 
 impl Selection {
@@ -100,6 +126,40 @@ impl Selection {
             state: State::Idle,
             anchor: None,
             cursor,
+            windows: Windows::default(),
+        }
+    }
+
+    /// ハイライトの対象にするウィンドウの一覧を渡す（Z オーダーの手前から奥）。
+    pub fn set_windows(&mut self, windows: Vec<WindowInfo>) {
+        self.windows.list = windows;
+    }
+
+    /// いまハイライトしているもの。Shift を押していて、範囲を選んでいないとき（押しただけでまだ
+    /// 動かしていないときを含む）だけ。
+    pub fn highlight(&self) -> Option<Highlight> {
+        let unmoved = match self.state {
+            State::Idle => true,
+            State::Selecting => self.anchor == Some(self.cursor),
+            State::Confirmed | State::Cancelled => false,
+        };
+        if !self.windows.shift || !unmoved {
+            return None;
+        }
+        highlight::find(&self.windows.list, self.cursor, self.windows.ctrl)
+    }
+
+    /// ハイライトから撮ることに決まったウィンドウ。範囲で確定したときや、まだ決まっていなければ None。
+    pub fn chosen_window(&self) -> Option<&Highlight> {
+        self.windows.chosen.as_ref()
+    }
+
+    /// ハイライトしていたものを撮ることにして確定する。何もハイライトしていなければ何もしない。
+    fn choose_window(&mut self, highlight: Option<Highlight>) {
+        if let Some(highlight) = highlight {
+            self.windows.chosen = Some(highlight);
+            self.anchor = None;
+            self.state = State::Confirmed;
         }
     }
 
@@ -127,8 +187,11 @@ impl Selection {
                 self.cursor = at;
                 if self.state == State::Selecting {
                     if self.anchor == Some(at) {
-                        // 動かさずに離した（クリック）。何も選ばなかったことにする
+                        // 動かさずに離した（クリック）。ハイライトしていればそのウィンドウを撮り、
+                        // していなければ何も選ばなかったことにする
+                        let highlight = self.highlight();
                         self.reset();
+                        self.choose_window(highlight);
                     } else {
                         self.state = State::Confirmed;
                     }
@@ -170,6 +233,11 @@ impl Selection {
                     self.confirm(rect);
                 }
             }
+            Input::Modifiers { shift, ctrl } => {
+                self.windows.shift = shift;
+                self.windows.ctrl = ctrl;
+            }
+            Input::Enter => self.choose_window(self.highlight()),
         }
         self.state
     }
