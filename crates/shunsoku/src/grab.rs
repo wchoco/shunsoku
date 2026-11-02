@@ -6,9 +6,12 @@
 //!   スレッドのパニックは `join` の `Err` になり、その取得の失敗として返す（常駐は続く）。
 //! - カーソルを写すときは、フレームと一緒に返るカーソルの形と位置を、自前のテクスチャに重ねる
 //!   （`draw_cursor`）。切り抜く前の画面の画像に重ねるので、範囲選択・定型領域・CLI のどれにも効き、
-//!   範囲選択の画面にも止まったカーソルとして出る。
+//!   範囲選択の画面にも止まったカーソルとして出る。重ねるのは HDR の変換のあと（8bit BGRA の画像）。
 //! - Duplication はフレームを自前のテクスチャへ写したらすぐ閉じる。開いたままにすると常駐時の
 //!   メモリが増える（ADR-0002）。
+//! - HDR のモニタは FP16（scRGB）で取り、全モニタの取得が終わった直後に `hdr::to_sdr_texture` で
+//!   8bit sRGB の BGRA にする（モニタごとに、そのモニタの「SDR コンテンツの明るさ」で）。
+//!   範囲選択の画面・スクラップ・保存画像は、どれも変換後の `Shot::texture` を使う。
 
 use std::ffi::c_void;
 use std::fmt;
@@ -17,6 +20,8 @@ use std::thread;
 use shunsoku_core::cursor::{Cursor, Shape, ShapeKind};
 use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::image::{Fragment, Image};
+
+use crate::hdr;
 
 use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, LUID, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -34,9 +39,10 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
-    IDXGIAdapter1, IDXGIDevice3, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+    IDXGIAdapter1, IDXGIDevice3, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication,
     IDXGIResource,
 };
+use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromRect};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::USER_DEFAULT_SCREEN_DPI;
 use windows::core::{Interface, Result};
@@ -70,8 +76,9 @@ pub struct Shot {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
     /// 画面の画像（`rect` と同じ大きさ、`DXGI_FORMAT_B8G8R8A8_UNORM`、`D3D11_USAGE_DEFAULT`）。
+    /// HDR のモニタでは SDR に変換したあとの画像。
     /// 切り抜くときは、ここから重なる部分だけを staging のテクスチャへ写して CPU に書き戻す。
-    /// None は、この画像をそのまま出せないモニタ（回転したモニタ、8bit BGRA でない HDR のモニタ）。
+    /// None は、この画像をそのまま出せないモニタ（回転したモニタ、変換できなかった HDR のモニタ）。
     pub texture: Option<ID3D11Texture2D>,
 }
 
@@ -277,12 +284,19 @@ impl Gpu {
         for ((device, _, rect, dpi), result) in jobs.into_iter().zip(results) {
             let grabbed = result?;
             let adapter = &self.adapters[device];
+            let texture = grabbed
+                .texture
+                .and_then(|t| to_sdr(&adapter.device, &rect, t));
+            // カーソルは 8bit BGRA の画像にしか重ねられないので、HDR の変換のあとに重ねる
+            if let (Some(texture), Some(cursor)) = (&texture, &grabbed.cursor) {
+                draw_cursor(&adapter.device, texture, cursor)?;
+            }
             shots.push(Shot {
                 rect,
                 dpi,
                 device: adapter.device.clone(),
                 context: adapter.context.clone(),
-                texture: grabbed.texture,
+                texture,
             });
         }
         Ok(shots)
@@ -374,6 +388,24 @@ impl Gpu {
     }
 }
 
+/// HDR のモニタの画像（FP16）を、そのモニタの「SDR コンテンツの明るさ」で 8bit sRGB にする。
+/// 8bit BGRA の画像はそのまま返す。変換できなければ None（そのモニタは黒で出す）。
+fn to_sdr(device: &ID3D11Device, rect: &RECT, texture: ID3D11Texture2D) -> Option<ID3D11Texture2D> {
+    if texture_format(&texture) != hdr::HDR_FORMAT {
+        return Some(texture);
+    }
+    // SAFETY: 矩形からモニタを引くだけ
+    let monitor = unsafe { MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST) };
+    let color = hdr::monitor_color(monitor);
+    log::info!(
+        "converting an HDR output to SDR (SDR white {} nits)",
+        color.sdr_white_nits
+    );
+    hdr::to_sdr_texture(device, &texture, color.sdr_white_nits)
+        .inspect_err(|e| log::warn!("could not convert the HDR output to SDR: {e}"))
+        .ok()
+}
+
 fn same_luid(a: LUID, b: LUID) -> bool {
     a.HighPart == b.HighPart && a.LowPart == b.LowPart
 }
@@ -404,14 +436,16 @@ fn attached_outputs(adapter: &IDXGIAdapter1) -> Result<Vec<(IDXGIOutput1, RECT, 
 /// 1 モニタ分の取得の結果。
 struct Grabbed {
     texture: Option<ID3D11Texture2D>,
+    /// まだ重ねていないカーソル（HDR の変換のあとに `Gpu::grab_outputs` で重ねる）。
+    cursor: Option<Cursor>,
 }
 
 /// スレッドから返すための `Grabbed`。
-struct RawGrabbed(Option<Raw>);
+struct RawGrabbed(Option<Raw>, Option<Cursor>);
 
 impl Grabbed {
     fn into_raw(self) -> RawGrabbed {
-        RawGrabbed(self.texture.map(|t| Raw(t.into_raw())))
+        RawGrabbed(self.texture.map(|t| Raw(t.into_raw())), self.cursor)
     }
 }
 
@@ -422,6 +456,7 @@ impl RawGrabbed {
             texture: self
                 .0
                 .map(|raw| unsafe { ID3D11Texture2D::from_raw(raw.0) }),
+            cursor: self.1,
         }
     }
 }
@@ -447,16 +482,13 @@ fn grab_output(
 fn grab_once(device: &ID3D11Device, output: &IDXGIOutput1, cursor: bool) -> Result<Grabbed> {
     // SAFETY: device はこの出力が属するアダプタのもの。フレームは ReleaseFrame まで使う
     unsafe {
-        let duplication = output.DuplicateOutput(device)?;
+        let duplication = duplicate(device, output)?;
         let rotation = duplication.GetDesc().Rotation;
         let (frame, pointer) = acquire_frame(&duplication, cursor)?;
         let result = copy_frame(device, &frame);
         drop(frame);
         let _ = duplication.ReleaseFrame();
         let texture = result?;
-        if let Some(pointer) = pointer {
-            draw_cursor(device, &texture, &pointer)?;
-        }
 
         // 回転したモニタの画像は回転前の向きで来る。M1 では回して出さない（下で None にする）
         let upright =
@@ -465,12 +497,29 @@ fn grab_once(device: &ID3D11Device, output: &IDXGIOutput1, cursor: bool) -> Resu
         if !upright {
             log::warn!("output is rotated ({rotation:?}); it is not shown in M1");
         }
-        if format != DXGI_FORMAT_B8G8R8A8_UNORM {
-            log::warn!("output format is {format:?}, not 8-bit BGRA; it is not shown in M1");
+        // FP16（HDR）は UI スレッドに戻ってから SDR に変換する（`Gpu::grab`）
+        let known = format == DXGI_FORMAT_B8G8R8A8_UNORM || format == hdr::HDR_FORMAT;
+        if !known {
+            log::warn!("output format is {format:?}, neither 8-bit BGRA nor FP16; it is not shown");
         }
         Ok(Grabbed {
-            texture: (upright && format == DXGI_FORMAT_B8G8R8A8_UNORM).then_some(texture),
+            texture: (upright && known).then_some(texture),
+            cursor: pointer,
         })
+    }
+}
+
+/// Duplication を開く。HDR のモニタの画像は FP16（scRGB）で受ける。`DuplicateOutput1` のない
+/// 古い Windows では `DuplicateOutput`（HDR のモニタでは 8bit に落とされた画像になる）。
+fn duplicate(device: &ID3D11Device, output: &IDXGIOutput1) -> Result<IDXGIOutputDuplication> {
+    // SAFETY: device はこの出力が属するアダプタのもの
+    unsafe {
+        match output.cast::<IDXGIOutput5>() {
+            Ok(output5) => {
+                output5.DuplicateOutput1(device, 0, &[hdr::HDR_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM])
+            }
+            Err(_) => output.DuplicateOutput(device),
+        }
     }
 }
 
@@ -614,7 +663,7 @@ fn pointer_shape(duplication: &IDXGIOutputDuplication, size: u32) -> Result<Opti
 }
 
 /// カーソルを画面の画像に重ねる。重なる部分だけを staging に写し、CPU で重ねて書き戻す。
-/// 8bit BGRA でない画像（HDR のモニタ）には重ねない。
+/// 8bit BGRA でない画像には重ねない（HDR のモニタの画像は変換のあとに渡す）。
 fn draw_cursor(device: &ID3D11Device, texture: &ID3D11Texture2D, cursor: &Cursor) -> Result<()> {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     // SAFETY: 説明を読むだけ

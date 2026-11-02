@@ -5,12 +5,15 @@
 //!   呼ばない（非パッケージアプリでは可否がシステムのスイッチで決まり、プロンプトも出ない。#11 のプローブ）。
 //!   枠が消せない環境（Windows 10 など）でも `PrintWindow` には切り替えない（spec #34）。
 //! - フレームプールは free-threaded で作り、UI スレッドで `TryGetNextFrame` を短く待つ。メッセージは回さない。
+//! - HDR のモニタ（ウィンドウとの重なりが最も大きいモニタ）では FP16（scRGB）で撮り、書き戻す前に
+//!   `hdr::to_sdr_texture` でそのモニタの「SDR コンテンツの明るさ」を白にした 8bit sRGB にする。
 //! - 撮ったフレームは staging のテクスチャに写して CPU に書き戻し、すぐにセッションとプールを閉じる。
 
 use std::time::{Duration, Instant};
 
+use shunsoku_core::capture::window::visible_bounds;
 use shunsoku_core::geometry::{Rect, Size};
-use shunsoku_core::image::Image;
+use shunsoku_core::image::{Fragment, Image};
 
 use windows::Foundation::Metadata::ApiInformation;
 use windows::Graphics::Capture::{
@@ -25,12 +28,16 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 use windows::core::{Error, HSTRING, Interface, Result, factory, h};
+
+use crate::grab::{Gpu, GrabError};
+use crate::hdr;
 
 /// 最初のフレームを待つ時間の上限。
 const FRAME_TIMEOUT: Duration = Duration::from_secs(1);
@@ -55,18 +62,27 @@ pub fn grab_window(device: &ID3D11Device, hwnd: HWND, cursor: bool) -> Result<Wi
     let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     // SAFETY: hwnd は呼び出し側が GetForegroundWindow などで得たトップレベルのウィンドウ
     let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
-    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &winrt,
-        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        1,
-        item.Size()?,
-    )?;
+    // SAFETY: ウィンドウからモニタを引くだけ
+    let color = hdr::monitor_color(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) });
+    let (format, sdr_white) = if color.hdr {
+        log::info!(
+            "capturing the window in FP16 (SDR white {} nits)",
+            color.sdr_white_nits
+        );
+        (
+            DirectXPixelFormat::R16G16B16A16Float,
+            Some(color.sdr_white_nits),
+        )
+    } else {
+        (DirectXPixelFormat::B8G8R8A8UIntNormalized, None)
+    };
+    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&winrt, format, 1, item.Size()?)?;
     let session = pool.CreateCaptureSession(&item)?;
     let result = configure(&session, cursor)
         .and_then(|()| session.StartCapture())
         .and_then(|()| next_frame(&pool))
         .and_then(|frame| {
-            let image = read_frame(device, &frame);
+            let image = read_frame(device, &frame, sdr_white);
             let _ = frame.Close();
             image
         });
@@ -113,11 +129,20 @@ fn next_frame(pool: &Direct3D11CaptureFramePool) -> Result<Direct3D11CaptureFram
     }
 }
 
-/// フレームのうち中身のある部分（`ContentSize`）を CPU に書き戻す。
-fn read_frame(device: &ID3D11Device, frame: &Direct3D11CaptureFrame) -> Result<Image> {
+/// フレームのうち中身のある部分（`ContentSize`）を CPU に書き戻す。`sdr_white` があれば
+/// フレームは FP16 で、その明るさを白にして SDR に変換してから書き戻す。
+fn read_frame(
+    device: &ID3D11Device,
+    frame: &Direct3D11CaptureFrame,
+    sdr_white: Option<f32>,
+) -> Result<Image> {
     let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
     // SAFETY: フレームのサーフェスは D3D11 のテクスチャ。フレームを閉じるまで使う
     let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
+    let texture = match sdr_white {
+        Some(white) => hdr::to_sdr_texture(device, &texture, white)?,
+        None => texture,
+    };
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     // SAFETY: 説明を読むだけ
     unsafe { texture.GetDesc(&mut desc) };
@@ -185,4 +210,35 @@ fn window_bounds(hwnd: HWND) -> Rect {
         }
     }
     Rect::new(r.left, r.top, r.right, r.bottom)
+}
+
+/// WGC で撮れなかったウィンドウ（UAC で昇格したウィンドウなど）の後退: ウィンドウの矩形のうちモニタに
+/// 写っている部分を Desktop Duplication で撮る（spec #34、#64）。他のウィンドウに隠れた部分は、
+/// 隠しているウィンドウが写る。どのモニタにも重ならなければ Ok(None)。`cursor` は `grab_window` と同じ。
+pub fn grab_visible(
+    gpu: &mut Gpu,
+    hwnd: HWND,
+    cursor: bool,
+) -> std::result::Result<Option<WindowShot>, GrabError> {
+    let shots = gpu.grab(cursor)?;
+    let monitors: Vec<Rect> = shots
+        .iter()
+        .map(|s| Rect::new(s.rect.left, s.rect.top, s.rect.right, s.rect.bottom))
+        .collect();
+    let Some(rect) = visible_bounds(window_bounds(hwnd), &monitors) else {
+        return Ok(None);
+    };
+    let fragments: Vec<Fragment> = shots
+        .iter()
+        .filter_map(|shot| match shot.read_back(rect) {
+            Ok(fragment) => fragment,
+            Err(e) => {
+                // 撮れなかったモニタの部分は透明になる
+                log::warn!("could not read back a monitor for the window: {e}");
+                None
+            }
+        })
+        .collect();
+    let image = Image::compose(rect, &fragments);
+    Ok(Some(WindowShot { rect, image }))
 }
