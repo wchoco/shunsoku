@@ -5,6 +5,8 @@
 //!   呼ばない（非パッケージアプリでは可否がシステムのスイッチで決まり、プロンプトも出ない。#11 のプローブ）。
 //!   枠が消せない環境（Windows 10 など）でも `PrintWindow` には切り替えない（spec #34）。
 //! - フレームプールは free-threaded で作り、UI スレッドで `TryGetNextFrame` を短く待つ。メッセージは回さない。
+//! - HDR のモニタ（ウィンドウとの重なりが最も大きいモニタ）では FP16（scRGB）で撮り、書き戻す前に
+//!   `hdr::to_sdr_texture` でそのモニタの「SDR コンテンツの明るさ」を白にした 8bit sRGB にする。
 //! - 撮ったフレームは staging のテクスチャに写して CPU に書き戻し、すぐにセッションとプールを閉じる。
 
 use std::time::{Duration, Instant};
@@ -25,12 +27,15 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 use windows::core::{Error, HSTRING, Interface, Result, factory, h};
+
+use crate::hdr;
 
 /// 最初のフレームを待つ時間の上限。
 const FRAME_TIMEOUT: Duration = Duration::from_secs(1);
@@ -55,18 +60,27 @@ pub fn grab_window(device: &ID3D11Device, hwnd: HWND, cursor: bool) -> Result<Wi
     let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     // SAFETY: hwnd は呼び出し側が GetForegroundWindow などで得たトップレベルのウィンドウ
     let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
-    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &winrt,
-        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        1,
-        item.Size()?,
-    )?;
+    // SAFETY: ウィンドウからモニタを引くだけ
+    let color = hdr::monitor_color(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) });
+    let (format, sdr_white) = if color.hdr {
+        log::info!(
+            "capturing the window in FP16 (SDR white {} nits)",
+            color.sdr_white_nits
+        );
+        (
+            DirectXPixelFormat::R16G16B16A16Float,
+            Some(color.sdr_white_nits),
+        )
+    } else {
+        (DirectXPixelFormat::B8G8R8A8UIntNormalized, None)
+    };
+    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&winrt, format, 1, item.Size()?)?;
     let session = pool.CreateCaptureSession(&item)?;
     let result = configure(&session, cursor)
         .and_then(|()| session.StartCapture())
         .and_then(|()| next_frame(&pool))
         .and_then(|frame| {
-            let image = read_frame(device, &frame);
+            let image = read_frame(device, &frame, sdr_white);
             let _ = frame.Close();
             image
         });
@@ -113,11 +127,20 @@ fn next_frame(pool: &Direct3D11CaptureFramePool) -> Result<Direct3D11CaptureFram
     }
 }
 
-/// フレームのうち中身のある部分（`ContentSize`）を CPU に書き戻す。
-fn read_frame(device: &ID3D11Device, frame: &Direct3D11CaptureFrame) -> Result<Image> {
+/// フレームのうち中身のある部分（`ContentSize`）を CPU に書き戻す。`sdr_white` があれば
+/// フレームは FP16 で、その明るさを白にして SDR に変換してから書き戻す。
+fn read_frame(
+    device: &ID3D11Device,
+    frame: &Direct3D11CaptureFrame,
+    sdr_white: Option<f32>,
+) -> Result<Image> {
     let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
     // SAFETY: フレームのサーフェスは D3D11 のテクスチャ。フレームを閉じるまで使う
     let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
+    let texture = match sdr_white {
+        Some(white) => hdr::to_sdr_texture(device, &texture, white)?,
+        None => texture,
+    };
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     // SAFETY: 説明を読むだけ
     unsafe { texture.GetDesc(&mut desc) };
