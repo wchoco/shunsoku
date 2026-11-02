@@ -64,7 +64,7 @@ use shunsoku_core::scrap::ops::{
 use shunsoku_core::scrap::{
     Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
-use shunsoku_core::selection::{Button, Direction, Input, Selection, State};
+use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
 use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
 use shunsoku_core::trash::TrashId;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -89,6 +89,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
+// 精密モード（#66）で足したもの
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
+use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
 
 use crate::{
     clipboard, grab, hotkey, logger, menu, notify, overlay, panic_hook, perf, render, save,
@@ -879,12 +882,29 @@ fn on_overlay_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> O
             });
             Some(LRESULT(0))
         }
+        // 2 回目の押下は WM_LBUTTONDOWN の代わりにこれで来る（CS_DBLCLKS）
+        WM_LBUTTONDBLCLK => {
+            // SAFETY: 自分のウィンドウ
+            unsafe { SetCapture(hwnd) };
+            on_selection_input(Input::DoubleClick { at: at() });
+            Some(LRESULT(0))
+        }
         WM_RBUTTONDOWN => {
             on_selection_input(Input::Press {
                 button: Button::Right,
                 at: at(),
             });
             Some(LRESULT(0))
+        }
+        // 調整の状態では、つまみや範囲の上でカーソルの形を変える
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+            let shape = with_app(|app| match &app.capture {
+                Capture::Selecting { selection, .. } => Some(selection.cursor_shape()),
+                _ => None,
+            })
+            .flatten();
+            overlay::set_cursor(shape.unwrap_or(CursorShape::Cross));
+            Some(LRESULT(1))
         }
         WM_KEYDOWN => {
             if let Some(input) = selection_key(wparam, lparam) {
@@ -1713,9 +1733,18 @@ fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
     let repeat = lparam.0 & (1 << 30) != 0;
     let shift = down(VK_SHIFT);
     let win = down(VK_LWIN) || down(VK_RWIN);
-    let arrow = |direction| Some(Input::Arrow { direction, shift });
+    let ctrl = down(VK_CONTROL);
+    let arrow = |direction| {
+        Some(if ctrl {
+            Input::ResizeArrow { direction, shift }
+        } else {
+            Input::Arrow { direction, shift }
+        })
+    };
     match VIRTUAL_KEY(wparam.0 as u16) {
         VK_ESCAPE => Some(Input::Escape),
+        VK_TAB if !repeat => Some(Input::ToggleMode),
+        VK_RETURN if !repeat => Some(Input::Enter),
         VK_LEFT => arrow(Direction::Left),
         VK_RIGHT => arrow(Direction::Right),
         VK_UP => arrow(Direction::Up),
@@ -1723,7 +1752,7 @@ fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
         // 押しっぱなしで始点と終点が続けて決まらないよう、リピートは無視する
         VK_SPACE if !repeat => Some(Input::Space),
         // Ctrl+A と Ctrl+Shift+A だけ。Ctrl+Alt+A などほかの修飾キーとの組み合わせは対象にしない
-        VK_A if down(VK_CONTROL) && !down(VK_MENU) && !win && !repeat => Some(if shift {
+        VK_A if ctrl && !down(VK_MENU) && !win && !repeat => Some(if shift {
             Input::SelectAllMonitors
         } else {
             Input::SelectMonitor
@@ -1741,9 +1770,9 @@ fn on_selection_input(input: Input) {
         else {
             return None;
         };
-        let before = selection.rect();
+        let before = selection.view();
         let state = selection.handle(input);
-        if selection.rect() != before {
+        if selection.view() != before {
             // 描くだけでウィンドウは作らないので、借りたまま描いてよい
             overlay.redraw(selection);
         }
@@ -1753,7 +1782,10 @@ fn on_selection_input(input: Input) {
     let state = state.map(|(state, cursor)| {
         // 矢印で動かしたカーソルの位置に、実際のマウスのカーソルを合わせる。
         // 合わせたあとの WM_MOUSEMOVE は同じ位置なので、状態は変わらない
-        if matches!(input, Input::Arrow { .. }) && matches!(state, State::Idle | State::Selecting) {
+        // 調整の状態の矢印は範囲を動かすので、カーソルは動かさない
+        if matches!(input, Input::Arrow { .. } | Input::ResizeArrow { .. })
+            && matches!(state, State::Idle | State::Selecting)
+        {
             // SAFETY: UI スレッドで呼ぶ。座標はスクリーン座標（物理ピクセル、PMv2）
             if let Err(e) = unsafe { SetCursorPos(cursor.x, cursor.y) } {
                 log::warn!("could not move the cursor: {e}");
@@ -1976,6 +2008,15 @@ fn open_overlay() {
     let selection = overlay.new_selection();
     let rejected = with_app(|app| match std::mem::take(&mut app.capture) {
         Capture::Waiting(request) => {
+            // 開くたびに設定の既定のモードから始める（Tab の切り替えはその回だけ）
+            let selection = selection
+                .with_mode(app.settings.selection.mode)
+                .with_crosshair(app.settings.selection.crosshair);
+            let mut overlay = overlay;
+            if selection.view().crosshair.is_some() {
+                // 描くだけでウィンドウは作らないので、借りたまま描いてよい
+                overlay.redraw(&selection);
+            }
             app.capture = Capture::Selecting {
                 request,
                 overlay,
