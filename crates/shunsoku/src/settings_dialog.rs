@@ -183,6 +183,16 @@ fn capture_page(b: &mut PageBuilder) {
         y,
         PAGE_WIDTH,
     );
+    // タブの下端（ページの y で 193 あたり）に収まるよう、行の間を詰める
+    y += 16;
+    b.label(
+        "settings_gui.capture.crosshair_color",
+        0,
+        y + 2,
+        LABEL_WIDTH,
+        10,
+    );
+    b.color_field(Field::CrosshairColor, FIELD_X, y);
     y += 18;
     b.label("settings_gui.capture.hint", 0, y, PAGE_WIDTH, 20);
 }

@@ -289,6 +289,14 @@ fn write_selection(t: &mut dyn TableLike, s: &SelectionScreen) {
         &s.crosshair,
         |&v| Some(v.into()),
     );
+    put(
+        t,
+        "crosshair_color",
+        rgb,
+        Some(d.crosshair_color),
+        &s.crosshair_color,
+        |c| Some(c.to_string().into()),
+    );
 }
 
 /// 定型領域（`[[regions]]`）。`regions` の並びに要素を作り直す。
@@ -584,6 +592,7 @@ notifications = false
         s.annotation.font = "Meiryo".to_owned();
         s.selection.mode = Mode::Precise;
         s.selection.crosshair = true;
+        s.selection.crosshair_color = Rgb(0x00, 0xFF, 0x80);
         s
     }
 
