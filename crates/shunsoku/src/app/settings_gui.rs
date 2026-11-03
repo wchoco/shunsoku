@@ -13,7 +13,10 @@
 //! - 「定型領域」タブ（`settings_dialog::regions`）: 一覧で行を選んだら、詳細の欄（`Fields::bind_region`）と
 //!   ホットキーの欄の `ChordRow::item` をその領域に結び直す。一覧の下のボタンは写しの領域を足す・写す・消す・
 //!   動かし（`Editor::add_region` など）、移った行を選ぶ。出し直す（`refresh`）ときは一覧の行を先に写しに揃える。
-//!   定型領域を選んで名前の欄にフォーカスを置いて開くのは `open_region`。
+//!   定型領域を選んで名前の欄にフォーカスを置いて開くのは `open_region`（トレイの「定型領域を追加…」で登録した
+//!   あとの `region_registered`。開いていれば写しと base にも足す）。
+//!   「範囲を選び直す」と「試しに撮る」は、ダイアログを隠してから（写り込まないように）依頼し、範囲選択の画面を
+//!   閉じたか撮り終えたら出し直す（`capture_done`）。選び直した範囲は写しに入れるだけ（`region_reselected`）。
 //! - キーの組み合わせの欄にフォーカスがある間は、全体のホットキーの登録を外す（`App::hotkeys_suspended`）。欄の
 //!   フォーカスの出入りで `WM_APP_SETTINGS_FOCUS` を自分に送り、届いた時点のフォーカスで決める（`check_focus`）。
 //! - 適用（`apply`）: その時点のファイルと写しを 3 者で突き合わせ（`settings::merge`）、両方で変えた項目があれば
@@ -27,12 +30,17 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
+use shunsoku_core::monitors;
 use shunsoku_core::settings::editor::{Editor, Move};
 use shunsoku_core::settings::merge::{Field, merge};
-use shunsoku_core::settings::{self, Settings, SettingsItem, unset};
+use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmSetWindowAttribute,
+};
 use windows::Win32::UI::Controls::{
     EM_GETSEL, EM_SETSEL, LVIS_SELECTED, LVN_ITEMCHANGED, NMHDR, NMLISTVIEW, TCN_SELCHANGE,
 };
@@ -40,21 +48,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CBN_SELCHANGE, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GetWindowRect,
     IDCANCEL, IDOK, IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MSG,
-    MessageBoxW, PostMessageW, PostQuitMessage, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, WM_COMMAND,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
+    MessageBoxW, PostMessageW, PostQuitMessage, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INITDIALOG, WM_NEXTDLGCTL,
+    WM_NOTIFY, WM_SETTINGCHANGE,
 };
-use windows::core::PCWSTR;
+use windows::core::{BOOL, PCWSTR};
 
 use super::{
-    App, EXIT_PANIC, Moment, WM_APP_SETTINGS_FOCUS, adopt_settings, language, log_failed,
-    notify_user, register_hotkeys, settings_notice, sync_autostart, text, with_app, write_settings,
+    App, EXIT_PANIC, Moment, WM_APP_SETTINGS_DPI, WM_APP_SETTINGS_FOCUS, adopt_settings, language,
+    log_failed, notify_user, register_hotkeys, settings_notice, sync_autostart, text, with_app,
+    write_settings,
 };
 use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
 use crate::settings_dialog::regions::{self, ListButton};
 use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops};
 use crate::wide::to_wide;
-use crate::{menu, notify, panic_hook, save};
+use crate::{menu, monitor_list, notify, panic_hook, save};
 
 /// 開いている設定 GUI。
 pub(super) struct SettingsGui {
@@ -69,6 +79,8 @@ pub(super) struct SettingsGui {
 thread_local! {
     /// 開いている設定 GUI のウィンドウ。メッセージ ループの `IsDialogMessageW` に渡す（`App` を借りずに読む）。
     static DIALOG: Cell<Option<HWND>> = const { Cell::new(None) };
+    /// 「範囲を選び直す」「試しに撮る」の間、隠しているダイアログ（`capture_done` で出し直す）。
+    static HIDDEN: Cell<Option<HWND>> = const { Cell::new(None) };
     /// 組み直すために今のダイアログを壊し、新しく作っている（その間の通知は無視する。`WM_DESTROY` で閉じた
     /// ことにしない）。
     static REBUILDING: Cell<bool> = const { Cell::new(false) };
@@ -93,12 +105,38 @@ pub(super) fn open_for_unset_hotkey() {
     open_with(Some(Page::Capture), Some(SettingsItem::SelectCaptureHotkey));
 }
 
+impl SettingsGui {
+    /// 開いている間にトレイの「定型領域を追加…」で登録する定型領域（名前は写しの定型領域とも重ならない）。
+    pub(super) fn new_registered_region(
+        &self,
+        applied: &Settings,
+        base: &str,
+        monitor: &str,
+        rect: Rect,
+    ) -> Region {
+        self.editor
+            .new_registered_region(applied, base, monitor, rect)
+    }
+}
+
+/// トレイの「定型領域を追加…」で定型領域 `region` を設定ファイルに書いた。「定型領域」タブで開いてその領域を選び、
+/// 名前の欄にフォーカスを置く（自動の名前「領域 N」は初期値のまま）。開いていれば、写しと base にも足す。
+pub(super) fn region_registered(region: Region) {
+    let Some((open, index)) = with_app(|app| match app.settings_gui.as_mut() {
+        Some(gui) => (Some(gui.hwnd), gui.editor.registered(region)),
+        // 開くときの写しは今の設定（書いた定型領域は末尾）
+        None => (None, app.settings.regions.len().saturating_sub(1)),
+    }) else {
+        return;
+    };
+    if let Some(hwnd) = open {
+        refresh(hwnd);
+    }
+    open_region(index);
+}
+
 /// 「定型領域」タブで開き、写しの定型領域 `index` を選んで名前の欄にフォーカスを置く。開いていれば前に出す。
-#[expect(
-    dead_code,
-    reason = "#99 で、トレイの「定型領域を追加…」で登録したあとに呼ぶ"
-)]
-pub(super) fn open_region(index: usize) {
+fn open_region(index: usize) {
     open(Some(Page::Regions));
     let Some(hwnd) = DIALOG.get() else {
         return;
@@ -319,6 +357,18 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
             check_focus();
             true
         }
+        WM_DPICHANGED => {
+            // ダイアログが大きさを直し終えてから、定型領域の一覧の列を一覧の幅に合わせ直す
+            // SAFETY: 自分のダイアログに送る
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_APP_SETTINGS_DPI, WPARAM(0), LPARAM(0));
+            }
+            false
+        }
+        WM_APP_SETTINGS_DPI => {
+            regions::fit_columns(hwnd);
+            true
+        }
         WM_DESTROY => {
             closed();
             false
@@ -354,6 +404,8 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
                 edit(hwnd, |editor| editor.reset_binding(&row));
             }
         }
+        _ if id == regions::reselect_id() && code == BN_CLICKED => on_reselect(hwnd),
+        _ if id == regions::test_capture_id() && code == BN_CLICKED => on_test_capture(hwnd),
         _ if code == BN_CLICKED && regions::list_button(id).is_some() => {
             if let Some(button) = regions::list_button(id) {
                 on_region_list_button(hwnd, button);
@@ -680,6 +732,95 @@ fn on_region_list_button(hwnd: HWND, button: ListButton) {
     regions::select(hwnd, index);
     if matches!(button, ListButton::Add | ListButton::Duplicate) {
         set_focus(hwnd, regions::name_id());
+    }
+}
+
+/// 「範囲を選び直す」: ダイアログを隠して、範囲選択の画面を登録のモードで開く。
+fn on_reselect(hwnd: HWND) {
+    let Some(index) = regions::selected(hwnd) else {
+        return;
+    };
+    hide_for_capture(hwnd);
+    if !super::request_reselect(index) {
+        log::info!("reselecting a region while another capture is in progress; ignored");
+        capture_done();
+    }
+}
+
+/// 範囲選択の画面で、写しの定型領域 `index` の範囲を選び直した（`rect` はスクリーン座標）。写しのモニタと範囲を
+/// 置き換えて欄に出す。ファイルに書くのは適用のとき。
+pub(super) fn region_reselected(index: usize, rect: Rect) {
+    let monitors = monitor_list::list();
+    let Some((monitor, relative)) = monitors::relative_to(&monitors, rect) else {
+        log::warn!("no monitor contains the reselected range {rect:?}");
+        return;
+    };
+    let id = monitors[monitor].id.as_str();
+    let Some(hwnd) = with_app(|app| {
+        let gui = app.settings_gui.as_mut()?;
+        gui.editor.set_region_range(index, id, relative);
+        Some(gui.hwnd)
+    })
+    .flatten() else {
+        return;
+    };
+    log::info!(
+        "region {} reselected on monitor {id} at {relative:?}",
+        index + 1
+    );
+    regions::refresh_monitors();
+    refresh(hwnd);
+}
+
+/// 「試しに撮る」: 選んでいる写しの定型領域の値で撮る。ダイアログは撮り終えるまで隠す。
+fn on_test_capture(hwnd: HWND) {
+    let Some(index) = regions::selected(hwnd) else {
+        return;
+    };
+    let Some(region) = with_app(|app| {
+        app.settings_gui
+            .as_ref()
+            .and_then(|gui| gui.editor.draft().regions.get(index).cloned())
+    })
+    .flatten() else {
+        return;
+    };
+    hide_for_capture(hwnd);
+    if !super::request_trial(&region) {
+        log::info!("trial capture while another capture is in progress; ignored");
+        capture_done();
+    }
+}
+
+/// 撮る前にダイアログを隠す。消える動きを止め、隠れた画面が合成されるのを待つ（写り込まないように）。
+fn hide_for_capture(hwnd: HWND) {
+    let disable = BOOL::from(true);
+    // SAFETY: 自分のダイアログ。値は呼び出しの間生きている
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            &disable as *const BOOL as *const core::ffi::c_void,
+            size_of::<BOOL>() as u32,
+        );
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        let _ = DwmFlush();
+    }
+    HIDDEN.set(Some(hwnd));
+}
+
+/// 範囲選択の画面を閉じたか、撮り終えた。「範囲を選び直す」「試しに撮る」で隠したダイアログを出し直す。
+pub(super) fn capture_done() {
+    let Some(hwnd) = HIDDEN.take() else {
+        return;
+    };
+    if DIALOG.get() != Some(hwnd) {
+        return;
+    }
+    // SAFETY: 自分のダイアログ
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 

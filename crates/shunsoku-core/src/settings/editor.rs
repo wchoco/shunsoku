@@ -9,7 +9,8 @@
 //!   `mouse`）。ショートカットの欄にキーを入れたら、その 1 つで上書きする（`set_chord`）。マウスは候補から選ぶ
 //!   （`set_mouse`。既定と同じなら上書きを消す）。行の「既定に戻す」は両方の上書きを消す（`reset_binding`）。
 //! - 「定型領域」タブの一覧の追加・複製・削除・並べ替えは `add_region` / `duplicate_region` / `remove_region` /
-//!   `move_region`。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
+//!   `move_region`。「範囲を選び直す」は `set_region_range`。GUI を開いている間にトレイから登録した定型領域は
+//!   `new_registered_region` で名前を決め、書いたら `registered` で base と写しに足す。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
 
 use std::collections::BTreeSet;
 
@@ -183,6 +184,38 @@ impl Editor {
         let region = new_region(&self.draft, base, monitor, rect);
         self.draft.regions.push(region);
         self.forget_region_marks();
+        self.draft.regions.len() - 1
+    }
+
+    /// 定型領域 `index` のモニタと範囲（モニタ相対）を置き換える（「範囲を選び直す」）。ほかの項目と、ファイルの
+    /// 要素との結び付き（`loaded_name`）はそのまま。`index` の定型領域がなければ何もしない。
+    pub fn set_region_range(&mut self, index: usize, monitor: &str, rect: Rect) {
+        if let Some(region) = self.draft.regions.get_mut(index) {
+            region.monitor = monitor.to_owned();
+            region.rect = rect;
+        }
+    }
+
+    /// GUI を開いている間に、トレイの「定型領域を追加…」で登録する定型領域を作る（`new_region`）。名前は、適用済みの
+    /// 設定 `applied` と写しのどちらの定型領域とも重ならない `"{base} N"`。
+    pub fn new_registered_region(
+        &self,
+        applied: &Settings,
+        base: &str,
+        monitor: &str,
+        rect: Rect,
+    ) -> Region {
+        let mut taken = applied.clone();
+        taken.regions.extend(self.draft.regions.iter().cloned());
+        // 保存先とファイル名テンプレートの初期値は、適用済みの全体設定（`taken` の general）
+        new_region(&taken, base, monitor, rect)
+    }
+
+    /// トレイの「定型領域を追加…」でファイルに書いた定型領域 `region` を、base と写しの末尾に足す（ファイルには
+    /// もうあるので、適用で足し直さない）。写しでの位置を返す。
+    pub fn registered(&mut self, region: Region) -> usize {
+        self.base.regions.push(region.clone());
+        self.draft.regions.push(region);
         self.draft.regions.len() - 1
     }
 
@@ -697,6 +730,77 @@ mod tests {
         );
         assert_eq!(added.loaded_name, None);
         assert!(editor.buttons().apply);
+        assert_eq!(editor.base().regions.len(), 2);
+    }
+
+    #[test]
+    fn a_reselected_range_replaces_only_the_monitor_and_range_in_the_copy() {
+        let mut settings = with_regions(&["a", "b"]);
+        settings.regions[1].hotkey = Some(chord("Ctrl+Alt+2"));
+        let mut editor = Editor::new(settings.clone());
+
+        editor.set_region_range(1, "M2", Rect::new(5, 6, 105, 206));
+
+        let b = &editor.draft().regions[1];
+        assert_eq!(
+            (b.name.as_str(), b.monitor.as_str(), b.rect, b.hotkey),
+            (
+                "b",
+                "M2",
+                Rect::new(5, 6, 105, 206),
+                Some(chord("Ctrl+Alt+2"))
+            )
+        );
+        // ファイルの要素との結び付きは残す（適用で同じ [[regions]] の値を書き換える）
+        assert_eq!(b.loaded_name.as_deref(), Some("b"));
+        assert_eq!(editor.draft().regions[0], settings.regions[0]);
+        // ファイルに書くのは適用のとき
+        assert_eq!(editor.base(), &settings);
+        assert!(editor.buttons().apply);
+    }
+
+    #[test]
+    fn reselecting_a_region_that_is_gone_changes_nothing() {
+        let mut editor = Editor::new(with_regions(&["a"]));
+
+        editor.set_region_range(3, "M2", Rect::new(5, 6, 105, 206));
+
+        assert_eq!(editor.draft(), editor.base());
+    }
+
+    #[test]
+    fn a_region_registered_from_the_tray_avoids_names_only_in_the_copy() {
+        let applied = with_regions(&["領域 1"]);
+        let mut editor = Editor::new(applied.clone());
+        // GUI で足して、まだ適用していない
+        editor.add_region("領域", "M1", Rect::new(0, 0, 10, 10));
+
+        let region = editor.new_registered_region(&applied, "領域", "M2", Rect::new(1, 2, 3, 4));
+
+        assert_eq!(region.name, "領域 3");
+        assert_eq!(
+            (region.monitor.as_str(), region.rect),
+            ("M2", Rect::new(1, 2, 3, 4))
+        );
+    }
+
+    #[test]
+    fn a_region_written_from_the_tray_joins_both_the_base_and_the_copy() {
+        let mut editor = Editor::new(with_regions(&["a"]));
+        editor.add_region("領域", "M1", Rect::new(0, 0, 10, 10));
+        let mut written = with_regions(&["領域 2"]).regions.remove(0);
+        written.monitor = "M2".to_owned();
+
+        let i = editor.registered(written.clone());
+
+        assert_eq!(i, 2);
+        assert_eq!(region_names(&editor), ["a", "領域 1", "領域 2"]);
+        assert_eq!(editor.draft().regions[2], written);
+        // ファイルにはもう書いたので、base にも入れる（適用で足し直さない）
+        assert_eq!(
+            editor.base().regions.last().map(|r| r.name.as_str()),
+            Some("領域 2")
+        );
         assert_eq!(editor.base().regions.len(), 2);
     }
 
