@@ -15,6 +15,7 @@ trash_empty = "（空）"
 close_all = "すべてのスクラップを閉じる"
 hide_all = "すべて隠す"
 show_all = "すべて表示"
+settings = "設定…"
 exit = "終了"
 
 [panic]
@@ -32,6 +33,33 @@ conflicts = "重なったキーを、重なった項目のすべてで無効に�
 mouse_conflicts = "重なったマウス操作を、重なった項目のすべてで無効にしました: "
 overlaps = "ホットキーとショートカットが重なっています（ホットキーが優先され、そのショートカットは効きません）: "
 watch_stopped = "設定ファイルの監視が止まりました。設定ファイルを直したら shunsoku を起動し直してください。"
+
+# 設定 GUI（ダイアログ）
+[settings_gui]
+title = "shunsoku の設定"
+# ダイアログの文字のフォント（DS_SETFONT の書体名）
+font = "Yu Gothic UI"
+ok = "OK"
+cancel = "キャンセル"
+apply = "適用"
+write_failed = "設定ファイルに書けませんでした。設定 GUI の内容はまだ適用されていません。"
+
+[settings_gui.tab]
+capture = "キャプチャ"
+
+[settings_gui.capture]
+select_capture = "範囲選択キャプチャ:"
+hint = "欄を選んでキーを押すと割り当てます。Tab で次の欄へ移ります。"
+
+# 欄の横の印
+[settings_gui.mark]
+unset = "未設定"
+conflict = "重なっています"
+mouse_conflict = "重なっています"
+overlap = "ショートカットと重なっています（ホットキーが優先）"
+not_registered = "登録できませんでした（他のアプリが使っている可能性があります）"
+empty_name = "名前が空です"
+duplicate_name = "名前が重なっています"
 
 [hotkey]
 failed = "次のホットキーを登録できませんでした（他のアプリが使っている可能性があります）: "

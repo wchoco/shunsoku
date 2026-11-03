@@ -76,6 +76,7 @@ use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, Shortcuts};
 use crate::selection::Mode;
 
+pub mod editor;
 mod write;
 pub use write::{OwnWrites, rewrite, write};
 
