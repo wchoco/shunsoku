@@ -36,7 +36,7 @@ use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
 use shunsoku_core::monitors;
 use shunsoku_core::settings::editor::{Editor, Move};
-use shunsoku_core::settings::form::PauseChange;
+use shunsoku_core::settings::form::{FieldEntry, PauseChange};
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
@@ -78,6 +78,8 @@ pub(super) struct SettingsGui {
     rows: Vec<ChordRow>,
     fields: Fields,
     editor: Editor,
+    /// フォーカスのあるテキストの欄と、入ったときの文字（読めない値で出たら戻す）。
+    entry: FieldEntry<fields::Field>,
     /// ダイアログを組んだときの UI の言語。
     language: Language,
     /// ダイアログに渡す、外のこと（モニタは `refresh_monitors` で集め直す）。
@@ -215,6 +217,7 @@ fn open_with(page: Option<Page>, focus: Option<SettingsItem>) {
         rows: dialog.rows,
         fields: dialog.fields,
         editor,
+        entry: FieldEntry::default(),
         language: language(),
         env,
     };
@@ -509,21 +512,38 @@ fn on_field(hwnd: HWND, id: i32, code: u32, control: HWND) {
         return;
     };
     let mut rejected = None;
-    let changed = match (row.kind, code) {
+    match (row.kind, code) {
         (Kind::Check, BN_CLICKED)
         | (Kind::Text { .. } | Kind::Number { .. }, EN_CHANGE)
-        | (Kind::Choice, CBN_SELCHANGE) => true,
-        // 読めない入力は、フォーカスが外れたら写しの値に戻し、書き方を吹き出しで知らせる
+        | (Kind::Choice, CBN_SELCHANGE) => set_field(row.field, fields::input(row, control)),
+        // 入ったときの文字を覚えておく
+        (Kind::Text { .. } | Kind::Number { .. }, EN_SETFOCUS) => {
+            if let Input::Text(s) = fields::input(row, control) {
+                with_app(|app| {
+                    if let Some(gui) = app.settings_gui.as_mut() {
+                        gui.entry.entered(row.field, s);
+                    }
+                });
+            }
+            return;
+        }
+        // 読めない入力は、フォーカスが外れたら入ったときの値に戻し（打つ途中に読めた値は写しに入っている）、
+        // 書き方を吹き出しで知らせる
         (Kind::Text { .. } | Kind::Number { .. }, EN_KILLFOCUS) => {
             if let Input::Text(s) = fields::input(row, control) {
                 rejected = fields::rejected(row.field, &s);
             }
-            false
+            let restore = with_app(|app| {
+                app.settings_gui
+                    .as_mut()
+                    .and_then(|gui| gui.entry.left(row.field, rejected.is_none()))
+            })
+            .flatten();
+            if let Some(text) = restore {
+                set_field(row.field, Input::Text(text));
+            }
         }
         _ => return,
-    };
-    if changed {
-        set_field(row.field, fields::input(row, control));
     }
     refresh(hwnd);
     // 戻した後に出す（欄の文字を書き換えると吹き出しは消える）

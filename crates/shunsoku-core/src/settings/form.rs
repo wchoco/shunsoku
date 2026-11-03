@@ -45,6 +45,33 @@ impl FillPass {
     }
 }
 
+/// フォーカスのあるテキストの欄と、入ったときの文字。読めない値で出たら、入ったときの値に戻す（キーを打つ
+/// たびに読める値は写しに入るので、打つ途中の値に戻さないように）。`K` は欄を指す値。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldEntry<K> {
+    entered: Option<(K, String)>,
+}
+
+impl<K> Default for FieldEntry<K> {
+    fn default() -> Self {
+        FieldEntry { entered: None }
+    }
+}
+
+impl<K: PartialEq> FieldEntry<K> {
+    /// 欄 `field` に入った。`text` はそのときの欄の文字（写しの値）。
+    pub fn entered(&mut self, field: K, text: impl Into<String>) {
+        self.entered = Some((field, text.into()));
+    }
+
+    /// 欄 `field` から出た。`readable` は今の文字が読めるか。読めなければ、写しと欄に戻す文字（入ったときの
+    /// 文字）を返す。入ったのと違う欄なら何も返さない。
+    pub fn left(&mut self, field: K, readable: bool) -> Option<String> {
+        let (entered, text) = self.entered.take()?;
+        (entered == field && !readable).then_some(text)
+    }
+}
+
 /// 設定 GUI のキーの組み合わせの欄にフォーカスがある間、全体のホットキーの登録を外しておく（押したキーが
 /// 欄に届くように）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -137,6 +164,8 @@ pub fn range_thumbnail(monitor: Option<Size>, range: Rect, size: Size) -> Thumbn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
+    use crate::settings::editor::Editor;
 
     #[test]
     fn after_binding_another_region_the_next_fill_overwrites_the_focused_region_field_once() {
@@ -183,6 +212,57 @@ mod tests {
         pause.reregistering();
         assert!(!pause.is_paused());
         assert_eq!(pause.focus_changed(true), Some(PauseChange::Pause));
+    }
+
+    /// Win32 層の不透明度の欄と同じく、読める入力だけを写しに入れる（`fields::set`）。
+    fn type_opacity(editor: &mut Editor, s: &str) {
+        if let Some(n) = read_opacity(s) {
+            editor.draft_mut().scrap.opacity = n;
+        }
+    }
+
+    fn read_opacity(s: &str) -> Option<u8> {
+        s.trim().parse().ok().filter(|n| (10..=100).contains(n))
+    }
+
+    #[test]
+    fn leaving_a_field_with_an_unreadable_value_restores_the_value_it_had_when_entered() {
+        let mut editor = Editor::new(Settings::default());
+        let mut entry = FieldEntry::default();
+        entry.entered("opacity", "100");
+        // 100 → 500 と打つ途中の 50 は読めるので写しに入る
+        for typed in ["10", "1", "", "5", "50", "500"] {
+            type_opacity(&mut editor, typed);
+        }
+        assert_eq!(editor.draft().scrap.opacity, 50);
+
+        // 打つ途中の 50 ではなく、入ったときの 100 に戻す
+        let restore = entry.left("opacity", read_opacity("500").is_some());
+        assert_eq!(restore.as_deref(), Some("100"));
+        type_opacity(&mut editor, restore.as_deref().unwrap_or_default());
+        assert_eq!(editor.draft(), editor.base());
+        assert!(!editor.buttons().apply);
+    }
+
+    #[test]
+    fn leaving_a_field_with_a_readable_value_keeps_it() {
+        let mut entry = FieldEntry::default();
+        entry.entered("opacity", "100");
+        assert_eq!(entry.left("opacity", true), None);
+        // 出たあとは覚えていない
+        assert_eq!(entry.left("opacity", false), None);
+    }
+
+    #[test]
+    fn leaving_a_field_other_than_the_one_entered_restores_nothing() {
+        let mut entry = FieldEntry::default();
+        entry.entered("save_dir", r"C:\shots");
+        assert_eq!(entry.left("opacity", false), None);
+
+        // 別の欄に入り直したら、その欄の値を覚える
+        entry.entered("save_dir", r"C:\shots");
+        entry.entered("opacity", "80");
+        assert_eq!(entry.left("opacity", false).as_deref(), Some("80"));
     }
 
     #[test]
