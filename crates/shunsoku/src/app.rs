@@ -3788,7 +3788,7 @@ fn settings_notice(
             }
             SettingsIssue::Invalid { item } => invalid.push(item.as_str()),
             SettingsIssue::Conflict { chord, items } => {
-                conflicts.push(format!("{chord}（{}）", items.join(", ")));
+                conflicts.push(format!("{chord}（{}）", join_items(items)));
             }
             SettingsIssue::Overlap {
                 chord,
@@ -3796,7 +3796,7 @@ fn settings_notice(
                 shortcut,
             } => overlaps.push(format!("{chord}（{hotkey}, {shortcut}）")),
             SettingsIssue::MouseConflict { gesture, items } => {
-                mouse_conflicts.push(format!("{gesture}（{}）", items.join(", ")));
+                mouse_conflicts.push(format!("{gesture}（{}）", join_items(items)));
             }
         }
     }
@@ -3824,6 +3824,12 @@ fn settings_notice(
         lines.push(path.display().to_string());
     }
     Some((level, lines.join("\n")))
+}
+
+/// 項目名を `, ` でつなぐ（`shortcuts.copy, shortcuts.close`）。
+fn join_items(items: &[settings::SettingsItem]) -> String {
+    let names: Vec<String> = items.iter().map(ToString::to_string).collect();
+    names.join(", ")
 }
 
 /// トレイの通知を出す。出したら true。設定で通知をオフにしたときは、成功の通知だけを止める（エラーと警告は出す）。
