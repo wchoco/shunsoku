@@ -28,6 +28,7 @@ use std::thread::LocalKey;
 use shunsoku_core::monitors::Monitor;
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::Editor;
+use shunsoku_core::settings::gui::TabStep;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
@@ -54,8 +55,9 @@ pub use fields::Fields;
 pub const ID_APPLY: i32 = 10;
 /// タブ。
 pub const ID_TAB: i32 = 100;
-/// Static の左寄せ（`SS_LEFT`）。
-const SS_LEFT: WINDOW_STYLE = WINDOW_STYLE(0);
+/// ページの Static の書式: 左寄せ（`SS_LEFT` = 0）で、`&` を下線の印にしない（`SS_NOPREFIX` = 0x80）。
+/// 定型領域の名前やモニタの ID、ファイル名の例のように、ユーザーや OS から来た文字列もそのまま出すため。
+const STATIC_TEXT: WINDOW_STYLE = WINDOW_STYLE(0x80);
 /// ダイアログの背景をタブの中の色で塗る（`ETDT_ENABLE | ETDT_USETABTEXTURE`）。ページの Static の背景がタブと揃う。
 const ETDT_ENABLETAB: u32 = 6;
 /// ページのコントロールの ID の帯。
@@ -361,6 +363,18 @@ pub fn current_page(hwnd: HWND) -> Page {
         .map_or_else(Page::default, |def| def.page)
 }
 
+/// タブを `step` の向きに 1 つ移す（Ctrl+Tab / Ctrl+Shift+Tab）。端では反対の端へ回る。
+pub fn step_page(hwnd: HWND, step: TabStep) {
+    let current = current_page(hwnd);
+    let index = PAGES
+        .iter()
+        .position(|def| def.page == current)
+        .unwrap_or(0);
+    if let Some(def) = PAGES.get(step.from(index, PAGES.len())) {
+        show_page(hwnd, def.page);
+    }
+}
+
 /// `page` のタブを選び、そのページのコントロールだけを出す。
 pub fn show_page(hwnd: HWND, page: Page) {
     let index = PAGES.iter().position(|def| def.page == page).unwrap_or(0);
@@ -506,7 +520,7 @@ impl PageBuilder<'_> {
             class: Class::Static,
             text,
             id,
-            style: SS_LEFT,
+            style: STATIC_TEXT,
             ex_style: WINDOW_EX_STYLE(0),
             rect: (PAGE_X + x, PAGE_Y + y, cx, cy),
         });
@@ -552,7 +566,7 @@ impl PageBuilder<'_> {
             class: Class::Static,
             text: "",
             id: mark,
-            style: SS_LEFT,
+            style: STATIC_TEXT,
             ex_style: WINDOW_EX_STYLE(0),
             rect: (PAGE_X + x, PAGE_Y + y + 16, PAGE_WIDTH - x, 18),
         });

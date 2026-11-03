@@ -37,6 +37,7 @@ use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::monitors;
 use shunsoku_core::settings::editor::{Editor, Move};
 use shunsoku_core::settings::form::{FieldEntry, PauseChange};
+use shunsoku_core::settings::gui::TabStep;
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
@@ -57,6 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
 };
+use windows::Win32::UI::WindowsAndMessaging::{IsChild, WM_KEYDOWN};
 use windows::core::{BOOL, PCWSTR};
 
 use super::{
@@ -105,11 +107,23 @@ thread_local! {
     static REBUILDING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// 設定 GUI へのメッセージ（Tab の移動など）なら処理して true。
+/// 設定 GUI へのメッセージ（Tab の移動など）なら処理して true。Ctrl+Tab / Ctrl+Shift+Tab はタブを移す
+/// （フォーカスがどの欄にあっても。キーの組み合わせの欄も Tab は入力にしない）。
 pub(super) fn is_dialog_message(msg: &MSG) -> bool {
     let Some(dialog) = DIALOG.get() else {
         return false;
     };
+    // SAFETY: ウィンドウの親子を調べるだけ
+    let inside = msg.hwnd == dialog || unsafe { IsChild(dialog, msg.hwnd) }.as_bool();
+    if inside
+        && msg.message == WM_KEYDOWN
+        && let Some(step) = TabStep::from_key_down(msg.wParam.0 as u16, chord_field::held())
+    {
+        settings_dialog::step_page(dialog, step);
+        // 隠したページの欄にフォーカスを残さない（タブを押したときと同じくタブに置く）
+        set_focus(dialog, ID_TAB);
+        return true;
+    }
     // SAFETY: msg はこの呼び出しの間生きている
     unsafe { IsDialogMessageW(dialog, msg) }.as_bool()
 }
@@ -405,7 +419,7 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
             true
         }
         WM_DPICHANGED => {
-            // ダイアログが大きさを直し終えてから、定型領域の一覧の列を一覧の幅に合わせ直す
+            // ダイアログが大きさと書体を直し終えてから、一覧の列の幅を合わせ直す
             // SAFETY: 自分のダイアログに送る
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_APP_SETTINGS_DPI, WPARAM(0), LPARAM(0));
@@ -414,6 +428,7 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
         }
         WM_APP_SETTINGS_DPI => {
             regions::fit_columns(hwnd);
+            scrap_ops::fit_columns(hwnd);
             true
         }
         WM_DESTROY => {

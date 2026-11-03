@@ -45,7 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use super::{Class, During, Env, Item, PAGE_X, PAGE_Y, PageBuilder, SS_LEFT, Text, item};
+use super::{Class, During, Env, Item, PAGE_X, PAGE_Y, PageBuilder, STATIC_TEXT, Text, item};
 use crate::wide::to_wide;
 
 /// 欄が結ぶ写しの項目（キーの組み合わせの項目は `SettingsItem` と `ChordRow`）。
@@ -1067,7 +1067,7 @@ impl PageBuilder<'_> {
             y,
             SIDE_BUTTON,
         );
-        let preview = self.control(Class::Static, "", SS_LEFT, x, y + 17, cx, 10);
+        let preview = self.control(Class::Static, "", STATIC_TEXT, x, y + 17, cx, 10);
         if let Some(row) = self.fields.rows.iter_mut().find(|r| r.control == id) {
             row.kind = Kind::Text {
                 preview: Some(preview),
