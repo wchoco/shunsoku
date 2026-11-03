@@ -34,6 +34,8 @@ mouse_conflicts = "Disabled mouse actions assigned to more than one item, for al
 overlaps = "Hotkeys and shortcuts overlap (the hotkey wins and the shortcut does not work): "
 watch_stopped = "Stopped watching the settings file. After fixing the settings file, restart shunsoku."
 autostart_failed = "Could not update the autostart registration to match the settings."
+write_not_toml = "The current settings file is not valid TOML, so it was not overwritten: "
+write_no_location = "The location of the settings file is unknown."
 items_open = " ("
 items_close = ")"
 

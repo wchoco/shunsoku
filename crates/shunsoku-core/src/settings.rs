@@ -87,8 +87,10 @@ mod location;
 pub mod merge;
 pub mod unset;
 mod write;
+mod write_failure;
 pub use location::{SettingsLocation, locate};
 pub use write::{OwnWrites, rewrite, write};
+pub use write_failure::WriteFailure;
 
 /// 対応している設定ファイルの形式の版。
 pub const VERSION: i64 = 1;
