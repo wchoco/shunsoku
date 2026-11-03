@@ -7,6 +7,8 @@
 //!   捨てる（常駐時のメモリを増やさないため）。書き終えるまでと、書けなかったときはメモリに持つ。
 //!   書き終えたら `PostMessageW(window, message)` で UI スレッドを起こし、`app` が `on_written` を呼ぶ。
 //! - 退避する画素は `Stash` 1 つずつ。いまは元の画像（`Entry::image`）だけ。
+//! - 一覧に付けるサムネイル（`Entry::thumbnail`、閉じたときの見た目を縮めたもの）は小さいのでメモリに持ち、
+//!   一覧を出すたびに一時ファイルを読まない。項目と一緒に捨てる。
 //! - ごみ箱から消えたもの（上限で捨てた・戻した）の一時ファイルは消す。drop（終了時）でフォルダごと消す。
 //!   起動時（`new`）には前回の残り（`%TEMP%\shunsoku\` の下のほかのフォルダ）も消す。
 
@@ -39,6 +41,8 @@ pub struct Trashed {
 pub struct Listed<'a> {
     pub id: TrashId,
     pub model: &'a ScrapModel,
+    /// 閉じたときの見た目（トリムと書き込みを反映したもの）を縮めた画像。
+    pub thumbnail: &'a Image,
     /// 閉じた時刻。
     pub closed_at: LocalTime,
 }
@@ -48,6 +52,7 @@ struct Entry {
     model: ScrapModel,
     closed_at: LocalTime,
     image: Stash,
+    thumbnail: Image,
 }
 
 impl Entry {
@@ -145,11 +150,19 @@ impl TrashStore {
     }
 
     /// 閉じたスクラップを入れ、画素を裏のスレッドで一時ファイルに書き始める。上限が 0 なら、そのまま捨てる。
-    pub fn push(&mut self, model: ScrapModel, image: Image, closed_at: LocalTime) {
+    /// `thumbnail` は一覧に付ける縮めた見た目。
+    pub fn push(
+        &mut self,
+        model: ScrapModel,
+        image: Image,
+        thumbnail: Image,
+        closed_at: LocalTime,
+    ) {
         let entry = Entry {
             model,
             closed_at,
             image: Stash::new(image),
+            thumbnail,
         };
         let pushed = self.trash.push(entry);
         for mut discarded in pushed.discarded {
@@ -242,6 +255,7 @@ impl TrashStore {
             .map(|(id, entry)| Listed {
                 id,
                 model: &entry.model,
+                thumbnail: &entry.thumbnail,
                 closed_at: entry.closed_at,
             })
             .collect()

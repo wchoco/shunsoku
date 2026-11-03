@@ -1128,19 +1128,22 @@ fn on_tray(owner: HWND, event: tray::Event) {
     match event {
         tray::Event::Menu { x, y } => {
             // ごみ箱の一覧（新しいものから）。項目の番号は CMD_TRASH_FIRST + 添字
-            let trashed: Vec<(TrashId, String)> = with_app(|app| {
+            // サムネイルは小さいので写して持つ（メニューはモーダルなので App を借りたまま出せない）
+            let trashed: Vec<(TrashId, String, Image)> = with_app(|app| {
                 app.trash
                     .list()
                     .iter()
-                    .map(|listed| (listed.id, trash_label(listed)))
+                    .map(|listed| (listed.id, trash_label(listed), listed.thumbnail.clone()))
                     .collect()
             })
             .unwrap_or_default();
             let mut trash_entries: Vec<menu::Entry> = trashed
                 .iter()
                 .enumerate()
-                .map(|(i, (_, label))| {
-                    menu::Entry::item(CMD_TRASH_FIRST + i as u32, label.as_str(), true)
+                .map(|(i, (_, label, thumbnail))| menu::Entry::Picture {
+                    id: CMD_TRASH_FIRST + i as u32,
+                    label: label.as_str().into(),
+                    image: thumbnail,
                 })
                 .collect();
             if trash_entries.is_empty() {
@@ -1215,7 +1218,7 @@ fn on_tray(owner: HWND, event: tray::Event) {
             }
             match command.checked_sub(CMD_TRASH_FIRST) {
                 Some(i) => {
-                    if let Some(&(id, _)) = trashed.get(i as usize) {
+                    if let Some(&(id, ..)) = trashed.get(i as usize) {
                         restore_scrap(id);
                     }
                 }
@@ -2480,17 +2483,19 @@ fn save_failed(path: Option<&Path>, reason: &str) {
 fn close_scrap(hwnd: HWND) {
     let removed = with_app(|app| {
         let index = app.scraps.iter().position(|s| s.window.hwnd() == hwnd)?;
+        let mut scrap = app.scraps.remove(index);
+        // トリムの範囲を選んでいる途中で閉じたら選ぶ前の状態で、書き込みの編集モードなら抜けてから入れる
+        scrap.model.settle();
+        let thumbnail = trash_thumbnail(&scrap);
         let Scrap {
             toolbar,
             window,
-            mut model,
+            model,
             image,
             ..
-        } = app.scraps.remove(index);
-        // トリムの範囲を選んでいる途中で閉じたら選ぶ前の状態で、書き込みの編集モードなら抜けてから入れる
-        model.settle();
+        } = scrap;
         // 一時ファイルは裏のスレッドで書くので、借りたままでよい
-        app.trash.push(model, image, save::now());
+        app.trash.push(model, image, thumbnail, save::now());
         Some((toolbar, window))
     })
     .flatten();
@@ -2499,6 +2504,26 @@ fn close_scrap(hwnd: HWND) {
         drop(toolbar);
         drop(window);
         log::info!("scrap closed");
+    }
+}
+
+/// ごみ箱の一覧に付けるサムネイル: 閉じたときの見た目（トリムと書き込みを反映したもの）を、閉じたモニタの
+/// DPI で長い辺 64px 相当に縮める。書き込みを描けなければ、画像だけを縮める。
+fn trash_thumbnail(scrap: &Scrap) -> Image {
+    let side = shunsoku_core::trash::thumbnail_side(scrap.window.dpi());
+    let layer = render::AnnotationLayer {
+        annotations: scrap.model.annotations().items(),
+        view: scrap.model.output_view(),
+        selected: None,
+        typing: None,
+        scale: 1.0,
+    };
+    match render::render_image(scrap.shown(), layer) {
+        Ok(image) => image.thumbnail(side),
+        Err(e) => {
+            log::warn!("could not draw the annotations for the trash thumbnail: {e}");
+            scrap.shown().thumbnail(side)
+        }
     }
 }
 
