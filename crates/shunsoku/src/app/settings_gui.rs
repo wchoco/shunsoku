@@ -6,7 +6,8 @@
 //! - 欄にキーが入ったら（`EN_CHANGE`）写しの項目を変え、印とボタンを出し直す。
 //! - キーの組み合わせの欄にフォーカスがある間は、全体のホットキーの登録を外す（`App::hotkeys_suspended`）。欄の
 //!   フォーカスの出入りで `WM_APP_SETTINGS_FOCUS` を自分に送り、届いた時点のフォーカスで決める（`check_focus`）。
-//! - 適用（`apply`）: 写しを書き（`write_settings`）、読み込み直しと同じ反映をし（`adopt_settings`）、ホットキーは
+//! - 適用（`apply`）: その時点のファイルと写しを 3 者で突き合わせ（`settings::merge`）、両方で変えた項目があれば
+//!   借りずに確かめてから、結果を書き（`write_settings`）、読み込み直しと同じ反映をし（`adopt_settings`）、ホットキーは
 //!   必ず登録し直して、登録できなかった項目を写しの印にする（`Editor::applied`）。OK は適用して、全部登録できたら閉じる。
 //! - 言語の切り替え（#102）で組み直すときは、`settings_dialog::current_page` と位置を覚えて壊し、
 //!   `settings_dialog::create` と `refresh` をし直す（`WM_DESTROY` で `App::settings_gui` を消さないようにする）。
@@ -16,14 +17,16 @@ use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use shunsoku_core::settings::editor::Editor;
+use shunsoku_core::settings::merge::{Field, merge};
+use shunsoku_core::settings::{self, Settings};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{NMHDR, TCN_SELCHANGE};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, IDCANCEL, IDOK,
-    IsDialogMessageW, IsIconic, MSG, PostMessageW, PostQuitMessage, SW_RESTORE, SW_SHOW,
-    SendMessageW, SetForegroundWindow, ShowWindow, WM_COMMAND, WM_DESTROY, WM_INITDIALOG,
-    WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
+    IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MSG, MessageBoxW,
+    PostMessageW, PostQuitMessage, SW_RESTORE, SW_SHOW, SendMessageW, SetForegroundWindow,
+    ShowWindow, WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
 };
 use windows::core::PCWSTR;
 
@@ -32,6 +35,7 @@ use super::{
     register_hotkeys, text, with_app, write_settings,
 };
 use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field};
+use crate::wide::to_wide;
 use crate::{notify, panic_hook};
 
 /// 開いている設定 GUI。
@@ -249,32 +253,26 @@ fn on_chord_changed(hwnd: HWND, field: i32, chord: Option<shunsoku_core::keys::C
 }
 
 /// 写しを適用する。適用でき、ホットキーを全部登録できたら true（OK で閉じてよい）。
+///
+/// その時点のファイルを読み、GUI で変えた項目だけを当てる（3 者の突き合わせ、`settings::merge`）。外と GUI の両方で
+/// 変えた項目があれば、`App` を借りずに確かめ、上書きを選ばれたら読み直してもう一度突き合わせる（確かめている間に
+/// 新しい衝突が増えていれば、また確かめる）。
 fn apply(hwnd: HWND) -> bool {
-    let result = with_app(|app| {
-        let gui = app.settings_gui.as_ref()?;
-        if !gui.editor.buttons().ok {
-            return None;
+    let mut confirmed: Vec<Field> = Vec::new();
+    let result = loop {
+        match with_app(|app| apply_merged(app, &confirmed)).flatten() {
+            Some(Step::Confirm(conflicts)) => {
+                // MessageBox の間は借りない
+                if !confirm_overwrite(hwnd, &conflicts) {
+                    log::info!("applying the settings GUI cancelled: {conflicts:?}");
+                    break None;
+                }
+                confirmed = conflicts;
+            }
+            Some(Step::Done(result)) => break Some(result),
+            None => break None,
         }
-        let new = gui.editor.draft().clone();
-        if new == app.settings && app.unregistered.is_empty() {
-            return Some(Ok(true));
-        }
-        let old = app.settings.clone();
-        if let Err(e) = write_settings(app, &new) {
-            return Some(Err(e));
-        }
-        // 適用では登録し直して結果を見る。欄にフォーカスが残っていれば、`check_focus` で外し直す
-        app.hotkeys_suspended = false;
-        let (_, failed) = adopt_settings(app, &old, true);
-        let unregistered = app.unregistered.clone();
-        let applied = app.settings.clone();
-        if let Some(gui) = app.settings_gui.as_mut() {
-            gui.editor.applied(applied, unregistered);
-        }
-        log::info!("settings applied from the GUI");
-        Some(Ok(failed.is_empty()))
-    })
-    .flatten();
+    };
     // SAFETY: 自分のダイアログに送る
     unsafe {
         let _ = PostMessageW(Some(hwnd), WM_APP_SETTINGS_FOCUS, WPARAM(0), LPARAM(0));
@@ -292,6 +290,90 @@ fn apply(hwnd: HWND) -> bool {
         }
         None => false,
     }
+}
+
+/// 適用の 1 回分の結果。
+enum Step {
+    /// 確かめていない衝突がある。
+    Confirm(Vec<Field>),
+    /// 書いた（か、書くものがなかった）。ホットキーを全部登録できたら Ok(true)。
+    Done(Result<bool, String>),
+}
+
+/// ファイルを読んで写しと突き合わせ、衝突が `confirmed` に収まっていれば書いて反映する。
+fn apply_merged(app: &mut App, confirmed: &[Field]) -> Option<Step> {
+    let gui = app.settings_gui.as_ref()?;
+    if !gui.editor.buttons().ok {
+        return None;
+    }
+    let theirs = read_current(app);
+    let merged = merge(gui.editor.base(), gui.editor.draft(), &theirs);
+    if merged
+        .conflicts
+        .iter()
+        .any(|field| !confirmed.contains(field))
+    {
+        return Some(Step::Confirm(merged.conflicts));
+    }
+    let new = merged.settings;
+    if new == theirs && new == app.settings && app.unregistered.is_empty() {
+        if let Some(gui) = app.settings_gui.as_mut() {
+            gui.editor.applied(new, []);
+        }
+        return Some(Step::Done(Ok(true)));
+    }
+    let old = app.settings.clone();
+    if let Err(e) = write_settings(app, &new) {
+        return Some(Step::Done(Err(e)));
+    }
+    // 適用では登録し直して結果を見る。欄にフォーカスが残っていれば、`check_focus` で外し直す
+    app.hotkeys_suspended = false;
+    let (_, failed) = adopt_settings(app, &old, true);
+    let unregistered = app.unregistered.clone();
+    let applied = app.settings.clone();
+    if let Some(gui) = app.settings_gui.as_mut() {
+        gui.editor.applied(applied, unregistered);
+    }
+    log::info!("settings applied from the GUI");
+    Some(Step::Done(Ok(failed.is_empty())))
+}
+
+/// 突き合わせに使う、今のファイルの設定。ファイルがなければ既定値。読めないか TOML でなければ、常駐側の設定
+/// （直前の有効な設定）を使う（そのときは `write_settings` が書くのを断る）。
+fn read_current(app: &App) -> Settings {
+    let Some(path) = app.settings_path.as_deref() else {
+        return app.settings.clone();
+    };
+    match std::fs::read_to_string(path) {
+        Ok(src) => settings::reload(&app.settings, Some(&src)).0,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            settings::reload(&app.settings, None).0
+        }
+        Err(_) => app.settings.clone(),
+    }
+}
+
+/// 外と GUI の両方で変えた項目 `conflicts` を見せ、「GUI の値で上書き」なら true、「適用をやめる」なら false。
+/// モーダルなので `App` を借りずに呼ぶ。
+fn confirm_overwrite(hwnd: HWND, conflicts: &[Field]) -> bool {
+    let items: Vec<String> = conflicts.iter().map(|f| format!("  {f}")).collect();
+    let body = to_wide(&format!(
+        "{}\n\n{}\n\n{}",
+        text("settings_gui.conflict.body"),
+        items.join("\n"),
+        text("settings_gui.conflict.choices"),
+    ));
+    let title = to_wide(text("settings_gui.title"));
+    // SAFETY: 文字列はこの呼び出しの間生きている。持ち主は自分のダイアログ
+    let answer = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    };
+    answer == IDOK
 }
 
 /// キーの組み合わせの欄にフォーカスがあれば全体のホットキーの登録を外し、なければ登録し直す。
