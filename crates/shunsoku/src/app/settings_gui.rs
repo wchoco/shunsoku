@@ -1040,10 +1040,9 @@ fn apply(hwnd: HWND) -> Option<Vec<hotkey::Failed>> {
         Some(Ok(failed)) => Some(failed),
         Some(Err(e)) => {
             log::error!("could not write the settings: {e:?}");
-            let detail = e.detail(i18n::catalog(language()));
             notify_user(
                 notify::Level::Error,
-                &format!("{}\n{detail}", text("settings_gui.write_failed")),
+                &e.notice(i18n::catalog(language()), "settings_gui.write_failed"),
             );
             None
         }

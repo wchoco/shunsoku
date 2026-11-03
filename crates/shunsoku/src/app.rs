@@ -3625,10 +3625,9 @@ fn register_region(rect: Rect) {
         }
         Some(Err(e)) => {
             log::error!("could not register the region: {e:?}");
-            let detail = e.detail(i18n::catalog(language()));
             notify_user(
                 notify::Level::Error,
-                &format!("{}\n{detail}", text("region.register_failed")),
+                &e.notice(i18n::catalog(language()), "region.register_failed"),
             );
         }
         None => {}

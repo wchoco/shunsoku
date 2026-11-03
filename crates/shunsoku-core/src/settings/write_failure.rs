@@ -14,6 +14,11 @@ pub enum WriteFailure {
 }
 
 impl WriteFailure {
+    /// 通知の本文。文言のキー `headline` の「書けませんでした」の行の下に、理由の 1 行（`detail`）を添える。
+    pub fn notice(&self, catalog: &Catalog, headline: &str) -> String {
+        format!("{}\n{}", catalog.text(headline), self.detail(catalog))
+    }
+
     /// 通知で「書けませんでした」の後ろに添える、理由の 1 行。
     ///
     /// - OS に断られたときは、断られたファイルと OS のエラーの文言だけを出す。書く前の読み直しで断られても
@@ -62,6 +67,23 @@ mod tests {
         assert_eq!(
             failure.detail(catalog(Language::English)),
             r"The current settings file is not valid TOML, so it was not overwritten: C:\portC\settings.toml"
+        );
+    }
+
+    #[test]
+    fn the_notice_puts_the_headline_above_the_reason() {
+        let failure = WriteFailure::Io {
+            path: r"C:\portC\settings.toml".to_owned(),
+            error: "Access is denied. (os error 5)".to_owned(),
+        };
+        assert_eq!(
+            failure.notice(catalog(Language::English), "region.register_failed"),
+            "Could not save the region.\nC:\\portC\\settings.toml: Access is denied. (os error 5)"
+        );
+        assert_eq!(
+            WriteFailure::NoLocation
+                .notice(catalog(Language::Japanese), "settings_gui.write_failed"),
+            "設定ファイルに書けませんでした。設定 GUI の内容はまだ適用されていません。\n設定ファイルの場所が決まっていません。"
         );
     }
 
