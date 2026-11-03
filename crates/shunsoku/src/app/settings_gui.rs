@@ -406,7 +406,8 @@ fn insert_variable(hwnd: HWND, fields: &Fields, of: fields::TemplateOf) {
     let entries: Vec<menu::Entry> = variables
         .iter()
         .zip(1u32..)
-        .map(|(v, id)| menu::Entry::item(id, format!("{}\t{}", text(v.label_key), v.token), true))
+        // 文言に変数の書き方が入っている（`{datetime:…}` は挿入する既定の書式を略して見せる）
+        .map(|(v, id)| menu::Entry::item(id, text(v.label_key), true))
         .collect();
     let Some(chosen) = menu::show(hwnd, &entries, rect.left, rect.bottom) else {
         return;
