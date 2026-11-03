@@ -345,6 +345,31 @@ impl Default for AnnotationDefaults {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
+/// `#RRGGBB`（大文字）。
+impl std::fmt::Display for Rgb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Rgb(r, g, b) = *self;
+        write!(f, "#{r:02X}{g:02X}{b:02X}")
+    }
+}
+
+/// `#RRGGBB`（大文字と小文字を問わない）でない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotRgb;
+
+impl std::str::FromStr for Rgb {
+    type Err = NotRgb;
+
+    fn from_str(s: &str) -> Result<Rgb, NotRgb> {
+        let hex = s.strip_prefix('#').ok_or(NotRgb)?;
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(NotRgb);
+        }
+        let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| NotRgb);
+        Ok(Rgb(channel(0)?, channel(2)?, channel(4)?))
+    }
+}
+
 /// 範囲選択の画面（`[selection]`）。開くたびに読む。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SelectionScreen {
@@ -1060,12 +1085,7 @@ fn in_range<T: TryFrom<i64> + PartialOrd>(
 
 /// `#RRGGBB`。
 fn rgb(item: &Item) -> Option<Rgb> {
-    let hex = item.as_str()?.strip_prefix('#')?;
-    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-    Some(Rgb(channel(0)?, channel(2)?, channel(4)?))
+    item.as_str()?.parse().ok()
 }
 
 fn selection_mode(item: &Item) -> Option<Mode> {
@@ -1101,6 +1121,22 @@ fn log_level(item: &Item) -> Option<LogLevel> {
 mod tests {
     use super::*;
     use crate::scrap::ops::OPERATIONS;
+
+    #[test]
+    fn a_colour_is_read_from_hash_rrggbb_and_written_in_upper_case() {
+        assert_eq!("#1e88E5".parse::<Rgb>(), Ok(Rgb(0x1E, 0x88, 0xE5)));
+        assert_eq!(Rgb(0x1E, 0x88, 0x05).to_string(), "#1E8805");
+        for bad in [
+            "1E88E5",
+            "#1E88E",
+            "#1E88E5F",
+            "#GGGGGG",
+            "",
+            "#１２３４５６",
+        ] {
+            assert!(bad.parse::<Rgb>().is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn version_only_file_gives_defaults_without_issues() {

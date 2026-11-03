@@ -14,6 +14,76 @@
 //! 同じ名前のファイルが既にあれば、`_2`、`_3` … を付けて避ける（`{seq}` があるときは連番を進める）。
 //! 名前の比較は Windows に合わせて大文字と小文字を区別しない。
 
+/// 設定 GUI の「変数を挿入」で出す変数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Variable {
+    /// テンプレートに入れる文字列。
+    pub token: &'static str,
+    /// 挿入のメニューの文言のキー（`template.var.*`）。
+    pub label_key: &'static str,
+    /// 定型領域のテンプレートでだけ値が入る（全体のテンプレートでは出さない）。
+    pub region_only: bool,
+}
+
+/// 挿入できる変数（メニューの順）。
+pub const VARIABLES: &[Variable] = &[
+    Variable {
+        token: "{name}",
+        label_key: "template.var.name",
+        region_only: true,
+    },
+    Variable {
+        token: "{date}",
+        label_key: "template.var.date",
+        region_only: false,
+    },
+    Variable {
+        token: "{time}",
+        label_key: "template.var.time",
+        region_only: false,
+    },
+    Variable {
+        token: "{datetime:yyyy-MM-dd_HH-mm-ss}",
+        label_key: "template.var.datetime",
+        region_only: false,
+    },
+    Variable {
+        token: "{seq}",
+        label_key: "template.var.seq",
+        region_only: false,
+    },
+    Variable {
+        token: "{seq:3}",
+        label_key: "template.var.seq3",
+        region_only: false,
+    },
+];
+
+/// テンプレート `text` の選択 `selection`（UTF-16 の位置。エディットコントロールの `EM_GETSEL` の単位。逆向きでも
+/// よい）を `token` で置き換える。置き換えた文字列と、挿入した後ろの位置（UTF-16）を返す。はみ出す位置は末尾、
+/// サロゲートの間の位置は前の文字の境目とみなす。
+pub fn insert(text: &str, selection: std::ops::Range<usize>, token: &str) -> (String, usize) {
+    let byte_at = |utf16: usize| {
+        let mut units = 0;
+        for (i, c) in text.char_indices() {
+            if units + c.len_utf16() > utf16 {
+                return i;
+            }
+            units += c.len_utf16();
+        }
+        text.len()
+    };
+    let (from, to) = if selection.start <= selection.end {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    };
+    let (from, to) = (byte_at(from), byte_at(to));
+    let out = format!("{}{token}{}", &text[..from], &text[to..]);
+    let caret = text[..from].encode_utf16().count() + token.encode_utf16().count();
+    (out, caret)
+}
+
 /// 日時（ローカル時刻）。Win32 層が `GetLocalTime` から作る。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LocalTime {
@@ -182,6 +252,8 @@ fn parse_seq(pieces: &[Piece], stem: &str) -> Option<u64> {
     let mut rest = stem;
     for piece in pieces {
         match piece {
+            // 空の片は `sanitize` で `_` になるので飛ばす（`{seq}` で始まるテンプレート）
+            Piece::Text(text) if text.is_empty() => {}
             Piece::Text(text) => {
                 rest = rest.strip_prefix(sanitize(text).to_lowercase().as_str())?;
             }
@@ -294,6 +366,70 @@ mod tests {
             "game_10.png"
         );
         assert_eq!(region_name("new", "{name}_{seq}", &existing), "new_1.png");
+    }
+
+    #[test]
+    fn every_variable_offered_for_insertion_expands_in_the_preview() {
+        let tokens: Vec<&str> = VARIABLES.iter().map(|v| v.token).collect();
+        assert_eq!(
+            tokens,
+            [
+                "{name}",
+                "{date}",
+                "{time}",
+                "{datetime:yyyy-MM-dd_HH-mm-ss}",
+                "{seq}",
+                "{seq:3}"
+            ]
+        );
+        let previews: Vec<String> = tokens
+            .iter()
+            .map(|t| name(t, &["7.png", "007.png"]))
+            .collect();
+        assert_eq!(
+            previews,
+            [
+                "area.png",
+                "20260307.png",
+                "090504.png",
+                "2026-03-07_09-05-04.png",
+                "8.png",
+                "008.png"
+            ]
+        );
+        // {name} は定型領域でだけ値が入る
+        let region_only: Vec<&str> = VARIABLES
+            .iter()
+            .filter(|v| v.region_only)
+            .map(|v| v.token)
+            .collect();
+        assert_eq!(region_only, ["{name}"]);
+    }
+
+    #[test]
+    fn every_variable_has_a_label_in_the_bundled_locale() {
+        let catalog =
+            crate::i18n::Catalog::parse(include_str!("../../../locales/ja.toml")).unwrap();
+        for v in VARIABLES {
+            assert_ne!(catalog.text(v.label_key), v.label_key, "{}", v.token);
+        }
+    }
+
+    #[test]
+    fn a_variable_replaces_the_selection_and_the_caret_goes_after_it() {
+        // 位置は UTF-16 の単位（エディットコントロールの選択の単位）
+        assert_eq!(
+            insert("shot_", 5..5, "{date}"),
+            ("shot_{date}".to_owned(), 11)
+        );
+        assert_eq!(insert("a_XX_b", 2..4, "{seq}"), ("a_{seq}_b".to_owned(), 7));
+        // 選択は逆向きでもよい。全角や絵文字の後ろでも UTF-16 の位置で数える
+        assert_eq!(
+            insert("画面😀_", 5..4, "{time}"),
+            ("画面😀{time}".to_owned(), 10)
+        );
+        // はみ出す位置は末尾
+        assert_eq!(insert("ab", 9..9, "{seq}"), ("ab{seq}".to_owned(), 7));
     }
 
     #[test]

@@ -155,3 +155,12 @@ saved = "保存しました（クリックでフォルダを開きます）:"
 failed = "保存できませんでした。スクラップは残っています。"
 # 「名前を付けて保存」のファイルの種類
 png_filter = "PNG 画像"
+
+# ファイル名テンプレートの「変数を挿入」のメニュー。キーは template::VARIABLES の label_key
+[template.var]
+name = "{name}  定型領域の名前"
+date = "{date}  日付（20260307）"
+time = "{time}  時刻（090504）"
+datetime = "{datetime:…}  日時の書式（2026-03-07_09-05-04）"
+seq = "{seq}  連番（1, 2, …）"
+seq3 = "{seq:3}  3 桁の連番（001, 002, …）"
