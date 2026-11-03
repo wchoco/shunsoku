@@ -1,5 +1,8 @@
 //! 設定 GUI の、入力で変わる状態（写しの中身ではないもの）と、出し方の計算。Win32 の層は通知を渡して、決まったことに従う。
 
+use std::ops::RangeInclusive;
+use std::str::FromStr;
+
 use crate::geometry::{Rect, Size};
 
 /// 定型領域の詳細の欄が指す領域。結び直したら、次に欄に出すときはフォーカスのある欄も書き換える。
@@ -43,6 +46,14 @@ impl FillPass {
     pub fn overwrites(self, focused: bool, region_field: bool) -> bool {
         !focused || (self.rebound && region_field)
     }
+}
+
+/// 数の欄の入力 `s` を読む。前後の空白は無視し、`range` の中の整数だけを読む（ほかは読めない入力）。
+pub fn read_number<T>(s: &str, range: &RangeInclusive<T>) -> Option<T>
+where
+    T: FromStr + PartialOrd,
+{
+    s.trim().parse().ok().filter(|n| range.contains(n))
 }
 
 /// フォーカスのあるテキストの欄と、入ったときの文字。読めない値で出たら、入ったときの値に戻す（キーを打つ
@@ -189,8 +200,8 @@ pub fn range_thumbnail(monitor: Option<Size>, range: Rect, size: Size) -> Thumbn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::Settings;
     use crate::settings::editor::Editor;
+    use crate::settings::{OPACITY_RANGE, Settings};
 
     #[test]
     fn after_binding_another_region_the_next_fill_overwrites_the_focused_region_field_once() {
@@ -247,7 +258,21 @@ mod tests {
     }
 
     fn read_opacity(s: &str) -> Option<u8> {
-        s.trim().parse().ok().filter(|n| (10..=100).contains(n))
+        read_number(s, &OPACITY_RANGE)
+    }
+
+    #[test]
+    fn a_number_field_reads_whole_numbers_in_its_range() {
+        assert_eq!(read_number(" 50 ", &OPACITY_RANGE), Some(50));
+        assert_eq!(read_number("10", &OPACITY_RANGE), Some(10));
+        assert_eq!(read_number("100", &OPACITY_RANGE), Some(100));
+        // 範囲の外、空、数でないものは読めない
+        assert_eq!(read_number("5", &OPACITY_RANGE), None);
+        assert_eq!(read_number("500", &OPACITY_RANGE), None);
+        assert_eq!(read_number("", &OPACITY_RANGE), None);
+        assert_eq!(read_number("-20", &OPACITY_RANGE), None);
+        assert_eq!(read_number("50%", &OPACITY_RANGE), None);
+        assert_eq!(read_number("70000", &(1..=u32::MAX)), Some(70000));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
 use shunsoku_core::selection::Mode;
 use shunsoku_core::settings::editor::{Editor, choices};
-use shunsoku_core::settings::form::{FillPass, RegionDetail};
+use shunsoku_core::settings::form::{FillPass, RegionDetail, read_number};
 use shunsoku_core::settings::{
     BORDER_WIDTH_RANGE, DpiScaling, OPACITY_RANGE, Region, Rgb, Settings, TRASH_LIMIT_RANGE,
 };
@@ -552,10 +552,7 @@ pub fn folder_of(settings: &Settings, field: Field, default_dir: Option<&Path>) 
 /// 数の欄 `field` の入力。範囲（`number_range`）の外か、数でなければ None。
 fn parse_number(field: Field, s: &str) -> Option<u32> {
     let (min, max) = number_range(field);
-    s.trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|n| (min..=max).contains(n))
+    read_number(s, &(min..=max))
 }
 
 /// フォルダの欄の入力。空は既定（`Some(None)`）、絶対パスでなければ None。
