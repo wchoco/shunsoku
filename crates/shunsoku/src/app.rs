@@ -3845,7 +3845,7 @@ fn adopt_settings(
     let keymap = settings::keymap(&app.settings, ops::OPERATIONS);
     log_issues(&keymap.issues);
     let failed = if (changes.hotkeys || reregister) && !app.hotkey_pause.is_paused() {
-        register_hotkeys(app)
+        register_bound(app, &keymap.hotkeys.bound)
     } else {
         Vec::new()
     };
@@ -3861,7 +3861,16 @@ fn adopt_settings(
 /// いまの設定（`app.settings`）のホットキーを登録し直す。登録できなかったものを `App::unregistered` に覚えて返す。
 fn register_hotkeys(app: &mut App) -> Vec<hotkey::Failed> {
     let keymap = settings::keymap(&app.settings, ops::OPERATIONS);
-    let failed = app.hotkeys.reregister(&keymap.hotkeys.bound);
+    register_bound(app, &keymap.hotkeys.bound)
+}
+
+/// ホットキー `bound`（いまの設定から作った対応表）を登録し直す。登録できなかったものを `App::unregistered` に
+/// 覚えて返す。
+fn register_bound(
+    app: &mut App,
+    bound: &std::collections::BTreeMap<Chord, settings::HotkeyAction>,
+) -> Vec<hotkey::Failed> {
+    let failed = app.hotkeys.reregister(bound);
     app.unregistered = failed.iter().map(|f| f.action.into()).collect();
     failed
 }

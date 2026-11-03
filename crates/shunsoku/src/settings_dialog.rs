@@ -16,11 +16,14 @@
 
 pub mod chord_field;
 pub mod fields;
+mod list_view;
 mod pages;
 pub mod regions;
 pub mod scrap_ops;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::thread::LocalKey;
 
 use shunsoku_core::monitors::Monitor;
 use shunsoku_core::settings::SettingsItem;
@@ -188,6 +191,23 @@ pub struct Env {
     /// 全体の保存先が空のときに保存する先（ピクチャ）。
     pub default_dir: Option<PathBuf>,
     pub file_name: FileName,
+}
+
+/// 処理の間だけ旗を立てておく（その処理がコントロールに送ったメッセージで届く通知を、ダイアログが見分ける）。
+/// 落としたら旗を下ろす。
+pub struct During(&'static LocalKey<Cell<bool>>);
+
+impl During {
+    pub fn enter(flag: &'static LocalKey<Cell<bool>>) -> During {
+        flag.set(true);
+        During(flag)
+    }
+}
+
+impl Drop for During {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 /// キーの組み合わせの欄と、その横の印の欄。

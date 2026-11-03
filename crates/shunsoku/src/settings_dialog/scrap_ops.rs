@@ -16,11 +16,9 @@ use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::{Editor, ShortcutValue};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Controls::{
-    LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_STATE, LVIF_TEXT,
-    LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
-    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_GETITEMCOUNT, LVM_INSERTCOLUMNW,
+    LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -29,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, PWSTR};
 
+use super::list_view::{self, set_cell};
 use super::{Class, PAGE_WIDTH, Page, PageBuilder, Text, chord_field, item, page_first_id};
 use crate::wide::to_wide;
 
@@ -153,20 +152,8 @@ pub fn mouse_id() -> i32 {
 
 /// 一覧で選んでいる行。
 pub fn selected(hwnd: HWND) -> Option<BindingRow> {
-    let list = item(hwnd, list_id())?;
-    // SAFETY: 自分のダイアログの一覧へのメッセージ
-    let index = unsafe {
-        SendMessageW(
-            list,
-            LVM_GETNEXTITEM,
-            Some(WPARAM(usize::MAX)),
-            Some(LPARAM(LVNI_SELECTED as isize)),
-        )
-    }
-    .0;
-    binding_rows(OPERATIONS)
-        .get(usize::try_from(index).ok()?)
-        .copied()
+    let index = list_view::selected(item(hwnd, list_id())?)?;
+    binding_rows(OPERATIONS).get(index).copied()
 }
 
 /// ドロップダウンで選んだマウスの割り当て（None は「なし」）。選んだ行のマウスを変えられなければ None。
@@ -300,39 +287,8 @@ fn init_list(hwnd: HWND, list: HWND, rows: &[BindingRow], text: Text) {
                 Some(LPARAM(&entry as *const LVITEMW as isize)),
             );
         }
-        let state = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
-        let entry = LVITEMW {
-            mask: LVIF_STATE,
-            state,
-            stateMask: state,
-            ..Default::default()
-        };
-        SendMessageW(
-            list,
-            LVM_SETITEMSTATE,
-            Some(WPARAM(0)),
-            Some(LPARAM(&entry as *const LVITEMW as isize)),
-        );
     }
-}
-
-/// 一覧の `row` 行 `column` 列に `value` を入れる。
-fn set_cell(list: HWND, row: usize, column: i32, value: &str) {
-    let mut value = to_wide(value);
-    let entry = LVITEMW {
-        iSubItem: column,
-        pszText: PWSTR(value.as_mut_ptr()),
-        ..Default::default()
-    };
-    // SAFETY: 文字列と構造体は呼び出しの間生きている（一覧が写す）
-    unsafe {
-        SendMessageW(
-            list,
-            LVM_SETITEMTEXTW,
-            Some(WPARAM(row)),
-            Some(LPARAM(&entry as *const LVITEMW as isize)),
-        );
-    }
+    list_view::select(list, 0);
 }
 
 /// 一覧のショートカットの列の文言。

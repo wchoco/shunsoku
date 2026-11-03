@@ -44,7 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use super::{Class, Env, Item, PAGE_X, PAGE_Y, PageBuilder, SS_LEFT, Text, item};
+use super::{Class, During, Env, Item, PAGE_X, PAGE_Y, PageBuilder, SS_LEFT, Text, item};
 use crate::wide::to_wide;
 
 /// 欄が結ぶ写しの項目（キーの組み合わせの項目は `SettingsItem` と `ChordRow`）。
@@ -643,7 +643,7 @@ pub fn is_filling() -> bool {
 
 /// 写し `editor` を欄に出す。
 pub fn fill(hwnd: HWND, fields: &Fields, pass: FillPass, editor: &Editor, text: Text, env: &Env) {
-    FILLING.set(true);
+    let _filling = During::enter(&FILLING);
     // SAFETY: 引数なし
     let focus = unsafe { GetFocus() };
     for row in &fields.rows {
@@ -703,7 +703,6 @@ pub fn fill(hwnd: HWND, fields: &Fields, pass: FillPass, editor: &Editor, text: 
             }
         }
     }
-    FILLING.set(false);
 }
 
 /// 欄 `row`（コントロール `control`）の今の入力。

@@ -66,7 +66,9 @@ use super::{
 };
 use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
 use crate::settings_dialog::regions::{self, ListButton};
-use crate::settings_dialog::{self, ChordRow, Env, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops};
+use crate::settings_dialog::{
+    self, ChordRow, During, Env, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops,
+};
 use crate::wide::to_wide;
 use crate::{hotkey, menu, monitor_list, notify, panic_hook, save};
 
@@ -80,6 +82,15 @@ pub(super) struct SettingsGui {
     language: Language,
     /// ダイアログに渡す、外のこと（モニタは `refresh_monitors` で集め直す）。
     env: Env,
+}
+
+impl SettingsGui {
+    /// 一覧の行で変わるキーの欄（ID `field`）を、設定の項目 `item` に結び直す。
+    fn rebind_chord_row(&mut self, field: i32, item: SettingsItem) {
+        if let Some(row) = self.rows.iter_mut().find(|r| r.field == field) {
+            row.item = item;
+        }
+    }
 }
 
 thread_local! {
@@ -362,25 +373,11 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
             }
             if header.idFrom == ID_TAB as usize && header.code == TCN_SELCHANGE {
                 settings_dialog::show_page(hwnd, settings_dialog::current_page(hwnd));
-            } else if header.idFrom == scrap_ops::list_id() as usize
-                && header.code == LVN_ITEMCHANGED
+            } else if header.idFrom == scrap_ops::list_id() as usize && row_selected(header, lparam)
             {
-                // SAFETY: LVN_ITEMCHANGED の lparam は NMLISTVIEW を指す
-                let change = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
-                if change.uNewState & LVIS_SELECTED.0 != 0
-                    && change.uOldState & LVIS_SELECTED.0 == 0
-                {
-                    on_scrap_op_selected(hwnd);
-                }
-            } else if header.idFrom == regions::list_id() as usize && header.code == LVN_ITEMCHANGED
-            {
-                // SAFETY: LVN_ITEMCHANGED の lparam は NMLISTVIEW を指す
-                let change = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
-                if change.uNewState & LVIS_SELECTED.0 != 0
-                    && change.uOldState & LVIS_SELECTED.0 == 0
-                {
-                    on_region_selected(hwnd);
-                }
+                on_scrap_op_selected(hwnd);
+            } else if header.idFrom == regions::list_id() as usize && row_selected(header, lparam) {
+                on_region_selected(hwnd);
             }
             false
         }
@@ -422,6 +419,16 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
         }
         _ => false,
     }
+}
+
+/// 一覧の通知 `header`（`lparam` が指す）が、行が選ばれた（選ばれていなかった行が選ばれた）ことか。
+fn row_selected(header: &NMHDR, lparam: LPARAM) -> bool {
+    if header.code != LVN_ITEMCHANGED {
+        return false;
+    }
+    // SAFETY: LVN_ITEMCHANGED の lparam は NMLISTVIEW を指す
+    let change = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
+    change.uNewState & LVIS_SELECTED.0 != 0 && change.uOldState & LVIS_SELECTED.0 == 0
 }
 
 fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
@@ -647,11 +654,12 @@ fn rebuild(old: HWND) {
     unsafe {
         let _ = GetWindowRect(old, &mut rect);
     }
-    REBUILDING.set(true);
-    destroy(old);
-    DIALOG.set(None);
-    let created = settings_dialog::create(module, page, text, &env, Some(dialog_proc));
-    REBUILDING.set(false);
+    let created = {
+        let _rebuilding = During::enter(&REBUILDING);
+        destroy(old);
+        DIALOG.set(None);
+        settings_dialog::create(module, page, text, &env, Some(dialog_proc))
+    };
     let dialog = match created {
         Ok(dialog) => dialog,
         Err(e) => {
@@ -735,9 +743,7 @@ fn on_region_selected(hwnd: HWND) {
     with_app(|app| {
         if let Some(gui) = app.settings_gui.as_mut() {
             gui.fields.bind_region(index);
-            if let Some(chord_row) = gui.rows.iter_mut().find(|r| r.field == field) {
-                chord_row.item = SettingsItem::RegionHotkey(index);
-            }
+            gui.rebind_chord_row(field, SettingsItem::RegionHotkey(index));
         }
     });
     // 一覧を揃えている途中なら、揃えたあとで出す（`refresh`）
@@ -900,10 +906,8 @@ fn on_scrap_op_selected(hwnd: HWND) {
     };
     let field = scrap_ops::field_id();
     with_app(|app| {
-        if let Some(gui) = app.settings_gui.as_mut()
-            && let Some(chord_row) = gui.rows.iter_mut().find(|r| r.field == field)
-        {
-            chord_row.item = shunsoku_core::settings::SettingsItem::Shortcut(row.op.id.to_owned());
+        if let Some(gui) = app.settings_gui.as_mut() {
+            gui.rebind_chord_row(field, SettingsItem::Shortcut(row.op.id.to_owned()));
         }
     });
     refresh(hwnd);
