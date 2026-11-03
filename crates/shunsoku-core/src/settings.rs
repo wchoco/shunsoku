@@ -7,6 +7,7 @@
 //! - 読み込み直しでは `diff` で変わった部分を調べ、`app` が変わったものだけを反映し直す。
 //! - キーの重なりは `keymap` で見つける。同じ範囲（ホットキー同士、ショートカット同士）の重なりは `assign` の
 //!   規則で両方を無効にし、ホットキーとショートカットの重なりは警告だけにする。
+//! - 設定 GUI で適用できるかは `validate` で決める。問題の項目は `SettingsItem`（GUI の行）で指す。
 //!
 //! スキーマ（書かなかった項目は既定値）:
 //!
@@ -72,7 +73,7 @@ use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::geometry::Rect;
 use crate::keys::Chord;
-use crate::scrap::ops::{MouseBindings, MouseGesture, OperationDescriptor, Shortcuts};
+use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, Shortcuts};
 use crate::selection::Mode;
 
 mod write;
@@ -219,15 +220,6 @@ impl HotkeyAction {
             HotkeyAction::RestoreLast => "restore_last",
             HotkeyAction::ActiveWindowCapture => "active_window_capture",
             HotkeyAction::Region(_) => "hotkey",
-        }
-    }
-
-    /// 通知に出す項目名（`hotkeys.select_capture`、`regions[N].hotkey`）。N は `Settings::regions` の位置 + 1
-    /// （読み込みで捨てた定型領域があれば、ファイルの中の位置とずれる）。
-    pub fn item(self) -> String {
-        match self {
-            HotkeyAction::Region(i) => format!("regions[{}].{}", i + 1, self.key()),
-            _ => format!("hotkeys.{}", self.key()),
         }
     }
 }
@@ -426,21 +418,179 @@ pub enum SettingsIssue {
     /// 表にない操作と、ショートカットを持てない操作への `[shortcuts]` の上書きもこれにする（無視する）。
     Invalid { item: String },
     /// 同じ範囲（ホットキー同士、ショートカット同士）で重なったキーの組み合わせ。重なった項目のどれにも
-    /// 付けない。`items` は重なった項目名（`shortcuts.close` など。表の既定値から来たものも含む）。
-    Conflict { chord: Chord, items: Vec<String> },
+    /// 付けない。`items` は重なった項目（`Shortcut("close")` など。表の既定値から来たものも含む）。
+    Conflict {
+        chord: Chord,
+        items: Vec<SettingsItem>,
+    },
     /// ホットキーとショートカットの重なり。警告だけで、どちらも付けたままにする（OS に登録したホットキーが
     /// 先にキーを取るので、そのショートカットは効かない）。
     Overlap {
         chord: Chord,
-        hotkey: String,
-        shortcut: String,
+        hotkey: SettingsItem,
+        shortcut: SettingsItem,
     },
-    /// 2 つ以上の操作に付いたマウスの操作。どの操作にも付けない。`items` は重なった項目名
-    /// （`mouse.close` など。表の既定値から来たものも含む）。
+    /// 2 つ以上の操作に付いたマウスの操作。どの操作にも付けない。`items` は重なった項目
+    /// （`Mouse("close")` など。表の既定値から来たものも含む）。
     MouseConflict {
         gesture: MouseGesture,
-        items: Vec<String>,
+        items: Vec<SettingsItem>,
     },
+}
+
+/// 設定の項目。設定 GUI の行に当たる。問題の項目を指すのに使う。
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SettingsItem {
+    /// `[hotkeys] select_capture`。
+    SelectCaptureHotkey,
+    /// `[hotkeys] restore_last`。
+    RestoreLastHotkey,
+    /// `[hotkeys] active_window_capture`。
+    ActiveWindowCaptureHotkey,
+    /// `[shortcuts]` のスクラップ操作の id。
+    Shortcut(String),
+    /// `[mouse]` のスクラップ操作の id。
+    Mouse(String),
+    /// 定型領域のホットキー。`Settings::regions` の中の位置。
+    RegionHotkey(usize),
+    /// 定型領域の名前。`Settings::regions` の中の位置。
+    RegionName(usize),
+}
+
+impl From<HotkeyAction> for SettingsItem {
+    fn from(action: HotkeyAction) -> SettingsItem {
+        match action {
+            HotkeyAction::SelectCapture => SettingsItem::SelectCaptureHotkey,
+            HotkeyAction::RestoreLast => SettingsItem::RestoreLastHotkey,
+            HotkeyAction::ActiveWindowCapture => SettingsItem::ActiveWindowCaptureHotkey,
+            HotkeyAction::Region(i) => SettingsItem::RegionHotkey(i),
+        }
+    }
+}
+
+/// 通知とログに出す項目名（`hotkeys.select_capture`、`shortcuts.copy`、`mouse.close`、`regions[N].hotkey`、
+/// `regions[N].name`）。N は `Settings::regions` の位置 + 1（読み込みで捨てた定型領域があれば、ファイルの中の
+/// 位置とずれる）。
+impl std::fmt::Display for SettingsItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SettingsItem::SelectCaptureHotkey => f.write_str("hotkeys.select_capture"),
+            SettingsItem::RestoreLastHotkey => f.write_str("hotkeys.restore_last"),
+            SettingsItem::ActiveWindowCaptureHotkey => f.write_str("hotkeys.active_window_capture"),
+            SettingsItem::Shortcut(id) => write!(f, "shortcuts.{id}"),
+            SettingsItem::Mouse(id) => write!(f, "mouse.{id}"),
+            SettingsItem::RegionHotkey(i) => write!(f, "regions[{}].hotkey", i + 1),
+            SettingsItem::RegionName(i) => write!(f, "regions[{}].name", i + 1),
+        }
+    }
+}
+
+/// 項目名を文字列として出す。`SettingsIssue` の `{:?}` でログに書く文言を、項目を文字列で持っていたときと
+/// 同じに保つため。
+impl std::fmt::Debug for SettingsItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.to_string(), f)
+    }
+}
+
+/// 設定 GUI で適用する前に見つける問題の中身（`validate`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Problem {
+    /// 必須の項目が空（範囲選択キャプチャのホットキー）。
+    Unset,
+    /// 同じ範囲（ホットキー同士、ショートカット同士）で重なったキーの組み合わせ。
+    Conflict(Chord),
+    /// 2 つ以上の操作に付いたマウスの操作。
+    MouseConflict(MouseGesture),
+    /// ホットキーとショートカットの重なり。警告だけ。
+    Overlap(Chord),
+    /// 定型領域の名前が空。
+    EmptyName,
+    /// 定型領域の名前がほかの定型領域と同じ。
+    DuplicateName,
+}
+
+impl Problem {
+    /// 適用を止める（OK と適用を押せなくする）。止めないものは警告として出す。
+    pub fn blocks_apply(self) -> bool {
+        !matches!(self, Problem::Overlap(_))
+    }
+}
+
+/// 設定 GUI で適用する前に見つける問題。重なりでは、重なった項目ごとに 1 つずつ作る（両方の行に印を付ける）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub item: SettingsItem,
+    pub problem: Problem,
+}
+
+impl ValidationIssue {
+    /// 適用を止める（`Problem::blocks_apply`）。
+    pub fn blocks_apply(&self) -> bool {
+        self.problem.blocks_apply()
+    }
+}
+
+/// 設定 GUI の写しを適用できるかを調べる。`blocks_apply` の問題が 1 つでもあれば、OK と適用を押せなくする。
+///
+/// - 範囲選択キャプチャのホットキーが空なら `Unset`。
+/// - キーとマウスの重なりは `keymap`（`scrap::ops::OPERATIONS` に重ねる）の結果から作る。同じ範囲の重なりは
+///   止め、ホットキーとショートカットの重なりは警告にする。無視した上書き（`SettingsIssue::Invalid`）は
+///   GUI からは作れず、適用しても害がないので、ここでは出さない。
+/// - 定型領域の名前が空（空白だけを含む）か、ほかの定型領域と同じなら止める。重複は同じ名前のすべての
+///   定型領域に付ける。
+pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    if settings.hotkeys.select_capture.is_none() {
+        issues.push(ValidationIssue {
+            item: SettingsItem::SelectCaptureHotkey,
+            problem: Problem::Unset,
+        });
+    }
+    let each = |items: &[SettingsItem], problem: Problem| {
+        items
+            .iter()
+            .map(move |item| ValidationIssue {
+                item: item.clone(),
+                problem,
+            })
+            .collect::<Vec<_>>()
+    };
+    for issue in keymap(settings, OPERATIONS).issues {
+        match issue {
+            SettingsIssue::Conflict { chord, items } => {
+                issues.extend(each(&items, Problem::Conflict(chord)));
+            }
+            SettingsIssue::MouseConflict { gesture, items } => {
+                issues.extend(each(&items, Problem::MouseConflict(gesture)));
+            }
+            SettingsIssue::Overlap {
+                chord,
+                hotkey,
+                shortcut,
+            } => issues.extend(each(&[hotkey, shortcut], Problem::Overlap(chord))),
+            SettingsIssue::NotToml { .. } | SettingsIssue::Invalid { .. } => {}
+        }
+    }
+    for (i, region) in settings.regions.iter().enumerate() {
+        let problem = if region.name.trim().is_empty() {
+            Problem::EmptyName
+        } else if settings
+            .regions
+            .iter()
+            .enumerate()
+            .any(|(j, other)| j != i && other.name == region.name)
+        {
+            Problem::DuplicateName
+        } else {
+            continue;
+        };
+        issues.push(ValidationIssue {
+            item: SettingsItem::RegionName(i),
+            problem,
+        });
+    }
+    issues
 }
 
 /// 設定から作ったキーの割り当て（`keymap`）。
@@ -477,14 +627,14 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
             .chain(region_hotkeys),
     );
     let shortcuts = Shortcuts::new(ops, &settings.shortcuts);
-    let shortcut_item = |id: &str| format!("shortcuts.{id}");
-    let hotkey_item = |action: HotkeyAction| action.item();
+    let shortcut_item = |id: &str| SettingsItem::Shortcut(id.to_owned());
+    let hotkey_item = SettingsItem::from;
 
     let mut issues: Vec<SettingsIssue> = shortcuts
         .ignored_overrides()
         .iter()
         .map(|id| SettingsIssue::Invalid {
-            item: shortcut_item(id),
+            item: shortcut_item(id).to_string(),
         })
         .collect();
     issues.extend(
@@ -510,13 +660,13 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
         }
     }
     let mouse = MouseBindings::new(ops, &settings.mouse);
-    let mouse_item = |id: &str| format!("mouse.{id}");
+    let mouse_item = |id: &str| SettingsItem::Mouse(id.to_owned());
     issues.extend(
         mouse
             .ignored_overrides()
             .iter()
             .map(|id| SettingsIssue::Invalid {
-                item: mouse_item(id),
+                item: mouse_item(id).to_string(),
             }),
     );
     issues.extend(
@@ -971,6 +1121,14 @@ mod tests {
 
     fn chord(s: &str) -> Chord {
         s.parse().unwrap()
+    }
+
+    fn shortcut(id: &str) -> SettingsItem {
+        SettingsItem::Shortcut(id.to_owned())
+    }
+
+    fn mouse(id: &str) -> SettingsItem {
+        SettingsItem::Mouse(id.to_owned())
     }
 
     fn invalid(item: &str) -> SettingsIssue {
@@ -1545,8 +1703,8 @@ a = 1
             vec![SettingsIssue::Conflict {
                 chord: chord("Ctrl+Alt+S"),
                 items: vec![
-                    "hotkeys.select_capture".to_owned(),
-                    "hotkeys.restore_last".to_owned()
+                    SettingsItem::SelectCaptureHotkey,
+                    SettingsItem::RestoreLastHotkey
                 ],
             }]
         );
@@ -1741,8 +1899,8 @@ width = 0
             vec![SettingsIssue::Conflict {
                 chord: chord("Ctrl+Alt+S"),
                 items: vec![
-                    "hotkeys.select_capture".to_owned(),
-                    "regions[3].hotkey".to_owned()
+                    SettingsItem::SelectCaptureHotkey,
+                    SettingsItem::RegionHotkey(2)
                 ],
             }]
         );
@@ -1788,7 +1946,7 @@ width = 0
             keymap.issues,
             vec![SettingsIssue::Conflict {
                 chord: chord("Ctrl+W"),
-                items: vec!["shortcuts.copy".to_owned(), "shortcuts.close".to_owned()],
+                items: vec![shortcut("copy"), shortcut("close")],
             }]
         );
     }
@@ -1801,10 +1959,7 @@ width = 0
             keymap.issues,
             vec![SettingsIssue::Conflict {
                 chord: chord("Ctrl+S"),
-                items: vec![
-                    "shortcuts.save_default".to_owned(),
-                    "shortcuts.close".to_owned()
-                ],
+                items: vec![shortcut("save_default"), shortcut("close")],
             }]
         );
     }
@@ -1821,8 +1976,8 @@ width = 0
             keymap.issues,
             vec![SettingsIssue::Overlap {
                 chord: chord("Ctrl+C"),
-                hotkey: "hotkeys.select_capture".to_owned(),
-                shortcut: "shortcuts.copy".to_owned(),
+                hotkey: SettingsItem::SelectCaptureHotkey,
+                shortcut: shortcut("copy"),
             }]
         );
         // 重なりで無効になったショートカットとは、重ならない
@@ -1885,7 +2040,7 @@ width = 0
                 invalid("mouse.fly"),
                 SettingsIssue::MouseConflict {
                     gesture: MouseGesture::DoubleClick,
-                    items: vec!["mouse.copy".to_owned(), "mouse.toggle_compact".to_owned()],
+                    items: vec![mouse("copy"), mouse("toggle_compact")],
                 },
             ]
         );
@@ -2052,5 +2207,145 @@ width = 0
                 scrap: false,
             }
         );
+    }
+
+    fn issue(item: SettingsItem, problem: Problem) -> ValidationIssue {
+        ValidationIssue { item, problem }
+    }
+
+    fn with_select_capture(src: &str) -> Settings {
+        let (settings, issues) = load(&format!(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Shift+A\"\n{src}"
+        ));
+        assert_eq!(issues, vec![], "{src}");
+        settings
+    }
+
+    #[test]
+    fn items_are_named_in_notices_and_logs_as_the_file_keys() {
+        let names: Vec<String> = [
+            SettingsItem::SelectCaptureHotkey,
+            SettingsItem::RestoreLastHotkey,
+            SettingsItem::ActiveWindowCaptureHotkey,
+            shortcut("copy"),
+            mouse("close"),
+            SettingsItem::RegionHotkey(0),
+            SettingsItem::RegionName(2),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "hotkeys.select_capture",
+                "hotkeys.restore_last",
+                "hotkeys.active_window_capture",
+                "shortcuts.copy",
+                "mouse.close",
+                "regions[1].hotkey",
+                "regions[3].name",
+            ]
+        );
+        let issue = SettingsIssue::Overlap {
+            chord: chord("Ctrl+C"),
+            hotkey: SettingsItem::SelectCaptureHotkey,
+            shortcut: shortcut("copy"),
+        };
+        let logged = format!("{issue:?}");
+        assert!(
+            logged.contains(r#"hotkey: "hotkeys.select_capture", shortcut: "shortcuts.copy""#),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn validate_blocks_apply_while_the_select_capture_hotkey_is_unset() {
+        let issues = validate(&Settings::default());
+        assert_eq!(
+            issues,
+            vec![issue(SettingsItem::SelectCaptureHotkey, Problem::Unset)]
+        );
+        assert!(issues[0].blocks_apply());
+        assert_eq!(validate(&with_select_capture("")), vec![]);
+    }
+
+    #[test]
+    fn validate_blocks_apply_on_both_rows_of_overlapping_hotkeys() {
+        let settings = with_select_capture(&format!(
+            "restore_last = \"Ctrl+Alt+R\"\n{}",
+            region_src("a", "hotkey = \"Ctrl+Alt+R\"")
+        ));
+        let issues = validate(&settings);
+        let conflict = Problem::Conflict(chord("Ctrl+Alt+R"));
+        assert_eq!(
+            issues,
+            vec![
+                issue(SettingsItem::RestoreLastHotkey, conflict),
+                issue(SettingsItem::RegionHotkey(0), conflict),
+            ]
+        );
+        assert!(issues.iter().all(ValidationIssue::blocks_apply));
+    }
+
+    #[test]
+    fn validate_blocks_apply_on_both_rows_of_overlapping_shortcuts_and_mouse() {
+        let settings = with_select_capture(
+            "[shortcuts]\ncopy = \"Ctrl+W\"\nclose = \"Ctrl+W\"\n[mouse]\ncopy = \"DoubleClick\"\n",
+        );
+        let issues = validate(&settings);
+        let conflict = Problem::Conflict(chord("Ctrl+W"));
+        let mouse_conflict = Problem::MouseConflict(MouseGesture::DoubleClick);
+        assert_eq!(
+            issues,
+            vec![
+                issue(shortcut("copy"), conflict),
+                issue(shortcut("close"), conflict),
+                issue(mouse("copy"), mouse_conflict),
+                issue(mouse("toggle_compact"), mouse_conflict),
+            ]
+        );
+        assert!(issues.iter().all(ValidationIssue::blocks_apply));
+    }
+
+    #[test]
+    fn validate_blocks_apply_on_empty_and_duplicate_region_names() {
+        let mut settings = with_select_capture(&format!(
+            "{}{}{}",
+            region_src("a", ""),
+            region_src("b", ""),
+            region_src("c", "")
+        ));
+        let mut region = |i: usize, name: &str| {
+            settings.regions[i].name = name.to_owned();
+        };
+        region(0, "same");
+        region(1, " ");
+        region(2, "same");
+        let issues = validate(&settings);
+        assert_eq!(
+            issues,
+            vec![
+                issue(SettingsItem::RegionName(0), Problem::DuplicateName),
+                issue(SettingsItem::RegionName(1), Problem::EmptyName),
+                issue(SettingsItem::RegionName(2), Problem::DuplicateName),
+            ]
+        );
+        assert!(issues.iter().all(ValidationIssue::blocks_apply));
+    }
+
+    #[test]
+    fn validate_only_warns_on_a_hotkey_overlapping_a_shortcut() {
+        let settings = with_select_capture("active_window_capture = \"Ctrl+C\"\n");
+        let issues = validate(&settings);
+        let overlap = Problem::Overlap(chord("Ctrl+C"));
+        assert_eq!(
+            issues,
+            vec![
+                issue(SettingsItem::ActiveWindowCaptureHotkey, overlap),
+                issue(shortcut("copy"), overlap),
+            ]
+        );
+        assert!(issues.iter().all(|issue| !issue.blocks_apply()));
     }
 }
