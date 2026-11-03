@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(insert("a_XX_b", 2..4, "{seq}"), ("a_{seq}_b".to_owned(), 7));
         // 選択は逆向きでもよい。全角や絵文字の後ろでも UTF-16 の位置で数える
         assert_eq!(
-            insert("画面😀_", 5..4, "{time}"),
+            insert("画面😀_", std::ops::Range { start: 5, end: 4 }, "{time}"),
             ("画面😀{time}".to_owned(), 10)
         );
         // はみ出す位置は末尾
