@@ -11,6 +11,7 @@ pub mod image;
 pub mod keys;
 pub mod log_file;
 pub mod magnifier;
+pub mod menu;
 pub mod monitors;
 pub mod notice;
 pub mod perf;

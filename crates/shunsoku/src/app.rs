@@ -1138,12 +1138,12 @@ fn on_tray(owner: HWND, event: tray::Event) {
                     false,
                 ));
             }
-            // 定型領域の一覧（設定ファイルの順）。項目の番号は CMD_REGION_FIRST + 添字
+            // 定型領域の一覧（設定ファイルの順）。項目の番号は CMD_REGION_FIRST + 添字。名前の & はそのまま出す
             let region_names: Vec<String> = with_app(|app| {
                 app.settings
                     .regions
                     .iter()
-                    .map(|region| region.name.clone())
+                    .map(|region| shunsoku_core::menu::literal_label(&region.name))
                     .collect()
             })
             .unwrap_or_default();
