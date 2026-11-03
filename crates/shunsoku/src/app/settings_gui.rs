@@ -784,16 +784,20 @@ fn on_test_capture(hwnd: HWND) {
     let Some(index) = regions::selected(hwnd) else {
         return;
     };
-    let Some(region) = with_app(|app| {
-        app.settings_gui
-            .as_ref()
-            .and_then(|gui| gui.editor.draft().regions.get(index).cloned())
+    let Some((region, general_dir)) = with_app(|app| {
+        app.settings_gui.as_ref().and_then(|gui| {
+            let draft = gui.editor.draft();
+            let region = draft.regions.get(index).cloned()?;
+            Some((region, draft.general.save_dir.clone()))
+        })
     })
     .flatten() else {
         return;
     };
+    // 領域に保存先がなければ、写しの全体の保存先（それもなければピクチャ）に保存する。欄のプレビューと同じ
+    let general_dir = general_dir.or_else(|| save::default_dir().ok());
     hide_for_capture(hwnd);
-    if !super::request_trial(&region) {
+    if !super::request_trial(&region, general_dir) {
         log::info!("trial capture while another capture is in progress; ignored");
         capture_done();
     }

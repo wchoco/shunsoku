@@ -3323,14 +3323,14 @@ fn request_reselect(index: usize) -> bool {
 }
 
 /// 設定 GUI の「試しに撮る」: 写しの定型領域 `region` の値で撮る（定型領域キャプチャと同じ待ち行列で、この処理を
-/// 抜けてから撮る）。ほかの依頼を進めていれば受けずに false。
-fn request_trial(region: &settings::Region) -> bool {
+/// 抜けてから撮る）。領域に保存先がなければ `general_dir` に保存する。ほかの依頼を進めていれば受けずに false。
+fn request_trial(region: &settings::Region, general_dir: Option<PathBuf>) -> bool {
     let queued = with_app(|app| {
         if !matches!(app.capture, Capture::Idle) {
             return None;
         }
         app.regions_waiting
-            .push_back(CaptureRequest::trial_region(region));
+            .push_back(CaptureRequest::trial_region(region, general_dir));
         Some(app.windows.message)
     })
     .flatten();
@@ -3489,10 +3489,8 @@ fn menus_visible() -> bool {
 
 /// 定型領域キャプチャを 1 件撮り、依頼の出力（保存・スクラップ）を出す。撮れなければ失敗を通知する。
 fn capture_region(request: CaptureRequest) {
-    let name = match &request.method {
-        CaptureMethod::Region(id) => id.0.clone(),
-        CaptureMethod::TrialRegion(region) => region.name.clone(),
-        _ => return,
+    let Some(name) = request.region_name().map(str::to_owned) else {
+        return;
     };
     let name = name.as_str();
     // 試しに撮る依頼（設定 GUI）は写しの値で、ほかは適用済みの設定から名前で引く
