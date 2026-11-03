@@ -21,12 +21,12 @@ impl Place {
         }
     }
 
-    /// `dpi` のときの、左右の余白の合計（ピクセル）。見出しは本体の `list_view::HEADER_PADDING`（96 DPI で 14）を
+    /// `dpi` のときの、左右の余白の合計（ピクセル）。見出しは本体と同じ `app_window::LIST_HEADER_PADDING`（96 DPI で 14）を
     /// DPI で拡大した値。行は、`LVSCW_AUTOSIZE` が付けた幅（略さない最小の幅）と文字の幅の差を実機で測った値で、
     /// 100% でも 150% でも同じだった（DPI で変わらない）。
     pub fn pad(self, dpi: u32) -> i32 {
         match self {
-            Place::Header => padding(dpi, 14),
+            Place::Header => padding(dpi, shunsoku_core::app_window::LIST_HEADER_PADDING),
             Place::FirstColumn => 8,
             Place::OtherColumn => 12,
         }

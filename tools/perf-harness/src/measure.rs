@@ -18,7 +18,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use shunsoku_core::autostart;
-use shunsoku_core::keys::Chord;
+use shunsoku_core::keys::{Chord, Key, Modifiers};
 use shunsoku_core::perf::{self, Mark, PerfLog, Summary};
 use windows::Win32::Foundation::{ERROR_BAD_LENGTH, HANDLE, LPARAM, WPARAM};
 use windows::Win32::System::Performance::QueryPerformanceCounter;
@@ -28,14 +28,13 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, SendInput,
-    VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_SHIFT,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, HWND_MESSAGE, PostMessageW, SetCursorPos, WM_CLOSE,
 };
-use windows::core::w;
 
 use crate::{Metric, Options};
 
@@ -57,8 +56,9 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// 参考値「撮影 10 回後」の回数。
 const CAPTURES: usize = 10;
 
-/// 本体のウィンドウのクラス名（`crates/shunsoku/src/app.rs` の `CLASS_NAME`）。
-const APP_CLASS: windows::core::PCWSTR = w!("shunsoku.app");
+/// 本体のウィンドウのクラス名（`shunsoku_core::app_window`）。
+const APP_CLASS: windows::core::PCWSTR =
+    windows::core::PCWSTR(shunsoku_core::app_window::APP_CLASS_WIDE.as_ptr());
 
 /// `QueryWorkingSet` の 1 ページの情報のうち「共有できる」のビット。
 const PAGE_SHAREABLE: usize = 1 << 8;
@@ -201,7 +201,7 @@ fn measure_memory(options: &Options, workspace: &Workspace) -> Result<Memory> {
             app.wait(Mark::OverlayFlushed, i, OVERLAY_TIMEOUT)?;
             sleep(Duration::from_millis(200));
             if scrap_missing {
-                send_keys(&[VK_ESCAPE]);
+                send_escape();
             } else {
                 drag((100, 100), (300, 250));
                 if app.wait(Mark::ScrapShown, captured, SCRAP_TIMEOUT).is_ok() {
@@ -211,7 +211,7 @@ fn measure_memory(options: &Options, workspace: &Workspace) -> Result<Memory> {
                     // スクラップを出せない版（区切り scrap_shown を書かない）。範囲選択の画面を閉じるだけにする
                     scrap_missing = true;
                 }
-                send_keys(&[VK_ESCAPE]);
+                send_escape();
             }
             sleep(Duration::from_millis(300));
         }
@@ -231,7 +231,7 @@ fn measure_memory(options: &Options, workspace: &Workspace) -> Result<Memory> {
         } else {
             // スクラップを出せない版（区切り scrap_shown を書かない）。範囲選択の画面を閉じて次へ
             scrap_missing = true;
-            send_keys(&[VK_ESCAPE]);
+            send_escape();
         }
         drop(app);
         sleep(Duration::from_millis(500));
@@ -259,7 +259,7 @@ fn measure_hotkey(options: &Options, workspace: &Workspace) -> Result<Hotkey> {
             hotkey.to_wm_hotkey.extend(log.millis(sent, received));
         }
         sleep(Duration::from_millis(300));
-        send_keys(&[VK_ESCAPE]);
+        send_escape();
         sleep(Duration::from_millis(500));
     }
     Ok(hotkey)
@@ -447,42 +447,40 @@ fn page_size() -> u64 {
     u64::from(info.dwPageSize)
 }
 
-/// ホットキーを押して離す。修飾キーを押してからキーを押し、逆の順に離す。
+/// ホットキーを押して離す。押す順は `Chord::strokes`（修飾キーを押してからキーを押し、逆の順に離す）。
 fn send_hotkey(chord: Chord) {
-    let m = chord.modifiers;
-    let mut keys = Vec::new();
-    for (on, vk) in [
-        (m.win, VK_LWIN),
-        (m.ctrl, VK_CONTROL),
-        (m.alt, VK_MENU),
-        (m.shift, VK_SHIFT),
-    ] {
-        if on {
-            keys.push(vk);
-        }
-    }
-    keys.push(VIRTUAL_KEY(chord.key.vk()));
-    send_keys(&keys);
-}
-
-/// `keys` を順に押し、逆の順に離す。
-fn send_keys(keys: &[VIRTUAL_KEY]) {
-    let key = |vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk,
-                dwFlags: flags,
-                ..Default::default()
-            },
-        },
-    };
-    let inputs: Vec<INPUT> = keys
-        .iter()
-        .map(|&vk| key(vk, KEYBD_EVENT_FLAGS(0)))
-        .chain(keys.iter().rev().map(|&vk| key(vk, KEYEVENTF_KEYUP)))
+    let inputs: Vec<INPUT> = chord
+        .strokes()
+        .into_iter()
+        .map(|k| {
+            let mut flags = KEYBD_EVENT_FLAGS(0);
+            if k.up {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            if k.extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(k.vk),
+                        dwFlags: flags,
+                        ..Default::default()
+                    },
+                },
+            }
+        })
         .collect();
     send(&inputs);
+}
+
+/// Esc を押して離す。
+fn send_escape() {
+    send_hotkey(Chord {
+        modifiers: Modifiers::default(),
+        key: Key::from_vk(VK_ESCAPE.0).expect("Esc は名前の表にある"),
+    });
 }
 
 /// 左ボタンで `from` から `to` まで（スクリーン座標、物理ピクセル）ドラッグする。

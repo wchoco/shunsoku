@@ -9,7 +9,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use shunsoku_core::keys::Chord;
+use shunsoku_core::keys::{Chord, Modifiers};
 
 /// 待つコマンドの時間切れの既定値。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -21,6 +21,7 @@ usage: win-driver --root <テスト用のフォルダ> <コマンド> [引数...
   launch [--portable] <exe> [引数...]     起動して PID を出す。待たない
   run [--portable] [--timeout ms] <exe> [引数...]
                                          終わるまで待ち、終了コード・標準出力・標準エラーを出す
+                                         exe は shunsoku.exe か shunsoku-cli.exe だけ。入力の宛先になるのは shunsoku.exe
   kill <pid>                             自分が起動した PID だけを止める
   pids                                   自分が起動して、まだ動いている PID
 
@@ -48,8 +49,23 @@ usage: win-driver --root <テスト用のフォルダ> <コマンド> [引数...
   move <hwnd> <x> <y>                    テスト対象のウィンドウの左上をスクリーン座標へ動かす（モニタをまたぐ確認）
   keys <組み合わせ>...                   例: keys Tab Ctrl+A Enter
   type <文字>                            Unicode の文字として送る
-  click <x> <y> [left|right]             スクリーン座標（物理ピクセル）
-  tray-menu <pid>                        テスト対象の通知領域のアイコンのメニューを開く
+  hold-key <組み合わせ> <ms>             押したまま ms 待ってから離す
+  click <x> <y> [left|right|middle]      スクリーン座標（物理ピクセル）。カーソルの下もテスト対象か確かめる
+  dblclick <x> <y> [left|right|middle]
+  drag <x1> <y1> <x2> <y2> [--button left|right|middle] [--with 修飾キー]
+                                         例: --with Ctrl+Shift（押したままドラッグ）。通る点すべての下を確かめる
+  wheel <x> <y> <目盛り>                 正は奥へ、負は手前へ
+  hold-button <x> <y> <ms> [left|right|middle]
+  clip-get                               クリップボードの形式と、文字（あれば）・画像の大きさ（あれば）
+  clip-set <文字>                        クリップボードに文字を入れる
+
+入力の例外（宛先が決まっているもの）
+  hotkey <組み合わせ>...                 前面がテスト対象でなければタスクバーを前面にしてから送る。前面がテスト対象・
+                                         デスクトップ・タスクバーのどれでもなければ送らない
+  tray-click <pid>                       テスト対象の通知領域のアイコンを左クリックする。アイコンの上が通知領域で
+                                         なければクリックしない。アイコンが隠れていれば、クリックせずに
+                                         NIN_SELECT を本体に送る（posted と出す）
+  tray-menu <pid>                        テスト対象の通知領域のアイコンのメニューを開く（本体にメッセージを送る）
 
 終了コード: 0 成功、1 失敗・時間切れ、2 使い方の誤り、3 安全の決まりで止めた";
 
@@ -83,6 +99,28 @@ pub struct FocusFilter {
 pub enum Button {
     Left,
     Right,
+    Middle,
+}
+
+/// 解釈できなかった。
+#[derive(Debug, PartialEq)]
+pub enum Usage {
+    /// `--help`。使い方を出して成功で終える。
+    Help,
+    /// 使い方の誤り（終了コード 2）。
+    Invalid(String),
+}
+
+impl From<String> for Usage {
+    fn from(m: String) -> Usage {
+        Usage::Invalid(m)
+    }
+}
+
+impl From<&str> for Usage {
+    fn from(m: &str) -> Usage {
+        Usage::Invalid(m.into())
+    }
 }
 
 /// コマンド。
@@ -166,23 +204,58 @@ pub enum Command {
     Type {
         text: String,
     },
+    HoldKey {
+        chord: Chord,
+        duration: Duration,
+    },
     Click {
         x: i32,
         y: i32,
         button: Button,
+        /// 2 ならダブルクリック。
+        count: u32,
+    },
+    Drag {
+        from: (i32, i32),
+        to: (i32, i32),
+        button: Button,
+        /// ドラッグの間押したままにする修飾キー。
+        with: Modifiers,
+    },
+    Wheel {
+        x: i32,
+        y: i32,
+        notches: i32,
+    },
+    HoldButton {
+        x: i32,
+        y: i32,
+        duration: Duration,
+        button: Button,
+    },
+    ClipGet,
+    ClipSet {
+        text: String,
+    },
+    Hotkey {
+        chords: Vec<Chord>,
+    },
+    TrayClick {
+        pid: u32,
     },
     TrayMenu {
         pid: u32,
     },
 }
 
-pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Invocation, String> {
+pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Invocation, Usage> {
     let mut args = args.into_iter();
     let mut root = None;
     let name = loop {
         match args.next().as_deref() {
             Some("--root") => root = Some(args.next().ok_or("--root の値がない")?),
-            Some("-h" | "--help") | None => return Err(USAGE.into()),
+            Some("-h" | "--help") => return Err(Usage::Help),
+            None => return Err(USAGE.into()),
             Some(name) => break name.to_owned(),
         }
     };
@@ -190,6 +263,41 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Invocation, Strin
     let rest: Vec<String> = args.collect();
     let command = parse_command(&name, rest)?;
     Ok(Invocation { root, command })
+}
+
+fn chords(name: &str, rest: &[String]) -> Result<Vec<Chord>, String> {
+    let chords = rest
+        .iter()
+        .map(|s| Chord::from_str(s).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if chords.is_empty() {
+        return Err(format!("{name}: 組み合わせがない"));
+    }
+    Ok(chords)
+}
+
+fn button(name: &str, s: Option<&str>) -> Result<Button, String> {
+    match s {
+        None | Some("left") => Ok(Button::Left),
+        Some("right") => Ok(Button::Right),
+        Some("middle") => Ok(Button::Middle),
+        Some(b) => Err(format!("{name}: 知らないボタン: {b}")),
+    }
+}
+
+/// `Ctrl+Shift` のような修飾キーだけの並び。
+fn modifiers(s: &str) -> Result<Modifiers, String> {
+    let mut m = Modifiers::default();
+    for part in s.split('+') {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" => m.ctrl = true,
+            "shift" => m.shift = true,
+            "alt" => m.alt = true,
+            "win" => m.win = true,
+            _ => return Err(format!("修飾キーでない: {part}")),
+        }
+    }
+    Ok(m)
 }
 
 fn parse_command(name: &str, rest: Vec<String>) -> Result<Command, String> {
@@ -228,19 +336,19 @@ fn parse_command(name: &str, rest: Vec<String>) -> Result<Command, String> {
                 }
             })
         }
-        "keys" => {
-            let chords = rest
-                .iter()
-                .map(|s| Chord::from_str(s).map_err(|e| e.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
-            if chords.is_empty() {
-                return Err("keys: 組み合わせがない".into());
-            }
-            Ok(Command::Keys { chords })
-        }
+        "keys" => Ok(Command::Keys {
+            chords: chords(name, &rest)?,
+        }),
+        "hotkey" => Ok(Command::Hotkey {
+            chords: chords(name, &rest)?,
+        }),
         "type" => {
             let [text] = <[String; 1]>::try_from(rest).map_err(|_| "type: 文字を 1 つ渡す")?;
             Ok(Command::Type { text })
+        }
+        "clip-set" => {
+            let [text] = <[String; 1]>::try_from(rest).map_err(|_| "clip-set: 文字を 1 つ渡す")?;
+            Ok(Command::ClipSet { text })
         }
         _ => parse_with_options(name, rest),
     }
@@ -336,14 +444,46 @@ fn parse_with_options(name: &str, rest: Vec<String>) -> Result<Command, String> 
             x: number(&o.positional(1, "x")?)?,
             y: number(&o.positional(2, "y")?)?,
         },
-        "click" => Command::Click {
+        "click" | "dblclick" => Command::Click {
             x: number(&o.positional(0, "x")?)?,
             y: number(&o.positional(1, "y")?)?,
-            button: match o.positional(2, "button").ok().as_deref() {
-                None | Some("left") => Button::Left,
-                Some("right") => Button::Right,
-                Some(b) => return Err(format!("click: 知らないボタン: {b}")),
-            },
+            button: button(name, o.positional(2, "button").ok().as_deref())?,
+            count: if name == "click" { 1 } else { 2 },
+        },
+        "drag" => Command::Drag {
+            from: (
+                number(&o.positional(0, "x1")?)?,
+                number(&o.positional(1, "y1")?)?,
+            ),
+            to: (
+                number(&o.positional(2, "x2")?)?,
+                number(&o.positional(3, "y2")?)?,
+            ),
+            button: button(name, o.take("--button").as_deref())?,
+            with: o
+                .take("--with")
+                .map(|s| modifiers(&s))
+                .transpose()?
+                .unwrap_or_default(),
+        },
+        "wheel" => Command::Wheel {
+            x: number(&o.positional(0, "x")?)?,
+            y: number(&o.positional(1, "y")?)?,
+            notches: number(&o.positional(2, "目盛り")?)?,
+        },
+        "hold-key" => Command::HoldKey {
+            chord: Chord::from_str(&o.positional(0, "組み合わせ")?).map_err(|e| e.to_string())?,
+            duration: millis(&o.positional(1, "ms")?)?,
+        },
+        "hold-button" => Command::HoldButton {
+            x: number(&o.positional(0, "x")?)?,
+            y: number(&o.positional(1, "y")?)?,
+            duration: millis(&o.positional(2, "ms")?)?,
+            button: button(name, o.positional(3, "button").ok().as_deref())?,
+        },
+        "clip-get" => Command::ClipGet,
+        "tray-click" => Command::TrayClick {
+            pid: number(&o.positional(0, "pid")?)?,
         },
         "tray-menu" => Command::TrayMenu {
             pid: number(&o.positional(0, "pid")?)?,
@@ -433,7 +573,7 @@ fn hwnd(s: &str) -> Result<isize, String> {
 mod tests {
     use super::*;
 
-    fn p(s: &str) -> Result<Invocation, String> {
+    fn p(s: &str) -> Result<Invocation, Usage> {
         parse(s.split_whitespace().map(str::to_owned))
     }
 
@@ -542,5 +682,109 @@ mod tests {
         assert_eq!(chords[1].key.vk(), 0x41);
         assert!(chords[1].modifiers.ctrl);
         assert!(p(r"--root C:\t keys Ctrl+").is_err());
+    }
+
+    #[test]
+    fn help_is_not_an_error() {
+        assert_eq!(p("--help"), Err(Usage::Help));
+        assert_eq!(p("-h"), Err(Usage::Help));
+        assert!(matches!(p(""), Err(Usage::Invalid(_))));
+    }
+
+    #[test]
+    fn clicks_take_any_of_the_three_buttons_and_a_count() {
+        assert_eq!(
+            cmd("click 10 -20 middle"),
+            Command::Click {
+                x: 10,
+                y: -20,
+                button: Button::Middle,
+                count: 1,
+            }
+        );
+        assert_eq!(
+            cmd("dblclick 10 20"),
+            Command::Click {
+                x: 10,
+                y: 20,
+                button: Button::Left,
+                count: 2,
+            }
+        );
+        assert!(p(r"--root C:\t click 1 2 back").is_err());
+    }
+
+    #[test]
+    fn drag_takes_two_points_a_button_and_held_modifiers() {
+        assert_eq!(
+            cmd("drag 0 0 100 50"),
+            Command::Drag {
+                from: (0, 0),
+                to: (100, 50),
+                button: Button::Left,
+                with: Modifiers::default(),
+            }
+        );
+        assert_eq!(
+            cmd("drag 0 0 100 50 --button right --with Ctrl+Shift"),
+            Command::Drag {
+                from: (0, 0),
+                to: (100, 50),
+                button: Button::Right,
+                with: Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            }
+        );
+        assert!(p(r"--root C:\t drag 0 0 1 1 --with Ctrl+A").is_err());
+    }
+
+    #[test]
+    fn wheel_takes_a_point_and_signed_notches() {
+        assert_eq!(
+            cmd("wheel 5 6 -3"),
+            Command::Wheel {
+                x: 5,
+                y: 6,
+                notches: -3
+            }
+        );
+    }
+
+    #[test]
+    fn holds_take_a_duration_in_millis() {
+        let Command::HoldKey { chord, duration } = cmd("hold-key Shift+F10 800") else {
+            panic!()
+        };
+        assert_eq!(chord.key.vk(), 0x79);
+        assert_eq!(duration, Duration::from_millis(800));
+        assert_eq!(
+            cmd("hold-button 5 6 1200 right"),
+            Command::HoldButton {
+                x: 5,
+                y: 6,
+                duration: Duration::from_millis(1200),
+                button: Button::Right,
+            }
+        );
+    }
+
+    #[test]
+    fn hotkey_and_tray_click_and_clipboard() {
+        let Command::Hotkey { chords } = cmd("hotkey Ctrl+Alt+F9 Ctrl+Alt+F9") else {
+            panic!()
+        };
+        assert_eq!(chords.len(), 2);
+        assert!(p(r"--root C:\t hotkey").is_err());
+        assert_eq!(cmd("tray-click 42"), Command::TrayClick { pid: 42 });
+        assert_eq!(cmd("clip-get"), Command::ClipGet);
+        assert_eq!(
+            cmd("clip-set こんにちは"),
+            Command::ClipSet {
+                text: "こんにちは".into()
+            }
+        );
     }
 }

@@ -50,6 +50,16 @@ impl fmt::Display for Key {
     }
 }
 
+/// キーを 1 回押すか離すこと。道具（`tools/perf-harness`、`tools/win-driver`）が `SendInput` で送る順に並べる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyStroke {
+    pub vk: u16,
+    /// 離す（`KEYEVENTF_KEYUP`）。
+    pub up: bool,
+    /// 拡張キー（`KEYEVENTF_EXTENDEDKEY`）。PageUp〜Delete（0x21〜0x2E）。付けないとテンキーのキーとして届く。
+    pub extended: bool,
+}
+
 /// キーの組み合わせ。修飾キー（なくてもよい）とキー 1 つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Chord {
@@ -83,6 +93,34 @@ impl Chord {
         let mut chord = self;
         chord.modifiers.shift = true;
         chord
+    }
+
+    /// 組み合わせを押すときのキーの順。修飾キーを Win、Ctrl、Alt、Shift の順に押し、キーを押し、逆の順に離す。
+    pub fn strokes(self) -> Vec<KeyStroke> {
+        const WIN: u16 = 0x5B;
+        const CONTROL: u16 = 0x11;
+        const ALT: u16 = 0x12;
+        const SHIFT: u16 = 0x10;
+        let m = self.modifiers;
+        let mut keys: Vec<u16> = [
+            (m.win, WIN),
+            (m.ctrl, CONTROL),
+            (m.alt, ALT),
+            (m.shift, SHIFT),
+        ]
+        .into_iter()
+        .filter_map(|(on, vk)| on.then_some(vk))
+        .collect();
+        keys.push(self.key.vk());
+        let stroke = |vk: u16, up: bool| KeyStroke {
+            vk,
+            up,
+            extended: (0x21..=0x2E).contains(&vk),
+        };
+        keys.iter()
+            .map(|&vk| stroke(vk, false))
+            .chain(keys.iter().rev().map(|&vk| stroke(vk, true)))
+            .collect()
     }
 
     /// 設定 GUI の入力欄で、キー（仮想キーコード `vk`）を押したときに入る組み合わせ。`held` は押したときの
@@ -321,6 +359,50 @@ fn name_of(vk: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stroke(vk: u16, up: bool, extended: bool) -> KeyStroke {
+        KeyStroke { vk, up, extended }
+    }
+
+    #[test]
+    fn strokes_press_modifiers_then_the_key_and_release_in_reverse() {
+        // Win 0x5B、Ctrl 0x11、Alt 0x12、Shift 0x10、A 0x41
+        let chord: Chord = "Shift+Win+Alt+Ctrl+A".parse().unwrap();
+        assert_eq!(
+            chord.strokes(),
+            vec![
+                stroke(0x5B, false, false),
+                stroke(0x11, false, false),
+                stroke(0x12, false, false),
+                stroke(0x10, false, false),
+                stroke(0x41, false, false),
+                stroke(0x41, true, false),
+                stroke(0x10, true, false),
+                stroke(0x12, true, false),
+                stroke(0x11, true, false),
+                stroke(0x5B, true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn navigation_keys_are_sent_as_extended_keys() {
+        // Left 0x25 は拡張キー。付けないとテンキーの 4 になる
+        let chord: Chord = "Ctrl+Left".parse().unwrap();
+        assert_eq!(
+            chord.strokes(),
+            vec![
+                stroke(0x11, false, false),
+                stroke(0x25, false, true),
+                stroke(0x25, true, true),
+                stroke(0x11, true, false),
+            ]
+        );
+        let delete: Chord = "Delete".parse().unwrap();
+        assert!(delete.strokes()[0].extended);
+        let f5: Chord = "F5".parse().unwrap();
+        assert!(!f5.strokes()[0].extended);
+    }
 
     #[test]
     fn parses_and_displays_ctrl_shift_letter() {

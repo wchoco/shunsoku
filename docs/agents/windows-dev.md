@@ -54,7 +54,7 @@ cargo.exe test --workspace -- --ignored
 
 - 値の名前は試験用のもの（`shunsoku-test-<pid>`）だけを使い、終わったら（落ちても）消す。ユーザーの登録（`shunsoku`）には触れない。
 - 走らせる前と後で `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run` と `%APPDATA%\shunsoku` の一覧を控え、同じであることを確かめる。
-- `#[ignore]` の付かない Windows のテストも、ユーザーの環境は変えない。`%APPDATA%` や exe のフォルダには `%TEMP%` の下に作った試験用のフォルダを渡し、終わったら消す。
+- `#[ignore]` の付かない Windows のテストも、ユーザーの環境は変えない。`%APPDATA%` や exe のフォルダには、ビルドの出力（`CARGO_TARGET_DIR` の下）に作った試験用のフォルダを渡し、終わったら消す。ユーザーの `%TEMP%` にも作らない（ACL を変えるテストがある）。
 
 ## 実機を道具で操作する（手動確認）
 

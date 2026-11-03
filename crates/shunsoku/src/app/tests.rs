@@ -1,7 +1,8 @@
 //! ポータブルモードの設定ファイルの書き込み先（docs/manual-checks.md の M5-15、M5-16）。
 //!
-//! exe のフォルダと `%APPDATA%` は `%TEMP%` の下に作った試験用のフォルダを渡す。ユーザーの `%APPDATA%` と
-//! 環境変数には触れない。
+//! exe のフォルダと `%APPDATA%` は、ビルドの出力（`target/` の下。テストの exe の隣）に作った試験用のフォルダを渡す。
+//! ユーザーの `%TEMP%`・`%APPDATA%` と環境変数には触れない。書き込みを断る ACE は試験用のフォルダの中にだけ足し、
+//! 前の回が落ちて残っていれば、次の回の始めに外して消す。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,14 +11,18 @@ use shunsoku_core::settings::{self, OwnWrites, Settings, WriteFailure};
 
 use super::{locate_settings_at, write_settings_file};
 
-/// `%TEMP%` の下の試験用のフォルダ。落ちても消す。
+/// ビルドの出力の下の試験用のフォルダ。名前は回ごとに同じなので、落ちて残ったものは次の回の始めに消える。
 struct Sandbox(PathBuf);
 
 impl Sandbox {
     fn new(name: &str) -> Sandbox {
-        let root =
-            std::env::temp_dir().join(format!("shunsoku-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let exe = std::env::current_exe().unwrap();
+        let root = exe
+            .parent()
+            .unwrap()
+            .join("test-sandbox")
+            .join(format!("shunsoku-test-{name}"));
+        remove(&root);
         std::fs::create_dir_all(root.join("exe")).unwrap();
         std::fs::create_dir_all(root.join("appdata")).unwrap();
         Sandbox(root)
@@ -34,13 +39,20 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        // 書き込みを断る ACE を足していれば外してから消す
-        let _ = Command::new("icacls")
-            .arg(self.exe_dir())
-            .args(["/remove:d", "*S-1-1-0"])
-            .output();
-        let _ = std::fs::remove_dir_all(&self.0);
+        remove(&self.0);
     }
+}
+
+/// 書き込みを断る ACE を足していれば外してから消す。
+fn remove(root: &Path) {
+    if !root.exists() {
+        return;
+    }
+    let _ = Command::new("icacls")
+        .arg(root)
+        .args(["/remove:d", "*S-1-1-0", "/T", "/C", "/Q"])
+        .output();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn is_empty(dir: &Path) -> bool {

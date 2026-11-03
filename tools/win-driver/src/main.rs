@@ -9,6 +9,7 @@
 
 mod cli;
 mod guard;
+mod input;
 mod list_view;
 mod test_env;
 mod wait;
@@ -18,7 +19,11 @@ mod win;
 fn main() {
     let inv = match cli::parse(std::env::args().skip(1)) {
         Ok(inv) => inv,
-        Err(message) => {
+        Err(cli::Usage::Help) => {
+            println!("{}", cli::USAGE);
+            return;
+        }
+        Err(cli::Usage::Invalid(message)) => {
             eprintln!("{message}");
             std::process::exit(2);
         }

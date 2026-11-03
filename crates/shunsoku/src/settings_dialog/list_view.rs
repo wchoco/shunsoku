@@ -76,7 +76,7 @@ pub fn set_cell(list: HWND, row: usize, column: i32, value: &str) {
 }
 
 /// 見出しの文言の左右の余白の合計（96 DPI のピクセル）。
-const HEADER_PADDING: i32 = 14;
+const HEADER_PADDING: i32 = shunsoku_core::app_window::LIST_HEADER_PADDING;
 
 /// 一覧 `list` の列の幅を中身（見出しと全部の行の文言）に合わせ、余りは最後の列に足す
 /// （`columns::column_widths`）。一覧に入りきらなければ略さずに横にスクロールさせる。

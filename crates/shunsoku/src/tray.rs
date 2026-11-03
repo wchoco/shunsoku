@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{HICON, WM_CONTEXTMENU};
 use crate::wide::copy_truncated;
 
 /// トレイのアイコンの番号。通知（`notify`）も同じアイコンに出す。
-pub const ICON_ID: u32 = 1;
+pub const ICON_ID: u32 = shunsoku_core::app_window::TRAY_ICON_ID;
 
 /// トレイのアイコン。drop で消える。
 pub struct Tray {

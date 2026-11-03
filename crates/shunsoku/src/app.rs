@@ -84,6 +84,7 @@ use std::time::Instant;
 use shunsoku_core::APP_NAME;
 use shunsoku_core::annotate::toolbar::{self, Button as ToolbarButton, Layout as ToolbarLayout};
 use shunsoku_core::annotate::{Carryover, EditInput, EditOutput, Style};
+use shunsoku_core::app_window;
 use shunsoku_core::capture::request::{
     self, CaptureMethod, CaptureRequest, OnSaveFailure, ReplyTo, SaveTarget, Source,
 };
@@ -166,8 +167,8 @@ use cli::{
     REPLIER, capture_rect, on_pipe_requests, reply, reply_cancelled, reply_failed, waiting_reply,
 };
 
-/// トレイのアイコンへの操作（`tray::event` で読む）。
-const WM_APP_TRAY: u32 = WM_APP + 1;
+/// トレイのアイコンへの操作（`tray::event` で読む）。道具も送るので、番号は `app_window` に置く。
+const WM_APP_TRAY: u32 = WM_APP + app_window::TRAY_MESSAGE_FROM_WM_APP;
 /// 環境変数 `SHUNSOKU_TEST_PANIC=ui` のとき、UI スレッドでパニックを起こす（手で確かめる用。デバッグ ビルドだけ）。
 #[cfg(debug_assertions)]
 const WM_APP_TEST_PANIC: u32 = WM_APP + 2;
@@ -188,7 +189,7 @@ const WM_APP_SETTINGS_FOCUS: u32 = WM_APP + 8;
 const WM_APP_SETTINGS_DPI: u32 = WM_APP + 9;
 
 /// 2 つのウィンドウのクラス名。2 つ目のプロセスはこの名前でメッセージ専用ウィンドウを探す。
-const CLASS_NAME: PCWSTR = w!("shunsoku.app");
+const CLASS_NAME: PCWSTR = PCWSTR(app_window::APP_CLASS_WIDE.as_ptr());
 /// 2 つ目のプロセスが送る登録メッセージの名前。
 const SECOND_INSTANCE_MESSAGE: PCWSTR = w!("shunsoku.SecondInstance");
 
