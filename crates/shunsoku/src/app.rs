@@ -2145,13 +2145,11 @@ fn drive_recipe(hwnd: HWND, mut run: Run) {
 
 /// いま押されている修飾キー（キーのメッセージを処理している時点の状態）。
 fn held_modifiers() -> Modifiers {
-    // SAFETY: 引数は定数
-    let down = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
     Modifiers {
-        win: down(VK_LWIN.0) || down(VK_RWIN.0),
-        ctrl: down(VK_CONTROL.0),
-        alt: down(VK_MENU.0),
-        shift: down(VK_SHIFT.0),
+        win: key_held(VK_LWIN) || key_held(VK_RWIN),
+        ctrl: key_held(VK_CONTROL),
+        alt: key_held(VK_MENU),
+        shift: key_held(VK_SHIFT),
     }
 }
 
@@ -2861,70 +2859,90 @@ fn selection_modifiers(wparam: WPARAM) -> Option<Input> {
 
 /// いま押している Shift と Ctrl。`GetKeyState` は処理中のメッセージまでを反映する。
 fn held_selection_modifiers() -> Input {
-    // SAFETY: GetKeyState は引数のキーの状態を読むだけ
-    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
     Input::Modifiers {
-        shift: down(VK_SHIFT),
-        ctrl: down(VK_CONTROL),
+        shift: key_held(VK_SHIFT),
+        ctrl: key_held(VK_CONTROL),
     }
 }
 
-/// 範囲選択の画面での `WM_KEYDOWN` を入力にする。対象でないキーは None。
+/// `key` を押しているか。`GetKeyState` は処理中のメッセージまでを反映する。
+fn key_held(key: VIRTUAL_KEY) -> bool {
+    // SAFETY: GetKeyState は引数のキーの状態を読むだけ
+    unsafe { GetKeyState(i32::from(key.0)) < 0 }
+}
+
+/// 範囲選択の画面とトリムで共通の、`WM_KEYDOWN` の読み方。
+struct KeyDown {
+    key: VIRTUAL_KEY,
+    /// 押しっぱなしの自動リピート（lParam の bit 30 = 直前も押されていた）。
+    repeat: bool,
+    shift: bool,
+    ctrl: bool,
+}
+
+impl KeyDown {
+    fn read(wparam: WPARAM, lparam: LPARAM) -> KeyDown {
+        KeyDown {
+            key: VIRTUAL_KEY(wparam.0 as u16),
+            repeat: lparam.0 & (1 << 30) != 0,
+            shift: key_held(VK_SHIFT),
+            ctrl: key_held(VK_CONTROL),
+        }
+    }
+
+    /// 矢印キーの向き。矢印キーでなければ None。Ctrl つきは大きさを変え、Shift つきは 10px ずつ動かす。
+    fn arrow(&self) -> Option<Direction> {
+        match self.key {
+            VK_LEFT => Some(Direction::Left),
+            VK_RIGHT => Some(Direction::Right),
+            VK_UP => Some(Direction::Up),
+            VK_DOWN => Some(Direction::Down),
+            _ => None,
+        }
+    }
+}
+
 /// トリムの最中のキーを、トリムの入力にする。範囲選択の画面の精密モード（`selection_key`）と同じ割り当て。
 fn trim_key(wparam: WPARAM, lparam: LPARAM) -> Option<TrimInput> {
-    // SAFETY: GetKeyState は引数のキーの状態を読むだけ
-    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
-    // 押しっぱなしの自動リピート（lParam の bit 30 = 直前も押されていた）
-    let repeat = lparam.0 & (1 << 30) != 0;
-    let shift = down(VK_SHIFT);
-    let arrow = |direction| {
-        Some(if down(VK_CONTROL) {
+    let key = KeyDown::read(wparam, lparam);
+    if let Some(direction) = key.arrow() {
+        let shift = key.shift;
+        return Some(if key.ctrl {
             TrimInput::ResizeArrow { direction, shift }
         } else {
             TrimInput::Arrow { direction, shift }
-        })
-    };
-    match VIRTUAL_KEY(wparam.0 as u16) {
+        });
+    }
+    match key.key {
         VK_ESCAPE => Some(TrimInput::Cancel),
-        VK_RETURN | VK_SPACE if !repeat => Some(TrimInput::Confirm),
-        VK_LEFT => arrow(Direction::Left),
-        VK_RIGHT => arrow(Direction::Right),
-        VK_UP => arrow(Direction::Up),
-        VK_DOWN => arrow(Direction::Down),
+        VK_RETURN | VK_SPACE if !key.repeat => Some(TrimInput::Confirm),
         _ => None,
     }
 }
 
+/// 範囲選択の画面での `WM_KEYDOWN` を入力にする。対象でないキーは None。
 fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
-    // SAFETY: GetKeyState は引数のキーの状態を読むだけ
-    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
-    // 押しっぱなしの自動リピート（lParam の bit 30 = 直前も押されていた）
-    let repeat = lparam.0 & (1 << 30) != 0;
-    let shift = down(VK_SHIFT);
-    let win = down(VK_LWIN) || down(VK_RWIN);
-    let ctrl = down(VK_CONTROL);
-    let arrow = |direction| {
-        Some(if ctrl {
-            Input::ResizeArrow { direction, shift }
-        } else {
-            Input::Arrow { direction, shift }
-        })
-    };
     if let Some(input) = selection_modifiers(wparam) {
         return Some(input);
     }
-    match VIRTUAL_KEY(wparam.0 as u16) {
+    let key = KeyDown::read(wparam, lparam);
+    if let Some(direction) = key.arrow() {
+        let shift = key.shift;
+        return Some(if key.ctrl {
+            Input::ResizeArrow { direction, shift }
+        } else {
+            Input::Arrow { direction, shift }
+        });
+    }
+    let win = key_held(VK_LWIN) || key_held(VK_RWIN);
+    match key.key {
         VK_ESCAPE => Some(Input::Escape),
-        VK_TAB if !repeat => Some(Input::ToggleMode),
-        VK_RETURN if !repeat => Some(Input::Enter),
-        VK_LEFT => arrow(Direction::Left),
-        VK_RIGHT => arrow(Direction::Right),
-        VK_UP => arrow(Direction::Up),
-        VK_DOWN => arrow(Direction::Down),
+        VK_TAB if !key.repeat => Some(Input::ToggleMode),
+        VK_RETURN if !key.repeat => Some(Input::Enter),
         // 押しっぱなしで始点と終点が続けて決まらないよう、リピートは無視する
-        VK_SPACE if !repeat => Some(Input::Space),
+        VK_SPACE if !key.repeat => Some(Input::Space),
         // Ctrl+A と Ctrl+Shift+A だけ。Ctrl+Alt+A などほかの修飾キーとの組み合わせは対象にしない
-        VK_A if ctrl && !down(VK_MENU) && !win && !repeat => Some(if shift {
+        VK_A if key.ctrl && !key_held(VK_MENU) && !win && !key.repeat => Some(if key.shift {
             Input::SelectAllMonitors
         } else {
             Input::SelectMonitor
