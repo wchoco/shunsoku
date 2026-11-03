@@ -21,6 +21,7 @@ use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
 use shunsoku_core::selection::Mode;
 use shunsoku_core::settings::editor::{Editor, choices};
+use shunsoku_core::settings::form::{FillPass, RegionDetail};
 use shunsoku_core::settings::{
     BORDER_WIDTH_RANGE, DpiScaling, OPACITY_RANGE, Region, Rgb, Settings, TRASH_LIMIT_RANGE,
 };
@@ -190,9 +191,7 @@ pub struct Fields {
     /// インストール済みの書体（昇順）。書体のドロップダウンの候補。
     fonts: Rc<Vec<String>>,
     /// 定型領域の詳細の欄が指す領域（`bind_region`）。
-    region: usize,
-    /// `bind_region` で結び直してから、まだ欄に出していない。フォーカスのある欄も書き換える（前の領域の値が残るため）。
-    rebound: Cell<bool>,
+    region: RegionDetail,
 }
 
 impl Fields {
@@ -213,8 +212,7 @@ impl Fields {
 
     /// 定型領域の詳細の欄と横のボタンを、領域 `index` に結び直す。
     pub fn bind_region(&mut self, index: usize) {
-        self.region = index;
-        self.rebound.set(true);
+        self.region.bind(index);
         for row in &mut self.rows {
             row.field = row.field.with_region(index);
         }
@@ -233,7 +231,12 @@ impl Fields {
 
     /// 定型領域の詳細の欄が指す領域。
     pub fn region(&self) -> usize {
-        self.region
+        self.region.index()
+    }
+
+    /// 欄に出し始める（`fill` に渡す）。結び直した直後の 1 回だけ、フォーカスのある詳細の欄も書き換える。
+    pub fn begin_fill(&mut self) -> FillPass {
+        self.region.begin_fill()
     }
 }
 
@@ -649,11 +652,10 @@ pub fn is_filling() -> bool {
 }
 
 /// 写し `editor` を欄に出す。
-pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
+pub fn fill(hwnd: HWND, fields: &Fields, pass: FillPass, editor: &Editor, text: Text) {
     FILLING.set(true);
     // SAFETY: 引数なし
     let focus = unsafe { GetFocus() };
-    let rebound = fields.rebound.replace(false);
     for row in &fields.rows {
         let Some(control) = item(hwnd, row.control) else {
             continue;
@@ -671,8 +673,8 @@ pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
                 }
             }
             Shown::Text(value) => {
-                let keep_typing = control == focus && !(rebound && row.field.is_region());
-                if !keep_typing && window_text(control) != value {
+                let overwrite = pass.overwrites(control == focus, row.field.is_region());
+                if overwrite && window_text(control) != value {
                     set_window_text(control, &value);
                 }
             }
@@ -872,8 +874,7 @@ impl Fields {
             rows: Vec::new(),
             buttons: Vec::new(),
             fonts: Rc::new(installed_fonts()),
-            region: 0,
-            rebound: Cell::new(false),
+            region: RegionDetail::default(),
         }
     }
 }

@@ -82,6 +82,7 @@ use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescri
 use crate::selection::Mode;
 
 pub mod editor;
+pub mod form;
 mod location;
 pub mod merge;
 pub mod unset;

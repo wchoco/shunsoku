@@ -43,7 +43,7 @@
 //!   未設定のまま GUI を閉じたときは通知する（core の `settings::unset::prompt`）。
 //! - 設定 GUI（トレイの「設定…」・2 つ目の起動）は `settings_gui` が開き、ダイアログの組み立ては `settings_dialog`。
 //!   適用は `write_settings` で書いてから `adopt_settings` で読み込み直しと同じ反映をする。キーの入力欄に
-//!   フォーカスがある間はホットキーの登録を外す（`App::hotkeys_suspended`）。
+//!   フォーカスがある間はホットキーの登録を外す（`App::hotkey_pause`）。
 //! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。通知のクリックは
 //!   中身を持たないので、クリックで開くフォルダ（`App::notice_folder`）を覚えておき、新しい通知を出したら忘れる。
 //! - コピーと保存の画像は `render::render_image` で表示と同じ描き方で作る。保存先とファイル名は UI スレッドで
@@ -102,6 +102,7 @@ use shunsoku_core::scrap::{
     Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
 use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
+use shunsoku_core::settings::form::HotkeyPause;
 use shunsoku_core::settings::{
     self, LogLevel, Rgb, Settings, SettingsChanges, SettingsIssue, unset,
 };
@@ -291,7 +292,7 @@ struct App {
     /// 開いている設定 GUI。
     settings_gui: Option<settings_gui::SettingsGui>,
     /// 設定 GUI のキーの組み合わせの欄にフォーカスがあり、全体のホットキーの登録を外している。
-    hotkeys_suspended: bool,
+    hotkey_pause: HotkeyPause,
     /// 最後に登録したときに登録できなかったホットキー（設定 GUI の印にする）。
     unregistered: Vec<settings::SettingsItem>,
     hotkeys: hotkey::Registered,
@@ -909,7 +910,7 @@ fn start(
         notice_folder: None,
         gpu: grab::Gpu::default(),
         settings_gui: None,
-        hotkeys_suspended: false,
+        hotkey_pause: HotkeyPause::default(),
         unregistered: failed.iter().map(|f| f.action.into()).collect(),
         hotkeys,
         windows,
@@ -3847,7 +3848,7 @@ fn adopt_settings(
     log::info!("settings changed: {changes:?}");
     let keymap = settings::keymap(&app.settings, ops::OPERATIONS);
     log_issues(&keymap.issues);
-    let failed = if (changes.hotkeys || reregister) && !app.hotkeys_suspended {
+    let failed = if (changes.hotkeys || reregister) && !app.hotkey_pause.is_paused() {
         register_hotkeys(app)
     } else {
         Vec::new()

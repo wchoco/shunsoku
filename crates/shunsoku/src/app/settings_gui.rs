@@ -17,7 +17,7 @@
 //!   あとの `region_registered`。開いていれば写しと base にも足す）。
 //!   「範囲を選び直す」と「試しに撮る」は、ダイアログを隠してから（写り込まないように）依頼し、範囲選択の画面を
 //!   閉じたか撮り終えたら出し直す（`capture_done`）。選び直した範囲は写しに入れるだけ（`region_reselected`）。
-//! - キーの組み合わせの欄にフォーカスがある間は、全体のホットキーの登録を外す（`App::hotkeys_suspended`）。欄の
+//! - キーの組み合わせの欄にフォーカスがある間は、全体のホットキーの登録を外す（`App::hotkey_pause`）。欄の
 //!   フォーカスの出入りで `WM_APP_SETTINGS_FOCUS` を自分に送り、届いた時点のフォーカスで決める（`check_focus`）。
 //! - 適用（`apply`）: その時点のファイルと写しを 3 者で突き合わせ（`settings::merge`）、両方で変えた項目があれば
 //!   借りずに確かめてから、結果を書き（`write_settings`）、読み込み直しと同じ反映をし（`adopt_settings`）、ホットキーは
@@ -34,6 +34,7 @@ use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
 use shunsoku_core::monitors;
 use shunsoku_core::settings::editor::{Editor, Move};
+use shunsoku_core::settings::form::PauseChange;
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
@@ -263,15 +264,21 @@ fn refresh(hwnd: HWND) {
         regions::sync_list(hwnd, &editor, bound, text);
     }
     let snapshot = with_app(|app| {
-        app.settings_gui
-            .as_ref()
-            .map(|gui| (gui.rows.clone(), gui.fields.clone(), gui.editor.clone()))
+        app.settings_gui.as_mut().map(|gui| {
+            let pass = gui.fields.begin_fill();
+            (
+                gui.rows.clone(),
+                gui.fields.clone(),
+                pass,
+                gui.editor.clone(),
+            )
+        })
     })
     .flatten();
-    if let Some((rows, fields, editor)) = snapshot {
+    if let Some((rows, fields, pass, editor)) = snapshot {
         // コントロールにメッセージを送るので、借りずに出す
         settings_dialog::fill(hwnd, &rows, &editor, text);
-        fields::fill(hwnd, &fields, &editor, text);
+        fields::fill(hwnd, &fields, pass, &editor, text);
     }
 }
 
@@ -919,7 +926,7 @@ fn apply_merged(app: &mut App, confirmed: &[Field]) -> Option<Step> {
         return Some(Step::Done(Err(e)));
     }
     // 適用では登録し直して結果を見る。欄にフォーカスが残っていれば、`check_focus` で外し直す
-    app.hotkeys_suspended = false;
+    app.hotkey_pause.reregistering();
     let (_, failed) = adopt_settings(app, &old, true);
     let unregistered = app.unregistered.clone();
     let applied = app.settings.clone();
@@ -974,21 +981,24 @@ fn check_focus() {
     let focus = unsafe { GetFocus() };
     let in_field = chord_field::is_field(focus);
     with_app(|app| {
-        if in_field && !app.hotkeys_suspended {
-            app.hotkeys.reregister(&BTreeMap::new());
-            app.hotkeys_suspended = true;
-            log::info!("hotkeys suspended while a chord field has focus");
-        } else if !in_field && app.hotkeys_suspended {
-            resume_hotkeys(app);
-        }
+        let change = app.hotkey_pause.focus_changed(in_field);
+        pause_hotkeys(app, change);
     });
 }
 
-fn resume_hotkeys(app: &mut App) {
-    app.hotkeys_suspended = false;
-    let failed = register_hotkeys(app);
-    log_failed(&failed);
-    log::info!("hotkeys registered again");
+fn pause_hotkeys(app: &mut App, change: Option<PauseChange>) {
+    match change {
+        Some(PauseChange::Pause) => {
+            app.hotkeys.reregister(&BTreeMap::new());
+            log::info!("hotkeys suspended while a chord field has focus");
+        }
+        Some(PauseChange::Resume) => {
+            let failed = register_hotkeys(app);
+            log_failed(&failed);
+            log::info!("hotkeys registered again");
+        }
+        None => {}
+    }
 }
 
 /// ダイアログが壊れた。範囲選択キャプチャのホットキーが未設定のまま（キャンセルで）閉じたら、通知で知らせる。
@@ -996,9 +1006,8 @@ fn closed() {
     DIALOG.set(None);
     let notice = with_app(|app| {
         app.settings_gui = None;
-        if app.hotkeys_suspended {
-            resume_hotkeys(app);
-        }
+        let change = app.hotkey_pause.closed();
+        pause_hotkeys(app, change);
         if unset::prompt(unset::When::GuiClosed, &app.settings) == Some(unset::Prompt::Notify) {
             settings_notice(Moment::Reload, &[], &[], true, app.settings_path.as_deref())
         } else {
