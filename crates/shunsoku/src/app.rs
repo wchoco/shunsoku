@@ -50,6 +50,21 @@
 //!   ごみ箱に入れる画素は元の画像（トリム前）で、トリムの範囲は `ScrapModel` に残るので、戻すとトリムしたまま戻る。
 //! - トリムの範囲を選んでいる間（`Effect::EnterTrimMode` から）は、左ボタン・カーソルの移動・Enter・`Esc`・
 //!   ダブルクリックを core の `ScrapModel::trim_input` に渡し、範囲を描き直す（`on_trim_input`）。
+//! - 書き込みの編集モードの間（`Effect::EnterEditMode` から）は、左ボタン・カーソルの移動・キーを core の
+//!   `ScrapModel::edit_input` に渡し、描き直す（`on_edit_input`）。ショートカットとマウスの割り当て（ホイール・
+//!   中クリック・ダブルクリックも）は効かない。ほかのウィンドウにフォーカスが移ったら（`WM_ACTIVATE`）抜ける。
+//! - 編集モードの間は、スクラップの直下にツールバー（`toolbar_window`、`Scrap::toolbar`）を出す。押してもスクラップの
+//!   フォーカスは動かない。道具・色・太さを選ぶ（`EditInput::Pick`）、完了（`EditInput::Leave`）、つまみのドラッグで
+//!   スクラップごと動かす（`on_toolbar_drag`）。置き場所は core の `annotate::toolbar::place` で、スクラップを描き直す・
+//!   動かすたび（`Scrap::paint` / `Scrap::redraw`）についていく。選んだものは `App::carryover` に覚え、次の編集モードに
+//!   引き継ぐ。
+//!   書き込みは表示にも保存とコピーにも `render` の同じ関数で描く（ADR-0006）。
+//! - 文字の道具で打つ間（`EditOutput::TypingStarted` から `TypingEnded` まで）だけ、スクラップで IME を使う
+//!   （`ime`、`sync_ime`）。`WM_CHAR` は `EditInput::Utf16`、IME の確定した文字と変換中の文字は
+//!   `EditInput::Composition` にして渡す。変換中の文字は core（`EditState::composition`）が持ち、打っている文字の
+//!   続きに描く。変換中にクリックやツールバーなどで打ち終えるときに変換中の文字を確定したことにするのも core で、
+//!   そのとき（`EditOutput::CompositionTaken`）は IME の側の変換中の文字を捨てる。編集モードのダブルクリックは
+//!   `EditInput::DoubleClick`。
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -60,6 +75,8 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
+use shunsoku_core::annotate::toolbar::{self, Button as ToolbarButton, Layout as ToolbarLayout};
+use shunsoku_core::annotate::{Carryover, EditInput, EditOutput, Style};
 use shunsoku_core::capture::request::{
     self, CaptureMethod, CaptureRequest, OnSaveFailure, ReplyTo, SaveTarget, Source,
 };
@@ -78,7 +95,7 @@ use shunsoku_core::scrap::{
     Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
 use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
-use shunsoku_core::settings::{self, LogLevel, Settings, SettingsChanges, SettingsIssue};
+use shunsoku_core::settings::{self, LogLevel, Rgb, Settings, SettingsChanges, SettingsIssue};
 use shunsoku_core::trash::TrashId;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
@@ -99,23 +116,36 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetMessagePos, GetMessageW, HWND_MESSAGE, IDI_APPLICATION, IsWindowVisible,
     KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SPI_GETSELECTIONFADE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    SetCursorPos, SetTimer, SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE,
-    WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    SetCursorPos, SetTimer, SystemParametersInfoW, TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE,
+    WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
 // 精密モード（#66）で足したもの
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
 use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, WM_SETCURSOR};
+// 文字の書き込み（#87）で足したもの
+use crate::ime;
+use shunsoku_core::annotate::{EditState, Font};
+use windows::Win32::UI::WindowsAndMessaging::{
+    WM_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+};
+// 書き込みのツールバー（#84）で足したもの
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, IDC_SIZEALL, LoadCursorW, MA_NOACTIVATE, SetCursor, WM_MOUSEACTIVATE,
+};
 
 mod cli;
 
 use crate::{
     clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook, perf,
-    pipe_server, render, save, scrap_window, settings_watch, single_instance, trash_store, tray,
-    window_list,
+    pipe_server, render, save, scrap_window, settings_watch, single_instance, toolbar_window,
+    trash_store, tray, window_list,
 };
 use cli::{
     REPLIER, capture_rect, on_pipe_requests, reply, reply_cancelled, reply_failed, waiting_reply,
@@ -177,6 +207,9 @@ const ZOOM_LABEL_MS: u32 = 1000;
 /// スクラップのウィンドウのモニタの DPI が変わった（wparam が新しい DPI）。`WM_DPICHANGED` はウィンドウを
 /// 動かしている間（App を借りている間）に届くので、自分に送り直して借りられるときに core へ渡す。
 const WM_APP_SCRAP_DPI: u32 = WM_APP + 0x100;
+/// スクラップが非アクティブになった（`WM_ACTIVATE` の `WA_INACTIVE`）。隠す・壊すなど App を借りている間にも届くので、
+/// 自分に送り直して借りられるときに編集モードを抜ける。
+const WM_APP_SCRAP_INACTIVE: u32 = WM_APP + 0x101;
 
 /// UI スレッドのパニックで終わったときの終了コード（Rust の既定と同じ）。
 const EXIT_PANIC: i32 = 101;
@@ -234,6 +267,8 @@ struct App {
     save_fallbacks: Vec<(PathBuf, Fallback)>,
     /// スクラップの中身を描く Direct2D の描き手。描き直しのたびに作らないよう使い回す（`paint_scrap`）。
     renderer: Option<render::Renderer>,
+    /// 書き込みの編集モードで最後に選んだ道具・色・太さ。アプリが動いている間、次の編集モードに引き継ぐ。
+    carryover: Carryover,
     /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
     notice_folder: Option<PathBuf>,
     gpu: grab::Gpu,
@@ -278,6 +313,8 @@ struct Fallback {
 
 /// 浮かべているスクラップ 1 枚。
 struct Scrap {
+    /// 書き込みの編集モードの間だけ出すツールバー。持ち主のウィンドウより先に壊すよう、`window` より前に置く。
+    toolbar: Option<Toolbar>,
     /// drop でウィンドウを壊す。
     window: scrap_window::ScrapWindow,
     model: ScrapModel,
@@ -291,9 +328,102 @@ struct Scrap {
     wheel: Wheel,
     /// 倍率を出しているか（`Effect::ShowZoom` から `TIMER_ZOOM_LABEL` が鳴るまで）。
     zoom_label: bool,
+    /// 最後に描いたキャレットの矩形（ウィンドウの中の座標）。打っていなければ None。
+    caret: std::cell::Cell<Option<Rect>>,
+}
+
+/// 書き込みの編集モードのツールバー。
+struct Toolbar {
+    /// drop でウィンドウを壊す。
+    window: toolbar_window::ToolbarWindow,
+    /// 並べる色（`toolbar::palette`）。入ったときの設定の既定色で決める。
+    colours: Vec<Rgb>,
+    /// 最後に出した並びと矩形（スクリーン座標）。まだ出していなければ None。当たり判定に使う。
+    placed: std::cell::RefCell<Option<(ToolbarLayout, Rect)>>,
+    /// つまみのドラッグ。
+    drag: Drag,
+}
+
+impl Toolbar {
+    /// スクリーン座標の点 `at` にあるボタン。
+    fn hit(&self, at: Point) -> Option<ToolbarButton> {
+        let placed = self.placed.borrow();
+        let (layout, rect) = placed.as_ref()?;
+        layout.hit(Point::new(at.x - rect.left, at.y - rect.top))
+    }
+}
+
+/// ツールバーとスクラップの画像の間（DPI 96 のときの物理ピクセル。枠と影の外に足す）。
+const TOOLBAR_GAP: f64 = 4.0;
+
+/// `hwnd` のあるモニタの作業領域（タスクバーを除く。スクリーン座標）。
+fn work_area(hwnd: HWND) -> Option<Rect> {
+    // SAFETY: 引数は生きているウィンドウと、この関数の中の構造体
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(monitor, &mut info).as_bool().then(|| {
+            let r = info.rcWork;
+            Rect::new(r.left, r.top, r.right, r.bottom)
+        })
+    }
 }
 
 impl Scrap {
+    /// 書き込みのツールバーを、スクラップの画像の直下（`toolbar::place`）に出す。`repaint` か、DPI が変わって並びが
+    /// 変わったときだけ描き直し、そうでなければ動かすだけにする。ツールバーがなければ何もしない。
+    fn sync_toolbar(
+        &self,
+        appearance: &Appearance,
+        renderer: &mut Option<render::Renderer>,
+        repaint: bool,
+    ) {
+        let (Some(toolbar), Some(state)) = (&self.toolbar, self.model.edit_state()) else {
+            return;
+        };
+        let scale = f64::from(self.window.dpi()) / 96.0;
+        let layout = ToolbarLayout::for_state(&toolbar.colours, scale, state);
+        let size = layout.size();
+        let image = self.model.image_rect();
+        let work = work_area(self.window.hwnd()).unwrap_or(image);
+        let gap = self.model.appearance(appearance).margin() + (TOOLBAR_GAP * scale).round() as i32;
+        let rect = Rect::from_origin_size(toolbar::place(image, size, work, gap), size);
+        let mut placed = toolbar.placed.borrow_mut();
+        let first = placed.is_none();
+        let same = placed.as_ref().is_some_and(|(l, _)| *l == layout);
+        let shown = if same && !repaint {
+            toolbar.window.move_to(rect)
+        } else {
+            (|| {
+                let canvas = render::Canvas::new(size)?;
+                let painter = match renderer.take() {
+                    Some(painter) => painter,
+                    None => render::Renderer::new()?,
+                };
+                painter.paint_toolbar(
+                    &canvas,
+                    &layout,
+                    state,
+                    self.model.annotations(),
+                    scale as f32,
+                )?;
+                *renderer = Some(painter);
+                toolbar.window.present(canvas.dc(), rect)
+            })()
+        };
+        if let Err(e) = shown {
+            log::warn!("could not show the annotation toolbar: {e}");
+            return;
+        }
+        *placed = Some((layout, rect));
+        if first {
+            toolbar.window.show();
+        }
+    }
+
     /// 表示する画像（保存・コピーの対象）。トリムしていればトリム後。
     fn shown(&self) -> &Image {
         self.shown.as_ref().unwrap_or(&self.image)
@@ -316,7 +446,9 @@ impl Scrap {
         repaint: bool,
     ) -> Result<()> {
         if self.model.same_content(before) && !repaint {
-            self.window.move_to(self.model.window_rect(appearance))
+            self.window.move_to(self.model.window_rect(appearance))?;
+            self.sync_toolbar(appearance, renderer, false);
+            Ok(())
         } else {
             self.paint(appearance, renderer)
         }
@@ -355,14 +487,17 @@ impl Scrap {
             percent: self.model.zoom(),
             scale: self.window.dpi() as f32 / 96.0,
         });
-        paint_scrap(
+        let caret = paint_scrap(
             renderer,
             &self.window,
             self.shown(),
             &self.model,
             appearance,
             label,
-        )
+        )?;
+        self.caret.set(caret);
+        self.sync_toolbar(appearance, renderer, true);
+        Ok(())
     }
 }
 
@@ -372,6 +507,8 @@ impl Scrap {
 ///
 /// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
 /// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
+/// 文字を打っていれば、IME の変換中の文字（`EditState::composition`）をつなげて描き、キャレットの矩形（ウィンドウの
+/// 中の座標）を返す。
 fn paint_scrap(
     renderer: &mut Option<render::Renderer>,
     window: &scrap_window::ScrapWindow,
@@ -379,7 +516,7 @@ fn paint_scrap(
     model: &ScrapModel,
     appearance: &Appearance,
     label: Option<render::ZoomLabel>,
-) -> Result<()> {
+) -> Result<Option<Rect>> {
     let rect = model.window_rect(appearance);
     let appearance = &model.appearance(appearance);
     let canvas = render::Canvas::new(rect.size())?;
@@ -403,10 +540,29 @@ fn paint_scrap(
             r.offset(margin - model.position.x, margin - model.position.y)
         }),
     });
-    painter.paint_scrap(&canvas, image, display, appearance, label, trim)?;
+    let annotations = model.annotations_to_draw();
+    let typing = model.typing_annotation();
+    let composition = model.edit_state().and_then(EditState::composition);
+    let overlays = render::Overlays {
+        annotations: render::AnnotationLayer {
+            annotations: &annotations,
+            view: model.annotation_view(),
+            selected: model.selected_annotation().map(|a| a.bounds()),
+            typing: typing.as_ref().map(|annotation| render::TypingLayer {
+                annotation,
+                composition: composition.map_or("", |c| c.text.as_str()),
+                cursor: composition.map_or(0, |c| c.cursor),
+            }),
+            scale: window.dpi() as f32 / 96.0,
+        },
+        label,
+        trim,
+    };
+    let caret = painter.paint_scrap(&canvas, image, display, appearance, overlays)?;
     *renderer = Some(painter);
     // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
-    window.present(canvas.dc(), rect, appearance.opacity)
+    window.present(canvas.dc(), rect, appearance.opacity)?;
+    Ok(caret)
 }
 
 struct Windows {
@@ -588,6 +744,7 @@ fn start(
 
     overlay::register_class(module, Some(overlay_wndproc))?;
     scrap_window::register_class(module, Some(scrap_wndproc))?;
+    toolbar_window::register_class(module, Some(toolbar_wndproc))?;
 
     // SAFETY: 名前は 'static
     let _ = TASKBAR_CREATED.set(unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
@@ -686,6 +843,7 @@ fn start(
         pending_saves: Vec::new(),
         save_fallbacks: Vec::new(),
         renderer: None,
+        carryover: Carryover::default(),
         notice_folder: None,
         gpu: grab::Gpu::default(),
         hotkeys,
@@ -754,6 +912,17 @@ unsafe extern "system" fn scrap_wndproc(
 ) -> LRESULT {
     // SAFETY: 受け取った引数をそのまま渡す
     unsafe { dispatch(on_scrap_message, hwnd, msg, wparam, lparam) }
+}
+
+/// 書き込みのツールバーのウィンドウのプロシージャ。
+unsafe extern "system" fn toolbar_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: 受け取った引数をそのまま渡す
+    unsafe { dispatch(on_toolbar_message, hwnd, msg, wparam, lparam) }
 }
 
 /// `handler` をパニックから守って呼ぶ。`handler` が None を返したら DefWindowProcW に任せる。
@@ -1099,6 +1268,9 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             // SAFETY: 自分のウィンドウ
             unsafe { SetCapture(hwnd) };
             let at = message_screen_point();
+            if on_edit_input(hwnd, EditInput::Press(at)).is_some() {
+                return Some(LRESULT(0));
+            }
             if !on_trim_input(hwnd, TrimInput::Press(at)) {
                 with_app(|app| {
                     if let Some(scrap) = app.scrap_mut(hwnd) {
@@ -1109,7 +1281,9 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             Some(LRESULT(0))
         }
         WM_MOUSEMOVE => {
-            if is_trimming(hwnd) {
+            if is_editing(hwnd) {
+                on_edit_move(hwnd, wparam, message_screen_point());
+            } else if is_trimming(hwnd) {
                 on_trim_move(hwnd, wparam, message_screen_point());
             } else {
                 on_scrap_drag(hwnd, wparam, message_screen_point());
@@ -1129,15 +1303,24 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
                 }
             });
             on_trim_input(hwnd, TrimInput::Release);
+            on_edit_input(hwnd, EditInput::Release);
             Some(LRESULT(0))
         }
         // 2 回目の押下は WM_LBUTTONDOWN の代わりにこれで来る（CS_DBLCLKS）。トリムの最中は確定にする
+        // 書き込みの編集モードでは core に渡す（文字の上なら打ち直し、ほかはふつうの押下と同じに描き始める）
         WM_LBUTTONDBLCLK => {
+            let at = message_screen_point();
+            if is_editing(hwnd) {
+                // SAFETY: 自分のウィンドウ
+                unsafe { SetCapture(hwnd) };
+                on_edit_input(hwnd, EditInput::DoubleClick(at));
+                return Some(LRESULT(0));
+            }
             if on_trim_input(hwnd, TrimInput::Confirm) {
                 return Some(LRESULT(0));
             }
             let context = OpContext {
-                cursor: Some(message_screen_point()),
+                cursor: Some(at),
                 ..OpContext::default()
             };
             run_mouse_operation(hwnd, MouseGesture::DoubleClick, context);
@@ -1155,9 +1338,52 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
         }
         // Alt との組み合わせは WM_SYSKEYDOWN で来る。対応表にないキーは DefWindowProcW に任せる
         WM_KEYDOWN | WM_SYSKEYDOWN => on_scrap_key(hwnd, wparam).then_some(LRESULT(0)),
+        // 文字を打っている間の文字（TranslateMessage が作る）
+        WM_CHAR => on_scrap_char(hwnd, wparam).then_some(LRESULT(0)),
+        // 変換中の文字は IME の窓に出さず、スクラップに描く。App は借りない（IME の呼び出しの中でも届く）
+        WM_IME_SETCONTEXT => {
+            // SAFETY: 受け取った引数を（印を 1 つ落として）そのまま渡す
+            Some(unsafe {
+                DefWindowProcW(hwnd, msg, wparam, ime::without_composition_window(lparam))
+            })
+        }
+        WM_IME_STARTCOMPOSITION if is_typing(hwnd) => Some(LRESULT(0)),
+        WM_IME_COMPOSITION if is_typing(hwnd) => {
+            on_ime_composition(hwnd, lparam);
+            Some(LRESULT(0))
+        }
+        WM_IME_ENDCOMPOSITION if is_typing(hwnd) => {
+            on_edit_input(
+                hwnd,
+                EditInput::Composition {
+                    result: String::new(),
+                    composing: None,
+                },
+            );
+            Some(LRESULT(0))
+        }
         // 右クリック（DefWindowProcW が WM_RBUTTONUP から作る）と Shift+F10・アプリケーション キー
         WM_CONTEXTMENU => {
             show_scrap_menu(hwnd, lparam);
+            Some(LRESULT(0))
+        }
+        // ほかのウィンドウにフォーカスが移ったら、書き込みの編集モードを抜ける。既定の処理にも回す
+        // （隠す・壊すときなど App を借りている間にも届くので、送り直してから抜ける）
+        WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
+            // SAFETY: 自分のウィンドウに送る
+            if let Err(e) =
+                unsafe { PostMessageW(Some(hwnd), WM_APP_SCRAP_INACTIVE, WPARAM(0), LPARAM(0)) }
+            {
+                log::warn!("could not post the deactivation of a scrap: {e}");
+            }
+            None
+        }
+        // 送り直すまでの間にもう一度アクティブになっていれば（ツールバーは押してもアクティブにならない）抜けない
+        WM_APP_SCRAP_INACTIVE => {
+            // SAFETY: 引数なし
+            if unsafe { GetForegroundWindow() } != hwnd {
+                on_edit_input(hwnd, EditInput::Leave);
+            }
             Some(LRESULT(0))
         }
         // Alt+F4 など。ウィンドウだけ壊されて App に残らないように、閉じるのと同じにする
@@ -1197,6 +1423,10 @@ fn message_screen_point() -> Point {
 }
 
 impl App {
+    fn scrap(&self, hwnd: HWND) -> Option<&Scrap> {
+        self.scraps.iter().find(|s| s.window.hwnd() == hwnd)
+    }
+
     fn scrap_mut(&mut self, hwnd: HWND) -> Option<&mut Scrap> {
         self.scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)
     }
@@ -1260,14 +1490,260 @@ fn on_scrap_drag(hwnd: HWND, wparam: WPARAM, at: Point) {
     }
 }
 
-/// トリムの範囲を選んでいるか。
-fn is_trimming(hwnd: HWND) -> bool {
+/// 書き込みのツールバーのウィンドウへのメッセージ。押してもアクティブにならない（スクラップのフォーカスを奪わない）。
+fn on_toolbar_message(hwnd: HWND, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+    match msg {
+        WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
+        WM_LBUTTONDOWN => {
+            on_toolbar_press(hwnd, message_screen_point());
+            Some(LRESULT(0))
+        }
+        WM_MOUSEMOVE => {
+            on_toolbar_drag(hwnd, wparam, message_screen_point());
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONUP => {
+            // ドラッグは WM_CAPTURECHANGED で終える。App を借りる前に放す（そのメッセージが届くため）
+            // SAFETY: UI スレッドで呼ぶ
+            let _ = unsafe { ReleaseCapture() };
+            Some(LRESULT(0))
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                if let Some(toolbar) = app.toolbar_mut(hwnd) {
+                    toolbar.drag.end();
+                }
+            });
+            Some(LRESULT(0))
+        }
+        // つまみの上では移動のカーソルにする
+        WM_SETCURSOR => {
+            let on_grip = with_app(|app| {
+                app.toolbar_mut(hwnd)
+                    .and_then(|t| t.hit(message_screen_point()))
+                    == Some(ToolbarButton::Grip)
+            })
+            .unwrap_or(false);
+            if !on_grip {
+                return None;
+            }
+            // SAFETY: 共有のカーソルなので壊さなくてよい
+            if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_SIZEALL) } {
+                // SAFETY: UI スレッドで呼ぶ
+                unsafe { SetCursor(Some(cursor)) };
+            }
+            Some(LRESULT(1))
+        }
+        // 大きさはスクラップのモニタの DPI で決める（`Scrap::sync_toolbar`）
+        WM_DPICHANGED => Some(LRESULT(0)),
+        _ => None,
+    }
+}
+
+impl App {
+    /// ツールバーのウィンドウ `hwnd` を持つスクラップ。
+    fn scrap_of_toolbar(&mut self, hwnd: HWND) -> Option<&mut Scrap> {
+        self.scraps
+            .iter_mut()
+            .find(|s| s.toolbar.as_ref().is_some_and(|t| t.window.hwnd() == hwnd))
+    }
+
+    fn toolbar_mut(&mut self, hwnd: HWND) -> Option<&mut Toolbar> {
+        self.scrap_of_toolbar(hwnd)?.toolbar.as_mut()
+    }
+}
+
+/// ツールバーのボタンを押した: 道具・色・太さを選ぶ、完了で抜ける、つまみならドラッグを始める。
+fn on_toolbar_press(hwnd: HWND, at: Point) {
+    let Some((scrap, button)) = with_app(|app| {
+        let scrap = app.scrap_of_toolbar(hwnd)?;
+        let button = scrap.toolbar.as_ref()?.hit(at)?;
+        Some((scrap.window.hwnd(), button))
+    })
+    .flatten() else {
+        return;
+    };
+    match button {
+        ToolbarButton::Grip => {
+            // 速く動かしても追えるようにマウスを捕まえる。キー入力とアクティブはスクラップのまま
+            // SAFETY: 自分のウィンドウ
+            unsafe { SetCapture(hwnd) };
+            with_app(|app| {
+                if let Some(toolbar) = app.toolbar_mut(hwnd) {
+                    toolbar.drag.start(at);
+                }
+            });
+        }
+        ToolbarButton::Done => {
+            on_edit_input(scrap, EditInput::Leave);
+        }
+        ToolbarButton::Delete => {
+            on_edit_input(scrap, EditInput::Delete);
+        }
+        ToolbarButton::Undo => {
+            on_edit_input(scrap, EditInput::Undo);
+        }
+        ToolbarButton::Redo => {
+            on_edit_input(scrap, EditInput::Redo);
+        }
+        button => {
+            if let Some(pick) = button.pick() {
+                on_edit_input(scrap, EditInput::Pick(pick));
+            }
+        }
+    }
+}
+
+/// つまみのドラッグの間のカーソルの移動で、スクラップごと動かす（ツールバーはついてくる）。編集モードの間に
+/// スクラップを動かせるのはここだけ。
+fn on_toolbar_drag(hwnd: HWND, wparam: WPARAM, at: Point) {
+    let pointer = pointer_on_move(hwnd, wparam);
+    with_app(|app| {
+        let scrap = app.scrap_of_toolbar(hwnd)?;
+        let delta = scrap.toolbar.as_mut()?.drag.move_to(at, pointer)?;
+        let scrap_hwnd = scrap.window.hwnd();
+        let (scrap, appearance, renderer) = app.scrap_to_draw(scrap_hwnd)?;
+        let before = scrap.model.clone();
+        let p = scrap.model.position;
+        scrap.model.position = Point::new(p.x.saturating_add(delta.x), p.y.saturating_add(delta.y));
+        // 動かすときに届くメッセージでは App を借りないので、借りたまま動かす
+        scrap.redraw_or_revert(&before, &appearance, renderer, false, "toolbar grip");
+        Some(())
+    });
+    release_stray_capture(pointer);
+}
+
+/// 書き込みの編集モードにいるか。
+fn is_editing(hwnd: HWND) -> bool {
     with_app(|app| {
         app.scraps
             .iter()
-            .any(|s| s.window.hwnd() == hwnd && s.model.is_trimming())
+            .any(|s| s.window.hwnd() == hwnd && s.model.is_editing())
     })
     .unwrap_or(false)
+}
+
+/// 書き込みの編集モードのカーソルの移動。押したままでなければ（離したことを取りこぼしたなど）離したことにする。
+fn on_edit_move(hwnd: HWND, wparam: WPARAM, at: Point) {
+    let pointer = pointer_on_move(hwnd, wparam);
+    let input = if pointer.holding() {
+        // Shift を押していれば図形に制約をかける（正方形・円・45° 刻み）。wparam の MK_SHIFT は
+        // Win32_System_SystemServices を足さないよう値で持つ
+        const MK_SHIFT: usize = 0x0004;
+        let shift = wparam.0 & MK_SHIFT != 0;
+        EditInput::Move { at, shift }
+    } else {
+        EditInput::Release
+    };
+    on_edit_input(hwnd, input);
+    release_stray_capture(pointer);
+}
+
+/// 書き込みの編集モードに入力を渡し、変わったら描き直す。編集モードでなければ何もせず None。
+/// 変換中の文字を確定したことにしたら（`EditOutput::CompositionTaken`）IME の側の変換中の文字を捨て、打ち始めたら・
+/// 打ち終えたら IME を使う・使わないを切り替える。
+fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
+    let outputs = edit_input(hwnd, input);
+    if let Some(outputs) = &outputs {
+        if outputs.contains(&EditOutput::CompositionTaken) {
+            ime::cancel(hwnd);
+        }
+        if !outputs.is_empty() {
+            let switch = outputs
+                .iter()
+                .any(|o| matches!(o, EditOutput::TypingStarted | EditOutput::TypingEnded));
+            sync_ime(hwnd, switch);
+        }
+    }
+    outputs
+}
+
+/// 文字を打っているか。
+fn is_typing(hwnd: HWND) -> bool {
+    with_app(|app| {
+        app.scrap(hwnd)
+            .is_some_and(|s| s.model.edit_state().is_some_and(EditState::is_typing))
+    })
+    .unwrap_or(false)
+}
+
+/// `WM_CHAR`: 文字を打っている間の文字を渡す（サロゲート ペアは core が組み立てる）。受けなければ false。
+fn on_scrap_char(hwnd: HWND, wparam: WPARAM) -> bool {
+    on_edit_input(hwnd, EditInput::Utf16(wparam.0 as u16)).is_some_and(|o| !o.is_empty())
+}
+
+/// `WM_IME_COMPOSITION`: 確定した文字と変換中の文字を渡す。
+fn on_ime_composition(hwnd: HWND, lparam: LPARAM) {
+    let update = ime::read_composition(hwnd, lparam);
+    on_edit_input(
+        hwnd,
+        EditInput::Composition {
+            result: update.result,
+            composing: update.composition,
+        },
+    );
+}
+
+/// 打っている間は、変換中の文字と候補の窓をキャレットに合わせる。`switch`（打ち始めた・打ち終えた）なら、
+/// 打っていれば IME を使えるようにし、打っていなければ使えないようにする。IME を呼ぶのは App を返してから。
+fn sync_ime(hwnd: HWND, switch: bool) {
+    let Some((typing, caret)) = with_app(|app| {
+        let appearance = Appearance::from(app.settings.scrap);
+        let scrap = app.scrap(hwnd)?;
+        let typing = scrap.model.edit_state().is_some_and(EditState::is_typing);
+        let origin = scrap.model.window_rect(&appearance).origin();
+        let caret = scrap.caret.get().map(|r| r.offset(origin.x, origin.y));
+        Some((typing, caret))
+    })
+    .flatten() else {
+        return;
+    };
+    match (switch, typing) {
+        (true, true) => ime::enable(hwnd),
+        (true, false) => ime::disable(hwnd),
+        (false, _) => {}
+    }
+    if let (true, Some(caret)) = (typing, caret) {
+        ime::place(hwnd, caret);
+    }
+}
+
+/// 書き込みの編集モードに入力を渡し、変わったら描き直す（`on_edit_input` の中身）。
+fn edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
+    with_app(|app| {
+        let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
+        if !scrap.model.is_editing() {
+            return None;
+        }
+        let outputs = scrap.model.edit_input(input);
+        if outputs.contains(&EditOutput::Left) {
+            log::info!(
+                "edit mode left ({} annotations)",
+                scrap.model.annotations().items().len()
+            );
+            // ツールバーのウィンドウを壊すときに届くメッセージでは App を借りない
+            scrap.toolbar = None;
+        }
+        for output in &outputs {
+            if let EditOutput::Picked(pick) = output {
+                log::info!("edit pick {pick:?}");
+            }
+        }
+        if !outputs.is_empty() {
+            // 描くだけで App を借りるメッセージは届かないので、借りたまま描く
+            if let Err(e) = scrap.paint(&appearance, renderer) {
+                log::warn!("could not draw the annotations: {e}");
+            }
+        }
+        app.carryover.record(&outputs);
+        Some(outputs)
+    })
+    .flatten()
+}
+
+/// トリムの範囲を選んでいるか。
+fn is_trimming(hwnd: HWND) -> bool {
+    with_app(|app| app.scrap(hwnd).is_some_and(|s| s.model.is_trimming())).unwrap_or(false)
 }
 
 /// トリムの最中のカーソルの移動。押したままでなければ（離したことを取りこぼしたなど）押していないことにする
@@ -1331,7 +1807,7 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
         ..OpContext::default()
     };
     for _ in 0..notches.unsigned_abs() {
-        run_mouse_operation(hwnd, gesture, context);
+        run_mouse_operation(hwnd, gesture, context.clone());
     }
     true
 }
@@ -1378,8 +1854,11 @@ fn hide_zoom_label(hwnd: HWND) {
     });
 }
 
-/// マウスの操作をマウスの対応表で引いて実行する。
+/// マウスの操作をマウスの対応表で引いて実行する。書き込みの編集モードの間は、どの割り当ても効かない。
 fn run_mouse_operation(hwnd: HWND, gesture: MouseGesture, context: OpContext) {
+    if is_editing(hwnd) {
+        return;
+    }
     if let Some(op) = with_app(|app| app.mouse.operation(gesture)).flatten() {
         run_scrap_operation(hwnd, op, context);
     }
@@ -1404,6 +1883,11 @@ fn on_scrap_key(hwnd: HWND, wparam: WPARAM) -> bool {
         modifiers: held_modifiers(),
         key,
     };
+    // 書き込みの編集モードではショートカットは効かない。受けなかったキー（Alt+F4 など）は DefWindowProcW に任せる
+    // 変換中の文字を確定しただけ（`CompositionTaken`）なら受けていない
+    if let Some(outputs) = on_edit_input(hwnd, EditInput::Key(chord)) {
+        return outputs.iter().any(|o| *o != EditOutput::CompositionTaken);
+    }
     let Some(op) = with_app(|app| app.shortcuts.operation(chord)).flatten() else {
         return false;
     };
@@ -1485,7 +1969,7 @@ fn scrap_menu_entries(
                     None => text(item.label_key).into(),
                 },
                 enabled: item.enabled,
-                checked: false,
+                checked: item.checked,
             },
             MenuEntry::Submenu(submenu) => menu::Entry::Submenu {
                 label: text(submenu.label_key).into(),
@@ -1506,7 +1990,7 @@ fn scrap_menu_entries(
             },
             MenuEntry::Folder(folder) => menu::Entry::Submenu {
                 label: text(folder.label_key).into(),
-                enabled: true,
+                enabled: folder.is_enabled(),
                 items: scrap_menu_entries(&folder.entries, commands),
             },
             MenuEntry::Separator => menu::Entry::Separator,
@@ -1528,9 +2012,18 @@ enum Deferred {
     Close,
 }
 
-/// コピーや保存の画像を表示と同じ描き方で作り、`job` の `Deferred` にする。作れなければ `failed_key` の失敗にする。
-fn render_for(image: &Image, job: fn(Image) -> Deferred, failed_key: &'static str) -> Deferred {
-    match render::render_image(image) {
+/// コピーや保存の画像（書き込みを描いたもの）を表示と同じ描き方で作り、`job` の `Deferred` にする。作れなければ
+/// `failed_key` の失敗にする。
+fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static str) -> Deferred {
+    let layer = render::AnnotationLayer {
+        annotations: scrap.model.annotations().items(),
+        view: scrap.model.output_view(),
+        selected: None,
+        typing: None,
+        // 選択の印もキャレットも描かない
+        scale: 1.0,
+    };
+    match render::render_image(scrap.shown(), layer) {
         Ok(image) => job(image),
         Err(e) => Deferred::RenderFailed {
             failed_key,
@@ -1542,11 +2035,18 @@ fn render_for(image: &Image, job: fn(Image) -> Deferred, failed_key: &'static st
 /// スクラップ操作を実行し、返った `Effect` を実行する。スクラップのキー・マウス・メニューはすべてここを通る。
 fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
     let deferred = with_app(|app| {
+        let annotation = Style::from(&app.settings.annotation);
+        let font = Font::from(&app.settings.annotation);
+        let carryover = app.carryover;
+        let module = app.module;
         let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
         let before = scrap.model.clone();
         let mut deferred = Vec::new();
         let context = OpContext {
             appearance,
+            annotation,
+            font,
+            carryover,
             ..context
         };
         let effects = ops::execute(op, &mut scrap.model, &context);
@@ -1573,6 +2073,30 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                         log::warn!("could not show the trim mode: {e}");
                     }
                 }
+                Effect::EnterEditMode | Effect::LeaveEditMode => {
+                    let entered = effect == Effect::EnterEditMode;
+                    log::info!("edit mode {}", if entered { "entered" } else { "left" });
+                    // ツールバーのウィンドウを作る・壊すときに届くメッセージでは App を借りない
+                    scrap.toolbar = if entered {
+                        match toolbar_window::ToolbarWindow::create(module, hwnd) {
+                            Ok(window) => Some(Toolbar {
+                                window,
+                                colours: toolbar::palette(annotation.color),
+                                placed: Default::default(),
+                                drag: Drag::default(),
+                            }),
+                            Err(e) => {
+                                log::warn!("could not create the annotation toolbar: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Err(e) = scrap.paint(&appearance, renderer) {
+                        log::warn!("could not show the edit mode: {e}");
+                    }
+                }
                 // 倍率が変わらなかった（範囲の端）ときも、倍率だけは出す
                 Effect::ShowZoom if !redraws => {
                     if let Err(e) = scrap.paint(&appearance, renderer) {
@@ -1583,13 +2107,13 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                 Effect::MoveToTrash => deferred.push(Deferred::Close),
                 // 描くだけでメッセージは届かないので、借りたまま描く
                 Effect::CopyToClipboard => {
-                    deferred.push(render_for(scrap.shown(), Deferred::Copy, "copy.failed"));
+                    deferred.push(render_for(scrap, Deferred::Copy, "copy.failed"));
                 }
                 Effect::SaveDefault => {
-                    deferred.push(render_for(scrap.shown(), Deferred::Save, "save.failed"));
+                    deferred.push(render_for(scrap, Deferred::Save, "save.failed"));
                 }
                 Effect::ShowSaveDialog => {
-                    deferred.push(render_for(scrap.shown(), Deferred::SaveAs, "save.failed"));
+                    deferred.push(render_for(scrap, Deferred::SaveAs, "save.failed"));
                 }
             }
         }
@@ -1597,6 +2121,8 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
     })
     .flatten()
     .unwrap_or_default();
+    // 編集モードを抜けたら IME を使えないようにする（core が変換中の文字も書き込みにしてある）
+    sync_ime(hwnd, true);
     // クリップボード・通知・ウィンドウを壊すのはメッセージが届くことがあるので、App を借りずに行う
     for action in deferred {
         match action {
@@ -1870,20 +2396,22 @@ fn close_scrap(hwnd: HWND) {
     let removed = with_app(|app| {
         let index = app.scraps.iter().position(|s| s.window.hwnd() == hwnd)?;
         let Scrap {
+            toolbar,
             window,
             mut model,
             image,
             ..
         } = app.scraps.remove(index);
-        // トリムの範囲を選んでいる途中で閉じたら、選ぶ前の状態で入れる
-        model.trim_input(TrimInput::Cancel);
+        // トリムの範囲を選んでいる途中で閉じたら選ぶ前の状態で、書き込みの編集モードなら抜けてから入れる
+        model.settle();
         // 一時ファイルは裏のスレッドで書くので、借りたままでよい
         app.trash.push(model, image, save::now());
-        Some(window)
+        Some((toolbar, window))
     })
     .flatten();
-    // ウィンドウを壊すとメッセージが届くので、App を借りずに壊す
-    if let Some(window) = removed {
+    // ウィンドウを壊すとメッセージが届くので、App を借りずに壊す（ツールバーが先）
+    if let Some((toolbar, window)) = removed {
+        drop(toolbar);
         drop(window);
         log::info!("scrap closed");
     }
@@ -1912,9 +2440,12 @@ fn close_all_scraps() {
 fn set_scraps_visible(visible: bool) {
     with_app(|app| {
         for scrap in &app.scraps {
+            let toolbar = scrap.toolbar.as_ref().map(|t| &t.window);
             if visible {
                 scrap.window.show(false);
+                toolbar.inspect(|t| t.show());
             } else {
+                toolbar.inspect(|t| t.hide());
                 scrap.window.hide();
             }
         }
@@ -2152,6 +2683,8 @@ fn open_scrap(
 ) -> Result<Scrap> {
     let rect = model.window_rect(appearance);
     let window = scrap_window::ScrapWindow::create(module, rect)?;
+    // 文字を打つ間のほかは IME を使わない（IME がオンでもショートカットのキーが届くように）
+    ime::disable(window.hwnd());
     // 開いたモニタの DPI を覚える。ごみ箱から戻したものは、閉じたときと DPI が違えば設定に従って大きさを変える
     let mut model = model;
     let scaling = with_app(|app| app.settings.general.dpi_scaling).unwrap_or_default();
@@ -2174,6 +2707,7 @@ fn open_scrap(
     painted?;
     window.show(focus);
     Ok(Scrap {
+        toolbar: None,
         window,
         model,
         image,
@@ -2181,6 +2715,7 @@ fn open_scrap(
         drag: Drag::default(),
         wheel: Wheel::default(),
         zoom_label: false,
+        caret: Default::default(),
     })
 }
 
@@ -3166,6 +3701,8 @@ fn on_settings_changed() {
         app.mouse = keymap.mouse;
         let unset =
             app.settings.hotkeys.select_capture.is_some() && new.hotkeys.select_capture.is_none();
+        app.carryover
+            .settings_changed(&app.settings.annotation, &new.annotation);
         app.settings = new;
         apply_changes(app, &changes);
         settings_notice(

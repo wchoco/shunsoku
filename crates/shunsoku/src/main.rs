@@ -14,6 +14,10 @@ mod hdr;
 #[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
+mod ime;
+#[cfg(windows)]
+mod layered;
+#[cfg(windows)]
 mod logger;
 #[cfg(windows)]
 mod menu;
@@ -39,6 +43,8 @@ mod scrap_window;
 mod settings_watch;
 #[cfg(windows)]
 mod single_instance;
+#[cfg(windows)]
+mod toolbar_window;
 #[cfg(windows)]
 mod trash_store;
 #[cfg(windows)]

@@ -11,17 +11,18 @@
 //! - drop でウィンドウを壊す。
 
 use shunsoku_core::geometry::Rect;
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, POINT, SIZE};
-use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND};
+use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DestroyWindow, IDC_ARROW, IsWindowVisible, LoadCursorW,
     RegisterClassExW, RemovePropW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, ULW_ALPHA,
-    UpdateLayeredWindow, WNDCLASSEXW, WNDPROC, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, WNDCLASSEXW, WNDPROC,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, Result, w};
+
+use crate::layered;
 
 /// スクラップのウィンドウのクラス名。
 const CLASS_NAME: PCWSTR = w!("shunsoku.scrap");
@@ -89,35 +90,7 @@ impl ScrapWindow {
     /// `source`（premultiplied BGRA の DIB を選んだ DC、大きさは `rect` と同じ）の中身を `rect` に出す。
     /// `opacity` は透明度（%）。
     pub fn present(&self, source: HDC, rect: Rect, opacity: u8) -> Result<()> {
-        let position = POINT {
-            x: rect.left,
-            y: rect.top,
-        };
-        let size = SIZE {
-            cx: rect.width() as i32,
-            cy: rect.height() as i32,
-        };
-        let origin = POINT::default();
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: (u32::from(opacity.min(100)) * 255 / 100) as u8,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        // SAFETY: 自分のウィンドウ。引数はこの関数の中で生きている
-        unsafe {
-            UpdateLayeredWindow(
-                self.hwnd,
-                None,
-                Some(&position),
-                Some(&size),
-                Some(source),
-                Some(&origin),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            )
-        }
+        layered::present(self.hwnd, source, rect, opacity)
     }
 
     pub fn hwnd(&self) -> HWND {

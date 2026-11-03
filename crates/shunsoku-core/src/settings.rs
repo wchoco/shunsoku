@@ -25,7 +25,7 @@
 //!
 //! [hotkeys]
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
-//! restore_last = "Ctrl+Shift+Z"                # 最後に閉じたものを復元。既定は空で、必須ではない
+//! restore_last = "Ctrl+Alt+Z"                  # 最後に閉じたものを復元。既定は空で、必須ではない
 //! active_window_capture = "Ctrl+Shift+W"       # アクティブウィンドウのキャプチャ。既定は空で、必須ではない
 //!
 //! [shortcuts]                                  # スクラップ操作の id ごとの上書き。"" は割り当てなし
@@ -41,6 +41,12 @@
 //! border_width = 1                             # 1〜16（px）
 //! border_color = "#808080"
 //! shadow = true
+//!
+//! [annotation]                                 # 書き込みの既定値。新しく描く書き込みに使う
+//! color = "#E53935"
+//! width = 3                                    # 1〜64（画像の画素）
+//! font_size = 16                               # 文字の大きさ。1〜256（画像の画素）
+//! font = "Yu Gothic UI"                        # 文字の書体。入っていなければ代わりの書体で描く
 //!
 //! [selection]                                  # 範囲選択の画面
 //! mode = "normal"                              # 開いたときのモード: normal / precise
@@ -90,6 +96,12 @@ pub const TRASH_LIMIT_RANGE: std::ops::RangeInclusive<u8> = 0..=100;
 /// 枠の太さ（px）として書ける範囲。
 pub const BORDER_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 1..=16;
 
+/// 書き込みの太さ（画像の画素）として書ける範囲。
+pub const ANNOTATION_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 1..=64;
+
+/// 文字の書き込みの大きさ（画像の画素）として書ける範囲。
+pub const ANNOTATION_FONT_SIZE_RANGE: std::ops::RangeInclusive<u32> = 1..=256;
+
 /// 設定。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Settings {
@@ -98,6 +110,7 @@ pub struct Settings {
     pub shortcuts: ShortcutOverrides,
     pub mouse: MouseOverrides,
     pub scrap: ScrapAppearance,
+    pub annotation: AnnotationDefaults,
     pub selection: SelectionScreen,
     /// ログのレベル（隠し項目）。
     pub log_level: LogLevel,
@@ -303,6 +316,31 @@ impl Default for Border {
             visible: true,
             width: 1,
             color: Rgb(0x80, 0x80, 0x80),
+        }
+    }
+}
+
+/// 書き込みの既定値（`[annotation]`）。書き込みの編集モードに入るときに読む。描いた書き込みは描いたときの
+/// 値を持つので、あとで変えても変わらない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnotationDefaults {
+    pub color: Rgb,
+    /// 太さ（画像の画素）。
+    pub width: u32,
+    /// 文字の大きさ（画像の画素）。
+    pub font_size: u32,
+    /// 文字の書体の名前。入っていない書体でも誤りにはせず、描くときに DirectWrite が代わりの書体で描く。
+    pub font: String,
+}
+
+impl Default for AnnotationDefaults {
+    /// 赤 `#E53935`、太さ 3、文字は Yu Gothic UI の 16（spec #35）。
+    fn default() -> AnnotationDefaults {
+        AnnotationDefaults {
+            color: Rgb(0xE5, 0x39, 0x35),
+            width: 3,
+            font_size: 16,
+            font: "Yu Gothic UI".to_owned(),
         }
     }
 }
@@ -638,6 +676,24 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
     if let Some(on) = r.value(scrap, "scrap", "shadow", Item::as_bool) {
         s.scrap.shadow = on;
+    }
+
+    let annotation = r.table(root, "annotation");
+    if let Some(color) = r.value(annotation, "annotation", "color", rgb) {
+        s.annotation.color = color;
+    }
+    if let Some(w) = r.value(annotation, "annotation", "width", |i| {
+        in_range(i, ANNOTATION_WIDTH_RANGE)
+    }) {
+        s.annotation.width = w;
+    }
+    if let Some(size) = r.value(annotation, "annotation", "font_size", |i| {
+        in_range(i, ANNOTATION_FONT_SIZE_RANGE)
+    }) {
+        s.annotation.font_size = size;
+    }
+    if let Some(font) = r.value(annotation, "annotation", "font", non_empty_str) {
+        s.annotation.font = font;
     }
 
     let selection = r.table(root, "selection");
@@ -987,6 +1043,7 @@ shadow = false
                     },
                     shadow: false,
                 },
+                annotation: AnnotationDefaults::default(),
                 selection: SelectionScreen::default(),
                 log_level: LogLevel::Debug,
                 regions: Vec::new(),
@@ -1182,6 +1239,69 @@ shadow = 1
         }
         let (_, issues) = load("version = 1\nselection = 1\n");
         assert_eq!(issues, vec![invalid("selection")]);
+    }
+
+    #[test]
+    fn annotations_default_to_red_3px_and_read_the_annotation_section() {
+        let (settings, _) = load("version = 1\n");
+        assert_eq!(settings.annotation.color, Rgb(0xE5, 0x39, 0x35));
+        assert_eq!(settings.annotation.width, 3);
+        let (settings, issues) =
+            load("version = 1\n[annotation]\ncolor = \"#1E88E5\"\nwidth = 8\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.annotation.color, Rgb(0x1E, 0x88, 0xE5));
+        assert_eq!(settings.annotation.width, 8);
+    }
+
+    #[test]
+    fn invalid_annotation_items_fall_back_to_the_defaults_and_are_named() {
+        for value in ["\"red\"", "\"#E5393\"", "\"E53935\"", "1"] {
+            let (settings, issues) = load(&format!("version = 1\n[annotation]\ncolor = {value}\n"));
+            assert_eq!(issues, vec![invalid("annotation.color")], "{value}");
+            assert_eq!(settings.annotation.color, Rgb(0xE5, 0x39, 0x35), "{value}");
+        }
+        for value in ["0", "-1", "65", "\"3\"", "2.5"] {
+            let (settings, issues) = load(&format!("version = 1\n[annotation]\nwidth = {value}\n"));
+            assert_eq!(issues, vec![invalid("annotation.width")], "{value}");
+            assert_eq!(settings.annotation.width, 3, "{value}");
+        }
+        for value in ["1", "64"] {
+            let (_, issues) = load(&format!("version = 1\n[annotation]\nwidth = {value}\n"));
+            assert_eq!(issues, vec![], "{value}");
+        }
+        let (_, issues) = load("version = 1\nannotation = 1\n");
+        assert_eq!(issues, vec![invalid("annotation")]);
+    }
+
+    #[test]
+    fn text_annotations_default_to_yu_gothic_ui_16px_and_read_font_and_font_size() {
+        let (settings, _) = load("version = 1\n");
+        assert_eq!(settings.annotation.font, "Yu Gothic UI");
+        assert_eq!(settings.annotation.font_size, 16);
+        let (settings, issues) =
+            load("version = 1\n[annotation]\nfont = \"Meiryo\"\nfont_size = 24\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.annotation.font, "Meiryo");
+        assert_eq!(settings.annotation.font_size, 24);
+        // 入っていない書体でも設定の誤りにはしない（描くときに DirectWrite が代わりの書体で描く）
+        let (settings, issues) = load("version = 1\n[annotation]\nfont = \"No Such Font\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.annotation.font, "No Such Font");
+    }
+
+    #[test]
+    fn invalid_font_items_fall_back_to_the_defaults_and_are_named() {
+        for value in ["0", "-1", "257", "\"16\"", "2.5"] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[annotation]\nfont_size = {value}\n"));
+            assert_eq!(issues, vec![invalid("annotation.font_size")], "{value}");
+            assert_eq!(settings.annotation.font_size, 16, "{value}");
+        }
+        for value in ["\"\"", "1"] {
+            let (settings, issues) = load(&format!("version = 1\n[annotation]\nfont = {value}\n"));
+            assert_eq!(issues, vec![invalid("annotation.font")], "{value}");
+            assert_eq!(settings.annotation.font, "Yu Gothic UI", "{value}");
+        }
     }
 
     #[test]

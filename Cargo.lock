@@ -170,6 +170,7 @@ dependencies = [
  "shunsoku-core",
  "shunsoku-pipe-identity",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]
