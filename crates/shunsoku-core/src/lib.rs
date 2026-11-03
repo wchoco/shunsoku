@@ -12,6 +12,7 @@ pub mod keys;
 pub mod log_file;
 pub mod magnifier;
 pub mod monitors;
+pub mod notice;
 pub mod perf;
 pub mod protocol;
 pub mod scrap;
