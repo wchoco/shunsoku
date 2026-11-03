@@ -1,5 +1,6 @@
-//! 設定ファイル（`%APPDATA%\shunsoku\settings.toml`）の読み込み。
+//! 設定ファイル（`%APPDATA%\shunsoku\settings.toml`、ポータブルモードでは exe の横のもの）の読み込み。
 //!
+//! - どのファイルを使うかは `locate`（`settings/location.rs`）で決める。
 //! - `load` は項目ごとに値を取り出す。不正な項目はその項目だけ既定値にし、項目名を `SettingsIssue` に載せる。
 //!   知らないキーは無視する。ファイル全体が TOML として読めなければ、すべて既定値にする。
 //! - アプリから書き戻すときは `write`（`settings/write.rs`）で変わった項目だけを書き換え、手で書いたコメントと
@@ -7,6 +8,8 @@
 //! - 読み込み直しでは `diff` で変わった部分を調べ、`app` が変わったものだけを反映し直す。
 //! - キーの重なりは `keymap` で見つける。同じ範囲（ホットキー同士、ショートカット同士）の重なりは `assign` の
 //!   規則で両方を無効にし、ホットキーとショートカットの重なりは警告だけにする。
+//! - 設定 GUI で適用できるかは `validate` で決める。問題の項目は `SettingsItem`（GUI の行）で指す。
+//! - 設定 GUI の適用では、開いた時点の設定・写し・その時点のファイルを `merge::merge` で 3 者で突き合わせる。
 //!
 //! スキーマ（書かなかった項目は既定値）:
 //!
@@ -15,8 +18,10 @@
 //! log_level = "info"                           # 隠し項目: off / error / warn / info / debug / trace
 //!
 //! [general]
+//! language = "auto"                            # UI の言語: auto（OS の表示言語。日本語でなければ英語）/ ja / en
 //! save_dir = 'D:\shots'                        # 既定: ピクチャ フォルダの下の shunsoku
 //! file_name_template = "shunsoku_{date}-{time}"
+//! autostart = false                            # サインインしたときに常駐する（HKCU の Run キーに登録）
 //! notifications = true                         # false で止まるのは成功の通知だけ
 //! trash_limit = 10                             # ごみ箱の上限（0〜100 件）。0 なら閉じたらすぐに破棄
 //! dpi_scaling = "keep_pixels"                  # DPI の違うモニタへ動かしたとき: keep_pixels（画素を等倍に保つ）
@@ -71,11 +76,18 @@ use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::geometry::Rect;
+use crate::i18n::Language;
 use crate::keys::Chord;
-use crate::scrap::ops::{MouseBindings, MouseGesture, OperationDescriptor, Shortcuts};
+use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, Shortcuts};
 use crate::selection::Mode;
 
+pub mod editor;
+pub mod form;
+mod location;
+pub mod merge;
+pub mod unset;
 mod write;
+pub use location::{SettingsLocation, locate};
 pub use write::{OwnWrites, rewrite, write};
 
 /// 対応している設定ファイルの形式の版。
@@ -118,11 +130,25 @@ pub struct Settings {
     pub regions: Vec<Region>,
 }
 
+impl Settings {
+    /// ファイルに書いた（`write`・`rewrite`）あとの設定。定型領域を、書いた名前でファイルの要素に結び付け直す
+    /// （`Region::loaded_name` を今の名前にする）。
+    pub fn as_written(&self) -> Settings {
+        let mut s = self.clone();
+        for region in &mut s.regions {
+            region.loaded_name = Some(region.name.clone());
+        }
+        s
+    }
+}
+
 /// 定型領域のファイル名テンプレートの既定値。
 pub const DEFAULT_REGION_FILE_NAME_TEMPLATE: &str = "{name}_{date}-{time}";
 
 /// 定型領域（`[[regions]]` の 1 つ）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 比べる（`==`）ときは `loaded_name` を見ない（中身が同じなら同じ定型領域）。
+#[derive(Debug, Clone, Eq)]
 pub struct Region {
     /// 名前。空でなく、ほかの定型領域と重ならない。
     pub name: String,
@@ -138,6 +164,34 @@ pub struct Region {
     pub save: bool,
     /// 撮ったらスクラップとして表示する。`save` と両方 false にはならない（読み込みで `save` を true に戻す）。
     pub scrap: bool,
+    /// ファイルで付いている名前（読み込んだ・書いたときの `name`）。ファイルにまだない定型領域は None。
+    /// 書き戻し（`write`）と 3-way マージは、これで定型領域とファイルの `[[regions]]` の要素を結び付ける
+    /// （名前を変えても、手で書いたコメントは元の要素ごと残る）。
+    pub loaded_name: Option<String>,
+}
+
+impl PartialEq for Region {
+    fn eq(&self, other: &Self) -> bool {
+        let Region {
+            name,
+            hotkey,
+            monitor,
+            rect,
+            save_dir,
+            file_name_template,
+            save,
+            scrap,
+            loaded_name: _,
+        } = self;
+        *name == other.name
+            && *hotkey == other.hotkey
+            && *monitor == other.monitor
+            && *rect == other.rect
+            && *save_dir == other.save_dir
+            && *file_name_template == other.file_name_template
+            && *save == other.save
+            && *scrap == other.scrap
+    }
 }
 
 /// 範囲選択の画面で登録する定型領域。名前は `"{base} N"`（N は、ほかの定型領域と重ならない最も小さい
@@ -158,16 +212,22 @@ pub fn new_region(settings: &Settings, base: &str, monitor: &str, rect: Rect) ->
         file_name_template: settings.general.file_name_template.clone(),
         save: true,
         scrap: false,
+        loaded_name: None,
     }
 }
 
 /// 全体設定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct General {
+    /// UI の言語。None なら OS の表示言語に合わせる（`ui_language`）。
+    pub language: Option<Language>,
     /// 全体の保存先。None ならピクチャ フォルダの下の `shunsoku`（Win32 層で解決する）。
     pub save_dir: Option<PathBuf>,
     /// 全体のファイル名テンプレート。
     pub file_name_template: String,
+    /// 自動起動。Windows にサインインしたときに常駐する。正本はこの値で、起動と適用のときに Run キーを
+    /// 合わせる（`autostart`）。
+    pub autostart: bool,
     /// 通知。オフで止めるのは成功の通知だけで、エラーと警告は常に出す（spec #32）。
     pub notifications: bool,
     /// ごみ箱の上限（件）。0 なら閉じたらすぐに破棄する。
@@ -181,8 +241,10 @@ pub struct General {
 impl Default for General {
     fn default() -> General {
         General {
+            language: None,
             save_dir: None,
             file_name_template: DEFAULT_FILE_NAME_TEMPLATE.to_owned(),
+            autostart: false,
             notifications: true,
             trash_limit: DEFAULT_TRASH_LIMIT,
             dpi_scaling: DpiScaling::default(),
@@ -219,15 +281,6 @@ impl HotkeyAction {
             HotkeyAction::RestoreLast => "restore_last",
             HotkeyAction::ActiveWindowCapture => "active_window_capture",
             HotkeyAction::Region(_) => "hotkey",
-        }
-    }
-
-    /// 通知に出す項目名（`hotkeys.select_capture`、`regions[N].hotkey`）。N は `Settings::regions` の位置 + 1
-    /// （読み込みで捨てた定型領域があれば、ファイルの中の位置とずれる）。
-    pub fn item(self) -> String {
-        match self {
-            HotkeyAction::Region(i) => format!("regions[{}].{}", i + 1, self.key()),
-            _ => format!("hotkeys.{}", self.key()),
         }
     }
 }
@@ -349,6 +402,31 @@ impl Default for AnnotationDefaults {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
+/// `#RRGGBB`（大文字）。
+impl std::fmt::Display for Rgb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Rgb(r, g, b) = *self;
+        write!(f, "#{r:02X}{g:02X}{b:02X}")
+    }
+}
+
+/// `#RRGGBB`（大文字と小文字を問わない）でない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotRgb;
+
+impl std::str::FromStr for Rgb {
+    type Err = NotRgb;
+
+    fn from_str(s: &str) -> Result<Rgb, NotRgb> {
+        let hex = s.strip_prefix('#').ok_or(NotRgb)?;
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(NotRgb);
+        }
+        let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| NotRgb);
+        Ok(Rgb(channel(0)?, channel(2)?, channel(4)?))
+    }
+}
+
 /// 範囲選択の画面（`[selection]`）。開くたびに読む。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SelectionScreen {
@@ -356,6 +434,14 @@ pub struct SelectionScreen {
     pub mode: Mode,
     /// 通常モードでも十字線を出す。精密モードでは設定によらず出す。
     pub crosshair: bool,
+}
+
+impl General {
+    /// 使う UI の言語。言語が OS に合わせる（None）なら、OS の表示言語の LANGID（`langid`）から決める。
+    pub fn ui_language(&self, langid: u16) -> Language {
+        self.language
+            .unwrap_or_else(|| Language::from_ui_language(langid))
+    }
 }
 
 /// DPI の違うモニタへスクラップを動かしたときの見え方（`[general] dpi_scaling`）。
@@ -426,21 +512,179 @@ pub enum SettingsIssue {
     /// 表にない操作と、ショートカットを持てない操作への `[shortcuts]` の上書きもこれにする（無視する）。
     Invalid { item: String },
     /// 同じ範囲（ホットキー同士、ショートカット同士）で重なったキーの組み合わせ。重なった項目のどれにも
-    /// 付けない。`items` は重なった項目名（`shortcuts.close` など。表の既定値から来たものも含む）。
-    Conflict { chord: Chord, items: Vec<String> },
+    /// 付けない。`items` は重なった項目（`Shortcut("close")` など。表の既定値から来たものも含む）。
+    Conflict {
+        chord: Chord,
+        items: Vec<SettingsItem>,
+    },
     /// ホットキーとショートカットの重なり。警告だけで、どちらも付けたままにする（OS に登録したホットキーが
     /// 先にキーを取るので、そのショートカットは効かない）。
     Overlap {
         chord: Chord,
-        hotkey: String,
-        shortcut: String,
+        hotkey: SettingsItem,
+        shortcut: SettingsItem,
     },
-    /// 2 つ以上の操作に付いたマウスの操作。どの操作にも付けない。`items` は重なった項目名
-    /// （`mouse.close` など。表の既定値から来たものも含む）。
+    /// 2 つ以上の操作に付いたマウスの操作。どの操作にも付けない。`items` は重なった項目
+    /// （`Mouse("close")` など。表の既定値から来たものも含む）。
     MouseConflict {
         gesture: MouseGesture,
-        items: Vec<String>,
+        items: Vec<SettingsItem>,
     },
+}
+
+/// 設定の項目。設定 GUI の行に当たる。問題の項目を指すのに使う。
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SettingsItem {
+    /// `[hotkeys] select_capture`。
+    SelectCaptureHotkey,
+    /// `[hotkeys] restore_last`。
+    RestoreLastHotkey,
+    /// `[hotkeys] active_window_capture`。
+    ActiveWindowCaptureHotkey,
+    /// `[shortcuts]` のスクラップ操作の id。
+    Shortcut(String),
+    /// `[mouse]` のスクラップ操作の id。
+    Mouse(String),
+    /// 定型領域のホットキー。`Settings::regions` の中の位置。
+    RegionHotkey(usize),
+    /// 定型領域の名前。`Settings::regions` の中の位置。
+    RegionName(usize),
+}
+
+impl From<HotkeyAction> for SettingsItem {
+    fn from(action: HotkeyAction) -> SettingsItem {
+        match action {
+            HotkeyAction::SelectCapture => SettingsItem::SelectCaptureHotkey,
+            HotkeyAction::RestoreLast => SettingsItem::RestoreLastHotkey,
+            HotkeyAction::ActiveWindowCapture => SettingsItem::ActiveWindowCaptureHotkey,
+            HotkeyAction::Region(i) => SettingsItem::RegionHotkey(i),
+        }
+    }
+}
+
+/// 通知とログに出す項目名（`hotkeys.select_capture`、`shortcuts.copy`、`mouse.close`、`regions[N].hotkey`、
+/// `regions[N].name`）。N は `Settings::regions` の位置 + 1（読み込みで捨てた定型領域があれば、ファイルの中の
+/// 位置とずれる）。
+impl std::fmt::Display for SettingsItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SettingsItem::SelectCaptureHotkey => f.write_str("hotkeys.select_capture"),
+            SettingsItem::RestoreLastHotkey => f.write_str("hotkeys.restore_last"),
+            SettingsItem::ActiveWindowCaptureHotkey => f.write_str("hotkeys.active_window_capture"),
+            SettingsItem::Shortcut(id) => write!(f, "shortcuts.{id}"),
+            SettingsItem::Mouse(id) => write!(f, "mouse.{id}"),
+            SettingsItem::RegionHotkey(i) => write!(f, "regions[{}].hotkey", i + 1),
+            SettingsItem::RegionName(i) => write!(f, "regions[{}].name", i + 1),
+        }
+    }
+}
+
+/// 項目名を文字列として出す。`SettingsIssue` の `{:?}` でログに書く文言を、項目を文字列で持っていたときと
+/// 同じに保つため。
+impl std::fmt::Debug for SettingsItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.to_string(), f)
+    }
+}
+
+/// 設定 GUI で適用する前に見つける問題の中身（`validate`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Problem {
+    /// 必須の項目が空（範囲選択キャプチャのホットキー）。
+    Unset,
+    /// 同じ範囲（ホットキー同士、ショートカット同士）で重なったキーの組み合わせ。
+    Conflict(Chord),
+    /// 2 つ以上の操作に付いたマウスの操作。
+    MouseConflict(MouseGesture),
+    /// ホットキーとショートカットの重なり。警告だけ。
+    Overlap(Chord),
+    /// 定型領域の名前が空。
+    EmptyName,
+    /// 定型領域の名前がほかの定型領域と同じ。
+    DuplicateName,
+}
+
+impl Problem {
+    /// 適用を止める（OK と適用を押せなくする）。止めないものは警告として出す。
+    pub fn blocks_apply(self) -> bool {
+        !matches!(self, Problem::Overlap(_))
+    }
+}
+
+/// 設定 GUI で適用する前に見つける問題。重なりでは、重なった項目ごとに 1 つずつ作る（両方の行に印を付ける）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub item: SettingsItem,
+    pub problem: Problem,
+}
+
+impl ValidationIssue {
+    /// 適用を止める（`Problem::blocks_apply`）。
+    pub fn blocks_apply(&self) -> bool {
+        self.problem.blocks_apply()
+    }
+}
+
+/// 設定 GUI の写しを適用できるかを調べる。`blocks_apply` の問題が 1 つでもあれば、OK と適用を押せなくする。
+///
+/// - 範囲選択キャプチャのホットキーが空なら `Unset`。
+/// - キーとマウスの重なりは `keymap`（`scrap::ops::OPERATIONS` に重ねる）の結果から作る。同じ範囲の重なりは
+///   止め、ホットキーとショートカットの重なりは警告にする。無視した上書き（`SettingsIssue::Invalid`）は
+///   GUI からは作れず、適用しても害がないので、ここでは出さない。
+/// - 定型領域の名前が空（空白だけを含む）か、ほかの定型領域と同じなら止める。重複は同じ名前のすべての
+///   定型領域に付ける。
+pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    if settings.hotkeys.select_capture.is_none() {
+        issues.push(ValidationIssue {
+            item: SettingsItem::SelectCaptureHotkey,
+            problem: Problem::Unset,
+        });
+    }
+    let each = |items: &[SettingsItem], problem: Problem| {
+        items
+            .iter()
+            .map(move |item| ValidationIssue {
+                item: item.clone(),
+                problem,
+            })
+            .collect::<Vec<_>>()
+    };
+    for issue in keymap(settings, OPERATIONS).issues {
+        match issue {
+            SettingsIssue::Conflict { chord, items } => {
+                issues.extend(each(&items, Problem::Conflict(chord)));
+            }
+            SettingsIssue::MouseConflict { gesture, items } => {
+                issues.extend(each(&items, Problem::MouseConflict(gesture)));
+            }
+            SettingsIssue::Overlap {
+                chord,
+                hotkey,
+                shortcut,
+            } => issues.extend(each(&[hotkey, shortcut], Problem::Overlap(chord))),
+            SettingsIssue::NotToml { .. } | SettingsIssue::Invalid { .. } => {}
+        }
+    }
+    for (i, region) in settings.regions.iter().enumerate() {
+        let problem = if region.name.trim().is_empty() {
+            Problem::EmptyName
+        } else if settings
+            .regions
+            .iter()
+            .enumerate()
+            .any(|(j, other)| j != i && other.name == region.name)
+        {
+            Problem::DuplicateName
+        } else {
+            continue;
+        };
+        issues.push(ValidationIssue {
+            item: SettingsItem::RegionName(i),
+            problem,
+        });
+    }
+    issues
 }
 
 /// 設定から作ったキーの割り当て（`keymap`）。
@@ -477,14 +721,14 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
             .chain(region_hotkeys),
     );
     let shortcuts = Shortcuts::new(ops, &settings.shortcuts);
-    let shortcut_item = |id: &str| format!("shortcuts.{id}");
-    let hotkey_item = |action: HotkeyAction| action.item();
+    let shortcut_item = |id: &str| SettingsItem::Shortcut(id.to_owned());
+    let hotkey_item = SettingsItem::from;
 
     let mut issues: Vec<SettingsIssue> = shortcuts
         .ignored_overrides()
         .iter()
         .map(|id| SettingsIssue::Invalid {
-            item: shortcut_item(id),
+            item: shortcut_item(id).to_string(),
         })
         .collect();
     issues.extend(
@@ -510,13 +754,13 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
         }
     }
     let mouse = MouseBindings::new(ops, &settings.mouse);
-    let mouse_item = |id: &str| format!("mouse.{id}");
+    let mouse_item = |id: &str| SettingsItem::Mouse(id.to_owned());
     issues.extend(
         mouse
             .ignored_overrides()
             .iter()
             .map(|id| SettingsIssue::Invalid {
-                item: mouse_item(id),
+                item: mouse_item(id).to_string(),
             }),
     );
     issues.extend(
@@ -547,6 +791,8 @@ pub struct SettingsChanges {
     pub mouse: bool,
     /// 全体の保存先かファイル名テンプレート。次の保存から使う。
     pub save: bool,
+    /// 自動起動。Run キーを設定に合わせ直す。
+    pub autostart: bool,
     /// 通知のオン/オフ。
     pub notifications: bool,
     /// ごみ箱の上限。下げたら超えた分を古いものから捨てる。
@@ -555,6 +801,8 @@ pub struct SettingsChanges {
     pub appearance: bool,
     /// ログのレベル。
     pub log_level: bool,
+    /// UI の言語の設定（OS に合わせるかどうかを含む）。メニュー・通知・設定 GUI の文言を変える。
+    pub language: bool,
 }
 
 impl SettingsChanges {
@@ -572,10 +820,12 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
         mouse: old.mouse != new.mouse,
         save: old.general.save_dir != new.general.save_dir
             || old.general.file_name_template != new.general.file_name_template,
+        autostart: old.general.autostart != new.general.autostart,
         notifications: old.general.notifications != new.general.notifications,
         trash: old.general.trash_limit != new.general.trash_limit,
         appearance: old.scrap != new.scrap,
         log_level: old.log_level != new.log_level,
+        language: old.general.language != new.general.language,
     }
 }
 
@@ -604,8 +854,9 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     let root: &dyn TableLike = doc.as_table();
     let mut s = Settings::default();
 
-    // 形式が変わったら移行するための版。違う版でも、読める項目は読む
-    if root.get("version").and_then(Item::as_integer) != Some(VERSION) {
+    // 形式が変わったら移行するための版。違う版でも、読める項目は読む。
+    // 何も書いていない（空・空白・コメントだけの）ファイルは既定値として扱う
+    if !root.is_empty() && root.get("version").and_then(Item::as_integer) != Some(VERSION) {
         r.invalid("version");
     }
     if let Some(level) = r.value(Some(root), "", "log_level", log_level) {
@@ -613,11 +864,17 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
 
     let general = r.table(root, "general");
+    if let Some(language) = r.value(general, "general", "language", language) {
+        s.general.language = language;
+    }
     if let Some(dir) = r.value(general, "general", "save_dir", save_dir) {
         s.general.save_dir = Some(dir);
     }
     if let Some(t) = r.value(general, "general", "file_name_template", non_empty_str) {
         s.general.file_name_template = t;
+    }
+    if let Some(on) = r.value(general, "general", "autostart", Item::as_bool) {
+        s.general.autostart = on;
     }
     if let Some(on) = r.value(general, "general", "notifications", Item::as_bool) {
         s.general.notifications = on;
@@ -724,7 +981,15 @@ fn regions(root: &dyn TableLike, r: &mut Reader) -> Vec<Region> {
 
 /// `[[regions]]` の要素のうち読み込みで残る定型領域。
 fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<Region> {
-    let mut regions: Vec<Region> = Vec::new();
+    read_regions_at(tables, r)
+        .into_iter()
+        .map(|(_, region)| region)
+        .collect()
+}
+
+/// `[[regions]]` の要素のうち読み込みで残る定型領域と、その要素の添字。
+fn read_regions_at(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(usize, Region)> {
+    let mut regions: Vec<(usize, Region)> = Vec::new();
     for (i, table) in tables.iter().enumerate() {
         let path = format!("regions[{}]", i + 1);
         let t: Option<&dyn TableLike> = Some(table);
@@ -745,20 +1010,24 @@ fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<Region
         let (Some(name), Some(monitor), Some(rect)) = (name, monitor, rect) else {
             continue;
         };
-        if regions.iter().any(|region| region.name == name) {
+        if regions.iter().any(|(_, region)| region.name == name) {
             r.invalid(format!("{path}.name"));
             continue;
         }
-        regions.push(Region {
-            name,
-            hotkey,
-            monitor,
-            rect,
-            save_dir,
-            file_name_template,
-            save,
-            scrap,
-        });
+        regions.push((
+            i,
+            Region {
+                loaded_name: Some(name.clone()),
+                name,
+                hotkey,
+                monitor,
+                rect,
+                save_dir,
+                file_name_template,
+                save,
+                scrap,
+            },
+        ));
     }
     regions
 }
@@ -906,12 +1175,7 @@ fn in_range<T: TryFrom<i64> + PartialOrd>(
 
 /// `#RRGGBB`。
 fn rgb(item: &Item) -> Option<Rgb> {
-    let hex = item.as_str()?.strip_prefix('#')?;
-    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-    Some(Rgb(channel(0)?, channel(2)?, channel(4)?))
+    item.as_str()?.parse().ok()
 }
 
 fn selection_mode(item: &Item) -> Option<Mode> {
@@ -919,6 +1183,14 @@ fn selection_mode(item: &Item) -> Option<Mode> {
         "normal" => Some(Mode::Normal),
         "precise" => Some(Mode::Precise),
         _ => None,
+    }
+}
+
+/// `auto` は None（OS に合わせる）。
+fn language(item: &Item) -> Option<Option<Language>> {
+    match item.as_str()? {
+        "auto" => Some(None),
+        code => Language::from_code(code).map(Some),
     }
 }
 
@@ -949,6 +1221,38 @@ mod tests {
     use crate::scrap::ops::OPERATIONS;
 
     #[test]
+    fn a_colour_is_read_from_hash_rrggbb_and_written_in_upper_case() {
+        assert_eq!("#1e88E5".parse::<Rgb>(), Ok(Rgb(0x1E, 0x88, 0xE5)));
+        assert_eq!(Rgb(0x1E, 0x88, 0x05).to_string(), "#1E8805");
+        for bad in [
+            "1E88E5",
+            "#1E88E",
+            "#1E88E5F",
+            "#GGGGGG",
+            "",
+            "#１２３４５６",
+        ] {
+            assert!(bad.parse::<Rgb>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_empty_file_gives_defaults_without_issues() {
+        // ポータブルモードは空の settings.toml を置いて始める（README）
+        for src in ["", "\n", "  \r\n\t\n", "# 設定\n\n# version = 1\n"] {
+            assert_eq!(load(src), (Settings::default(), vec![]), "{src:?}");
+        }
+        // 何か書いてあれば、版がないことを知らせる
+        let (_, issues) = load("[general]\nautostart = true\n");
+        assert_eq!(
+            issues,
+            vec![SettingsIssue::Invalid {
+                item: "version".into()
+            }]
+        );
+    }
+
+    #[test]
     fn version_only_file_gives_defaults_without_issues() {
         let (settings, issues) = load("version = 1\n");
         assert_eq!(issues, vec![]);
@@ -973,6 +1277,14 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn shortcut(id: &str) -> SettingsItem {
+        SettingsItem::Shortcut(id.to_owned())
+    }
+
+    fn mouse(id: &str) -> SettingsItem {
+        SettingsItem::Mouse(id.to_owned())
+    }
+
     fn invalid(item: &str) -> SettingsIssue {
         SettingsIssue::Invalid {
             item: item.to_owned(),
@@ -986,6 +1298,7 @@ version = 1
 log_level = "debug"
 
 [general]
+language = "en"
 save_dir = 'D:\shots'
 file_name_template = "cap_{datetime:yyyy}"
 notifications = false
@@ -1017,8 +1330,10 @@ shadow = false
             settings,
             Settings {
                 general: General {
+                    language: Some(Language::English),
                     save_dir: Some(PathBuf::from(r"D:\shots")),
                     file_name_template: "cap_{datetime:yyyy}".to_owned(),
+                    autostart: false,
                     notifications: false,
                     trash_limit: 3,
                     dpi_scaling: DpiScaling::KeepApparentSize,
@@ -1049,6 +1364,17 @@ shadow = false
                 regions: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn autostart_is_off_by_default_and_read_from_general() {
+        assert!(!Settings::default().general.autostart);
+        let (settings, issues) = load("version = 1\n[general]\nautostart = true\n");
+        assert_eq!(issues, vec![]);
+        assert!(settings.general.autostart);
+        let (settings, issues) = load("version = 1\n[general]\nautostart = \"yes\"\n");
+        assert_eq!(issues, vec![invalid("general.autostart")]);
+        assert!(!settings.general.autostart);
     }
 
     #[test]
@@ -1179,6 +1505,37 @@ shadow = 1
         let (settings, issues) = load("version = 1\n[general]\ncapture_cursor = \"yes\"\n");
         assert_eq!(issues, vec![invalid("general.capture_cursor")]);
         assert!(!settings.general.capture_cursor);
+    }
+
+    #[test]
+    fn the_language_defaults_to_the_os_display_language_and_can_be_japanese_or_english() {
+        assert_eq!(load("version = 1\n").0.general.language, None);
+        for (value, language) in [
+            ("auto", None),
+            ("ja", Some(Language::Japanese)),
+            ("en", Some(Language::English)),
+        ] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[general]\nlanguage = \"{value}\"\n"));
+            assert_eq!(issues, vec![], "{value}");
+            assert_eq!(settings.general.language, language, "{value}");
+        }
+        for value in ["\"fr\"", "\"\"", "\"JA\"", "true", "1"] {
+            let (settings, issues) = load(&format!("version = 1\n[general]\nlanguage = {value}\n"));
+            assert_eq!(issues, vec![invalid("general.language")], "{value}");
+            assert_eq!(settings.general.language, None, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_language_that_follows_the_os_is_decided_by_the_os_display_language() {
+        let mut general = General::default();
+        assert_eq!(general.ui_language(0x0411), Language::Japanese);
+        assert_eq!(general.ui_language(0x0409), Language::English);
+        general.language = Some(Language::English);
+        assert_eq!(general.ui_language(0x0411), Language::English);
+        general.language = Some(Language::Japanese);
+        assert_eq!(general.ui_language(0x0409), Language::Japanese);
     }
 
     #[test]
@@ -1408,6 +1765,13 @@ a = 1
             }
         );
         assert_eq!(
+            changed(|s| s.general.autostart = true),
+            SettingsChanges {
+                autostart: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
             changed(|s| s.general.notifications = false),
             SettingsChanges {
                 notifications: true,
@@ -1440,6 +1804,13 @@ a = 1
             changed(|s| s.log_level = LogLevel::Trace),
             SettingsChanges {
                 log_level: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
+            changed(|s| s.general.language = Some(Language::English)),
+            SettingsChanges {
+                language: true,
                 ..SettingsChanges::default()
             }
         );
@@ -1545,8 +1916,8 @@ a = 1
             vec![SettingsIssue::Conflict {
                 chord: chord("Ctrl+Alt+S"),
                 items: vec![
-                    "hotkeys.select_capture".to_owned(),
-                    "hotkeys.restore_last".to_owned()
+                    SettingsItem::SelectCaptureHotkey,
+                    SettingsItem::RestoreLastHotkey
                 ],
             }]
         );
@@ -1592,6 +1963,7 @@ height = 1
                     file_name_template: "dash_{seq:3}".to_owned(),
                     save: false,
                     scrap: true,
+                    loaded_name: None,
                 },
                 Region {
                     name: "game".to_owned(),
@@ -1602,6 +1974,7 @@ height = 1
                     file_name_template: "{name}_{date}-{time}".to_owned(),
                     save: true,
                     scrap: false,
+                    loaded_name: None,
                 },
             ]
         );
@@ -1741,8 +2114,8 @@ width = 0
             vec![SettingsIssue::Conflict {
                 chord: chord("Ctrl+Alt+S"),
                 items: vec![
-                    "hotkeys.select_capture".to_owned(),
-                    "regions[3].hotkey".to_owned()
+                    SettingsItem::SelectCaptureHotkey,
+                    SettingsItem::RegionHotkey(2)
                 ],
             }]
         );
@@ -1788,7 +2161,7 @@ width = 0
             keymap.issues,
             vec![SettingsIssue::Conflict {
                 chord: chord("Ctrl+W"),
-                items: vec!["shortcuts.copy".to_owned(), "shortcuts.close".to_owned()],
+                items: vec![shortcut("copy"), shortcut("close")],
             }]
         );
     }
@@ -1801,10 +2174,7 @@ width = 0
             keymap.issues,
             vec![SettingsIssue::Conflict {
                 chord: chord("Ctrl+S"),
-                items: vec![
-                    "shortcuts.save_default".to_owned(),
-                    "shortcuts.close".to_owned()
-                ],
+                items: vec![shortcut("save_default"), shortcut("close")],
             }]
         );
     }
@@ -1821,8 +2191,8 @@ width = 0
             keymap.issues,
             vec![SettingsIssue::Overlap {
                 chord: chord("Ctrl+C"),
-                hotkey: "hotkeys.select_capture".to_owned(),
-                shortcut: "shortcuts.copy".to_owned(),
+                hotkey: SettingsItem::SelectCaptureHotkey,
+                shortcut: shortcut("copy"),
             }]
         );
         // 重なりで無効になったショートカットとは、重ならない
@@ -1885,7 +2255,7 @@ width = 0
                 invalid("mouse.fly"),
                 SettingsIssue::MouseConflict {
                     gesture: MouseGesture::DoubleClick,
-                    items: vec!["mouse.copy".to_owned(), "mouse.toggle_compact".to_owned()],
+                    items: vec![mouse("copy"), mouse("toggle_compact")],
                 },
             ]
         );
@@ -2008,6 +2378,7 @@ width = 0
             file_name_template: DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned(),
             save: true,
             scrap: false,
+            loaded_name: None,
         };
         Settings {
             regions: names.iter().map(|n| region(n)).collect(),
@@ -2050,7 +2421,148 @@ width = 0
                 file_name_template: "cap_{seq:3}".to_owned(),
                 save: true,
                 scrap: false,
+                loaded_name: None,
             }
         );
+    }
+
+    fn issue(item: SettingsItem, problem: Problem) -> ValidationIssue {
+        ValidationIssue { item, problem }
+    }
+
+    fn with_select_capture(src: &str) -> Settings {
+        let (settings, issues) = load(&format!(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Shift+A\"\n{src}"
+        ));
+        assert_eq!(issues, vec![], "{src}");
+        settings
+    }
+
+    #[test]
+    fn items_are_named_in_notices_and_logs_as_the_file_keys() {
+        let names: Vec<String> = [
+            SettingsItem::SelectCaptureHotkey,
+            SettingsItem::RestoreLastHotkey,
+            SettingsItem::ActiveWindowCaptureHotkey,
+            shortcut("copy"),
+            mouse("close"),
+            SettingsItem::RegionHotkey(0),
+            SettingsItem::RegionName(2),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "hotkeys.select_capture",
+                "hotkeys.restore_last",
+                "hotkeys.active_window_capture",
+                "shortcuts.copy",
+                "mouse.close",
+                "regions[1].hotkey",
+                "regions[3].name",
+            ]
+        );
+        let issue = SettingsIssue::Overlap {
+            chord: chord("Ctrl+C"),
+            hotkey: SettingsItem::SelectCaptureHotkey,
+            shortcut: shortcut("copy"),
+        };
+        let logged = format!("{issue:?}");
+        assert!(
+            logged.contains(r#"hotkey: "hotkeys.select_capture", shortcut: "shortcuts.copy""#),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn validate_blocks_apply_while_the_select_capture_hotkey_is_unset() {
+        let issues = validate(&Settings::default());
+        assert_eq!(
+            issues,
+            vec![issue(SettingsItem::SelectCaptureHotkey, Problem::Unset)]
+        );
+        assert!(issues[0].blocks_apply());
+        assert_eq!(validate(&with_select_capture("")), vec![]);
+    }
+
+    #[test]
+    fn validate_blocks_apply_on_both_rows_of_overlapping_hotkeys() {
+        let settings = with_select_capture(&format!(
+            "restore_last = \"Ctrl+Alt+R\"\n{}",
+            region_src("a", "hotkey = \"Ctrl+Alt+R\"")
+        ));
+        let issues = validate(&settings);
+        let conflict = Problem::Conflict(chord("Ctrl+Alt+R"));
+        assert_eq!(
+            issues,
+            vec![
+                issue(SettingsItem::RestoreLastHotkey, conflict),
+                issue(SettingsItem::RegionHotkey(0), conflict),
+            ]
+        );
+        assert!(issues.iter().all(ValidationIssue::blocks_apply));
+    }
+
+    #[test]
+    fn validate_blocks_apply_on_both_rows_of_overlapping_shortcuts_and_mouse() {
+        let settings = with_select_capture(
+            "[shortcuts]\ncopy = \"Ctrl+W\"\nclose = \"Ctrl+W\"\n[mouse]\ncopy = \"DoubleClick\"\n",
+        );
+        let issues = validate(&settings);
+        let conflict = Problem::Conflict(chord("Ctrl+W"));
+        let mouse_conflict = Problem::MouseConflict(MouseGesture::DoubleClick);
+        assert_eq!(
+            issues,
+            vec![
+                issue(shortcut("copy"), conflict),
+                issue(shortcut("close"), conflict),
+                issue(mouse("copy"), mouse_conflict),
+                issue(mouse("toggle_compact"), mouse_conflict),
+            ]
+        );
+        assert!(issues.iter().all(ValidationIssue::blocks_apply));
+    }
+
+    #[test]
+    fn validate_blocks_apply_on_empty_and_duplicate_region_names() {
+        let mut settings = with_select_capture(&format!(
+            "{}{}{}",
+            region_src("a", ""),
+            region_src("b", ""),
+            region_src("c", "")
+        ));
+        let mut region = |i: usize, name: &str| {
+            settings.regions[i].name = name.to_owned();
+        };
+        region(0, "same");
+        region(1, " ");
+        region(2, "same");
+        let issues = validate(&settings);
+        assert_eq!(
+            issues,
+            vec![
+                issue(SettingsItem::RegionName(0), Problem::DuplicateName),
+                issue(SettingsItem::RegionName(1), Problem::EmptyName),
+                issue(SettingsItem::RegionName(2), Problem::DuplicateName),
+            ]
+        );
+        assert!(issues.iter().all(ValidationIssue::blocks_apply));
+    }
+
+    #[test]
+    fn validate_only_warns_on_a_hotkey_overlapping_a_shortcut() {
+        let settings = with_select_capture("active_window_capture = \"Ctrl+C\"\n");
+        let issues = validate(&settings);
+        let overlap = Problem::Overlap(chord("Ctrl+C"));
+        assert_eq!(
+            issues,
+            vec![
+                issue(SettingsItem::ActiveWindowCaptureHotkey, overlap),
+                issue(shortcut("copy"), overlap),
+            ]
+        );
+        assert!(issues.iter().all(|issue| !issue.blocks_apply()));
     }
 }

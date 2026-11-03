@@ -4,7 +4,9 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, LPARAM, WPARAM,
 };
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, HWND_MESSAGE, PostMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, FindWindowExW, GetWindowThreadProcessId, HWND_MESSAGE, PostMessageW,
+};
 use windows::core::{PCWSTR, Result};
 
 use crate::wide::to_wide;
@@ -38,11 +40,22 @@ pub fn acquire() -> Result<Option<Guard>> {
 }
 
 /// 既にあるプロセスのメッセージ専用ウィンドウ（クラス名 `class`）に `message` を送る。送れたら true。
+/// 相手が画面（設定 GUI）を前に出せるよう、送る前に `AllowSetForegroundWindow` で前に出すのを許す。
 pub fn notify_first(class: PCWSTR, message: u32) -> bool {
     // SAFETY: メッセージ専用ウィンドウは FindWindowW では見つからないので HWND_MESSAGE の下を探す
     unsafe {
         match FindWindowExW(Some(HWND_MESSAGE), None, class, PCWSTR::null()) {
-            Ok(peer) => PostMessageW(Some(peer), message, WPARAM(0), LPARAM(0)).is_ok(),
+            Ok(peer) => {
+                let mut pid = 0;
+                GetWindowThreadProcessId(peer, Some(&mut pid));
+                if pid != 0 && AllowSetForegroundWindow(pid).is_err() {
+                    log::warn!(
+                        "AllowSetForegroundWindow failed: {}",
+                        windows::core::Error::from_thread()
+                    );
+                }
+                PostMessageW(Some(peer), message, WPARAM(0), LPARAM(0)).is_ok()
+            }
             Err(_) => false,
         }
     }

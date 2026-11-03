@@ -6,6 +6,8 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod autostart;
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod grab;
@@ -39,6 +41,8 @@ mod render;
 mod save;
 #[cfg(windows)]
 mod scrap_window;
+#[cfg(windows)]
+mod settings_dialog;
 #[cfg(windows)]
 mod settings_watch;
 #[cfg(windows)]

@@ -7,6 +7,7 @@
 //!   起動した常駐本体はそのまま常駐を続ける。
 
 use shunsoku_core::cli_args::{self, Command};
+use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::monitors;
 use shunsoku_core::protocol::{self, Request, Response};
 
@@ -78,7 +79,14 @@ fn run() -> i32 {
     match &response {
         Response::Captured { path: Some(path) } => println!("{path}"),
         Response::Captured { path: None } => {}
-        Response::Monitors(list) => print!("{}", monitors::listing(list)),
+        // CLI の文言は日本語だけ（英語 UI の対象外）
+        Response::Monitors(list) => print!(
+            "{}",
+            monitors::listing(
+                list,
+                i18n::catalog(Language::Japanese).text("monitors.main")
+            )
+        ),
         Response::Failed { message, .. } => error(message),
     }
     response.exit_code()

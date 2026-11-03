@@ -31,13 +31,19 @@
 //!   `App::shortcuts`、`ops::mouse_operation`、`ops::menu`）でスクラップ操作に変え、`run_scrap_operation` で
 //!   実行する。操作が返す `Effect` を実行するのはここ（`run_scrap_operation`）。操作を足すときは core の表に
 //!   行を足し、新しい `Effect` があればそこに足す。
-//! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
+//! - 設定（`%APPDATA%\shunsoku\settings.toml`、ポータブルモードでは exe の横のもの。場所は core の
+//!   `settings::locate`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
 //!   読み込み直す。アプリから書き戻すときは `write_settings` で変わった項目だけを書き、書いた直後の中身を監視が
 //!   拾っても読み込み直さない（`App::own_writes`）。読み込み直しでは core の `settings::diff` で変わった部分を調べ、
 //!   ホットキーの登録し直し・スクラップの描き直しなど、変わったものだけを反映する（`on_settings_changed`）。
 //!   保存先・ファイル名テンプレート・通知のオン/オフは、使うときに `App::settings` から読むので、次から効く。
 //!   キーの割り当てと重なりは core の `settings::keymap` で決める。
 //!   問題（読めない・不正な項目・重なったキー・登録できないホットキー・未設定のホットキー）は、まとめて 1 回だけ通知する。
+//!   範囲選択キャプチャのホットキーが未設定なら、起動時は通知せずに設定 GUI を開き、読み込み直しで空になったときと
+//!   未設定のまま GUI を閉じたときは通知する（core の `settings::unset::prompt`）。
+//! - 設定 GUI（トレイの「設定…」・2 つ目の起動）は `settings_gui` が開き、ダイアログの組み立ては `settings_dialog`。
+//!   適用は `write_settings` で書いてから `adopt_settings` で読み込み直しと同じ反映をする。キーの入力欄に
+//!   フォーカスがある間はホットキーの登録を外す（`App::hotkey_pause`）。
 //! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。通知のクリックは
 //!   中身を持たないので、クリックで開くフォルダ（`App::notice_folder`）を覚えておき、新しい通知を出したら忘れる。
 //! - コピーと保存の画像は `render::render_image` で表示と同じ描き方で作る。保存先とファイル名は UI スレッドで
@@ -71,6 +77,7 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -81,7 +88,7 @@ use shunsoku_core::capture::request::{
     self, CaptureMethod, CaptureRequest, OnSaveFailure, ReplyTo, SaveTarget, Source,
 };
 use shunsoku_core::geometry::{Point, Rect};
-use shunsoku_core::i18n::Catalog;
+use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
 use shunsoku_core::monitors::{self, LocateError};
@@ -95,9 +102,13 @@ use shunsoku_core::scrap::{
     Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
 use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
-use shunsoku_core::settings::{self, LogLevel, Rgb, Settings, SettingsChanges, SettingsIssue};
+use shunsoku_core::settings::form::HotkeyPause;
+use shunsoku_core::settings::{
+    self, LogLevel, Rgb, Settings, SettingsChanges, SettingsIssue, unset,
+};
 use shunsoku_core::trash::TrashId;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
@@ -141,10 +152,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 mod cli;
+mod settings_gui;
 
 use crate::{
-    clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook, perf,
-    pipe_server, render, save, scrap_window, settings_watch, single_instance, toolbar_window,
+    autostart, clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook,
+    perf, pipe_server, render, save, scrap_window, settings_watch, single_instance, toolbar_window,
     trash_store, tray, window_list,
 };
 use cli::{
@@ -167,6 +179,10 @@ const WM_APP_TRASH: u32 = WM_APP + 5;
 const WM_APP_PIPE: u32 = WM_APP + 6;
 /// 待っている定型領域キャプチャの依頼（`App::regions_waiting`）を進める。
 const WM_APP_REGION: u32 = WM_APP + 7;
+/// 設定 GUI のキーの組み合わせの欄のフォーカスが変わった（設定 GUI が自分に送る。`settings_gui::check_focus`）。
+const WM_APP_SETTINGS_FOCUS: u32 = WM_APP + 8;
+/// 設定 GUI の DPI が変わり、ダイアログが大きさを直し終えた（設定 GUI が自分に送る。定型領域の一覧の列の幅を直す）。
+const WM_APP_SETTINGS_DPI: u32 = WM_APP + 9;
 
 /// 2 つのウィンドウのクラス名。2 つ目のプロセスはこの名前でメッセージ専用ウィンドウを探す。
 const CLASS_NAME: PCWSTR = w!("shunsoku.app");
@@ -180,6 +196,7 @@ const CMD_CLOSE_ALL: u32 = 3;
 const CMD_HIDE_ALL: u32 = 4;
 const CMD_SHOW_ALL: u32 = 5;
 const CMD_ADD_REGION: u32 = 6;
+const CMD_SETTINGS: u32 = 7;
 /// ごみ箱の一覧の項目の番号は、これに一覧の添字を足したもの。
 const CMD_TRASH_FIRST: u32 = 100;
 /// 「定型領域」の項目の番号は、これに `Settings::regions` の添字を足したもの。
@@ -218,8 +235,8 @@ const EXIT_PANIC: i32 = 101;
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 static SECOND_INSTANCE: OnceLock<u32> = OnceLock::new();
 
-/// 埋め込みの文言（`locales/ja.toml`）。
-static CATALOG: OnceLock<Catalog> = OnceLock::new();
+/// いまの UI の言語が英語か（`text` で引くカタログ）。裏のスレッドとパニックのフックも読むので atomic。
+static ENGLISH: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -228,7 +245,7 @@ thread_local! {
 /// アプリの状態。UI スレッドだけが持つ。drop の順（宣言の順）で設定ファイルの監視を止め、トレイを消し、
 /// 範囲選択の画面を閉じ、ホットキーの登録を外してからウィンドウを壊す。
 struct App {
-    /// 設定ファイルの監視。`APPDATA` がないときや始められなかったときは None。
+    /// 設定ファイルの監視。設定ファイルの場所が決まらないときや始められなかったときは None。
     watcher: Option<settings_watch::Watcher>,
     tray: tray::Tray,
     /// トレイの登録に 1 度でも成功したか。性能の区切り `TrayRegistered` は最初の成功のときだけ書く。
@@ -272,6 +289,12 @@ struct App {
     /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
     notice_folder: Option<PathBuf>,
     gpu: grab::Gpu,
+    /// 開いている設定 GUI。
+    settings_gui: Option<settings_gui::SettingsGui>,
+    /// 設定 GUI のキーの組み合わせの欄にフォーカスがあり、全体のホットキーの登録を外している。
+    hotkey_pause: HotkeyPause,
+    /// 最後に登録したときに登録できなかったホットキー（設定 GUI の印にする）。
+    unregistered: Vec<settings::SettingsItem>,
     hotkeys: hotkey::Registered,
     windows: Windows,
     module: HINSTANCE,
@@ -580,37 +603,70 @@ impl Drop for Windows {
     }
 }
 
-/// キーの文言。キーがなければキーそのもの。
+/// いまの言語でのキーの文言。キーがなければキーそのもの。
 fn text(key: &'static str) -> &'static str {
-    CATALOG.get().map_or(key, |c| c.text(key))
+    i18n::catalog(language()).text(key)
+}
+
+/// いまの UI の言語。
+fn language() -> Language {
+    if ENGLISH.load(Ordering::Relaxed) {
+        Language::English
+    } else {
+        Language::Japanese
+    }
+}
+
+/// 設定 `settings` と OS の表示言語から、UI の言語を決める。変わったら true。
+fn set_language(settings: &Settings) -> bool {
+    // SAFETY: 引数なし
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    let language = settings.general.ui_language(langid);
+    let old = ENGLISH.swap(language == Language::English, Ordering::Relaxed);
+    log::info!("UI language: {language:?} (OS LANGID {langid:#06x})");
+    old != (language == Language::English)
+}
+
+/// 設定ファイルの場所を決める（core の `settings::locate`）。exe の横に `settings.toml` があればそれ
+/// （ポータブルモード）、なければ `%APPDATA%\shunsoku\settings.toml`。ポータブルモードで書けなくても
+/// `%APPDATA%` には逃がさない（`write_settings` がエラーを返し、呼び出し側が通知する）。
+fn locate_settings() -> Option<settings::SettingsLocation> {
+    // ロガーはまだ無いので、取れなければ黙って %APPDATA% にする
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(Path::parent);
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    settings::locate(exe_dir, appdata.as_deref(), Path::is_file)
 }
 
 /// 常駐本体を動かし、終了コードを返す。
 pub fn run() -> i32 {
     let perf_started = perf::start();
-    // 設定ファイルとログを置くフォルダ
-    let app_dir = std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join(APP_NAME));
-    let log_path = app_dir.as_deref().and_then(|dir| logger::init(dir).ok());
+    // 設定ファイルの場所（ポータブルモードの判定）。ログも同じフォルダに書く
+    let location = locate_settings();
+    let log_path = location
+        .as_ref()
+        .and_then(|location| logger::init(location.dir()).ok());
     log::info!("starting {APP_NAME} v{}", env!("CARGO_PKG_VERSION"));
+    match &location {
+        Some(location) if location.portable => {
+            log::info!("portable mode: using {}", location.settings_file.display())
+        }
+        Some(_) => {}
+        None => log::warn!("neither the exe folder nor APPDATA is known"),
+    }
     if let Err(e) = perf_started {
         log::warn!("could not open the perf log: {e}");
     }
 
-    let catalog = Catalog::parse(include_str!("../../../locales/ja.toml")).unwrap_or_else(|e| {
-        log::error!("bundled locale is not valid TOML: {e}");
-        Catalog::default()
+    // 設定を読むまでは OS の表示言語。文言はパニックした時点の言語で引く
+    set_language(&Settings::default());
+    panic_hook::install(std::thread::current().id(), move || {
+        let body = match &log_path {
+            Some(path) => format!("{}\n{}", text("panic.body"), path.display()),
+            None => text("panic.body").to_owned(),
+        };
+        (text("panic.title").to_owned(), body)
     });
-    let _ = CATALOG.set(catalog);
-
-    let body = match &log_path {
-        Some(path) => format!("{}\n{}", text("panic.body"), path.display()),
-        None => text("panic.body").to_owned(),
-    };
-    panic_hook::install(
-        std::thread::current().id(),
-        text("panic.title").to_owned(),
-        body,
-    );
 
     // manifest で Per-Monitor V2 になっている。念のための呼び出しで、既に設定済みならエラーになる
     // SAFETY: 引数は定数
@@ -642,11 +698,13 @@ pub fn run() -> i32 {
         log::warn!("could not initialize COM: {com:?}");
     }
 
-    let settings_path = app_dir.map(|dir| dir.join("settings.toml"));
+    let settings_path = location.map(|location| location.settings_file);
     let (settings, issues) = read_settings(settings_path.as_deref());
     log::set_max_level(level_filter(settings.log_level));
+    set_language(&settings);
 
-    let unset = settings.hotkeys.select_capture.is_none();
+    // 未設定なら、通知ではなく設定 GUI を開いて促す（初回起動の流れ）
+    let open_gui = unset::prompt(unset::When::Startup, &settings) == Some(unset::Prompt::OpenGui);
     let (app, key_issues, failed) = match start(instance, settings, settings_path) {
         Ok(started) => started,
         Err(e) => {
@@ -659,7 +717,7 @@ pub fn run() -> i32 {
         Moment::Startup,
         &issues,
         &failed,
-        unset,
+        false,
         app.settings_path.as_deref(),
     );
     #[cfg(debug_assertions)]
@@ -681,6 +739,11 @@ pub fn run() -> i32 {
     }
     if let Some((level, body)) = notice {
         notify_user(level, &body);
+    }
+    sync_autostart();
+    if open_gui {
+        log::info!("the select-capture hotkey is unset; opening the settings GUI");
+        settings_gui::open_for_unset_hotkey();
     }
     log::info!("started");
 
@@ -846,6 +909,9 @@ fn start(
         carryover: Carryover::default(),
         notice_folder: None,
         gpu: grab::Gpu::default(),
+        settings_gui: None,
+        hotkey_pause: HotkeyPause::default(),
+        unregistered: failed.iter().map(|f| f.action.into()).collect(),
         hotkeys,
         windows,
         module,
@@ -868,6 +934,8 @@ fn message_loop() -> i32 {
                 );
                 return 1;
             }
+            // 設定 GUI へのメッセージ（Tab の移動など）はダイアログに任せる
+            _ if settings_gui::is_dialog_message(&msg) => {}
             _ => unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -1035,8 +1103,8 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             Some(LRESULT(0))
         }
         _ if Some(&msg) == SECOND_INSTANCE.get() => {
-            // M1 では何もしない（M5 で設定 GUI を開く）
-            log::info!("another instance was launched");
+            log::info!("another instance was launched; opening the settings GUI");
+            settings_gui::open(None);
             Some(LRESULT(0))
         }
         _ => None,
@@ -1120,6 +1188,8 @@ fn on_tray(owner: HWND, event: tray::Event) {
                 },
                 menu::Entry::item(CMD_CLOSE_ALL, text("tray.menu.close_all"), any_scrap),
                 hide_or_show,
+                menu::Entry::Separator,
+                menu::Entry::item(CMD_SETTINGS, text("tray.menu.settings"), true),
                 menu::Entry::item(CMD_EXIT, text("tray.menu.exit"), true),
             ];
             // モーダルなので App を借りずに呼ぶ
@@ -1166,6 +1236,7 @@ fn on_command(command: u32) {
         CMD_CLOSE_ALL => close_all_scraps(),
         CMD_HIDE_ALL => set_scraps_visible(false),
         CMD_SHOW_ALL => set_scraps_visible(true),
+        CMD_SETTINGS => settings_gui::open(None),
         CMD_EXIT => {
             log::info!("exit requested from the tray menu");
             // SAFETY: UI スレッドで呼ぶ
@@ -2618,8 +2689,12 @@ fn finish_selection() {
         drop(overlay);
         end_capture();
         log::info!("overlay closed");
-        if let Some(rect) = selection.rect() {
-            register_region(rect);
+        match (request.method, selection.rect()) {
+            (CaptureMethod::ReselectRegion(index), Some(rect)) => {
+                settings_gui::region_reselected(index, rect)
+            }
+            (_, Some(rect)) => register_region(rect),
+            _ => {}
         }
         return;
     }
@@ -2800,15 +2875,17 @@ fn take_capture() {
         }
     };
     match method {
-        Some(request::CaptureMethod::Select | request::CaptureMethod::RegisterRegion) => {
-            open_overlay()
-        }
+        Some(
+            request::CaptureMethod::Select
+            | request::CaptureMethod::RegisterRegion
+            | request::CaptureMethod::ReselectRegion(_),
+        ) => open_overlay(),
         Some(request::CaptureMethod::ActiveWindow) => capture_active_window(),
         Some(request::CaptureMethod::Window(target)) => {
             capture_window(window_list::hwnd(target.window), target.crop);
         }
         Some(request::CaptureMethod::Rect { monitor, rect }) => capture_rect(monitor, rect),
-        Some(request::CaptureMethod::Region(_)) => {
+        Some(request::CaptureMethod::Region(_) | request::CaptureMethod::TrialRegion(_)) => {
             // 定型領域はふだん `request_region` の待ち行列から撮る。ここに来たら同じ流れで撮る
             let request = with_app(|app| match std::mem::take(&mut app.capture) {
                 Capture::Waiting(request) => Some(request),
@@ -3065,7 +3142,7 @@ fn open_overlay() {
     let grab_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     // ウィンドウを作るとメッセージが届くので、App を借りずに開く
-    let overlay = match overlay::Overlay::open(shots, module) {
+    let overlay = match overlay::Overlay::open(shots, module, text("selection.size_plus")) {
         Ok(overlay) => {
             // open は全モニタで DwmFlush が返ってから戻る
             perf::mark(Mark::OverlayFlushed);
@@ -3094,7 +3171,7 @@ fn open_overlay() {
                 .with_mode(app.settings.selection.mode)
                 .with_crosshair(app.settings.selection.crosshair);
             let mut overlay = overlay;
-            if request.method == request::CaptureMethod::RegisterRegion {
+            if request.method.registers_region() {
                 // 定型領域の登録は常に精密モードで、画面の上端に登録だと出す
                 selection = selection.registering();
                 overlay.set_banner(Some(text("selection.register_banner")));
@@ -3168,6 +3245,8 @@ fn end_capture() {
             post_region_message(window);
         }
     }
+    // 「範囲を選び直す」で隠した設定 GUI を出し直す
+    settings_gui::capture_done();
 }
 
 /// `WM_HOTKEY`。範囲選択の画面を開いている間に押されたものは `request_capture`・`request_region` が無視する。
@@ -3229,6 +3308,40 @@ fn request_region(index: usize, from: &str) {
     }
 }
 
+/// 設定 GUI の「範囲を選び直す」: 範囲選択の画面を登録のモードで開き、決めた範囲を写しの定型領域 `index` に
+/// 入れる（`settings_gui::region_reselected`）。ほかの依頼を進めていれば受けずに false。
+fn request_reselect(index: usize) -> bool {
+    let idle = with_app(|app| matches!(app.capture, Capture::Idle)).unwrap_or(false);
+    if idle {
+        log::info!(
+            "reselecting region {} requested from the settings GUI",
+            index + 1
+        );
+        submit(CaptureRequest::reselect_region(index));
+    }
+    idle
+}
+
+/// 設定 GUI の「試しに撮る」: 写しの定型領域 `region` の値で撮る（定型領域キャプチャと同じ待ち行列で、この処理を
+/// 抜けてから撮る）。領域に保存先がなければ `general_dir` に保存する。ほかの依頼を進めていれば受けずに false。
+fn request_trial(region: &settings::Region, general_dir: Option<PathBuf>) -> bool {
+    let queued = with_app(|app| {
+        if !matches!(app.capture, Capture::Idle) {
+            return None;
+        }
+        app.regions_waiting
+            .push_back(CaptureRequest::trial_region(region, general_dir));
+        Some(app.windows.message)
+    })
+    .flatten();
+    let Some(message_window) = queued else {
+        return false;
+    };
+    log::info!("trial capture of region {} requested", region.name);
+    post_region_message(message_window);
+    true
+}
+
 /// 待っている定型領域キャプチャを、いまの処理を抜けてから進めるよう `WM_APP_REGION` を送る。
 fn post_region_message(message_window: HWND) {
     // SAFETY: 自分のメッセージ専用ウィンドウに送るだけ
@@ -3261,6 +3374,8 @@ fn run_waiting_regions() {
                     flush_composition();
                 }
                 capture_region(request);
+                // 「試しに撮る」で隠した設定 GUI を出し直す
+                settings_gui::capture_done();
             }
             Some(Err(message_window)) => {
                 // SAFETY: 自分のウィンドウのタイマー
@@ -3374,18 +3489,12 @@ fn menus_visible() -> bool {
 
 /// 定型領域キャプチャを 1 件撮り、依頼の出力（保存・スクラップ）を出す。撮れなければ失敗を通知する。
 fn capture_region(request: CaptureRequest) {
-    let CaptureMethod::Region(id) = &request.method else {
+    let Some(name) = request.region_name().map(str::to_owned) else {
         return;
     };
-    let name = id.0.as_str();
-    let region = with_app(|app| {
-        app.settings
-            .regions
-            .iter()
-            .find(|region| region.name == name)
-            .cloned()
-    })
-    .flatten();
+    let name = name.as_str();
+    // 試しに撮る依頼（設定 GUI）は写しの値で、ほかは適用済みの設定から名前で引く
+    let region = with_app(|app| request.region_to_capture(&app.settings.regions)).flatten();
     let Some(region) = region else {
         log::warn!("region {name} is not in the settings");
         let message = format!("{}{name}", text("region.gone"));
@@ -3476,19 +3585,20 @@ fn capture_region(request: CaptureRequest) {
 }
 
 /// 範囲選択の画面で決めた範囲（スクリーン座標）を、定型領域として設定ファイルの `[[regions]]` に足す。
-/// 名前は重ならない「領域 N」、モニタは範囲の左上を含むモニタ。足せたら、トレイの「定型領域」サブメニュー
-/// （開くたびに `App::settings` から作る）に出て、すぐに撮れる。結果は通知で知らせる。
+/// 名前は重ならない「領域 N」（設定 GUI を開いていれば、その写しの定型領域とも重ならない）、モニタは範囲の左上を
+/// 含むモニタ。足せたら、トレイの「定型領域」サブメニュー（開くたびに `App::settings` から作る）に出て、すぐに
+/// 撮れる。結果は通知で知らせ、設定 GUI の「定型領域」タブで足した領域の名前の欄にフォーカスを置く。
 fn register_region(rect: Rect) {
     let monitors = monitor_list::list();
-    let Some(monitor) = monitors.iter().find(|m| m.rect.contains(rect.origin())) else {
+    let Some((index, relative)) = monitors::relative_to(&monitors, rect) else {
         log::warn!("no monitor contains the region to register at {rect:?}");
         notify_user(notify::Level::Error, text("region.register_failed"));
         return;
     };
-    let relative = rect.offset(-monitor.rect.left, -monitor.rect.top);
+    let monitor = &monitors[index];
     let result = with_app(|app| {
-        let region = settings::new_region(
-            &app.settings,
+        let region = settings_gui::region_to_register(
+            app,
             text("region.default_name"),
             &monitor.id,
             relative,
@@ -3505,10 +3615,13 @@ fn register_region(rect: Rect) {
                 region.monitor,
                 region.rect
             );
-            notify_user(
-                notify::Level::Success,
-                &format!("{}{}", text("region.registered"), region.name),
-            );
+            // 通知は出さない（設定 GUI でその領域を開くので、登録したことはそこでわかる）
+            // 書いた定型領域はファイルの要素に結び付いている（`Settings::as_written`）
+            let name = region.name.clone();
+            settings_gui::region_registered(settings::Region {
+                loaded_name: Some(name),
+                ..region
+            });
         }
         Some(Err(e)) => {
             log::error!("could not register the region: {e}");
@@ -3564,7 +3677,7 @@ fn float_scrap(at: Point, image: Image, focus: bool) -> std::result::Result<(), 
 /// ときと同じ問題にする。
 fn read_settings(path: Option<&Path>) -> (Settings, Vec<SettingsIssue>) {
     let Some(path) = path else {
-        log::warn!("APPDATA is not set; using the default settings");
+        log::warn!("no settings file location; using the default settings");
         return (Settings::default(), Vec::new());
     };
     let (settings, issues) = match std::fs::read_to_string(path) {
@@ -3596,7 +3709,7 @@ fn write_settings(app: &mut App, new: &Settings) -> std::result::Result<(), Stri
     let path = app
         .settings_path
         .clone()
-        .ok_or_else(|| "APPDATA is not set".to_owned())?;
+        .ok_or_else(|| "the settings file location is unknown".to_owned())?;
     let src = match std::fs::read_to_string(&path) {
         Ok(src) => src,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -3617,7 +3730,7 @@ fn write_settings(app: &mut App, new: &Settings) -> std::result::Result<(), Stri
         return Err(format!("{}: {e}", path.display()));
     }
     log::info!("settings written to {}", path.display());
-    app.settings = new.clone();
+    app.settings = new.as_written();
     Ok(())
 }
 
@@ -3665,6 +3778,7 @@ fn on_settings_changed() {
     let Some(content) = content else {
         return;
     };
+    let mut autostart_changed = false;
     let notice = with_app(|app| {
         let own = match &content {
             settings_watch::Content::Text(src) => app.own_writes.is_own(src),
@@ -3685,26 +3799,19 @@ fn on_settings_changed() {
                 (current.clone(), vec![SettingsIssue::NotToml { message }])
             }
         };
-        let changes = settings::diff(current, &new);
-        log::info!("settings reloaded: {changes:?}");
+        log::info!("settings reloaded");
         log_issues(&issues);
-        let keymap = settings::keymap(&new, ops::OPERATIONS);
-        log_issues(&keymap.issues);
-        issues.extend(keymap.issues);
-        let failed = if changes.hotkeys {
-            app.hotkeys.reregister(&keymap.hotkeys.bound)
-        } else {
-            Vec::new()
-        };
-        log_failed(&failed);
-        app.shortcuts = keymap.shortcuts;
-        app.mouse = keymap.mouse;
-        let unset =
-            app.settings.hotkeys.select_capture.is_some() && new.hotkeys.select_capture.is_none();
-        app.carryover
-            .settings_changed(&app.settings.annotation, &new.annotation);
-        app.settings = new;
-        apply_changes(app, &changes);
+        // 空になっても GUI は開かず、通知だけ出す
+        let unset = unset::prompt(
+            unset::When::Reload {
+                before: &app.settings,
+            },
+            &new,
+        ) == Some(unset::Prompt::Notify);
+        let old = std::mem::replace(&mut app.settings, new);
+        let (keymap_issues, failed) = adopt_settings(app, &old, false);
+        autostart_changed = old.general.autostart != app.settings.general.autostart;
+        issues.extend(keymap_issues);
         settings_notice(
             Moment::Reload,
             &issues,
@@ -3717,12 +3824,65 @@ fn on_settings_changed() {
     if let Some((level, body)) = notice {
         notify_user(level, &body);
     }
+    if autostart_changed {
+        sync_autostart();
+    }
+}
+
+/// 新しくした設定（`app.settings`、前は `old`）を反映する。読み込み直しと設定 GUI の適用で使う。
+///
+/// - 変わったものだけを反映する（`settings::diff`）。ホットキーは、変わったとき（`reregister` なら必ず）に登録し直す。
+///   ただし、設定 GUI の欄にフォーカスがあって外している間は登録しない（フォーカスが外れたら登録し直す）。
+/// - ショートカットとマウスの対応表は毎回作り直す。書き込みの既定値の変化を `Carryover` に伝える。
+/// - キーの割り当ての問題と、登録できなかったホットキーを返す。
+fn adopt_settings(
+    app: &mut App,
+    old: &Settings,
+    reregister: bool,
+) -> (Vec<SettingsIssue>, Vec<hotkey::Failed>) {
+    let changes = settings::diff(old, &app.settings);
+    log::info!("settings changed: {changes:?}");
+    let keymap = settings::keymap(&app.settings, ops::OPERATIONS);
+    log_issues(&keymap.issues);
+    let failed = if (changes.hotkeys || reregister) && !app.hotkey_pause.is_paused() {
+        register_bound(app, &keymap.hotkeys.bound)
+    } else {
+        Vec::new()
+    };
+    log_failed(&failed);
+    app.shortcuts = keymap.shortcuts;
+    app.mouse = keymap.mouse;
+    app.carryover
+        .settings_changed(&old.annotation, &app.settings.annotation);
+    apply_changes(app, &changes);
+    (keymap.issues, failed)
+}
+
+/// いまの設定（`app.settings`）のホットキーを登録し直す。登録できなかったものを `App::unregistered` に覚えて返す。
+fn register_hotkeys(app: &mut App) -> Vec<hotkey::Failed> {
+    let keymap = settings::keymap(&app.settings, ops::OPERATIONS);
+    register_bound(app, &keymap.hotkeys.bound)
+}
+
+/// ホットキー `bound`（いまの設定から作った対応表）を登録し直す。登録できなかったものを `App::unregistered` に
+/// 覚えて返す。
+fn register_bound(
+    app: &mut App,
+    bound: &std::collections::BTreeMap<Chord, settings::HotkeyAction>,
+) -> Vec<hotkey::Failed> {
+    let failed = app.hotkeys.reregister(bound);
+    app.unregistered = failed.iter().map(|f| f.action.into()).collect();
+    failed
 }
 
 /// 読み込み直した設定（`app.settings`）のうち、使うときに読むのでは足りないものを反映する。
 fn apply_changes(app: &mut App, changes: &SettingsChanges) {
     if changes.log_level {
         log::set_max_level(level_filter(app.settings.log_level));
+    }
+    // メニューと通知は出すたびに文言を引く。開いている設定 GUI は、適用したときに組み直す（`settings_gui`）
+    if changes.language {
+        set_language(&app.settings);
     }
     if changes.trash {
         app.trash.set_limit(app.settings.general.trash_limit);
@@ -3774,6 +3934,7 @@ fn settings_notice(
     let mut conflicts = Vec::new();
     let mut overlaps = Vec::new();
     let mut mouse_conflicts = Vec::new();
+    let (open, close) = (text("settings.items_open"), text("settings.items_close"));
     for issue in issues {
         match issue {
             SettingsIssue::NotToml { .. } => {
@@ -3788,15 +3949,15 @@ fn settings_notice(
             }
             SettingsIssue::Invalid { item } => invalid.push(item.as_str()),
             SettingsIssue::Conflict { chord, items } => {
-                conflicts.push(format!("{chord}（{}）", items.join(", ")));
+                conflicts.push(format!("{chord}{open}{}{close}", join_items(items)));
             }
             SettingsIssue::Overlap {
                 chord,
                 hotkey,
                 shortcut,
-            } => overlaps.push(format!("{chord}（{hotkey}, {shortcut}）")),
+            } => overlaps.push(format!("{chord}{open}{hotkey}, {shortcut}{close}")),
             SettingsIssue::MouseConflict { gesture, items } => {
-                mouse_conflicts.push(format!("{gesture}（{}）", items.join(", ")));
+                mouse_conflicts.push(format!("{gesture}{open}{}{close}", join_items(items)));
             }
         }
     }
@@ -3824,6 +3985,30 @@ fn settings_notice(
         lines.push(path.display().to_string());
     }
     Some((level, lines.join("\n")))
+}
+
+/// 項目名を `, ` でつなぐ（`shortcuts.copy, shortcuts.close`）。
+fn join_items(items: &[settings::SettingsItem]) -> String {
+    let names: Vec<String> = items.iter().map(ToString::to_string).collect();
+    names.join(", ")
+}
+
+/// 自動起動の登録（Run キー）をいまの設定に合わせる。起動したとき、設定 GUI で適用したとき、読み込み直しで
+/// 自動起動が変わったときに呼ぶ。合わせられなければ通知する。通知を出すので `App` を借りずに呼ぶ。
+fn sync_autostart() {
+    let Some(enabled) = with_app(|app| app.settings.general.autostart) else {
+        return;
+    };
+    match autostart::sync(enabled) {
+        Ok(action) => log::info!("autostart (enabled: {enabled}): {action:?}"),
+        Err(e) => {
+            log::error!("autostart: {e}");
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{e}", text("settings.autostart_failed")),
+            );
+        }
+    }
 }
 
 /// トレイの通知を出す。出したら true。設定で通知をオフにしたときは、成功の通知だけを止める（エラーと警告は出す）。

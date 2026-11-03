@@ -18,6 +18,12 @@ version = 1
 log_level = "info"
 
 [general]
+# メニュー・通知・設定 GUI・範囲選択の画面の言語。次のどれか（コマンドライン（shunsoku-cli）は日本語のままです）。
+#   auto  OS の表示言語に合わせる（日本語でなければ英語）
+#   ja    日本語
+#   en    英語（English）
+language = "auto"
+
 # 「既定の保存先へ保存」で画像を保存するフォルダ。絶対パスだけを書けます（C:\… か \\サーバー\共有\…）。
 # 既定はピクチャ フォルダの下の shunsoku。
 # バックスラッシュをそのまま書けるよう、' ' で囲んでください。
@@ -33,6 +39,12 @@ log_level = "info"
 # 知らない変数はそのまま残ります。ファイル名に使えない文字（<>:"/\|?* など）は _ に置き換えます。
 # 同じ名前のファイルがあれば _2、_3 … を付けて上書きを避けます。
 file_name_template = "shunsoku_{date}-{time}"
+
+# Windows にサインインしたときに shunsoku を常駐させるかどうか（true / false）。
+# 起動したときと設定 GUI で適用したときに、HKCU\Software\Microsoft\Windows\CurrentVersion\Run を
+# この値に合わせます（true ならいまの exe のパスで登録し、false なら登録を消します）。
+# exe を別のフォルダへ動かしたら、動かした先の exe を 1 回手で起動すると登録が直ります。
+autostart = false
 
 # 通知を出すかどうか（true / false）。false で止まるのは成功の通知（保存しました など）だけで、
 # エラーと警告は常に出します。

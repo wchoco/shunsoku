@@ -6,6 +6,7 @@ members = [
     "crates/shunsoku-cli",
     "crates/shunsoku-pipe-identity",
     "tools/perf-harness",
+    "tools/release-tools",
 ]
 
 [workspace.package]

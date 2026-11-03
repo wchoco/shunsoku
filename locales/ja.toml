@@ -15,6 +15,7 @@ trash_empty = "（空）"
 close_all = "すべてのスクラップを閉じる"
 hide_all = "すべて隠す"
 show_all = "すべて表示"
+settings = "設定…"
 exit = "終了"
 
 [panic]
@@ -31,11 +32,149 @@ unreadable_kept = "設定ファイルを TOML として読めないため、直�
 conflicts = "重なったキーを、重なった項目のすべてで無効にしました: "
 mouse_conflicts = "重なったマウス操作を、重なった項目のすべてで無効にしました: "
 overlaps = "ホットキーとショートカットが重なっています（ホットキーが優先され、そのショートカットは効きません）: "
+autostart_failed = "自動起動の登録を設定に合わせられませんでした。"
 watch_stopped = "設定ファイルの監視が止まりました。設定ファイルを直したら shunsoku を起動し直してください。"
+# 重なったキーの後ろに付ける、重なった項目の一覧の括弧（「Ctrl+A（copy, close）」）
+items_open = "（"
+items_close = "）"
+
+# 設定 GUI（ダイアログ）
+[settings_gui]
+title = "shunsoku の設定"
+# ダイアログの文字のフォント（DS_SETFONT の書体名）
+font = "Yu Gothic UI"
+ok = "OK"
+cancel = "キャンセル"
+apply = "適用"
+write_failed = "設定ファイルに書けませんでした。設定 GUI の内容はまだ適用されていません。"
+# 欄の横のボタン
+browse = "参照…"
+pick_color = "選ぶ…"
+# キーの組み合わせの欄が空のときに出す文字（標準のコントロールに任せると OS の表示言語で出る）
+chord_none = "なし"
+insert_variable = "変数を挿入"
+
+# 適用で、設定 GUI を開いている間に設定ファイルでも変わった項目を GUI でも変えていたときの確認
+
+# 読めない入力で欄を元に戻したときに、欄に出す吹き出し
+[settings_gui.invalid]
+title = "この値は使えません"
+number = "{min} から {max} までの整数を入れてください。欄は元の値に戻しました。"
+number_min = "{min} 以上の整数を入れてください。欄は元の値に戻しました。"
+color = "色は #RRGGBB（例: #FF0000）で入れてください。欄は元の値に戻しました。"
+folder = "フォルダはドライブから書いてください（例: C:\\Pictures）。空にすると既定になります。欄は元の値に戻しました。"
+template = "ファイル名は空にできません。欄は元の値に戻しました。"
+
+[settings_gui.conflict]
+body = "設定 GUI を開いている間に、次の項目が設定ファイルでも変わりました。GUI でも変えています。"
+choices = "OK: GUI の値で上書きする\nキャンセル: 適用をやめる（設定ファイルは変えません）"
+
+[settings_gui.tab]
+general = "一般"
+capture = "キャプチャ"
+regions = "定型領域"
+scrap = "スクラップ"
+scrap_ops = "スクラップ操作"
+annotation = "書き込み"
+
+[settings_gui.general]
+language = "言語:"
+# 言語の一覧の先頭。OS の表示言語に合わせる（日本語でなければ英語）
+language_auto = "OS に合わせる"
+autostart = "Windows にサインインしたときに起動する"
+notifications = "通知を出す"
+save_dir = "保存先:"
+# 保存先の欄が空のときに薄く出す（後ろに既定のフォルダが付く）
+default_dir = "既定: "
+file_name_template = "ファイル名:"
+
+[settings_gui.template]
+# ファイル名テンプレートの欄の下（後ろにいま撮ったら付く名前が付く）
+preview = "例: "
+
+[settings_gui.capture]
+select_capture = "範囲選択キャプチャ:"
+active_window_capture = "アクティブウィンドウ:"
+restore_last = "最後に閉じたものを復元:"
+capture_cursor = "マウスカーソルを写す"
+mode = "範囲選択の既定のモード:"
+mode_normal = "通常（離すと確定）"
+mode_precise = "精密（調整してから確定）"
+crosshair = "範囲選択の画面に十字線を出す"
+hint = "欄を選んでキーを押すと割り当てます。Tab で次の欄へ移ります。"
+
+[settings_gui.regions]
+# 一覧の列
+name = "名前"
+hotkey = "ホットキー"
+range = "範囲"
+# 一覧の下のボタン
+add = "追加"
+duplicate = "複製"
+remove = "削除"
+up = "上へ"
+down = "下へ"
+# 複製した定型領域の名前（元の名前の後ろに付ける。重なれば、さらに後ろに番号を付ける）
+copy_suffix = " のコピー"
+# 詳細
+name_label = "名前:"
+hotkey_label = "ホットキー:"
+monitor_label = "モニタ:"
+x = "X:"
+y = "Y:"
+width = "幅:"
+height = "高さ:"
+reselect = "範囲を選び直す"
+test_capture = "試しに撮る"
+monitor_not_found = "登録したモニタが見つかりません。撮れません。"
+out_of_bounds = "範囲がモニタからはみ出しています。撮れません。"
+save_dir_label = "保存先:"
+open_folder = "フォルダを開く"
+template_label = "ファイル名:"
+save = "保存する"
+scrap = "スクラップとして表示する"
+
+[settings_gui.scrap]
+opacity = "透明度（%）:"
+border = "枠を出す"
+border_width = "枠の太さ:"
+border_color = "枠の色:"
+shadow = "影を付ける"
+trash_limit = "ごみ箱に残す数:"
+dpi_scaling = "DPI の違うモニタへ動かしたとき:"
+dpi_keep_pixels = "画素を等倍に保つ"
+dpi_keep_apparent_size = "見かけの大きさを保つ"
+
+[settings_gui.annotation]
+color = "色:"
+width = "太さ:"
+font_size = "文字サイズ:"
+font = "書体:"
+hint = "これから書き込むときの既定値です。書き込み済みのものは変わりません。"
+
+[settings_gui.scrap_ops]
+operation = "操作"
+shortcut = "ショートカット"
+mouse = "マウス"
+mark = "印"
+shortcut_label = "ショートカット:"
+mouse_label = "マウス:"
+reset = "既定に戻す"
+none = "なし"
+
+# 欄の横の印
+[settings_gui.mark]
+unset = "未設定"
+conflict = "重なっています"
+mouse_conflict = "重なっています"
+overlap = "ショートカットと重なっています（ホットキーが優先）"
+not_registered = "登録できませんでした（他のアプリが使っている可能性があります）"
+empty_name = "名前が空です"
+duplicate_name = "名前が重なっています"
 
 [hotkey]
 failed = "次のホットキーを登録できませんでした（他のアプリが使っている可能性があります）: "
-unset = "範囲選択キャプチャのホットキーが未設定です。設定ファイルの [hotkeys] の select_capture に書いてください（トレイからも撮れます）。"
+unset = "範囲選択キャプチャのホットキーが未設定です。トレイのメニューの「設定…」の「キャプチャ」タブで設定してください（トレイのクリックでも撮れます）。"
 
 # スクラップ操作（右クリックメニュー）。キーは scrap::ops の表の label_key
 [scrap.op]
@@ -66,6 +205,16 @@ border = "枠"
 shadow = "影"
 toggle_compact = "コンパクト表示"
 close = "閉じる"
+
+# マウスの操作（設定 GUI のドロップダウン）。キーは scrap::ops の MouseGesture::label_key
+[mouse_gesture]
+left_drag = "左ドラッグ"
+middle_click = "中クリック"
+wheel_up = "ホイール上"
+wheel_down = "ホイール下"
+ctrl_wheel_up = "Ctrl+ホイール上"
+ctrl_wheel_down = "Ctrl+ホイール下"
+double_click = "ダブルクリック"
 
 # 枠の一覧（scrap::ops の border の選択肢）
 [scrap.border]
@@ -98,12 +247,22 @@ out_of_bounds = "定型領域の範囲がモニタからはみ出すため、撮
 gone = "その名前の定型領域が設定にないため、撮れませんでした: "
 # 定型領域の登録。登録した名前は「領域 1」「領域 2」…（この後ろに番号を付ける）
 default_name = "領域"
-registered = "定型領域を登録しました: "
 register_failed = "定型領域を登録できませんでした。"
 # 範囲選択の画面
 [selection]
 # 定型領域の登録のとき、画面の上端に出す
 register_banner = "定型領域の登録"
+# モニタをまたいだ範囲のサイズの、モニタごとのサイズのつなぎ（「100 × 200 ＋ 200 × 200」）
+size_plus = " ＋ "
+
+# 言語の名前（設定 GUI の言語の一覧）。どの言語の UI でも、その言語で書いた名前を出す
+[language]
+ja = "日本語"
+en = "English"
+
+# shunsoku-cli monitors の一覧で、メインモニタの行の末尾に付ける印
+[monitors]
+main = "メイン"
 
 # CLI（shunsoku-cli）に返す失敗の理由。標準エラーに出る
 [cli]
@@ -127,3 +286,12 @@ saved = "保存しました（クリックでフォルダを開きます）:"
 failed = "保存できませんでした。スクラップは残っています。"
 # 「名前を付けて保存」のファイルの種類
 png_filter = "PNG 画像"
+
+# ファイル名テンプレートの「変数を挿入」のメニュー。キーは template::VARIABLES の label_key
+[template.var]
+name = "{name}  定型領域の名前"
+date = "{date}  日付（20260307）"
+time = "{time}  時刻（090504）"
+datetime = "{datetime:…}  日時の書式（2026-03-07_09-05-04）"
+seq = "{seq}  連番（1, 2, …）"
+seq3 = "{seq:3}  3 桁の連番（001, 002, …）"

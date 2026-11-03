@@ -4,7 +4,8 @@
 //! Win32 層の `app` は依頼を受けて、待機（`delay`）→ 取得 → 範囲選択の画面 → 切り出し → 出力 → 結果、
 //! の 1 本の流れで進める。発生源を足すときは `Source` に 1 つ足し、ここで対応する依頼を返す。
 //! CLI からの依頼は `CaptureRequest::from_cli` で作り、結果を返す先（`reply`）を持たせる（ADR-0003）。
-//! 定型領域（ホットキー・トレイ）は領域の設定で決まるので、`CaptureRequest::region` で作る。
+//! 定型領域（ホットキー・トレイ）は領域の設定で決まるので、`CaptureRequest::region` で作る。設定 GUI の
+//! 「範囲を選び直す」「試しに撮る」は `reselect_region` / `trial_region`。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -51,6 +52,21 @@ pub enum CaptureMethod {
     /// 定型領域の登録。範囲選択の画面を登録のモード（`Selection::registering`）で開き、決めた範囲を
     /// `[[regions]]` に足す。撮らない。
     RegisterRegion,
+    /// 設定 GUI の「範囲を選び直す」。範囲選択の画面を登録のモードで開き、決めた範囲を設定 GUI の写しの定型領域
+    /// （`Settings::regions` の添字）に入れる。撮らない。ファイルに書くのは GUI の適用のとき。
+    ReselectRegion(usize),
+    /// 設定 GUI の「試しに撮る」。写しの定型領域の値（未適用でもよい）で撮る。
+    TrialRegion(Box<Region>),
+}
+
+impl CaptureMethod {
+    /// 範囲選択の画面を定型領域の登録のモード（`Selection::registering`）で開くか。
+    pub fn registers_region(&self) -> bool {
+        matches!(
+            self,
+            CaptureMethod::RegisterRegion | CaptureMethod::ReselectRegion(_)
+        )
+    }
 }
 
 /// 範囲選択の画面で選んだ、撮るウィンドウ。
@@ -207,6 +223,49 @@ impl CaptureRequest {
             delay: Duration::ZERO,
             notify: true,
             reply: None,
+        }
+    }
+
+    /// 設定 GUI の「範囲を選び直す」: 写しの定型領域 `index` の範囲を、範囲選択の画面で選び直す。
+    pub fn reselect_region(index: usize) -> CaptureRequest {
+        CaptureRequest {
+            method: CaptureMethod::ReselectRegion(index),
+            ..CaptureRequest::from_source(Source::AddRegion)
+        }
+    }
+
+    /// 設定 GUI の「試しに撮る」: 写しの定型領域 `region` の値（範囲・保存先・テンプレート・撮影後の動作）で、
+    /// 定型領域キャプチャ（`region`）と同じく撮る。領域に保存先がなければ `general_dir`（写しの全体の保存先。
+    /// 欄のプレビューと同じ場所）に保存する。
+    pub fn trial_region(region: &Region, general_dir: Option<PathBuf>) -> CaptureRequest {
+        let mut request = CaptureRequest {
+            method: CaptureMethod::TrialRegion(Box::new(region.clone())),
+            ..CaptureRequest::region(region)
+        };
+        if let Some(SaveTarget::Region { dir, .. }) = &mut request.outputs.save
+            && dir.is_none()
+        {
+            *dir = general_dir;
+        }
+        request
+    }
+
+    /// 定型領域キャプチャ（`Region` / `TrialRegion`）の領域の名前。ほかの依頼は None。
+    pub fn region_name(&self) -> Option<&str> {
+        match &self.method {
+            CaptureMethod::Region(id) => Some(&id.0),
+            CaptureMethod::TrialRegion(region) => Some(&region.name),
+            _ => None,
+        }
+    }
+
+    /// 撮る定型領域。名前で指す依頼（`Region`）は適用済みの定型領域 `regions` から引き、試しに撮る依頼
+    /// （`TrialRegion`）は持っている値を使う。定型領域の依頼でないか、その名前がなければ None。
+    pub fn region_to_capture(&self, regions: &[Region]) -> Option<Region> {
+        match &self.method {
+            CaptureMethod::Region(id) => regions.iter().find(|r| r.name == id.0).cloned(),
+            CaptureMethod::TrialRegion(region) => Some((**region).clone()),
+            _ => None,
         }
     }
 
@@ -514,6 +573,7 @@ mod tests {
             file_name_template: "{name}_{seq}".to_owned(),
             save,
             scrap,
+            loaded_name: None,
         }
     }
 
@@ -561,6 +621,98 @@ mod tests {
         let both = CaptureRequest::region(&region(true, true));
         assert_eq!(both.outputs.save, Some(region_save_target()));
         assert!(both.outputs.scrap && !both.outputs.focus_scrap);
+    }
+
+    /// spec #36: 「範囲を選び直す」は、定型領域の登録と同じく範囲選択の画面を登録のモードで開く。撮らない。
+    #[test]
+    fn reselecting_a_region_opens_the_register_mode_without_outputs() {
+        let request = CaptureRequest::reselect_region(2);
+        assert_eq!(request.method, CaptureMethod::ReselectRegion(2));
+        assert!(request.method.registers_region());
+        assert!(
+            CaptureRequest::from_source(Source::AddRegion)
+                .method
+                .registers_region()
+        );
+        assert!(
+            !CaptureRequest::from_source(Source::TrayClick)
+                .method
+                .registers_region()
+        );
+        assert_eq!(
+            request.outputs,
+            Outputs {
+                save: None,
+                scrap: false,
+                copy: false,
+                focus_scrap: false,
+            }
+        );
+        assert_eq!(request.reply, None);
+    }
+
+    /// spec #36: 「試しに撮る」は、写しの領域の値（未適用でも）で、定型領域キャプチャと同じ出力にする。
+    #[test]
+    fn a_trial_capture_uses_the_regions_values_not_the_applied_settings() {
+        let mut draft = region(false, true);
+        draft.name = "まだ適用していない".to_owned();
+        draft.rect = Rect::new(5, 5, 50, 50);
+        let request = CaptureRequest::trial_region(&draft, Some(PathBuf::from(r"E:\draft")));
+
+        assert_eq!(request.outputs, CaptureRequest::region(&draft).outputs);
+        assert_eq!(request.region_name(), Some("まだ適用していない"));
+        // 適用済みの設定に同じ名前の領域がなくても、別の値の同じ名前の領域があっても、写しの値で撮る
+        let mut applied = region(true, false);
+        applied.name = draft.name.clone();
+        assert_eq!(request.region_to_capture(&[]), Some(draft.clone()));
+        assert_eq!(request.region_to_capture(&[applied]), Some(draft));
+    }
+
+    #[test]
+    fn a_trial_capture_of_a_region_without_a_folder_saves_to_the_drafts_general_folder() {
+        let mut draft = region(true, false);
+        draft.save_dir = None;
+        let request = CaptureRequest::trial_region(&draft, Some(PathBuf::from(r"E:\draft")));
+        assert_eq!(
+            request.outputs.save,
+            Some(SaveTarget::Region {
+                dir: Some(PathBuf::from(r"E:\draft")),
+                file_name_template: "{name}_{seq}".to_owned(),
+                name: "dash".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn region_requests_name_their_region_and_others_do_not() {
+        assert_eq!(
+            CaptureRequest::region(&region(true, false)).region_name(),
+            Some("dash")
+        );
+        assert_eq!(
+            CaptureRequest::from_source(Source::TrayClick).region_name(),
+            None
+        );
+        assert_eq!(CaptureRequest::reselect_region(0).region_name(), None);
+    }
+
+    #[test]
+    fn a_region_capture_looks_its_region_up_by_name_in_the_applied_settings() {
+        let request = CaptureRequest::region(&region(true, false));
+        let mut other = region(true, false);
+        other.name = "other".to_owned();
+        let mut applied = region(false, true);
+        applied.rect = Rect::new(1, 1, 2, 2);
+
+        assert_eq!(
+            request.region_to_capture(&[other.clone(), applied.clone()]),
+            Some(applied)
+        );
+        assert_eq!(request.region_to_capture(&[other]), None);
+        assert_eq!(
+            CaptureRequest::from_source(Source::TrayClick).region_to_capture(&[region(true, true)]),
+            None
+        );
     }
 
     fn cli(target: cli_args::Target) -> CaptureRequest {

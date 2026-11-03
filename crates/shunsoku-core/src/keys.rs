@@ -81,6 +81,78 @@ impl Chord {
         chord.modifiers.shift = true;
         chord
     }
+
+    /// 設定 GUI の入力欄で、キー（仮想キーコード `vk`）を押したときに入る組み合わせ。`held` は押したときの
+    /// 修飾キー。入らないキーは None。
+    ///
+    /// - 修飾キーだけの押下は入れない（続けて押すキーを待つ）。
+    /// - Tab はフォーカスの移動に使うので入れない（ダイアログに任せる）。
+    /// - Win キーと PrintScreen は入力できない（ADR-0004）。Win キーを押したままでも、Win は付けない。
+    pub fn from_key_down(vk: u16, held: Modifiers) -> Option<Chord> {
+        const TAB: u16 = 0x09;
+        const PRINT_SCREEN: u16 = 0x2C;
+        if vk == TAB || vk == PRINT_SCREEN {
+            return None;
+        }
+        let key = Key::from_vk(vk)?;
+        Some(Chord {
+            modifiers: Modifiers { win: false, ..held },
+            key,
+        })
+    }
+
+    /// 標準の hot key control に `HKM_SETHOTKEY` で入れる値（下位バイトが仮想キーコード、上位バイトが
+    /// `HOTKEYF_*`）。矢印などの拡張キーには `HOTKEYF_EXT` を付ける（付けないと、テンキーの名前で表示される）。
+    /// コントロールが表せない組み合わせ（Win キー・PrintScreen を含む）は None。入力欄は文字で表示だけする。
+    pub fn to_hotkey_control(self) -> Option<u16> {
+        const SHIFT: u16 = 0x01;
+        const CONTROL: u16 = 0x02;
+        const ALT: u16 = 0x04;
+        const EXT: u16 = 0x08;
+        let vk = self.key.vk();
+        if self.modifiers.win || vk == 0x2C {
+            return None;
+        }
+        // PageUp〜Down（0x21〜0x28）、Insert、Delete、NumpadDivide
+        let extended = matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x6F);
+        let m = self.modifiers;
+        let mut flags = 0;
+        for (on, flag) in [
+            (m.shift, SHIFT),
+            (m.ctrl, CONTROL),
+            (m.alt, ALT),
+            (extended, EXT),
+        ] {
+            if on {
+                flags |= flag;
+            }
+        }
+        Some(flags << 8 | vk)
+    }
+}
+
+/// 設定 GUI のキーの入力欄で、キーを押したときの入力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldInput {
+    /// 組み合わせを入れる。
+    Set(Chord),
+    /// 割り当てを外す（「なし」にする）。
+    Clear,
+}
+
+impl FieldInput {
+    /// キー（仮想キーコード `vk`）を押したときの入力。修飾キーなしの Backspace・Delete は割り当てを外す。
+    /// それ以外は [`Chord::from_key_down`] と同じ。
+    pub fn from_key_down(vk: u16, held: Modifiers) -> Option<FieldInput> {
+        const BACKSPACE: u16 = 0x08;
+        const DELETE: u16 = 0x2E;
+        let chord = Chord::from_key_down(vk, held)?;
+        let plain = chord.modifiers == Modifiers::default();
+        if plain && (vk == BACKSPACE || vk == DELETE) {
+            return Some(FieldInput::Clear);
+        }
+        Some(FieldInput::Set(chord))
+    }
 }
 
 impl fmt::Display for Chord {
@@ -310,6 +382,129 @@ mod tests {
         assert_eq!(Key::from_vk(0x53).unwrap().to_string(), "S");
         assert_eq!(Key::from_vk(0x2C).unwrap().to_string(), "PrintScreen");
         assert_eq!(Key::from_vk(0x10), None); // VK_SHIFT は修飾キー
+    }
+
+    fn mods(ctrl: bool, alt: bool, shift: bool) -> Modifiers {
+        Modifiers {
+            win: false,
+            ctrl,
+            alt,
+            shift,
+        }
+    }
+
+    #[test]
+    fn a_key_press_in_the_input_field_becomes_a_chord_with_the_held_modifiers() {
+        let pressed = |vk, m| Chord::from_key_down(vk, m).map(|c| c.to_string());
+        assert_eq!(
+            pressed(0x1B, mods(false, false, false)).as_deref(),
+            Some("Esc")
+        );
+        assert_eq!(
+            pressed(0x0D, mods(false, false, false)).as_deref(),
+            Some("Enter")
+        );
+        assert_eq!(
+            pressed(0x25, mods(false, true, false)).as_deref(),
+            Some("Alt+Left")
+        );
+        assert_eq!(
+            pressed(0xBB, mods(true, false, false)).as_deref(),
+            Some("Ctrl+Plus")
+        );
+        assert_eq!(
+            pressed(0x6B, mods(true, false, false)).as_deref(),
+            Some("Ctrl+NumpadAdd")
+        );
+        assert_eq!(
+            pressed(0x41, mods(true, true, true)).as_deref(),
+            Some("Ctrl+Alt+Shift+A")
+        );
+    }
+
+    #[test]
+    fn modifier_keys_alone_tab_and_print_screen_are_not_input() {
+        for vk in [0x10, 0x11, 0x12, 0xA0, 0xA3, 0x5B, 0x5C] {
+            assert_eq!(
+                Chord::from_key_down(vk, Modifiers::default()),
+                None,
+                "{vk:#x}"
+            );
+        }
+        assert_eq!(Chord::from_key_down(0x09, Modifiers::default()), None);
+        assert_eq!(Chord::from_key_down(0x09, mods(false, false, true)), None);
+        assert_eq!(Chord::from_key_down(0x2C, Modifiers::default()), None);
+    }
+
+    #[test]
+    fn backspace_or_delete_alone_clears_the_field_but_with_modifiers_is_a_chord() {
+        let none = Modifiers::default();
+        assert_eq!(
+            FieldInput::from_key_down(0x08, none),
+            Some(FieldInput::Clear)
+        );
+        assert_eq!(
+            FieldInput::from_key_down(0x2E, none),
+            Some(FieldInput::Clear)
+        );
+        assert_eq!(
+            FieldInput::from_key_down(0x2E, mods(true, false, false)),
+            Some(FieldInput::Set("Ctrl+Delete".parse().unwrap()))
+        );
+        assert_eq!(
+            FieldInput::from_key_down(0x08, mods(false, true, false)),
+            Some(FieldInput::Set("Alt+Backspace".parse().unwrap()))
+        );
+        assert_eq!(
+            FieldInput::from_key_down(0x53, mods(true, false, false)),
+            Some(FieldInput::Set("Ctrl+S".parse().unwrap()))
+        );
+        assert_eq!(FieldInput::from_key_down(0x09, none), None);
+        assert_eq!(FieldInput::from_key_down(0x10, none), None);
+    }
+
+    #[test]
+    fn the_win_key_is_never_part_of_an_input_chord() {
+        let held = Modifiers {
+            win: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            Chord::from_key_down(0x53, held)
+                .map(|c| c.to_string())
+                .as_deref(),
+            Some("Ctrl+S")
+        );
+    }
+
+    #[test]
+    fn a_chord_becomes_the_hot_key_control_value_with_its_modifier_flags() {
+        let value = |s: &str| s.parse::<Chord>().unwrap().to_hotkey_control();
+        // 下位バイトが仮想キーコード、上位バイトが HOTKEYF_SHIFT 1 / CONTROL 2 / ALT 4 / EXT 8
+        assert_eq!(value("Esc"), Some(0x001B));
+        assert_eq!(value("Ctrl+Shift+A"), Some(0x0341));
+        assert_eq!(value("Alt+F4"), Some(0x0473));
+        assert_eq!(value("Ctrl+Plus"), Some(0x02BB));
+    }
+
+    #[test]
+    fn extended_keys_carry_the_ext_flag_so_the_control_names_them_right() {
+        let value = |s: &str| s.parse::<Chord>().unwrap().to_hotkey_control();
+        assert_eq!(value("Left"), Some(0x0825));
+        assert_eq!(value("Ctrl+Down"), Some(0x0A28));
+        assert_eq!(value("Delete"), Some(0x082E));
+        assert_eq!(value("PageUp"), Some(0x0821));
+        assert_eq!(value("NumpadDivide"), Some(0x086F));
+        assert_eq!(value("Numpad4"), Some(0x0064));
+    }
+
+    #[test]
+    fn chords_the_control_cannot_show_have_no_control_value() {
+        let value = |s: &str| s.parse::<Chord>().unwrap().to_hotkey_control();
+        assert_eq!(value("Win+Shift+S"), None);
+        assert_eq!(value("PrintScreen"), None);
+        assert_eq!(value("Ctrl+PrintScreen"), None);
     }
 
     #[test]

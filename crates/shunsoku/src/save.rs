@@ -20,9 +20,10 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTask
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Pictures, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_STRICTFILETYPES,
-    FileSaveDialog, IFileSaveDialog, IShellItem, KF_FLAG_DEFAULT, SHCreateItemFromParsingName,
-    SHGetKnownFolderPath, SIGDN_FILESYSPATH, ShellExecuteW,
+    FOLDERID_Pictures, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS,
+    FOS_STRICTFILETYPES, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog,
+    IShellItem, KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderPath,
+    SIGDN_FILESYSPATH, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
@@ -124,6 +125,35 @@ pub fn ask_path(
             dialog.SetFolder(&item)?;
         }
         dialog.SetFileName(&file_name)?;
+        match dialog.Show(Some(owner)) {
+            Ok(()) => {}
+            Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let chosen = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let text = chosen.to_string();
+        CoTaskMemFree(Some(chosen.0 as *const _));
+        Ok(Some(PathBuf::from(text?)))
+    }
+}
+
+/// フォルダを選ぶダイアログを出し、選ばれたフォルダを返す。`initial` があればそこ（なければその上のあるフォルダ）
+/// から開く。キャンセルされたら None。
+pub fn ask_folder(owner: HWND, initial: &Path) -> windows::core::Result<Option<PathBuf>> {
+    let folder = initial
+        .ancestors()
+        .find(|dir| dir.is_dir())
+        .map(HSTRING::from);
+    // SAFETY: 渡す文字列はどれも呼び出しの間生きている。返った文字列は CoTaskMemFree で返す
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        let options = dialog.GetOptions()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)?;
+        if let Some(folder) = &folder {
+            let item: IShellItem = SHCreateItemFromParsingName(folder, None)?;
+            dialog.SetFolder(&item)?;
+        }
         match dialog.Show(Some(owner)) {
             Ok(()) => {}
             Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => return Ok(None),

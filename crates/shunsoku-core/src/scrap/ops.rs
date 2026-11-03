@@ -128,6 +128,19 @@ impl MouseGesture {
         })
     }
 
+    /// 設定 GUI に出す文言のキー（`mouse_gesture.*`）。
+    pub fn label_key(self) -> &'static str {
+        match self {
+            MouseGesture::LeftDrag => "mouse_gesture.left_drag",
+            MouseGesture::MiddleClick => "mouse_gesture.middle_click",
+            MouseGesture::WheelUp => "mouse_gesture.wheel_up",
+            MouseGesture::WheelDown => "mouse_gesture.wheel_down",
+            MouseGesture::CtrlWheelUp => "mouse_gesture.ctrl_wheel_up",
+            MouseGesture::CtrlWheelDown => "mouse_gesture.ctrl_wheel_down",
+            MouseGesture::DoubleClick => "mouse_gesture.double_click",
+        }
+    }
+
     /// 設定ファイル（`[mouse]`）での名前。
     const NAMES: [(MouseGesture, &'static str); 7] = [
         (MouseGesture::LeftDrag, "LeftDrag"),
@@ -892,6 +905,47 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
 /// id から表の行を引く。
 pub fn find(id: &str) -> Option<&'static OperationDescriptor> {
     OPERATIONS.iter().find(|op| op.id == id)
+}
+
+/// 設定 GUI の「スクラップ操作」タブの 1 行。
+#[derive(Debug, Clone, Copy)]
+pub struct BindingRow {
+    pub op: &'static OperationDescriptor,
+    /// ショートカットの欄があれば、その既定（複数のこともある。空なら既定なし）。None なら欄がない
+    /// （引数のある操作）。
+    pub default_shortcut: Option<&'static [Chord]>,
+}
+
+impl BindingRow {
+    /// マウスの割り当てのドロップダウンの候補（表示の順）。左ドラッグは移動（`move`）専用で、移動の候補は
+    /// 左ドラッグだけ（変えられない）。ほかの操作には左ドラッグを出さない。
+    pub fn mouse_choices(&self) -> &'static [MouseGesture] {
+        if self.op.drag_only {
+            &[MouseGesture::LeftDrag]
+        } else {
+            &[
+                MouseGesture::WheelUp,
+                MouseGesture::WheelDown,
+                MouseGesture::CtrlWheelUp,
+                MouseGesture::CtrlWheelDown,
+                MouseGesture::MiddleClick,
+                MouseGesture::DoubleClick,
+            ]
+        }
+    }
+}
+
+/// 設定 GUI の「スクラップ操作」タブの行の一覧。`ops`（ふつうは `OPERATIONS`）の表の順で、ショートカットか
+/// マウスを割り当てられる操作の行を作る。引数の選択肢を持つ操作（`choices` が Some）はメニュー専用なので
+/// 行にしない。左ドラッグの移動（`drag_only`）は行にするが、ショートカットの欄はない。
+pub fn binding_rows(ops: &'static [OperationDescriptor]) -> Vec<BindingRow> {
+    ops.iter()
+        .filter(|op| op.choices.is_none())
+        .map(|op| BindingRow {
+            op,
+            default_shortcut: op.takes_binding().then_some(op.default_shortcut),
+        })
+        .collect()
 }
 
 /// ショートカットの対応表。表の既定値に、設定ファイルの上書き（`[shortcuts]`）を重ねて作る。
@@ -2460,6 +2514,88 @@ mod tests {
             },
         ] {
             assert_eq!(MouseGesture::wheel(other, 120), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_binding_rows_follow_the_table_and_only_operations_without_arguments_take_a_shortcut() {
+        let rows = binding_rows(OPERATIONS);
+        let ids: Vec<&str> = rows.iter().map(|row| row.op.id).collect();
+        // 引数のある操作（choices が Some）は行にしない。左ドラッグの移動は行にするがショートカットの欄はない
+        assert_eq!(
+            ids,
+            [
+                "copy",
+                "save_default",
+                "save_as",
+                "trim",
+                "untrim",
+                "annotate",
+                "move_left",
+                "move_right",
+                "move_up",
+                "move_down",
+                "move_left_10",
+                "move_right_10",
+                "move_up_10",
+                "move_down_10",
+                "move",
+                "zoom_in",
+                "zoom_out",
+                "zoom_actual",
+                "opacity_up",
+                "opacity_down",
+                "toggle_compact",
+                "close",
+            ]
+        );
+        let row = |id: &str| rows.iter().find(|row| row.op.id == id).unwrap();
+        assert_eq!(row("move").default_shortcut, None);
+        assert_eq!(row("untrim").default_shortcut, Some(&[][..]));
+        assert_eq!(
+            row("copy").default_shortcut,
+            Some(&["Ctrl+C".parse::<Chord>().unwrap()][..])
+        );
+        assert_eq!(row("zoom_in").default_shortcut.unwrap().len(), 3);
+        assert_eq!(row("zoom_out").default_shortcut.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn left_drag_is_a_mouse_choice_only_for_move() {
+        let rows = binding_rows(OPERATIONS);
+        for row in &rows {
+            let choices = row.mouse_choices();
+            if row.op.id == "move" {
+                assert_eq!(choices, [MouseGesture::LeftDrag]);
+            } else {
+                assert_eq!(
+                    choices,
+                    [
+                        MouseGesture::WheelUp,
+                        MouseGesture::WheelDown,
+                        MouseGesture::CtrlWheelUp,
+                        MouseGesture::CtrlWheelDown,
+                        MouseGesture::MiddleClick,
+                        MouseGesture::DoubleClick,
+                    ],
+                    "{}",
+                    row.op.id
+                );
+            }
+            // 表の既定値は候補に入っている
+            if let Some(gesture) = row.op.default_mouse {
+                assert!(choices.contains(&gesture), "{}", row.op.id);
+            }
+        }
+    }
+
+    #[test]
+    fn every_mouse_gesture_has_a_label() {
+        let catalog =
+            crate::i18n::Catalog::parse(include_str!("../../../../locales/ja.toml")).unwrap();
+        for (gesture, _) in MouseGesture::NAMES {
+            let key = gesture.label_key();
+            assert_ne!(catalog.text(key), key, "{gesture}");
         }
     }
 }

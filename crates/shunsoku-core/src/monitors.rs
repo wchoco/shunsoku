@@ -6,6 +6,7 @@
 //!   番号は位置の順（左から右、同じ左端なら上から下）に 1 から振る。抜き差しや配置の変更がなければ、
 //!   起動し直しても同じ番号になる。
 //! - 定型領域キャプチャの撮影の判定（`locate_by_id`）。定型領域はモニタを識別子で覚える。
+//! - 範囲選択の画面で決めた範囲を、定型領域のモニタ相対の範囲にする（`relative_to`）。
 
 use crate::geometry::Rect;
 
@@ -60,8 +61,9 @@ pub fn numbered(mut monitors: Vec<Monitor>) -> Vec<Monitor> {
     monitors
 }
 
-/// `monitors` の出力。1 行に 1 枚、番号の順に、番号・名前・解像度・拡大率（とメインモニタの印）をタブで区切る。
-pub fn listing(monitors: &[Monitor]) -> String {
+/// `monitors` の出力。1 行に 1 枚、番号の順に、番号・名前・解像度・拡大率（とメインモニタの印 `main`。文言の
+/// `monitors.main`）をタブで区切る。
+pub fn listing(monitors: &[Monitor], main: &str) -> String {
     let mut out = String::new();
     for (i, m) in numbered(monitors.to_vec()).iter().enumerate() {
         let size = m.rect.size();
@@ -75,7 +77,8 @@ pub fn listing(monitors: &[Monitor]) -> String {
             size.height
         ));
         if m.primary {
-            out.push_str("\tメイン");
+            out.push('\t');
+            out.push_str(main);
         }
         out.push('\n');
     }
@@ -128,6 +131,16 @@ pub fn locate_by_id(
     Ok(Located { index, screen })
 }
 
+/// 範囲選択の画面で決めた範囲 `screen`（スクリーン座標）を、左上を含むモニタの相対の範囲にする（定型領域の
+/// 登録と「範囲を選び直す」）。そのモニタの `monitors` の中の位置も返す。左上がどのモニタにもなければ None。
+pub fn relative_to(monitors: &[Monitor], screen: Rect) -> Option<(usize, Rect)> {
+    let index = monitors
+        .iter()
+        .position(|m| m.rect.contains(screen.origin()))?;
+    let monitor = &monitors[index].rect;
+    Some((index, screen.offset(-monitor.left, -monitor.top)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +165,28 @@ mod tests {
     }
 
     #[test]
+    fn a_chosen_range_belongs_to_the_monitor_holding_its_top_left_corner() {
+        let monitors = three();
+        // 左のモニタの中で選んだ範囲（スクリーン座標）は、そのモニタの左上からの位置になる
+        let (index, relative) = relative_to(&monitors, Rect::new(-1800, 100, -1000, 700)).unwrap();
+        assert_eq!(monitors[index].name, "left");
+        assert_eq!(relative, Rect::new(120, 100, 920, 700));
+        // 下のモニタ
+        let (index, relative) = relative_to(&monitors, Rect::new(10, 1450, 110, 1550)).unwrap();
+        assert_eq!(monitors[index].name, "below");
+        assert_eq!(relative, Rect::new(10, 10, 110, 110));
+    }
+
+    #[test]
+    fn a_range_starting_outside_every_monitor_has_no_monitor() {
+        // メインの右下の外（下のモニタは 1920 までの幅）
+        assert_eq!(
+            relative_to(&three(), Rect::new(2000, 1500, 2100, 1600)),
+            None
+        );
+    }
+
+    #[test]
     fn monitors_are_numbered_from_1_left_to_right_then_top_to_bottom() {
         let names: Vec<String> = numbered(three()).into_iter().map(|m| m.name).collect();
         assert_eq!(names, ["left", "main", "below"]);
@@ -164,7 +199,7 @@ mod tests {
         monitors[2].dpi = 120;
         monitors[2].name = r"\\.\DISPLAY3".to_owned();
         assert_eq!(
-            listing(&monitors),
+            listing(&monitors, "メイン"),
             "1\t\\\\.\\DISPLAY3\t1920x1080\t125%\n\
              2\tmain\t2560x1440\t150%\tメイン\n\
              3\tbelow\t1920x1080\t100%\n"
