@@ -1,4 +1,6 @@
-//! 設定 GUI の、入力で変わる状態（写しの中身ではないもの）。Win32 の層は通知を渡して、決まったことに従う。
+//! 設定 GUI の、入力で変わる状態（写しの中身ではないもの）と、出し方の計算。Win32 の層は通知を渡して、決まったことに従う。
+
+use crate::geometry::{Rect, Size};
 
 /// 定型領域の詳細の欄が指す領域。結び直したら、次に欄に出すときはフォーカスのある欄も書き換える。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -91,6 +93,47 @@ impl HotkeyPause {
     }
 }
 
+/// 定型領域の一覧の、範囲の絵（モニタの中のどこか）。座標は絵の左上からのピクセル。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Thumbnail {
+    /// モニタの枠。
+    pub monitor: Rect,
+    /// 範囲。モニタの外ならない。
+    pub range: Option<Rect>,
+}
+
+/// 大きさ `monitor` のモニタの中の範囲 `range`（モニタ相対）を、大きさ `size` の絵にする。モニタは縦横比を保って
+/// 真ん中に置く。小さな範囲も 1 px は見せ、モニタからはみ出す分は切る。モニタがわからなければ（見つからない）、
+/// 原点から範囲の右下までをモニタとみなす。
+pub fn range_thumbnail(monitor: Option<Size>, range: Rect, size: Size) -> Thumbnail {
+    let monitor = monitor.unwrap_or(Size::new(
+        range.right.max(1) as u32,
+        range.bottom.max(1) as u32,
+    ));
+    let (mw, mh) = (
+        f64::from(monitor.width.max(1)),
+        f64::from(monitor.height.max(1)),
+    );
+    let scale = (f64::from(size.width) / mw).min(f64::from(size.height) / mh);
+    let fw = (mw * scale).round() as i32;
+    let fh = (mh * scale).round() as i32;
+    let left = (size.width as i32 - fw) / 2;
+    let top = (size.height as i32 - fh) / 2;
+    let frame = Rect::new(left, top, left + fw, top + fh);
+    let bounds = Rect::new(0, 0, monitor.width as i32, monitor.height as i32);
+    let range = range.intersect(&bounds).map(|r| {
+        let at = |v: i32| (f64::from(v) * scale).round() as i32;
+        let (l, t) = (left + at(r.left), top + at(r.top));
+        let right = (left + at(r.right)).max(l + 1).min(frame.right.max(l + 1));
+        let bottom = (top + at(r.bottom)).max(t + 1).min(frame.bottom.max(t + 1));
+        Rect::new(l, t, right, bottom)
+    });
+    Thumbnail {
+        monitor: frame,
+        range,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +183,48 @@ mod tests {
         pause.reregistering();
         assert!(!pause.is_paused());
         assert_eq!(pause.focus_changed(true), Some(PauseChange::Pause));
+    }
+
+    #[test]
+    fn the_thumbnail_fits_the_monitor_in_the_box_and_scales_the_range_with_it() {
+        // 1920×1080 を 32×20 に: 縦横比を保って 32×18、上下に 1 px ずつ余らせる
+        let t = range_thumbnail(
+            Some(Size::new(1920, 1080)),
+            Rect::new(960, 540, 1920, 1080),
+            Size::new(32, 20),
+        );
+        assert_eq!(t.monitor, Rect::new(0, 1, 32, 19));
+        assert_eq!(t.range, Some(Rect::new(16, 10, 32, 19)));
+    }
+
+    #[test]
+    fn a_tiny_range_still_shows_as_one_pixel_and_one_outside_the_monitor_is_clipped() {
+        let t = range_thumbnail(
+            Some(Size::new(1000, 1000)),
+            Rect::new(0, 0, 2, 2),
+            Size::new(20, 20),
+        );
+        assert_eq!(t.range, Some(Rect::new(0, 0, 1, 1)));
+
+        let t = range_thumbnail(
+            Some(Size::new(1000, 1000)),
+            Rect::new(500, 500, 3000, 3000),
+            Size::new(20, 20),
+        );
+        assert_eq!(t.range, Some(Rect::new(10, 10, 20, 20)));
+
+        let t = range_thumbnail(
+            Some(Size::new(1000, 1000)),
+            Rect::new(1200, 0, 1300, 100),
+            Size::new(20, 20),
+        );
+        assert_eq!(t.range, None);
+    }
+
+    #[test]
+    fn without_its_monitor_the_thumbnail_is_scaled_to_the_ranges_bottom_right() {
+        let t = range_thumbnail(None, Rect::new(100, 0, 200, 100), Size::new(20, 20));
+        assert_eq!(t.monitor, Rect::new(0, 5, 20, 15));
+        assert_eq!(t.range, Some(Rect::new(10, 5, 20, 15)));
     }
 }

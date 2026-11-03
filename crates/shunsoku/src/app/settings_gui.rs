@@ -30,6 +30,7 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 
 use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
@@ -44,16 +45,17 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmSetWindowAttribute,
 };
 use windows::Win32::UI::Controls::{
-    EM_GETSEL, EM_SETSEL, LVIS_SELECTED, LVN_ITEMCHANGED, NMHDR, NMLISTVIEW, TCN_SELCHANGE,
+    EM_GETSEL, EM_SETSEL, LVIS_SELECTED, LVN_ITEMCHANGED, NM_CUSTOMDRAW, NMHDR, NMLISTVIEW,
+    NMLVCUSTOMDRAW, TCN_SELCHANGE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CBN_SELCHANGE, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GetWindowRect,
-    IDCANCEL, IDOK, IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MSG,
-    MessageBoxW, PostMessageW, PostQuitMessage, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INITDIALOG, WM_NEXTDLGCTL,
-    WM_NOTIFY, WM_SETTINGCHANGE,
+    BN_CLICKED, CBN_SELCHANGE, DWLP_MSGRESULT, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS,
+    GetWindowRect, IDCANCEL, IDOK, IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING,
+    MB_OKCANCEL, MSG, MessageBoxW, PostMessageW, PostQuitMessage, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
 };
 use windows::core::{BOOL, PCWSTR};
 
@@ -64,7 +66,7 @@ use super::{
 };
 use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
 use crate::settings_dialog::regions::{self, ListButton};
-use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops};
+use crate::settings_dialog::{self, ChordRow, Env, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops};
 use crate::wide::to_wide;
 use crate::{hotkey, menu, monitor_list, notify, panic_hook, save};
 
@@ -76,6 +78,8 @@ pub(super) struct SettingsGui {
     editor: Editor,
     /// ダイアログを組んだときの UI の言語。
     language: Language,
+    /// ダイアログに渡す、外のこと（モニタは `refresh_monitors` で集め直す）。
+    env: Env,
 }
 
 thread_local! {
@@ -177,16 +181,20 @@ fn open_with(page: Option<Page>, focus: Option<SettingsItem>) {
         }
         return;
     }
-    regions::refresh_monitors();
+    let env = Env {
+        monitors: monitor_list::list(),
+        default_dir: save::default_dir().ok(),
+        file_name: file_name_in,
+    };
     // ダイアログを作る間にプロシージャが呼ばれるので、借りずに作る
-    let dialog =
-        match settings_dialog::create(module, page.unwrap_or_default(), text, Some(dialog_proc)) {
-            Ok(dialog) => dialog,
-            Err(e) => {
-                log::error!("could not open the settings GUI: {e}");
-                return;
-            }
-        };
+    let page = page.unwrap_or_default();
+    let dialog = match settings_dialog::create(module, page, text, &env, Some(dialog_proc)) {
+        Ok(dialog) => dialog,
+        Err(e) => {
+            log::error!("could not open the settings GUI: {e}");
+            return;
+        }
+    };
     let hwnd = dialog.hwnd;
     let focus = focus
         .and_then(|item| dialog.rows.iter().find(|row| row.item == item))
@@ -200,6 +208,7 @@ fn open_with(page: Option<Page>, focus: Option<SettingsItem>) {
         fields: dialog.fields,
         editor,
         language: language(),
+        env,
     };
     if with_app(|app| app.settings_gui = Some(gui)).is_none() {
         // SAFETY: 作ったばかりの自分のダイアログ
@@ -258,28 +267,51 @@ fn refresh(hwnd: HWND) {
     let list = with_app(|app| {
         app.settings_gui
             .as_ref()
-            .map(|gui| (gui.editor.clone(), gui.fields.region()))
+            .map(|gui| (gui.editor.clone(), gui.fields.region(), gui.env.clone()))
     })
     .flatten();
-    if let Some((editor, bound)) = list {
-        regions::sync_list(hwnd, &editor, bound, text);
+    if let Some((editor, bound, env)) = list {
+        regions::sync_list(hwnd, &editor, bound, text, &env);
     }
     let snapshot = with_app(|app| {
         app.settings_gui.as_mut().map(|gui| {
             let pass = gui.fields.begin_fill();
+            let fields = gui.fields.clone();
             (
                 gui.rows.clone(),
-                gui.fields.clone(),
+                fields,
                 pass,
                 gui.editor.clone(),
+                gui.env.clone(),
             )
         })
     })
     .flatten();
-    if let Some((rows, fields, pass, editor)) = snapshot {
+    if let Some((rows, fields, pass, editor, env)) = snapshot {
         // コントロールにメッセージを送るので、借りずに出す
-        settings_dialog::fill(hwnd, &rows, &editor, text);
-        fields::fill(hwnd, &fields, pass, &editor, text);
+        settings_dialog::fill(hwnd, &rows, &editor, text, &env);
+        fields::fill(hwnd, &fields, pass, &editor, text, &env);
+    }
+}
+
+/// モニタの一覧を集め直す（開いたとき、行を選び直したとき、画面の構成が変わったとき）。
+fn refresh_monitors() {
+    let monitors = monitor_list::list();
+    with_app(|app| {
+        if let Some(gui) = app.settings_gui.as_mut() {
+            gui.env.monitors = monitors;
+        }
+    });
+}
+
+/// `dir` に `template` でいま撮ったら付く名前（欄のプレビュー。`Env::file_name`）。
+fn file_name_in(dir: &Path, template: &str, name: &str) -> Option<String> {
+    match save::destination(dir, template, name, save::now(), &[]) {
+        Ok(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        Err(e) => {
+            log::debug!("could not list {}: {e}", dir.display());
+            None
+        }
     }
 }
 
@@ -321,6 +353,16 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
         WM_NOTIFY => {
             // SAFETY: WM_NOTIFY の lparam は NMHDR を指す
             let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.idFrom == regions::list_id() as usize && header.code == NM_CUSTOMDRAW {
+                // SAFETY: 一覧の NM_CUSTOMDRAW の lparam は NMLVCUSTOMDRAW を指す
+                let draw = unsafe { &*(lparam.0 as *const NMLVCUSTOMDRAW) };
+                let result = regions::custom_draw(draw);
+                // SAFETY: 自分のダイアログの結果を置く
+                unsafe {
+                    SetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(DWLP_MSGRESULT as i32), result)
+                };
+                return true;
+            }
             if header.idFrom == ID_TAB as usize && header.code == TCN_SELCHANGE {
                 settings_dialog::show_page(hwnd, settings_dialog::current_page(hwnd));
             } else if header.idFrom == scrap_ops::list_id() as usize
@@ -347,7 +389,7 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
         }
         WM_DISPLAYCHANGE => {
             // 定型領域の警告とモニタの名前を出し直す
-            regions::refresh_monitors();
+            refresh_monitors();
             refresh(hwnd);
             false
         }
@@ -487,22 +529,21 @@ fn set_field(field: fields::Field, input: Input) {
 
 /// 欄の横のボタンが押された。ダイアログとメニューはモーダルなので、`App` を借りずに出す。
 fn on_button(hwnd: HWND, fields: &Fields, action: Action) {
-    let Some(draft) = with_app(|app| {
+    let Some((draft, default_dir)) = with_app(|app| {
         app.settings_gui
             .as_ref()
-            .map(|gui| gui.editor.draft().clone())
+            .map(|gui| (gui.editor.draft().clone(), gui.env.default_dir.clone()))
     })
     .flatten() else {
         return;
     };
+    let folder_of = |field| fields::folder_of(&draft, field, default_dir.as_deref());
     match action {
-        Action::BrowseFolder(field) => {
-            match save::ask_folder(hwnd, &fields::folder_of(&draft, field)) {
-                Ok(Some(dir)) => set_field(field, Input::Text(dir.to_string_lossy().into_owned())),
-                Ok(None) => {}
-                Err(e) => log::error!("could not show the folder dialog: {e}"),
-            }
-        }
+        Action::BrowseFolder(field) => match save::ask_folder(hwnd, &folder_of(field)) {
+            Ok(Some(dir)) => set_field(field, Input::Text(dir.to_string_lossy().into_owned())),
+            Ok(None) => {}
+            Err(e) => log::error!("could not show the folder dialog: {e}"),
+        },
         Action::PickColor(field) => {
             let Some(current) = fields::color_of(&draft, field) else {
                 return;
@@ -513,7 +554,7 @@ fn on_button(hwnd: HWND, fields: &Fields, action: Action) {
         }
         Action::InsertVariable(of) => insert_variable(hwnd, fields, of),
         Action::OpenFolder(field) => {
-            let dir = fields::folder_of(&draft, field);
+            let dir = folder_of(field);
             if !save::open_folder(&dir) {
                 log::warn!("could not open the folder {}", dir.display());
             }
@@ -596,7 +637,11 @@ fn rebuild_if_language_changed(hwnd: HWND) {
 /// 今のダイアログ `old` を壊し、いまの言語で組み直して写しを出す。ダイアログを作る間にプロシージャが呼ばれる
 /// ので、借りずに作る（`open_with` と同じ）。
 fn rebuild(old: HWND) {
-    let Some(module) = with_app(|app| app.module) else {
+    let Some((module, env)) = with_app(|app| {
+        let env = app.settings_gui.as_ref()?.env.clone();
+        Some((app.module, env))
+    })
+    .flatten() else {
         return;
     };
     let page = settings_dialog::current_page(old);
@@ -608,7 +653,7 @@ fn rebuild(old: HWND) {
     REBUILDING.set(true);
     destroy(old);
     DIALOG.set(None);
-    let created = settings_dialog::create(module, page, text, Some(dialog_proc));
+    let created = settings_dialog::create(module, page, text, &env, Some(dialog_proc));
     REBUILDING.set(false);
     let dialog = match created {
         Ok(dialog) => dialog,
@@ -700,7 +745,7 @@ fn on_region_selected(hwnd: HWND) {
     });
     // 一覧を揃えている途中なら、揃えたあとで出す（`refresh`）
     if !regions::is_syncing() {
-        regions::refresh_monitors();
+        refresh_monitors();
         refresh(hwnd);
     }
 }
@@ -710,7 +755,14 @@ fn on_region_list_button(hwnd: HWND, button: ListButton) {
     let selected = regions::selected(hwnd);
     let target = match button {
         ListButton::Add => {
-            let Some((monitor, rect)) = regions::new_region_place() else {
+            let monitors = with_app(|app| {
+                app.settings_gui
+                    .as_ref()
+                    .map(|gui| gui.env.monitors.clone())
+            })
+            .flatten()
+            .unwrap_or_default();
+            let Some((monitor, rect)) = regions::new_region_place(&monitors) else {
                 log::warn!("no monitor to add a region on");
                 return;
             };
@@ -784,7 +836,7 @@ pub(super) fn region_reselected(index: usize, rect: Rect) {
         "region {} reselected on monitor {id} at {relative:?}",
         index + 1
     );
-    regions::refresh_monitors();
+    refresh_monitors();
     refresh(hwnd);
 }
 
@@ -797,14 +849,14 @@ fn on_test_capture(hwnd: HWND) {
         app.settings_gui.as_ref().and_then(|gui| {
             let draft = gui.editor.draft();
             let region = draft.regions.get(index).cloned()?;
-            Some((region, draft.general.save_dir.clone()))
+            let general_dir = draft.general.save_dir.clone();
+            Some((region, general_dir.or_else(|| gui.env.default_dir.clone())))
         })
     })
     .flatten() else {
         return;
     };
     // 領域に保存先がなければ、写しの全体の保存先（それもなければピクチャ）に保存する。欄のプレビューと同じ
-    let general_dir = general_dir.or_else(|| save::default_dir().ok());
     hide_for_capture(hwnd);
     if !super::request_trial(&region, general_dir) {
         log::info!("trial capture while another capture is in progress; ignored");

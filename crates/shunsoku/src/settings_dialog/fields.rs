@@ -13,7 +13,7 @@
 //!   （範囲の外の数、`#RRGGBB` でない色、空のテンプレート）は写しを変えず、フォーカスが外れたら写しの値に戻る。
 
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use shunsoku_core::annotate::toolbar::{FONT_SIZES, WIDTHS};
@@ -44,8 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use super::{Class, Item, PAGE_X, PAGE_Y, PageBuilder, SS_LEFT, Text, item};
-use crate::save;
+use super::{Class, Env, Item, PAGE_X, PAGE_Y, PageBuilder, SS_LEFT, Text, item};
 use crate::wide::to_wide;
 
 /// 欄が結ぶ写しの項目（キーの組み合わせの項目は `SettingsItem` と `ChordRow`）。
@@ -551,8 +550,8 @@ pub fn color_of(settings: &Settings, field: Field) -> Option<Rgb> {
     }
 }
 
-/// フォルダの欄 `field` で、選ぶダイアログを開く場所（空なら既定の保存先）。
-pub fn folder_of(settings: &Settings, field: Field) -> PathBuf {
+/// フォルダの欄 `field` で、選ぶダイアログを開く場所（空なら既定の保存先 `default_dir`）。
+pub fn folder_of(settings: &Settings, field: Field, default_dir: Option<&Path>) -> PathBuf {
     let set = match field {
         Field::SaveDir => settings.general.save_dir.clone(),
         Field::Region(i, RegionKey::SaveDir) => settings
@@ -562,7 +561,8 @@ pub fn folder_of(settings: &Settings, field: Field) -> PathBuf {
             .or_else(|| settings.general.save_dir.clone()),
         _ => None,
     };
-    set.or_else(|| save::default_dir().ok()).unwrap_or_default()
+    set.or_else(|| default_dir.map(Path::to_path_buf))
+        .unwrap_or_default()
 }
 
 /// 保存先として受け付けるパス（設定の読み込みと同じく、`C:\…` か `\\server\share\…`）。
@@ -623,22 +623,12 @@ pub fn variables(of: TemplateOf) -> impl Iterator<Item = &'static template::Vari
 }
 
 /// いま撮ったら付く名前（保存先の既存のファイルと重ならないもの）。
-fn preview(settings: &Settings, of: TemplateOf) -> String {
+fn preview(settings: &Settings, of: TemplateOf, env: &Env) -> String {
     let (dir, name) = preview_target(settings, of);
-    let dir = match dir {
-        Some(dir) => dir,
-        None => save::default_dir().unwrap_or_default(),
+    let Some(dir) = dir.or_else(|| env.default_dir.clone()) else {
+        return String::new();
     };
-    match save::destination(&dir, template_of(settings, of), &name, save::now(), &[]) {
-        Ok(path) => path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        Err(e) => {
-            log::debug!("could not list {}: {e}", dir.display());
-            String::new()
-        }
-    }
+    (env.file_name)(&dir, template_of(settings, of), &name).unwrap_or_default()
 }
 
 thread_local! {
@@ -652,7 +642,7 @@ pub fn is_filling() -> bool {
 }
 
 /// 写し `editor` を欄に出す。
-pub fn fill(hwnd: HWND, fields: &Fields, pass: FillPass, editor: &Editor, text: Text) {
+pub fn fill(hwnd: HWND, fields: &Fields, pass: FillPass, editor: &Editor, text: Text, env: &Env) {
     FILLING.set(true);
     // SAFETY: 引数なし
     let focus = unsafe { GetFocus() };
@@ -704,7 +694,7 @@ pub fn fill(hwnd: HWND, fields: &Fields, pass: FillPass, editor: &Editor, text: 
             let line = format!(
                 "{}{}",
                 text("settings_gui.template.preview"),
-                preview(editor.draft(), of)
+                preview(editor.draft(), of, env)
             );
             let line = to_wide(&line);
             // SAFETY: 文字列は呼び出しの間生きている
@@ -734,7 +724,7 @@ pub fn input(row: FieldRow, control: HWND) -> Input {
 }
 
 /// 組み直したダイアログで 1 回だけすること（数の欄の範囲、保存先の欄の既定の表示）。
-pub fn init(hwnd: HWND, fields: &Fields, text: Text) {
+pub fn init(hwnd: HWND, fields: &Fields, text: Text, env: &Env) {
     for row in &fields.rows {
         match row.kind {
             Kind::Number { updown } => {
@@ -752,7 +742,9 @@ pub fn init(hwnd: HWND, fields: &Fields, text: Text) {
                 }
             }
             Kind::Text { .. } if row.field == Field::SaveDir => {
-                let default = save::default_dir()
+                let default = env
+                    .default_dir
+                    .as_ref()
                     .map(|d| {
                         format!(
                             "{}{}",
