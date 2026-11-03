@@ -258,7 +258,7 @@ pub struct View {
     /// 範囲。何も選んでいなければ None。
     pub rect: Option<Rect>,
     /// 範囲の左上の外側に出すサイズ（`Selection::size_label`）。
-    pub size_label: Option<String>,
+    pub size_label: Option<Vec<String>>,
     /// 調整の状態のつまみ（スクリーン座標）。ほかの状態では空。
     pub handles: Vec<Rect>,
     /// 十字線を通すカーソルの画素。出さなければ None。
@@ -821,19 +821,15 @@ impl Selection {
             .map_or_else(Vec::new, |rect| split(rect, &self.monitors))
     }
 
-    /// 範囲の左上の外側に出すサイズ（`1280 × 720`）。モニタをまたいでいれば、モニタごとのサイズを
-    /// 左から `＋` でつなぐ。何も選んでいなければ None。
-    pub fn size_label(&self) -> Option<String> {
+    /// 範囲の左上の外側に出すサイズ（`1280 × 720`）。モニタをまたいでいれば、モニタごとのサイズを左から
+    /// 並べる（画面では文言の `selection.size_plus` でつなぐ）。何も選んでいなければ None。
+    pub fn size_label(&self) -> Option<Vec<String>> {
         let rect = self.rect()?;
         let parts = split(rect, &self.monitors);
         let label = if parts.len() <= 1 {
-            size_text(rect)
+            vec![size_text(rect)]
         } else {
-            parts
-                .iter()
-                .map(|part| size_text(part.rect))
-                .collect::<Vec<_>>()
-                .join(" ＋ ")
+            parts.iter().map(|part| size_text(part.rect)).collect()
         };
         Some(label)
     }
@@ -1074,18 +1070,21 @@ mod tests {
             at: p(100, 100),
         });
         s.handle(Input::Move { at: p(1379, 819) });
-        assert_eq!(s.size_label().as_deref(), Some("1280 × 720"));
+        assert_eq!(s.size_label(), Some(vec!["1280 × 720".to_owned()]));
     }
 
     #[test]
-    fn the_size_label_joins_the_size_on_each_monitor_with_plus() {
+    fn the_size_label_has_the_size_on_each_monitor_from_the_left() {
         let mut s = Selection::new(three_monitors(), p(0, 0));
         s.handle(Input::Press {
             button: Button::Left,
             at: p(-100, 500),
         });
         s.handle(Input::Move { at: p(199, 699) });
-        assert_eq!(s.size_label().as_deref(), Some("100 × 200 ＋ 200 × 200"));
+        assert_eq!(
+            s.size_label(),
+            Some(vec!["100 × 200".to_owned(), "200 × 200".to_owned()])
+        );
     }
 
     fn arrow(direction: Direction, shift: bool) -> Input {
@@ -1171,7 +1170,7 @@ mod tests {
         let mut s = Selection::new(three_monitors(), p(-500, 300));
         assert_eq!(s.handle(Input::SelectMonitor), State::Confirmed);
         assert_eq!(s.rect(), Some(Rect::new(-1920, 0, 0, 1080)));
-        assert_eq!(s.size_label().as_deref(), Some("1920 × 1080"));
+        assert_eq!(s.size_label(), Some(vec!["1920 × 1080".to_owned()]));
     }
 
     #[test]

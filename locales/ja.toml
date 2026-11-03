@@ -33,6 +33,9 @@ conflicts = "重なったキーを、重なった項目のすべてで無効に�
 mouse_conflicts = "重なったマウス操作を、重なった項目のすべてで無効にしました: "
 overlaps = "ホットキーとショートカットが重なっています（ホットキーが優先され、そのショートカットは効きません）: "
 watch_stopped = "設定ファイルの監視が止まりました。設定ファイルを直したら shunsoku を起動し直してください。"
+# 重なったキーの後ろに付ける、重なった項目の一覧の括弧（「Ctrl+A（copy, close）」）
+items_open = "（"
+items_close = "）"
 
 # 設定 GUI（ダイアログ）
 [settings_gui]
@@ -46,6 +49,8 @@ write_failed = "設定ファイルに書けませんでした。設定 GUI の�
 # 欄の横のボタン
 browse = "参照…"
 pick_color = "選ぶ…"
+# キーの組み合わせの欄が空のときに出す文字（標準のコントロールに任せると OS の表示言語で出る）
+chord_none = "なし"
 insert_variable = "変数を挿入"
 
 # 適用で、設定 GUI を開いている間に設定ファイルでも変わった項目を GUI でも変えていたときの確認
@@ -61,6 +66,9 @@ scrap_ops = "スクラップ操作"
 annotation = "書き込み"
 
 [settings_gui.general]
+language = "言語:"
+# 言語の一覧の先頭。OS の表示言語に合わせる（日本語でなければ英語）
+language_auto = "OS に合わせる"
 notifications = "通知を出す"
 save_dir = "保存先:"
 # 保存先の欄が空のときに薄く出す（後ろに既定のフォルダが付く）
@@ -201,6 +209,17 @@ register_failed = "定型領域を登録できませんでした。"
 [selection]
 # 定型領域の登録のとき、画面の上端に出す
 register_banner = "定型領域の登録"
+# モニタをまたいだ範囲のサイズの、モニタごとのサイズのつなぎ（「100 × 200 ＋ 200 × 200」）
+size_plus = " ＋ "
+
+# 言語の名前（設定 GUI の言語の一覧）。どの言語の UI でも、その言語で書いた名前を出す
+[language]
+ja = "日本語"
+en = "English"
+
+# shunsoku-cli monitors の一覧で、メインモニタの行の末尾に付ける印
+[monitors]
+main = "メイン"
 
 # CLI（shunsoku-cli）に返す失敗の理由。標準エラーに出る
 [cli]

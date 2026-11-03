@@ -18,6 +18,7 @@
 //! log_level = "info"                           # 隠し項目: off / error / warn / info / debug / trace
 //!
 //! [general]
+//! language = "auto"                            # UI の言語: auto（OS の表示言語。日本語でなければ英語）/ ja / en
 //! save_dir = 'D:\shots'                        # 既定: ピクチャ フォルダの下の shunsoku
 //! file_name_template = "shunsoku_{date}-{time}"
 //! notifications = true                         # false で止まるのは成功の通知だけ
@@ -74,6 +75,7 @@ use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::geometry::Rect;
+use crate::i18n::Language;
 use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, Shortcuts};
 use crate::selection::Mode;
@@ -172,6 +174,8 @@ pub fn new_region(settings: &Settings, base: &str, monitor: &str, rect: Rect) ->
 /// 全体設定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct General {
+    /// UI の言語。None なら OS の表示言語に合わせる（`ui_language`）。
+    pub language: Option<Language>,
     /// 全体の保存先。None ならピクチャ フォルダの下の `shunsoku`（Win32 層で解決する）。
     pub save_dir: Option<PathBuf>,
     /// 全体のファイル名テンプレート。
@@ -189,6 +193,7 @@ pub struct General {
 impl Default for General {
     fn default() -> General {
         General {
+            language: None,
             save_dir: None,
             file_name_template: DEFAULT_FILE_NAME_TEMPLATE.to_owned(),
             notifications: true,
@@ -380,6 +385,14 @@ pub struct SelectionScreen {
     pub mode: Mode,
     /// 通常モードでも十字線を出す。精密モードでは設定によらず出す。
     pub crosshair: bool,
+}
+
+impl General {
+    /// 使う UI の言語。言語が OS に合わせる（None）なら、OS の表示言語の LANGID（`langid`）から決める。
+    pub fn ui_language(&self, langid: u16) -> Language {
+        self.language
+            .unwrap_or_else(|| Language::from_ui_language(langid))
+    }
 }
 
 /// DPI の違うモニタへスクラップを動かしたときの見え方（`[general] dpi_scaling`）。
@@ -737,6 +750,8 @@ pub struct SettingsChanges {
     pub appearance: bool,
     /// ログのレベル。
     pub log_level: bool,
+    /// UI の言語の設定（OS に合わせるかどうかを含む）。メニュー・通知・設定 GUI の文言を変える。
+    pub language: bool,
 }
 
 impl SettingsChanges {
@@ -758,6 +773,7 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
         trash: old.general.trash_limit != new.general.trash_limit,
         appearance: old.scrap != new.scrap,
         log_level: old.log_level != new.log_level,
+        language: old.general.language != new.general.language,
     }
 }
 
@@ -795,6 +811,9 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
 
     let general = r.table(root, "general");
+    if let Some(language) = r.value(general, "general", "language", language) {
+        s.general.language = language;
+    }
     if let Some(dir) = r.value(general, "general", "save_dir", save_dir) {
         s.general.save_dir = Some(dir);
     }
@@ -1099,6 +1118,14 @@ fn selection_mode(item: &Item) -> Option<Mode> {
     }
 }
 
+/// `auto` は None（OS に合わせる）。
+fn language(item: &Item) -> Option<Option<Language>> {
+    match item.as_str()? {
+        "auto" => Some(None),
+        code => Language::from_code(code).map(Some),
+    }
+}
+
 fn dpi_scaling(item: &Item) -> Option<DpiScaling> {
     match item.as_str()? {
         "keep_pixels" => Some(DpiScaling::KeepPixels),
@@ -1187,6 +1214,7 @@ version = 1
 log_level = "debug"
 
 [general]
+language = "en"
 save_dir = 'D:\shots'
 file_name_template = "cap_{datetime:yyyy}"
 notifications = false
@@ -1218,6 +1246,7 @@ shadow = false
             settings,
             Settings {
                 general: General {
+                    language: Some(Language::English),
                     save_dir: Some(PathBuf::from(r"D:\shots")),
                     file_name_template: "cap_{datetime:yyyy}".to_owned(),
                     notifications: false,
@@ -1380,6 +1409,37 @@ shadow = 1
         let (settings, issues) = load("version = 1\n[general]\ncapture_cursor = \"yes\"\n");
         assert_eq!(issues, vec![invalid("general.capture_cursor")]);
         assert!(!settings.general.capture_cursor);
+    }
+
+    #[test]
+    fn the_language_defaults_to_the_os_display_language_and_can_be_japanese_or_english() {
+        assert_eq!(load("version = 1\n").0.general.language, None);
+        for (value, language) in [
+            ("auto", None),
+            ("ja", Some(Language::Japanese)),
+            ("en", Some(Language::English)),
+        ] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[general]\nlanguage = \"{value}\"\n"));
+            assert_eq!(issues, vec![], "{value}");
+            assert_eq!(settings.general.language, language, "{value}");
+        }
+        for value in ["\"fr\"", "\"\"", "\"JA\"", "true", "1"] {
+            let (settings, issues) = load(&format!("version = 1\n[general]\nlanguage = {value}\n"));
+            assert_eq!(issues, vec![invalid("general.language")], "{value}");
+            assert_eq!(settings.general.language, None, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_language_that_follows_the_os_is_decided_by_the_os_display_language() {
+        let mut general = General::default();
+        assert_eq!(general.ui_language(0x0411), Language::Japanese);
+        assert_eq!(general.ui_language(0x0409), Language::English);
+        general.language = Some(Language::English);
+        assert_eq!(general.ui_language(0x0411), Language::English);
+        general.language = Some(Language::Japanese);
+        assert_eq!(general.ui_language(0x0409), Language::Japanese);
     }
 
     #[test]
@@ -1641,6 +1701,13 @@ a = 1
             changed(|s| s.log_level = LogLevel::Trace),
             SettingsChanges {
                 log_level: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
+            changed(|s| s.general.language = Some(Language::English)),
+            SettingsChanges {
+                language: true,
                 ..SettingsChanges::default()
             }
         );
