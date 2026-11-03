@@ -3,12 +3,13 @@
 //!
 //! - `WM_GETDLGCODE` では、標準の処理の戻り値に `DLGC_WANTALLKEYS` を足す（Esc と Enter をダイアログに取られない）。
 //!   Tab / Shift+Tab だけは標準の戻り値のまま返し、ダイアログにフォーカスを移させる。
-//! - キー押下（`WM_KEYDOWN` / `WM_SYSKEYDOWN`）はここで受け、core の `Chord::from_key_down` で組み合わせにして
-//!   `HKM_SETHOTKEY` で入れる。標準の処理には渡さない（標準の処理は Esc と Enter を「なし」にする）。キーを離す・
-//!   文字のメッセージも握りつぶす。入ったら親に `WM_COMMAND`（`EN_CHANGE`）を送る。値は `value` で読む。
+//! - キー押下（`WM_KEYDOWN` / `WM_SYSKEYDOWN`）はここで受け、core の `FieldInput::from_key_down` で入力にする。
+//!   組み合わせは `HKM_SETHOTKEY` でも入れる。修飾キーなしの Backspace・Delete は割り当てを外す（「なし」）。
+//!   標準の処理には渡さない（標準の処理は Esc と Enter を「なし」にする）。キーを離す・文字のメッセージも
+//!   握りつぶす。入ったら親に `WM_COMMAND`（`EN_CHANGE`）を送る。値は `value` で読む。
 //! - フォーカスを得た・失ったら、親に `WM_COMMAND`（`EN_SETFOCUS` / `EN_KILLFOCUS`）を送る。
-//! - コントロールで表せない組み合わせ（設定ファイルに書いた Win キー・PrintScreen）は、`set` で入れると文字で
-//!   描くだけにする（`WM_PAINT`）。キーを入れたら上書きする。
+//! - 描画（`WM_PAINT`）は自分でする。組み合わせは core の表示（`Ctrl+S`）で描き、一覧や設定ファイルと書き方を
+//!   揃える（標準の描画は `Ctrl + S`）。Win キー・PrintScreen を含む、コントロールで表せない組み合わせも同じに描く。
 //! - 値が空の間は、`set_placeholder` で入れた文字を灰色で描く（スクラップ操作の、上書きのない既定の一覧）。
 //!   それもなければ `attach` で渡した「なし」の文字を描く（標準の描画は OS の表示言語の「なし」を出し、UI の
 //!   言語に合わないため。#102）。
@@ -16,29 +17,33 @@
 
 use std::cell::{Cell, RefCell};
 
-use shunsoku_core::keys::{Chord, Modifiers};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use shunsoku_core::keys::{Chord, FieldInput, Modifiers};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
-    DrawTextW, EndPaint, FillRect, GetSysColor, GetSysColorBrush, HFONT, InvalidateRect,
-    PAINTSTRUCT, SYS_COLOR_INDEX, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT,
+    DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint, FillRect, GetSysColor, GetSysColorBrush,
+    GetTextExtentPoint32W, HFONT, InvalidateRect, PAINTSTRUCT, SelectObject, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::HKM_SETHOTKEY;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::Ime::{HIMC, ImmAssociateContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB,
+    GetFocus, GetKeyState, IsWindowEnabled, VK_CONTROL, VK_MENU, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::Shell::{
     DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DLGC_WANTALLKEYS, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GWLP_ID, GetClientRect, GetParent,
-    GetWindowLongPtrW, MSG, SendMessageW, WM_CHAR, WM_COMMAND, WM_DEADCHAR, WM_GETDLGCODE,
-    WM_GETFONT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS,
-    WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    DLGC_WANTALLKEYS, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GWLP_ID, GetCaretPos, GetClientRect,
+    GetParent, GetWindowLongPtrW, MSG, SendMessageW, SetCaretPos, WM_CHAR, WM_COMMAND, WM_DEADCHAR,
+    WM_GETDLGCODE, WM_GETFONT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_NCDESTROY, WM_PAINT,
+    WM_SETFOCUS, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 const SUBCLASS_ID: usize = 1;
+/// 文字の左の余白（96 DPI の px）。
+const MARGIN: i32 = 2;
 
 /// 欄の値と、空の間に描く文字。サブクラスの参照データとして持つ。
 struct State {
@@ -76,7 +81,7 @@ pub fn value(hwnd: HWND) -> Option<Chord> {
     state(hwnd).and_then(|s| s.chord.get())
 }
 
-/// 欄に `chord` を入れる。None は空（コントロールの「なし」）。コントロールで表せない組み合わせは文字で描く。
+/// 欄に `chord` を入れる。None は空（「なし」）。
 pub fn set(hwnd: HWND, chord: Option<Chord>) {
     let Some(state) = state(hwnd) else {
         return;
@@ -146,21 +151,32 @@ fn notify_parent(hwnd: HWND, code: u32) {
     }
 }
 
-/// コントロールで表せない値や、空の間の文字 `text` を `color` で描く。
-fn paint_text(hwnd: HWND, text: &str, color: SYS_COLOR_INDEX) {
+/// 文字 `text` を描く。`dim` なら灰色で描く。フォーカスがあれば、キャレットを文字の後ろに置く（標準の
+/// コントロールは自分の書き方の幅で置くため）。
+fn paint_text(hwnd: HWND, text: &str, dim: bool) {
     let mut text: Vec<u16> = text.encode_utf16().collect();
     // SAFETY: BeginPaint と EndPaint を対にする。フォントはコントロールのもの（ダイアログが持つ）
     unsafe {
+        let enabled = IsWindowEnabled(hwnd).as_bool();
         let mut ps = PAINTSTRUCT::default();
         let dc = BeginPaint(hwnd, &mut ps);
         let mut rect = RECT::default();
         let _ = GetClientRect(hwnd, &mut rect);
-        FillRect(dc, &rect, GetSysColorBrush(COLOR_WINDOW));
+        let back = if enabled { COLOR_WINDOW } else { COLOR_BTNFACE };
+        FillRect(dc, &rect, GetSysColorBrush(back));
         let font = HFONT(SendMessageW(hwnd, WM_GETFONT, None, None).0 as *mut _);
         let old = (!font.is_invalid()).then(|| SelectObject(dc, font.into()));
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, windows::Win32::Foundation::COLORREF(GetSysColor(color)));
-        rect.left += 2;
+        let color = if dim || !enabled {
+            COLOR_GRAYTEXT
+        } else {
+            COLOR_WINDOWTEXT
+        };
+        SetTextColor(dc, COLORREF(GetSysColor(color)));
+        // 余白は 96 DPI で 2 px
+        rect.left += MARGIN * GetDpiForWindow(hwnd) as i32 / 96;
+        let mut size = SIZE::default();
+        let _ = GetTextExtentPoint32W(dc, &text, &mut size);
         DrawTextW(
             dc,
             &mut text,
@@ -171,6 +187,17 @@ fn paint_text(hwnd: HWND, text: &str, color: SYS_COLOR_INDEX) {
             SelectObject(dc, old);
         }
         let _ = EndPaint(hwnd, &ps);
+        if GetFocus() == hwnd {
+            let mut caret = POINT::default();
+            let _ = GetCaretPos(&mut caret);
+            // 文字が空（灰色の既定の一覧・「なし」）なら先頭に置く
+            let x = if dim || state(hwnd).is_some_and(|s| s.chord.get().is_none()) {
+                rect.left
+            } else {
+                rect.left + size.cx
+            };
+            let _ = SetCaretPos(x, caret.y);
+        }
     }
 }
 
@@ -197,10 +224,13 @@ unsafe extern "system" fn subclass(
                 LRESULT(base.0 | DLGC_WANTALLKEYS as isize)
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
-                if let Some(chord) = Chord::from_key_down(wparam.0 as u16, held()) {
-                    set(hwnd, Some(chord));
-                    notify_parent(hwnd, EN_CHANGE);
-                }
+                let chord = match FieldInput::from_key_down(wparam.0 as u16, held()) {
+                    Some(FieldInput::Set(chord)) => Some(chord),
+                    Some(FieldInput::Clear) => None,
+                    None => return LRESULT(0),
+                };
+                set(hwnd, chord);
+                notify_parent(hwnd, EN_CHANGE);
                 LRESULT(0)
             }
             WM_KEYUP | WM_SYSKEYUP | WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => {
@@ -209,20 +239,13 @@ unsafe extern "system" fn subclass(
             WM_PAINT => {
                 let state = &*(data as *const State);
                 match state.chord.get() {
-                    Some(chord) if chord.to_hotkey_control().is_none() => {
-                        paint_text(hwnd, &chord.to_string(), COLOR_WINDOWTEXT);
-                        LRESULT(0)
-                    }
+                    Some(chord) => paint_text(hwnd, &chord.to_string(), false),
                     None if !state.placeholder.borrow().is_empty() => {
-                        paint_text(hwnd, &state.placeholder.borrow(), COLOR_GRAYTEXT);
-                        LRESULT(0)
+                        paint_text(hwnd, &state.placeholder.borrow(), true)
                     }
-                    None => {
-                        paint_text(hwnd, &state.none, COLOR_WINDOWTEXT);
-                        LRESULT(0)
-                    }
-                    _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+                    None => paint_text(hwnd, &state.none, false),
                 }
+                LRESULT(0)
             }
             WM_SETFOCUS | WM_KILLFOCUS => {
                 let result = DefSubclassProc(hwnd, msg, wparam, lparam);

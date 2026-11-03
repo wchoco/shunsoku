@@ -131,6 +131,30 @@ impl Chord {
     }
 }
 
+/// 設定 GUI のキーの入力欄で、キーを押したときの入力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldInput {
+    /// 組み合わせを入れる。
+    Set(Chord),
+    /// 割り当てを外す（「なし」にする）。
+    Clear,
+}
+
+impl FieldInput {
+    /// キー（仮想キーコード `vk`）を押したときの入力。修飾キーなしの Backspace・Delete は割り当てを外す。
+    /// それ以外は [`Chord::from_key_down`] と同じ。
+    pub fn from_key_down(vk: u16, held: Modifiers) -> Option<FieldInput> {
+        const BACKSPACE: u16 = 0x08;
+        const DELETE: u16 = 0x2E;
+        let chord = Chord::from_key_down(vk, held)?;
+        let plain = chord.modifiers == Modifiers::default();
+        if plain && (vk == BACKSPACE || vk == DELETE) {
+            return Some(FieldInput::Clear);
+        }
+        Some(FieldInput::Set(chord))
+    }
+}
+
 impl fmt::Display for Chord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let m = self.modifiers;
@@ -410,6 +434,33 @@ mod tests {
         assert_eq!(Chord::from_key_down(0x09, Modifiers::default()), None);
         assert_eq!(Chord::from_key_down(0x09, mods(false, false, true)), None);
         assert_eq!(Chord::from_key_down(0x2C, Modifiers::default()), None);
+    }
+
+    #[test]
+    fn backspace_or_delete_alone_clears_the_field_but_with_modifiers_is_a_chord() {
+        let none = Modifiers::default();
+        assert_eq!(
+            FieldInput::from_key_down(0x08, none),
+            Some(FieldInput::Clear)
+        );
+        assert_eq!(
+            FieldInput::from_key_down(0x2E, none),
+            Some(FieldInput::Clear)
+        );
+        assert_eq!(
+            FieldInput::from_key_down(0x2E, mods(true, false, false)),
+            Some(FieldInput::Set("Ctrl+Delete".parse().unwrap()))
+        );
+        assert_eq!(
+            FieldInput::from_key_down(0x08, mods(false, true, false)),
+            Some(FieldInput::Set("Alt+Backspace".parse().unwrap()))
+        );
+        assert_eq!(
+            FieldInput::from_key_down(0x53, mods(true, false, false)),
+            Some(FieldInput::Set("Ctrl+S".parse().unwrap()))
+        );
+        assert_eq!(FieldInput::from_key_down(0x09, none), None);
+        assert_eq!(FieldInput::from_key_down(0x10, none), None);
     }
 
     #[test]
