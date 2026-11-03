@@ -110,6 +110,14 @@ pub enum RegionKey {
 }
 
 impl Field {
+    /// 定型領域の詳細の欄か。
+    fn is_region(self) -> bool {
+        matches!(
+            self,
+            Field::Region(..) | Field::Template(TemplateOf::Region(_))
+        )
+    }
+
     /// 定型領域の項目なら、領域 `index` の同じ項目にする。
     fn with_region(self, index: usize) -> Field {
         match self {
@@ -183,6 +191,8 @@ pub struct Fields {
     fonts: Rc<Vec<String>>,
     /// 定型領域の詳細の欄が指す領域（`bind_region`）。
     region: usize,
+    /// `bind_region` で結び直してから、まだ欄に出していない。フォーカスのある欄も書き換える（前の領域の値が残るため）。
+    rebound: Cell<bool>,
 }
 
 impl Fields {
@@ -204,6 +214,7 @@ impl Fields {
     /// 定型領域の詳細の欄と横のボタンを、領域 `index` に結び直す。
     pub fn bind_region(&mut self, index: usize) {
         self.region = index;
+        self.rebound.set(true);
         for row in &mut self.rows {
             row.field = row.field.with_region(index);
         }
@@ -642,6 +653,7 @@ pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
     FILLING.set(true);
     // SAFETY: 引数なし
     let focus = unsafe { GetFocus() };
+    let rebound = fields.rebound.replace(false);
     for row in &fields.rows {
         let Some(control) = item(hwnd, row.control) else {
             continue;
@@ -659,7 +671,8 @@ pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
                 }
             }
             Shown::Text(value) => {
-                if control != focus && window_text(control) != value {
+                let keep_typing = control == focus && !(rebound && row.field.is_region());
+                if !keep_typing && window_text(control) != value {
                     set_window_text(control, &value);
                 }
             }
@@ -860,6 +873,7 @@ impl Fields {
             buttons: Vec::new(),
             fonts: Rc::new(installed_fonts()),
             region: 0,
+            rebound: Cell::new(false),
         }
     }
 }
