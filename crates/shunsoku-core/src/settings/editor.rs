@@ -187,6 +187,27 @@ impl Editor {
     }
 }
 
+/// ドロップダウンの項目と、選んでおく位置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choices<T> {
+    pub items: Vec<T>,
+    pub selected: usize,
+}
+
+/// 候補 `candidates`（昇順）から選ぶドロップダウンに、今の値 `current` を出す。設定ファイルに候補の外の値が
+/// 書かれていれば、それも順の位置に足して選んでおく（表示だけ。ほかを選べばその値になる）。
+pub fn choices<T: Ord + Clone>(candidates: &[T], current: &T) -> Choices<T> {
+    let mut items = candidates.to_vec();
+    let selected = match items.binary_search(current) {
+        Ok(i) => i,
+        Err(i) => {
+            items.insert(i, current.clone());
+            i
+        }
+    };
+    Choices { items, selected }
+}
+
 /// 設定 `settings` の、キーの組み合わせの項目 `item` の値。
 fn chord_of(settings: &Settings, item: &SettingsItem) -> Option<Chord> {
     match item {
@@ -402,6 +423,34 @@ mod tests {
             Some(chord("Ctrl+Alt+Z"))
         );
         assert_eq!(editor.chord(&SettingsItem::Mouse("close".into())), None);
+    }
+
+    #[test]
+    fn a_value_among_the_candidates_is_selected_in_place() {
+        assert_eq!(
+            choices(&[2, 3, 5, 8], &5),
+            Choices {
+                items: vec![2, 3, 5, 8],
+                selected: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_value_outside_the_candidates_is_shown_in_order_and_selected() {
+        assert_eq!(
+            choices(&[12, 16, 24, 32], &20),
+            Choices {
+                items: vec![12, 16, 20, 24, 32],
+                selected: 2
+            }
+        );
+        assert_eq!(choices(&[2, 3, 5, 8], &64).selected, 4);
+        let fonts = ["Meiryo".to_owned(), "Yu Gothic UI".to_owned()];
+        assert_eq!(
+            choices(&fonts, &"Not Installed".to_owned()).items,
+            ["Meiryo", "Not Installed", "Yu Gothic UI"]
+        );
     }
 
     #[test]

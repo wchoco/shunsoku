@@ -10,9 +10,13 @@
 //!   タブを切り替えたら帯で出し分ける（`show_page`）。
 //! - キーの組み合わせの欄（ホットキー・ショートカット）は `PageBuilder::chord_field` で置く。欄（`chord_field`）と、
 //!   その横の印の欄を組にして `ChordRow` として返す。呼び出し側は `ChordRow::item` で写しの項目と結ぶ。
+//! - それ以外の欄（チェックボックス・テキスト・数・ドロップダウンと、横の「参照…」などのボタン）は `fields`。
+//!   一般・スクラップ・書き込みのタブは `pages`。
 //! - タイトルバーだけダークモードに合わせる（`apply_dark`）。DPI の変化は PMv2 のダイアログマネージャに任せる。
 
 pub mod chord_field;
+pub mod fields;
+mod pages;
 pub mod scrap_ops;
 
 use shunsoku_core::settings::SettingsItem;
@@ -22,8 +26,8 @@ use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowA
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Controls::{
     EnableThemeDialogTexture, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
-    ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TCIF_TEXT, TCITEMW, TCM_GETCURSEL,
-    TCM_INSERTITEMW, TCM_SETCURSEL,
+    ICC_TAB_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, TCIF_TEXT,
+    TCITEMW, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -37,6 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::wide::to_wide;
+pub use fields::Fields;
 
 /// 適用のボタン。OK とキャンセルは `IDOK` / `IDCANCEL`。
 pub const ID_APPLY: i32 = 10;
@@ -51,8 +56,8 @@ const PAGE_ID_FIRST: i32 = 1000;
 const PAGE_ID_SPAN: i32 = 100;
 
 /// ダイアログの大きさ（ダイアログ単位）。
-const WIDTH: i16 = 320;
-const HEIGHT: i16 = 200;
+const WIDTH: i16 = 340;
+const HEIGHT: i16 = 250;
 const MARGIN: i16 = 7;
 const BUTTON_WIDTH: i16 = 50;
 const BUTTON_HEIGHT: i16 = 14;
@@ -65,9 +70,12 @@ pub const PAGE_WIDTH: i16 = WIDTH - 2 * PAGE_X;
 /// タブのページ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
+    General,
     #[default]
     Capture,
+    Scrap,
     ScrapOps,
+    Annotation,
 }
 
 /// タブのページの表の行。
@@ -80,22 +88,79 @@ struct PageDef {
 /// タブの順。
 const PAGES: &[PageDef] = &[
     PageDef {
+        page: Page::General,
+        label_key: "settings_gui.tab.general",
+        build: pages::general,
+    },
+    PageDef {
         page: Page::Capture,
         label_key: "settings_gui.tab.capture",
         build: capture_page,
+    },
+    PageDef {
+        page: Page::Scrap,
+        label_key: "settings_gui.tab.scrap",
+        build: pages::scrap,
     },
     PageDef {
         page: Page::ScrapOps,
         label_key: "settings_gui.tab.scrap_ops",
         build: scrap_ops::build,
     },
+    PageDef {
+        page: Page::Annotation,
+        label_key: "settings_gui.tab.annotation",
+        build: pages::annotation,
+    },
 ];
+
+/// ページの左の見出しの幅と、欄の左端。見出しは欄より 2 下げる。
+pub const LABEL_WIDTH: i16 = 100;
+pub const FIELD_X: i16 = LABEL_WIDTH + 5;
 
 /// 「キャプチャ」タブ。
 fn capture_page(b: &mut PageBuilder) {
-    b.label("settings_gui.capture.select_capture", 0, 2, 90, 10);
-    b.chord_field(SettingsItem::SelectCaptureHotkey, 95, 0, 110);
-    b.label("settings_gui.capture.hint", 0, 40, PAGE_WIDTH, 20);
+    use fields::Field;
+    let hotkeys = [
+        (
+            "settings_gui.capture.select_capture",
+            SettingsItem::SelectCaptureHotkey,
+        ),
+        (
+            "settings_gui.capture.active_window_capture",
+            SettingsItem::ActiveWindowCaptureHotkey,
+        ),
+        (
+            "settings_gui.capture.restore_last",
+            SettingsItem::RestoreLastHotkey,
+        ),
+    ];
+    let mut y = 0;
+    for (key, item) in hotkeys {
+        b.label(key, 0, y + 2, LABEL_WIDTH, 10);
+        b.chord_field(item, FIELD_X, y, 110);
+        y += 34;
+    }
+    b.check(
+        Field::CaptureCursor,
+        "settings_gui.capture.capture_cursor",
+        0,
+        y,
+        PAGE_WIDTH,
+    );
+    y += 16;
+    b.label("settings_gui.capture.mode", 0, y + 2, LABEL_WIDTH, 10);
+    b.choice(Field::SelectionMode, FIELD_X, y, 110, 60);
+    y += 20;
+    b.check(
+        Field::Crosshair,
+        "settings_gui.capture.crosshair",
+        0,
+        y,
+        PAGE_WIDTH,
+    );
+    y += 18;
+    b.label("settings_gui.capture.hint", 0, y, PAGE_WIDTH, 20);
 }
 
 /// 文言を引く関数（`app::text`）。
@@ -115,6 +180,7 @@ pub struct ChordRow {
 pub struct Dialog {
     pub hwnd: HWND,
     pub rows: Vec<ChordRow>,
+    pub fields: Fields,
 }
 
 /// 設定 GUI を組んで（見えないまま）作る。`page` のタブを選んでおく。`proc` がダイアログ プロシージャ。
@@ -122,7 +188,11 @@ pub struct Dialog {
 pub fn create(module: HINSTANCE, page: Page, text: Text, proc: DLGPROC) -> Result<Dialog> {
     let icc = INITCOMMONCONTROLSEX {
         dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_HOTKEY_CLASS | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES,
+        dwICC: ICC_HOTKEY_CLASS
+            | ICC_STANDARD_CLASSES
+            | ICC_TAB_CLASSES
+            | ICC_LISTVIEW_CLASSES
+            | ICC_UPDOWN_CLASS,
     };
     // SAFETY: 構造体はこの呼び出しの間生きている
     unsafe {
@@ -131,12 +201,14 @@ pub fn create(module: HINSTANCE, page: Page, text: Text, proc: DLGPROC) -> Resul
 
     let mut t = Template::new(text("settings_gui.title"), text("settings_gui.font"));
     let mut rows = Vec::new();
+    let mut fields = Fields::new();
     for (index, def) in PAGES.iter().enumerate() {
         let mut b = PageBuilder {
             template: &mut t,
             text,
             next_id: PAGE_ID_FIRST + index as i32 * PAGE_ID_SPAN,
             rows: &mut rows,
+            fields: &mut fields,
         };
         (def.build)(&mut b);
     }
@@ -193,6 +265,7 @@ pub fn create(module: HINSTANCE, page: Page, text: Text, proc: DLGPROC) -> Resul
             chord_field::attach(field);
         }
     }
+    fields::init(hwnd, &fields, text);
     if let Some(tab) = item(hwnd, ID_TAB) {
         for (index, def) in PAGES.iter().enumerate() {
             let mut label = to_wide(text(def.label_key));
@@ -218,7 +291,7 @@ pub fn create(module: HINSTANCE, page: Page, text: Text, proc: DLGPROC) -> Resul
     }
     show_page(hwnd, page);
     apply_dark(hwnd);
-    Ok(Dialog { hwnd, rows })
+    Ok(Dialog { hwnd, rows, fields })
 }
 
 /// ページ `page` のコントロールの ID の帯の最初。
@@ -364,6 +437,7 @@ pub struct PageBuilder<'a> {
     text: Text,
     next_id: i32,
     rows: &'a mut Vec<ChordRow>,
+    fields: &'a mut Fields,
 }
 
 impl PageBuilder<'_> {
@@ -440,6 +514,8 @@ impl PageBuilder<'_> {
 enum Class {
     Button,
     Static,
+    Edit,
+    UpDown,
     HotKey,
     Tab,
     ListView,
@@ -451,6 +527,8 @@ impl Class {
         match self {
             Class::Button => "Button",
             Class::Static => "Static",
+            Class::Edit => "Edit",
+            Class::UpDown => "msctls_updown32",
             Class::HotKey => "msctls_hotkey32",
             Class::Tab => "SysTabControl32",
             Class::ListView => "SysListView32",

@@ -13,10 +13,11 @@ use std::fmt::Display;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, TableLike, Value};
 
 use super::{
-    BORDER_WIDTH_RANGE, DEFAULT_REGION_FILE_NAME_TEMPLATE, DpiScaling, General, HotkeyAction,
-    Hotkeys, LogLevel, OPACITY_RANGE, Reader, Region, Rgb, ScrapAppearance, SelectionScreen,
-    Settings, TRASH_LIMIT_RANGE, VERSION, dpi_scaling, in_range, log_level, non_empty_str,
-    optional_chord, optional_gesture, read_regions, region_number, rgb, save_dir, selection_mode,
+    ANNOTATION_FONT_SIZE_RANGE, ANNOTATION_WIDTH_RANGE, AnnotationDefaults, BORDER_WIDTH_RANGE,
+    DEFAULT_REGION_FILE_NAME_TEMPLATE, DpiScaling, General, HotkeyAction, Hotkeys, LogLevel,
+    OPACITY_RANGE, Reader, Region, ScrapAppearance, SelectionScreen, Settings, TRASH_LIMIT_RANGE,
+    VERSION, dpi_scaling, in_range, log_level, non_empty_str, optional_chord, optional_gesture,
+    read_regions, region_number, rgb, save_dir, selection_mode,
 };
 use crate::selection::Mode;
 
@@ -43,6 +44,9 @@ pub fn write(doc: &mut DocumentMut, settings: &Settings) {
         write_overrides(t, &settings.mouse, optional_gesture)
     });
     section(root, "scrap", |t| write_scrap(t, &settings.scrap));
+    section(root, "annotation", |t| {
+        write_annotation(t, &settings.annotation)
+    });
     section(root, "selection", |t| {
         write_selection(t, &settings.selection)
     });
@@ -216,7 +220,7 @@ fn write_scrap(t: &mut dyn TableLike, s: &ScrapAppearance) {
         rgb,
         Some(d.border.color),
         &s.border.color,
-        |c| Some(rgb_str(c).into()),
+        |c| Some(c.to_string().into()),
     );
     put(
         t,
@@ -226,6 +230,32 @@ fn write_scrap(t: &mut dyn TableLike, s: &ScrapAppearance) {
         &s.shadow,
         |&v| Some(v.into()),
     );
+}
+
+fn write_annotation(t: &mut dyn TableLike, a: &AnnotationDefaults) {
+    let d = AnnotationDefaults::default();
+    put(t, "color", rgb, Some(d.color), &a.color, |c| {
+        Some(c.to_string().into())
+    });
+    put(
+        t,
+        "width",
+        |i| in_range(i, ANNOTATION_WIDTH_RANGE),
+        Some(d.width),
+        &a.width,
+        |&v| Some(i64::from(v).into()),
+    );
+    put(
+        t,
+        "font_size",
+        |i| in_range(i, ANNOTATION_FONT_SIZE_RANGE),
+        Some(d.font_size),
+        &a.font_size,
+        |&v| Some(i64::from(v).into()),
+    );
+    put(t, "font", non_empty_str, Some(d.font), &a.font, |s| {
+        Some(s.as_str().into())
+    });
 }
 
 fn write_selection(t: &mut dyn TableLike, s: &SelectionScreen) {
@@ -374,10 +404,6 @@ fn put<T: PartialEq>(
     }
 }
 
-fn rgb_str(&Rgb(r, g, b): &Rgb) -> String {
-    format!("#{r:02X}{g:02X}{b:02X}")
-}
-
 /// 空は `""`。
 fn optional_str<T: Display>(value: &Option<T>) -> String {
     value.as_ref().map(T::to_string).unwrap_or_default()
@@ -416,7 +442,7 @@ mod tests {
     use crate::geometry::Rect;
     use crate::keys::Chord;
     use crate::scrap::ops::MouseGesture;
-    use crate::settings::load;
+    use crate::settings::{Rgb, load};
 
     /// `src` を読み、`change` で変えた設定を書いた文字列。
     fn written(src: &str, change: impl FnOnce(&mut Settings)) -> String {
@@ -473,6 +499,10 @@ notifications = false
         s.scrap.border.width = 4;
         s.scrap.border.color = Rgb(0x12, 0xAB, 0xEF);
         s.scrap.shadow = false;
+        s.annotation.color = Rgb(0x1E, 0x88, 0xE5);
+        s.annotation.width = 8;
+        s.annotation.font_size = 24;
+        s.annotation.font = "Meiryo".to_owned();
         s.selection.mode = Mode::Precise;
         s.selection.crosshair = true;
         s
@@ -732,6 +762,49 @@ height = 10
             ..Settings::default()
         };
         assert_eq!(load(&out), (wanted, vec![]));
+    }
+
+    #[test]
+    fn each_annotation_item_rewrites_only_itself_and_keeps_comments() {
+        let src = r##"version = 1
+# 書き込み
+[annotation]
+color = "#1E88E5"   # 青
+width = 8 # 太め
+font_size = 24
+font = "Meiryo"     # 書体
+"##;
+        assert_eq!(
+            written(src, |s| s.annotation.color = Rgb(0x43, 0xA0, 0x47)),
+            src.replace("#1E88E5", "#43A047")
+        );
+        assert_eq!(
+            written(src, |s| s.annotation.width = 2),
+            src.replace("width = 8", "width = 2")
+        );
+        assert_eq!(
+            written(src, |s| s.annotation.font_size = 12),
+            src.replace("font_size = 24", "font_size = 12")
+        );
+        assert_eq!(
+            written(src, |s| s.annotation.font = "Yu Gothic UI".to_owned()),
+            src.replace("\"Meiryo\"", "\"Yu Gothic UI\"")
+        );
+    }
+
+    #[test]
+    fn annotation_defaults_written_into_a_file_without_them_read_back_the_same() {
+        let out = written("version = 1\n", |s| {
+            s.annotation.color = Rgb(0, 0, 0);
+            s.annotation.font = "Meiryo".to_owned();
+        });
+        assert_eq!(
+            out,
+            "version = 1\n\n[annotation]\ncolor = \"#000000\"\nfont = \"Meiryo\"\n"
+        );
+        let read = load(&out).0.annotation;
+        assert_eq!(read.color, Rgb(0, 0, 0));
+        assert_eq!(read.font, "Meiryo");
     }
 
     #[test]
