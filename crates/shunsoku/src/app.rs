@@ -1126,7 +1126,7 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
 
 fn on_tray(owner: HWND, event: tray::Event) {
     match event {
-        tray::Event::ContextMenu { x, y } => {
+        tray::Event::Menu { x, y } => {
             // ごみ箱の一覧（新しいものから）。項目の番号は CMD_TRASH_FIRST + 添字
             let trashed: Vec<(TrashId, String)> = with_app(|app| {
                 app.trash
@@ -1222,7 +1222,6 @@ fn on_tray(owner: HWND, event: tray::Event) {
                 None => on_command(command),
             }
         }
-        tray::Event::Select => request_capture(Source::TrayClick),
         tray::Event::NotificationClick => {
             let folder = with_app(|app| app.notices.clicked().map(Path::to_path_buf)).flatten();
             // ShellExecuteW はメッセージを回すことがあるので、App を借りずに呼ぶ
