@@ -16,10 +16,16 @@
 
 pub mod chord_field;
 pub mod fields;
+mod list_view;
 mod pages;
 pub mod regions;
 pub mod scrap_ops;
 
+use std::cell::Cell;
+use std::path::{Path, PathBuf};
+use std::thread::LocalKey;
+
+use shunsoku_core::monitors::Monitor;
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::Editor;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
@@ -68,11 +74,11 @@ pub const PAGE_Y: i16 = MARGIN + 20;
 /// ページに使える幅。
 pub const PAGE_WIDTH: i16 = WIDTH - 2 * PAGE_X;
 
-/// タブのページ。
+/// タブのページ。既定（開くページを指定しないとき）は最初の「全般」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
-    General,
     #[default]
+    General,
     Capture,
     Regions,
     Scrap,
@@ -173,6 +179,37 @@ fn capture_page(b: &mut PageBuilder) {
 /// 文言を引く関数（`app::text`）。
 pub type Text = fn(&'static str) -> &'static str;
 
+/// フォルダ `dir` に、ファイル名テンプレート `template`（`{name}` は `name`）でいま撮ったら付く名前
+/// （`app` が `save` で決める）。決められなければ None。
+pub type FileName = fn(dir: &Path, template: &str, name: &str) -> Option<String>;
+
+/// ダイアログの外から要るもの。`app` が集めて渡す（ADR-0005: Win32 のモジュールは `app` を通して互いを使う）。
+#[derive(Debug, Clone)]
+pub struct Env {
+    /// いまのモニタ（定型領域のモニタの名前・はみ出しの警告・追加の場所・範囲の絵）。
+    pub monitors: Vec<Monitor>,
+    /// 全体の保存先が空のときに保存する先（ピクチャ）。
+    pub default_dir: Option<PathBuf>,
+    pub file_name: FileName,
+}
+
+/// 処理の間だけ旗を立てておく（その処理がコントロールに送ったメッセージで届く通知を、ダイアログが見分ける）。
+/// 落としたら旗を下ろす。
+pub struct During(&'static LocalKey<Cell<bool>>);
+
+impl During {
+    pub fn enter(flag: &'static LocalKey<Cell<bool>>) -> During {
+        flag.set(true);
+        During(flag)
+    }
+}
+
+impl Drop for During {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 /// キーの組み合わせの欄と、その横の印の欄。
 #[derive(Debug, Clone)]
 pub struct ChordRow {
@@ -192,7 +229,13 @@ pub struct Dialog {
 
 /// 設定 GUI を組んで（見えないまま）作る。`page` のタブを選んでおく。`proc` がダイアログ プロシージャ。
 /// `WM_INITDIALOG` は、タブの見出しを入れる前に `proc` に届く。
-pub fn create(module: HINSTANCE, page: Page, text: Text, proc: DLGPROC) -> Result<Dialog> {
+pub fn create(
+    module: HINSTANCE,
+    page: Page,
+    text: Text,
+    env: &Env,
+    proc: DLGPROC,
+) -> Result<Dialog> {
     let icc = INITCOMMONCONTROLSEX {
         dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
         dwICC: ICC_HOTKEY_CLASS
@@ -272,7 +315,7 @@ pub fn create(module: HINSTANCE, page: Page, text: Text, proc: DLGPROC) -> Resul
             chord_field::attach(field, text("settings_gui.chord_none"));
         }
     }
-    fields::init(hwnd, &fields, text);
+    fields::init(hwnd, &fields, text, env);
     if let Some(tab) = item(hwnd, ID_TAB) {
         for (index, def) in PAGES.iter().enumerate() {
             let mut label = to_wide(text(def.label_key));
@@ -365,7 +408,7 @@ unsafe extern "system" fn collect_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
 }
 
 /// 写し `editor` を欄に出す: キーの組み合わせの欄の値、横の印、OK と適用を押せるか。
-pub fn fill(hwnd: HWND, rows: &[ChordRow], editor: &Editor, text: Text) {
+pub fn fill(hwnd: HWND, rows: &[ChordRow], editor: &Editor, text: Text, env: &Env) {
     for row in rows {
         if let Some(field) = item(hwnd, row.field) {
             chord_field::set(field, editor.chord(&row.item));
@@ -378,7 +421,7 @@ pub fn fill(hwnd: HWND, rows: &[ChordRow], editor: &Editor, text: Text) {
         }
     }
     scrap_ops::fill(hwnd, editor, text);
-    regions::fill(hwnd, editor, text);
+    regions::fill(hwnd, editor, text, env);
     let buttons = editor.buttons();
     for (id, enabled) in [(IDOK.0, buttons.ok), (ID_APPLY, buttons.apply)] {
         if let Some(button) = item(hwnd, id) {

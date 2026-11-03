@@ -43,7 +43,7 @@
 //!   未設定のまま GUI を閉じたときは通知する（core の `settings::unset::prompt`）。
 //! - 設定 GUI（トレイの「設定…」・2 つ目の起動）は `settings_gui` が開き、ダイアログの組み立ては `settings_dialog`。
 //!   適用は `write_settings` で書いてから `adopt_settings` で読み込み直しと同じ反映をする。キーの入力欄に
-//!   フォーカスがある間はホットキーの登録を外す（`App::hotkeys_suspended`）。
+//!   フォーカスがある間はホットキーの登録を外す（`App::hotkey_pause`）。
 //! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。通知のクリックは
 //!   中身を持たないので、クリックで開くフォルダ（`App::notice_folder`）を覚えておき、新しい通知を出したら忘れる。
 //! - コピーと保存の画像は `render::render_image` で表示と同じ描き方で作る。保存先とファイル名は UI スレッドで
@@ -102,6 +102,7 @@ use shunsoku_core::scrap::{
     Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
 use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
+use shunsoku_core::settings::form::HotkeyPause;
 use shunsoku_core::settings::{
     self, LogLevel, Rgb, Settings, SettingsChanges, SettingsIssue, unset,
 };
@@ -291,7 +292,7 @@ struct App {
     /// 開いている設定 GUI。
     settings_gui: Option<settings_gui::SettingsGui>,
     /// 設定 GUI のキーの組み合わせの欄にフォーカスがあり、全体のホットキーの登録を外している。
-    hotkeys_suspended: bool,
+    hotkey_pause: HotkeyPause,
     /// 最後に登録したときに登録できなかったホットキー（設定 GUI の印にする）。
     unregistered: Vec<settings::SettingsItem>,
     hotkeys: hotkey::Registered,
@@ -909,7 +910,7 @@ fn start(
         notice_folder: None,
         gpu: grab::Gpu::default(),
         settings_gui: None,
-        hotkeys_suspended: false,
+        hotkey_pause: HotkeyPause::default(),
         unregistered: failed.iter().map(|f| f.action.into()).collect(),
         hotkeys,
         windows,
@@ -3322,14 +3323,14 @@ fn request_reselect(index: usize) -> bool {
 }
 
 /// 設定 GUI の「試しに撮る」: 写しの定型領域 `region` の値で撮る（定型領域キャプチャと同じ待ち行列で、この処理を
-/// 抜けてから撮る）。ほかの依頼を進めていれば受けずに false。
-fn request_trial(region: &settings::Region) -> bool {
+/// 抜けてから撮る）。領域に保存先がなければ `general_dir` に保存する。ほかの依頼を進めていれば受けずに false。
+fn request_trial(region: &settings::Region, general_dir: Option<PathBuf>) -> bool {
     let queued = with_app(|app| {
         if !matches!(app.capture, Capture::Idle) {
             return None;
         }
         app.regions_waiting
-            .push_back(CaptureRequest::trial_region(region));
+            .push_back(CaptureRequest::trial_region(region, general_dir));
         Some(app.windows.message)
     })
     .flatten();
@@ -3488,10 +3489,8 @@ fn menus_visible() -> bool {
 
 /// 定型領域キャプチャを 1 件撮り、依頼の出力（保存・スクラップ）を出す。撮れなければ失敗を通知する。
 fn capture_region(request: CaptureRequest) {
-    let name = match &request.method {
-        CaptureMethod::Region(id) => id.0.clone(),
-        CaptureMethod::TrialRegion(region) => region.name.clone(),
-        _ => return,
+    let Some(name) = request.region_name().map(str::to_owned) else {
+        return;
     };
     let name = name.as_str();
     // 試しに撮る依頼（設定 GUI）は写しの値で、ほかは適用済みの設定から名前で引く
@@ -3598,11 +3597,12 @@ fn register_region(rect: Rect) {
     };
     let monitor = &monitors[index];
     let result = with_app(|app| {
-        let base = text("region.default_name");
-        let region = match &app.settings_gui {
-            Some(gui) => gui.new_registered_region(&app.settings, base, &monitor.id, relative),
-            None => settings::new_region(&app.settings, base, &monitor.id, relative),
-        };
+        let region = settings_gui::region_to_register(
+            app,
+            text("region.default_name"),
+            &monitor.id,
+            relative,
+        );
         let mut new = app.settings.clone();
         new.regions.push(region.clone());
         write_settings(app, &new).map(|()| region)
@@ -3615,10 +3615,7 @@ fn register_region(rect: Rect) {
                 region.monitor,
                 region.rect
             );
-            notify_user(
-                notify::Level::Success,
-                &format!("{}{}", text("region.registered"), region.name),
-            );
+            // 通知は出さない（設定 GUI でその領域を開くので、登録したことはそこでわかる）
             // 書いた定型領域はファイルの要素に結び付いている（`Settings::as_written`）
             let name = region.name.clone();
             settings_gui::region_registered(settings::Region {
@@ -3847,8 +3844,8 @@ fn adopt_settings(
     log::info!("settings changed: {changes:?}");
     let keymap = settings::keymap(&app.settings, ops::OPERATIONS);
     log_issues(&keymap.issues);
-    let failed = if (changes.hotkeys || reregister) && !app.hotkeys_suspended {
-        register_hotkeys(app)
+    let failed = if (changes.hotkeys || reregister) && !app.hotkey_pause.is_paused() {
+        register_bound(app, &keymap.hotkeys.bound)
     } else {
         Vec::new()
     };
@@ -3864,7 +3861,16 @@ fn adopt_settings(
 /// いまの設定（`app.settings`）のホットキーを登録し直す。登録できなかったものを `App::unregistered` に覚えて返す。
 fn register_hotkeys(app: &mut App) -> Vec<hotkey::Failed> {
     let keymap = settings::keymap(&app.settings, ops::OPERATIONS);
-    let failed = app.hotkeys.reregister(&keymap.hotkeys.bound);
+    register_bound(app, &keymap.hotkeys.bound)
+}
+
+/// ホットキー `bound`（いまの設定から作った対応表）を登録し直す。登録できなかったものを `App::unregistered` に
+/// 覚えて返す。
+fn register_bound(
+    app: &mut App,
+    bound: &std::collections::BTreeMap<Chord, settings::HotkeyAction>,
+) -> Vec<hotkey::Failed> {
+    let failed = app.hotkeys.reregister(bound);
     app.unregistered = failed.iter().map(|f| f.action.into()).collect();
     failed
 }

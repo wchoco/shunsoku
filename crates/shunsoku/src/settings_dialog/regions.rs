@@ -7,7 +7,7 @@
 //!   `SettingsItem::RegionHotkey(i)`。行を選び直したら呼び出し側が `Fields::bind_region` と `ChordRow::item` を
 //!   その行に差し替える（`hotkey_id`）。
 //! - 範囲の欄の下に、登録したモニタがない・範囲がはみ出す警告を出す（core の `monitors::locate_by_id`）。モニタの
-//!   一覧は `refresh_monitors` で集め直す（開いたとき、行を選び直したとき、画面の構成が変わったとき）。
+//!   一覧は呼び出し側が `Env::monitors` に集め直す（開いたとき、行を選び直したとき、画面の構成が変わったとき）。
 //! - 一覧の行の数は `sync_list` で写しに揃える。揃えて選んでいる行がなくなったら、詳細が指していた位置の行を選ぶ。
 //!   呼び出し側は、欄を出す（`fill`）前に `sync_list` を呼ぶ。`sync_list` の中で行を選んで届く通知では欄を結び
 //!   直すだけにする（`is_syncing`）。
@@ -21,14 +21,19 @@ use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::monitors::{self, LocateError, Monitor};
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::Editor;
+use shunsoku_core::settings::form::range_thumbnail;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOW, FillRect, FrameRect, GetSysColorBrush,
+    InvalidateRect,
+};
 use windows::Win32::UI::Controls::{
-    EM_SETCUEBANNER, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_STATE,
-    LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE,
-    LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVNI_SELECTED,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL,
+    CDDS_ITEMPOSTPAINT, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
+    CDRF_NOTIFYPOSTPAINT, EM_SETCUEBANNER, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT,
+    LVIR_BOUNDS, LVITEMW, LVM_DELETEALLITEMS, LVM_GETCOLUMNW, LVM_GETITEMCOUNT,
+    LVM_GETSTRINGWIDTHW, LVM_GETSUBITEMRECT, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
@@ -39,9 +44,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, PWSTR};
 
 use super::fields::{Action, Field, RegionKey, TemplateOf};
-use super::{Class, PAGE_WIDTH, Page, PageBuilder, SS_LEFT, Text, item, page_first_id};
+use super::list_view::{self, set_cell};
+use super::{
+    Class, During, Env, PAGE_WIDTH, Page, PageBuilder, SS_LEFT, Text, item, page_first_id,
+};
 use crate::wide::to_wide;
-use crate::{monitor_list, save};
 
 /// ページの帯の最初からの位置（`build` が置く順）。
 const LIST: i32 = 0;
@@ -75,14 +82,19 @@ const FIELD_WIDTH: i16 = PAGE_WIDTH - FIELD_X;
 /// 範囲の数の欄（上下のボタンを除く幅）と、横のボタン。
 const NUMBER_WIDTH: i16 = 32;
 const RANGE_BUTTON_X: i16 = DETAIL_X + 126;
-/// 一覧の列と、幅の割合。列の幅は一覧の中の幅（縦のスクロールバーの分を除く）をこの割合で分ける
-/// （`fit_columns`）。入りきらない文言は一覧が「…」で略す。
+/// 一覧の列と、幅の割合。範囲の列は絵の幅に決め、ほかの列で一覧の中の幅（縦のスクロールバーと範囲の列の分を
+/// 除く）をこの割合で分ける（`fit_columns`）。入りきらない文言は一覧が「…」で略す。
 const COLUMNS: [(&str, i32); 4] = [
     ("settings_gui.regions.name", 3),
     ("settings_gui.regions.hotkey", 3),
-    ("settings_gui.regions.range", 4),
+    ("settings_gui.regions.range", 0),
     ("settings_gui.scrap_ops.mark", 2),
 ];
+/// 範囲の列。
+const RANGE_COLUMN: usize = 2;
+/// 範囲の絵の大きさと、列の左右の余白（96 DPI のピクセル）。
+const THUMBNAIL: Size = Size::new(28, 16);
+const THUMBNAIL_PADDING: i32 = 6;
 
 /// 「追加」で足す定型領域の大きさ（物理ピクセル。モニタより大きければモニタに収める）。
 const NEW_REGION_SIZE: Size = Size::new(640, 480);
@@ -306,60 +318,22 @@ pub fn test_capture_id() -> i32 {
 
 /// 一覧で選んでいる行。
 pub fn selected(hwnd: HWND) -> Option<usize> {
-    let list = item(hwnd, list_id())?;
-    // SAFETY: 自分のダイアログの一覧へのメッセージ
-    let index = unsafe {
-        SendMessageW(
-            list,
-            LVM_GETNEXTITEM,
-            Some(WPARAM(usize::MAX)),
-            Some(LPARAM(LVNI_SELECTED as isize)),
-        )
-    }
-    .0;
-    usize::try_from(index).ok()
+    list_view::selected(item(hwnd, list_id())?)
 }
 
 /// 一覧の行 `index` を選んで見えるようにする。選び直しの通知（`LVN_ITEMCHANGED`）が届く。
 pub fn select(hwnd: HWND, index: usize) {
-    let Some(list) = item(hwnd, list_id()) else {
-        return;
-    };
-    let state = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
-    let entry = LVITEMW {
-        mask: LVIF_STATE,
-        state,
-        stateMask: state,
-        ..Default::default()
-    };
-    // SAFETY: 自分のダイアログの一覧へのメッセージ。構造体は呼び出しの間生きている
-    unsafe {
-        SendMessageW(
-            list,
-            LVM_SETITEMSTATE,
-            Some(WPARAM(index)),
-            Some(LPARAM(&entry as *const LVITEMW as isize)),
-        );
-        SendMessageW(
-            list,
-            LVM_ENSUREVISIBLE,
-            Some(WPARAM(index)),
-            Some(LPARAM(0)),
-        );
+    if let Some(list) = item(hwnd, list_id()) {
+        list_view::select(list, index);
     }
 }
 
 thread_local! {
-    /// 集めたモニタの一覧（`refresh_monitors`）。
-    static MONITORS: RefCell<Vec<Monitor>> = const { RefCell::new(Vec::new()) };
     /// `sync_list` の間。
     static SYNCING: Cell<bool> = const { Cell::new(false) };
-}
-
-/// モニタの一覧を集め直す。
-pub fn refresh_monitors() {
-    let list = monitor_list::list();
-    MONITORS.with_borrow_mut(|m| *m = list);
+    /// 一覧の行ごとの、範囲の絵の元（モニタの大きさ・わからなければ None と、モニタ相対の範囲）。
+    /// `sync_list` が入れ、一覧を描くとき（`custom_draw`）に絵にする。
+    static THUMBNAILS: RefCell<Vec<(Option<Size>, Rect)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// `sync_list` で行を揃えている途中か（届いた選び直しの通知では、欄を結び直すだけにする）。
@@ -368,35 +342,30 @@ pub fn is_syncing() -> bool {
 }
 
 /// 「追加」で足す定型領域のモニタと範囲: メインモニタの真ん中の `NEW_REGION_SIZE`。モニタがなければ None。
-pub fn new_region_place() -> Option<(String, Rect)> {
-    MONITORS.with_borrow(|monitors| {
-        let monitor = monitors
-            .iter()
-            .find(|m| m.primary)
-            .or_else(|| monitors.first())?;
-        let width = NEW_REGION_SIZE.width.min(monitor.rect.width());
-        let height = NEW_REGION_SIZE.height.min(monitor.rect.height());
-        let origin = Point::new(
-            ((monitor.rect.width() - width) / 2) as i32,
-            ((monitor.rect.height() - height) / 2) as i32,
-        );
-        Some((
-            monitor.id.clone(),
-            Rect::from_origin_size(origin, Size::new(width, height)),
-        ))
-    })
+pub fn new_region_place(monitors: &[Monitor]) -> Option<(String, Rect)> {
+    let monitor = monitors
+        .iter()
+        .find(|m| m.primary)
+        .or_else(|| monitors.first())?;
+    let width = NEW_REGION_SIZE.width.min(monitor.rect.width());
+    let height = NEW_REGION_SIZE.height.min(monitor.rect.height());
+    let origin = Point::new(
+        ((monitor.rect.width() - width) / 2) as i32,
+        ((monitor.rect.height() - height) / 2) as i32,
+    );
+    Some((
+        monitor.id.clone(),
+        Rect::from_origin_size(origin, Size::new(width, height)),
+    ))
 }
 
 /// 一覧の行を写し `editor` の定型領域に揃え、各行の文言を出す。選んでいる行がなくなったら、詳細が指していた
 /// 位置 `bound`（末尾を越えれば末尾）の行を選ぶ。
-pub fn sync_list(hwnd: HWND, editor: &Editor, bound: usize, text: Text) {
+pub fn sync_list(hwnd: HWND, editor: &Editor, bound: usize, text: Text, env: &Env) {
     let Some(list) = item(hwnd, list_id()) else {
         return;
     };
-    SYNCING.set(true);
-    if MONITORS.with_borrow(Vec::is_empty) {
-        refresh_monitors();
-    }
+    let _syncing = During::enter(&SYNCING);
     let regions = &editor.draft().regions;
     // SAFETY: 自分のダイアログの一覧へのメッセージ
     let count = unsafe { SendMessageW(list, LVM_GETITEMCOUNT, None, None) }.0;
@@ -432,22 +401,38 @@ pub fn sync_list(hwnd: HWND, editor: &Editor, bound: usize, text: Text) {
             |c| c.to_string(),
         );
         set_cell(list, i, 1, &hotkey);
-        set_cell(list, i, 2, &range_text(&region.rect));
         let mark = editor
             .mark(&SettingsItem::RegionName(i))
             .or_else(|| editor.mark(&SettingsItem::RegionHotkey(i)))
             .map_or("", |m| text(m.label_key()));
         set_cell(list, i, 3, mark);
     }
+    THUMBNAILS.set(
+        regions
+            .iter()
+            .map(|region| {
+                let monitor = env
+                    .monitors
+                    .iter()
+                    .find(|m| m.id.eq_ignore_ascii_case(&region.monitor))
+                    .map(|m| m.rect.size());
+                (monitor, region.rect)
+            })
+            .collect(),
+    );
+    // 範囲の列の文言は変わらないので、絵を描き直させる
+    // SAFETY: 自分のダイアログの一覧
+    unsafe {
+        let _ = InvalidateRect(Some(list), None, false);
+    }
     if selected(hwnd).is_none() && !regions.is_empty() {
         select(hwnd, bound.min(regions.len() - 1));
     }
-    SYNCING.set(false);
 }
 
 /// 選んだ行の詳細のうち、欄（`fields`）以外を出す: 名前の印、モニタの名前、警告、保存先の既定の表示、ボタンを
 /// 押せるか。欄の値は `fields::fill`、ホットキーの欄の値と印は `settings_dialog::fill` が出す。
-pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
+pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text, env: &Env) {
     let draft = editor.draft();
     let len = draft.regions.len();
     let selected = selected(hwnd).filter(|&i| i < len);
@@ -466,7 +451,8 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     set_text(hwnd, id(NAME_MARK), name_mark);
 
     let (monitor, warning) = match region {
-        Some((_, r)) => MONITORS.with_borrow(|monitors| {
+        Some((_, r)) => {
+            let monitors = &env.monitors;
             let name = monitors
                 .iter()
                 .find(|m| m.id.eq_ignore_ascii_case(&r.monitor))
@@ -477,7 +463,7 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
                 Err(_) => text("settings_gui.regions.monitor_not_found"),
             };
             (name, warning)
-        }),
+        }
         None => (String::new(), ""),
     };
     set_text(hwnd, id(MONITOR), &monitor);
@@ -488,7 +474,7 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
         .general
         .save_dir
         .clone()
-        .or_else(|| save::default_dir().ok());
+        .or_else(|| env.default_dir.clone());
     let cue = general
         .map(|d| {
             format!(
@@ -512,15 +498,63 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     }
 }
 
-/// 一覧の範囲の列の文言（大きさと、モニタの中の左上）。
-fn range_text(rect: &Rect) -> String {
-    format!(
-        "{}×{} ({}, {})",
-        rect.width(),
-        rect.height(),
-        rect.left,
-        rect.top
-    )
+/// 定型領域の一覧の `NM_CUSTOMDRAW`。範囲の列に、範囲がモニタの中のどこかを示す絵を描く: モニタの枠を窓の色で
+/// 塗って灰色で縁取り、範囲を選択の色で塗る。返り値はダイアログの結果（`DWLP_MSGRESULT`）にする。
+pub fn custom_draw(draw: &NMLVCUSTOMDRAW) -> isize {
+    let stage = draw.nmcd.dwDrawStage;
+    if stage == CDDS_PREPAINT {
+        return CDRF_NOTIFYITEMDRAW as isize;
+    }
+    if stage == CDDS_ITEMPREPAINT {
+        return CDRF_NOTIFYPOSTPAINT as isize;
+    }
+    if stage != CDDS_ITEMPOSTPAINT {
+        return CDRF_DODEFAULT as isize;
+    }
+    let row = draw.nmcd.dwItemSpec;
+    let Some((monitor, range)) = THUMBNAILS.with_borrow(|t| t.get(row).copied()) else {
+        return CDRF_DODEFAULT as isize;
+    };
+    let list = draw.nmcd.hdr.hwndFrom;
+    let dc = draw.nmcd.hdc;
+    // SAFETY: 描いている最中の一覧と、その DC。構造体は呼び出しの間生きている
+    unsafe {
+        let mut cell = RECT {
+            top: RANGE_COLUMN as i32,
+            left: LVIR_BOUNDS as i32,
+            ..Default::default()
+        };
+        if SendMessageW(
+            list,
+            LVM_GETSUBITEMRECT,
+            Some(WPARAM(row)),
+            Some(LPARAM(&mut cell as *mut RECT as isize)),
+        )
+        .0 == 0
+        {
+            return CDRF_DODEFAULT as isize;
+        }
+        let dpi = GetDpiForWindow(list) as i32;
+        let scale = |v: u32| (v as i32 * dpi / 96).max(1);
+        let w = scale(THUMBNAIL.width).min(cell.right - cell.left).max(0);
+        let h = scale(THUMBNAIL.height).min(cell.bottom - cell.top).max(0);
+        let x = cell.left + (cell.right - cell.left - w) / 2;
+        let y = cell.top + (cell.bottom - cell.top - h) / 2;
+        let thumbnail = range_thumbnail(monitor, range, Size::new(w as u32, h as u32));
+        let at = |r: Rect| RECT {
+            left: x + r.left,
+            top: y + r.top,
+            right: x + r.right,
+            bottom: y + r.bottom,
+        };
+        let frame = at(thumbnail.monitor);
+        FillRect(dc, &frame, GetSysColorBrush(COLOR_WINDOW));
+        if let Some(range) = thumbnail.range {
+            FillRect(dc, &at(range), GetSysColorBrush(COLOR_HIGHLIGHT));
+        }
+        FrameRect(dc, &frame, GetSysColorBrush(COLOR_GRAYTEXT));
+    }
+    CDRF_DODEFAULT as isize
 }
 
 /// 一覧の列を入れる。
@@ -564,7 +598,33 @@ pub fn fit_columns(hwnd: HWND) {
         let _ = GetClientRect(list, &mut client);
         GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(list))
     };
-    let widths = column_widths(client.right - client.left - scroll_bar);
+    // 範囲の列は、絵と見出しの文言の広いほうに合わせる
+    // SAFETY: 自分のダイアログの一覧へのメッセージ。バッファは呼び出しの間生きている
+    let range = unsafe {
+        let dpi = GetDpiForWindow(list) as i32;
+        let mut label = [0u16; 64];
+        let mut column = LVCOLUMNW {
+            mask: LVCF_TEXT,
+            pszText: PWSTR(label.as_mut_ptr()),
+            cchTextMax: label.len() as i32,
+            ..Default::default()
+        };
+        SendMessageW(
+            list,
+            LVM_GETCOLUMNW,
+            Some(WPARAM(RANGE_COLUMN)),
+            Some(LPARAM(&mut column as *mut LVCOLUMNW as isize)),
+        );
+        let label_width = SendMessageW(
+            list,
+            LVM_GETSTRINGWIDTHW,
+            None,
+            Some(LPARAM(label.as_ptr() as isize)),
+        )
+        .0 as i32;
+        label_width.max(THUMBNAIL.width as i32 * dpi / 96) + 2 * THUMBNAIL_PADDING * dpi / 96
+    };
+    let widths = column_widths(client.right - client.left - scroll_bar, range);
     for (i, width) in widths.into_iter().enumerate() {
         // SAFETY: 自分のダイアログの一覧へのメッセージ
         unsafe {
@@ -578,12 +638,14 @@ pub fn fit_columns(hwnd: HWND) {
     }
 }
 
-/// 幅 `available`（ピクセル）を列の割合で分ける。端数は最後の列に足す。
-fn column_widths(available: i32) -> [i32; 4] {
-    let available = available.max(0);
+/// 幅 `available`（ピクセル）から範囲の列の幅 `range` を除き、ほかの列の割合で分ける。端数は最後の列に足す。
+fn column_widths(available: i32, range: i32) -> [i32; 4] {
+    let range = range.min(available.max(0));
+    let available = (available - range).max(0);
     let total: i32 = COLUMNS.iter().map(|(_, w)| w).sum();
     let mut widths = COLUMNS.map(|(_, w)| available * w / total);
-    widths[3] += available - widths.iter().sum::<i32>();
+    widths[RANGE_COLUMN] = range;
+    widths[3] += available - (widths.iter().sum::<i32>() - range);
     widths
 }
 
@@ -597,25 +659,6 @@ fn column_count(list: HWND) -> isize {
             return 0;
         }
         SendMessageW(HWND(header as *mut _), HDM_GETITEMCOUNT, None, None).0
-    }
-}
-
-/// 一覧の `row` 行 `column` 列に `value` を入れる。
-fn set_cell(list: HWND, row: usize, column: i32, value: &str) {
-    let mut value = to_wide(value);
-    let entry = LVITEMW {
-        iSubItem: column,
-        pszText: PWSTR(value.as_mut_ptr()),
-        ..Default::default()
-    };
-    // SAFETY: 文字列と構造体は呼び出しの間生きている（一覧が写す）
-    unsafe {
-        SendMessageW(
-            list,
-            LVM_SETITEMTEXTW,
-            Some(WPARAM(row)),
-            Some(LPARAM(&entry as *const LVITEMW as isize)),
-        );
     }
 }
 

@@ -13,7 +13,7 @@
 //!   （範囲の外の数、`#RRGGBB` でない色、空のテンプレート）は写しを変えず、フォーカスが外れたら写しの値に戻る。
 
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use shunsoku_core::annotate::toolbar::{FONT_SIZES, WIDTHS};
@@ -21,6 +21,7 @@ use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
 use shunsoku_core::selection::Mode;
 use shunsoku_core::settings::editor::{Editor, choices};
+use shunsoku_core::settings::form::{FillPass, RegionDetail};
 use shunsoku_core::settings::{
     BORDER_WIDTH_RANGE, DpiScaling, OPACITY_RANGE, Region, Rgb, Settings, TRASH_LIMIT_RANGE,
 };
@@ -31,8 +32,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::Dialogs::{CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::UI::Controls::{
-    EM_SETCUEBANNER, UDM_SETRANGE32, UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_AUTOBUDDY, UDS_NOTHOUSANDS,
-    UDS_SETBUDDYINT,
+    EDITBALLOONTIP, EM_SETCUEBANNER, EM_SHOWBALLOONTIP, TTI_WARNING, UDM_SETRANGE32,
+    UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_AUTOBUDDY, UDS_NOTHOUSANDS, UDS_SETBUDDYINT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -43,8 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use super::{Class, Item, PAGE_X, PAGE_Y, PageBuilder, SS_LEFT, Text, item};
-use crate::save;
+use super::{Class, During, Env, Item, PAGE_X, PAGE_Y, PageBuilder, SS_LEFT, Text, item};
 use crate::wide::to_wide;
 
 /// 欄が結ぶ写しの項目（キーの組み合わせの項目は `SettingsItem` と `ChordRow`）。
@@ -190,9 +190,7 @@ pub struct Fields {
     /// インストール済みの書体（昇順）。書体のドロップダウンの候補。
     fonts: Rc<Vec<String>>,
     /// 定型領域の詳細の欄が指す領域（`bind_region`）。
-    region: usize,
-    /// `bind_region` で結び直してから、まだ欄に出していない。フォーカスのある欄も書き換える（前の領域の値が残るため）。
-    rebound: Cell<bool>,
+    region: RegionDetail,
 }
 
 impl Fields {
@@ -213,8 +211,7 @@ impl Fields {
 
     /// 定型領域の詳細の欄と横のボタンを、領域 `index` に結び直す。
     pub fn bind_region(&mut self, index: usize) {
-        self.region = index;
-        self.rebound.set(true);
+        self.region.bind(index);
         for row in &mut self.rows {
             row.field = row.field.with_region(index);
         }
@@ -233,7 +230,12 @@ impl Fields {
 
     /// 定型領域の詳細の欄が指す領域。
     pub fn region(&self) -> usize {
-        self.region
+        self.region.index()
+    }
+
+    /// 欄に出し始める（`fill` に渡す）。結び直した直後の 1 回だけ、フォーカスのある詳細の欄も書き換える。
+    pub fn begin_fill(&mut self) -> FillPass {
+        self.region.begin_fill()
     }
 }
 
@@ -427,11 +429,8 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
         (Field::Border, Input::Check(v)) => draft.scrap.border.visible = v,
         (Field::Shadow, Input::Check(v)) => draft.scrap.shadow = v,
         (Field::SaveDir, Input::Text(s)) => {
-            let s = s.trim();
-            if s.is_empty() {
-                draft.general.save_dir = None;
-            } else if is_absolute_dir(s) {
-                draft.general.save_dir = Some(PathBuf::from(s));
+            if let Some(dir) = parse_folder(&s) {
+                draft.general.save_dir = dir;
             }
         }
         (Field::Template(of), Input::Text(s)) if !s.trim().is_empty() => {
@@ -455,13 +454,7 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
             }
         }
         (Field::Opacity | Field::BorderWidth | Field::TrashLimit, Input::Text(s)) => {
-            let (min, max) = number_range(field);
-            let Some(n) = s
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|n| (min..=max).contains(n))
-            else {
+            let Some(n) = parse_number(field, &s) else {
                 return;
             };
             match field {
@@ -507,21 +500,12 @@ fn set_region(region: &mut Region, key: RegionKey, input: Input) {
     match (key, input) {
         (RegionKey::Name, Input::Text(s)) => region.name = s.trim().to_owned(),
         (RegionKey::SaveDir, Input::Text(s)) => {
-            let s = s.trim();
-            if s.is_empty() {
-                region.save_dir = None;
-            } else if is_absolute_dir(s) {
-                region.save_dir = Some(PathBuf::from(s));
+            if let Some(dir) = parse_folder(&s) {
+                region.save_dir = dir;
             }
         }
         (RegionKey::X | RegionKey::Y | RegionKey::Width | RegionKey::Height, Input::Text(s)) => {
-            let (min, max) = number_range(Field::Region(0, key));
-            let Some(n) = s
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|n| (min..=max).contains(n))
-            else {
+            let Some(n) = parse_number(Field::Region(0, key), &s) else {
                 return;
             };
             let (mut origin, mut size) = (region.rect.origin(), region.rect.size());
@@ -548,8 +532,8 @@ pub fn color_of(settings: &Settings, field: Field) -> Option<Rgb> {
     }
 }
 
-/// フォルダの欄 `field` で、選ぶダイアログを開く場所（空なら既定の保存先）。
-pub fn folder_of(settings: &Settings, field: Field) -> PathBuf {
+/// フォルダの欄 `field` で、選ぶダイアログを開く場所（空なら既定の保存先 `default_dir`）。
+pub fn folder_of(settings: &Settings, field: Field, default_dir: Option<&Path>) -> PathBuf {
     let set = match field {
         Field::SaveDir => settings.general.save_dir.clone(),
         Field::Region(i, RegionKey::SaveDir) => settings
@@ -559,10 +543,108 @@ pub fn folder_of(settings: &Settings, field: Field) -> PathBuf {
             .or_else(|| settings.general.save_dir.clone()),
         _ => None,
     };
-    set.or_else(|| save::default_dir().ok()).unwrap_or_default()
+    set.or_else(|| default_dir.map(Path::to_path_buf))
+        .unwrap_or_default()
 }
 
 /// 保存先として受け付けるパス（設定の読み込みと同じく、`C:\…` か `\\server\share\…`）。
+/// 数の欄 `field` の入力。範囲（`number_range`）の外か、数でなければ None。
+fn parse_number(field: Field, s: &str) -> Option<u32> {
+    let (min, max) = number_range(field);
+    s.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (min..=max).contains(n))
+}
+
+/// フォルダの欄の入力。空は既定（`Some(None)`）、絶対パスでなければ None。
+fn parse_folder(s: &str) -> Option<Option<PathBuf>> {
+    let s = s.trim();
+    if s.is_empty() {
+        Some(None)
+    } else if is_absolute_dir(s) {
+        Some(Some(PathBuf::from(s)))
+    } else {
+        None
+    }
+}
+
+/// 読めずに捨てたテキストの欄の入力が、どう書けばよいか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejected {
+    /// `min` 以上 `max` 以下の整数。
+    Number { min: u32, max: u32 },
+    /// `#RRGGBB`。
+    Color,
+    /// 絶対パスのフォルダ（空なら既定）。
+    Folder,
+    /// 空でないテンプレート。
+    Template,
+}
+
+impl Rejected {
+    /// 知らせる文言（`text` で引き、数の範囲を埋める）。
+    pub fn message(self, text: Text) -> String {
+        match self {
+            // 上が実質ない（座標と大きさ）なら、下だけを書く
+            Rejected::Number { min, max } if max == i32::MAX as u32 => {
+                text("settings_gui.invalid.number_min").replace("{min}", &min.to_string())
+            }
+            Rejected::Number { min, max } => text("settings_gui.invalid.number")
+                .replace("{min}", &min.to_string())
+                .replace("{max}", &max.to_string()),
+            Rejected::Color => text("settings_gui.invalid.color").to_owned(),
+            Rejected::Folder => text("settings_gui.invalid.folder").to_owned(),
+            Rejected::Template => text("settings_gui.invalid.template").to_owned(),
+        }
+    }
+}
+
+/// テキストの欄 `field` に打った `s` を写しに入れられないなら、その理由（`set` が捨てる入力）。
+pub fn rejected(field: Field, s: &str) -> Option<Rejected> {
+    let number = |field| {
+        let (min, max) = number_range(field);
+        parse_number(field, s)
+            .is_none()
+            .then_some(Rejected::Number { min, max })
+    };
+    match field {
+        Field::Opacity | Field::BorderWidth | Field::TrashLimit => number(field),
+        Field::Region(_, RegionKey::X | RegionKey::Y | RegionKey::Width | RegionKey::Height) => {
+            number(field)
+        }
+        Field::SaveDir | Field::Region(_, RegionKey::SaveDir) => {
+            parse_folder(s).is_none().then_some(Rejected::Folder)
+        }
+        Field::Template(_) => s.trim().is_empty().then_some(Rejected::Template),
+        Field::BorderColor | Field::AnnotationColor => {
+            s.trim().parse::<Rgb>().is_err().then_some(Rejected::Color)
+        }
+        _ => None,
+    }
+}
+
+/// 欄 `control` に、読めずに捨てた入力の書き方 `rejected` を吹き出しで出す。
+pub fn show_rejected(control: HWND, rejected: Rejected, text: Text) {
+    let title = to_wide(text("settings_gui.invalid.title"));
+    let message = to_wide(&rejected.message(text));
+    let tip = EDITBALLOONTIP {
+        cbStruct: size_of::<EDITBALLOONTIP>() as u32,
+        pszTitle: PCWSTR(title.as_ptr()),
+        pszText: PCWSTR(message.as_ptr()),
+        ttiIcon: TTI_WARNING,
+    };
+    // SAFETY: 自分のエディットへのメッセージ。文字列と構造体は呼び出しの間生きている
+    unsafe {
+        SendMessageW(
+            control,
+            EM_SHOWBALLOONTIP,
+            None,
+            Some(LPARAM(&tip as *const EDITBALLOONTIP as isize)),
+        );
+    }
+}
+
 fn is_absolute_dir(s: &str) -> bool {
     let b = s.as_bytes();
     let sep = |c: u8| c == b'\\' || c == b'/';
@@ -620,22 +702,12 @@ pub fn variables(of: TemplateOf) -> impl Iterator<Item = &'static template::Vari
 }
 
 /// いま撮ったら付く名前（保存先の既存のファイルと重ならないもの）。
-fn preview(settings: &Settings, of: TemplateOf) -> String {
+fn preview(settings: &Settings, of: TemplateOf, env: &Env) -> String {
     let (dir, name) = preview_target(settings, of);
-    let dir = match dir {
-        Some(dir) => dir,
-        None => save::default_dir().unwrap_or_default(),
+    let Some(dir) = dir.or_else(|| env.default_dir.clone()) else {
+        return String::new();
     };
-    match save::destination(&dir, template_of(settings, of), &name, save::now(), &[]) {
-        Ok(path) => path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        Err(e) => {
-            log::debug!("could not list {}: {e}", dir.display());
-            String::new()
-        }
-    }
+    (env.file_name)(&dir, template_of(settings, of), &name).unwrap_or_default()
 }
 
 thread_local! {
@@ -649,11 +721,10 @@ pub fn is_filling() -> bool {
 }
 
 /// 写し `editor` を欄に出す。
-pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
-    FILLING.set(true);
+pub fn fill(hwnd: HWND, fields: &Fields, pass: FillPass, editor: &Editor, text: Text, env: &Env) {
+    let _filling = During::enter(&FILLING);
     // SAFETY: 引数なし
     let focus = unsafe { GetFocus() };
-    let rebound = fields.rebound.replace(false);
     for row in &fields.rows {
         let Some(control) = item(hwnd, row.control) else {
             continue;
@@ -671,8 +742,8 @@ pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
                 }
             }
             Shown::Text(value) => {
-                let keep_typing = control == focus && !(rebound && row.field.is_region());
-                if !keep_typing && window_text(control) != value {
+                let overwrite = pass.overwrites(control == focus, row.field.is_region());
+                if overwrite && window_text(control) != value {
                     set_window_text(control, &value);
                 }
             }
@@ -702,7 +773,7 @@ pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
             let line = format!(
                 "{}{}",
                 text("settings_gui.template.preview"),
-                preview(editor.draft(), of)
+                preview(editor.draft(), of, env)
             );
             let line = to_wide(&line);
             // SAFETY: 文字列は呼び出しの間生きている
@@ -711,7 +782,6 @@ pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
             }
         }
     }
-    FILLING.set(false);
 }
 
 /// 欄 `row`（コントロール `control`）の今の入力。
@@ -732,7 +802,7 @@ pub fn input(row: FieldRow, control: HWND) -> Input {
 }
 
 /// 組み直したダイアログで 1 回だけすること（数の欄の範囲、保存先の欄の既定の表示）。
-pub fn init(hwnd: HWND, fields: &Fields, text: Text) {
+pub fn init(hwnd: HWND, fields: &Fields, text: Text, env: &Env) {
     for row in &fields.rows {
         match row.kind {
             Kind::Number { updown } => {
@@ -750,7 +820,9 @@ pub fn init(hwnd: HWND, fields: &Fields, text: Text) {
                 }
             }
             Kind::Text { .. } if row.field == Field::SaveDir => {
-                let default = save::default_dir()
+                let default = env
+                    .default_dir
+                    .as_ref()
                     .map(|d| {
                         format!(
                             "{}{}",
@@ -872,8 +944,7 @@ impl Fields {
             rows: Vec::new(),
             buttons: Vec::new(),
             fonts: Rc::new(installed_fonts()),
-            region: 0,
-            rebound: Cell::new(false),
+            region: RegionDetail::default(),
         }
     }
 }

@@ -17,11 +17,12 @@
 //!   あとの `region_registered`。開いていれば写しと base にも足す）。
 //!   「範囲を選び直す」と「試しに撮る」は、ダイアログを隠してから（写り込まないように）依頼し、範囲選択の画面を
 //!   閉じたか撮り終えたら出し直す（`capture_done`）。選び直した範囲は写しに入れるだけ（`region_reselected`）。
-//! - キーの組み合わせの欄にフォーカスがある間は、全体のホットキーの登録を外す（`App::hotkeys_suspended`）。欄の
+//! - キーの組み合わせの欄にフォーカスがある間は、全体のホットキーの登録を外す（`App::hotkey_pause`）。欄の
 //!   フォーカスの出入りで `WM_APP_SETTINGS_FOCUS` を自分に送り、届いた時点のフォーカスで決める（`check_focus`）。
 //! - 適用（`apply`）: その時点のファイルと写しを 3 者で突き合わせ（`settings::merge`）、両方で変えた項目があれば
 //!   借りずに確かめてから、結果を書き（`write_settings`）、読み込み直しと同じ反映をし（`adopt_settings`）、ホットキーは
-//!   必ず登録し直して、登録できなかった項目を写しの印にする（`Editor::applied`）。OK は適用して、全部登録できたら閉じる。
+//!   必ず登録し直して、登録できなかった項目を写しの印にする（`Editor::applied`）。OK は適用して、書けたら閉じる
+//!   （登録できなかったホットキーは通知で知らせる）。
 //! - 適用で UI の言語が変わったら（`SettingsGui::language` と違ったら）、同じタブ・同じ位置で組み直す（`rebuild`）。
 //!   今のダイアログは `REBUILDING` を立てて壊し（`WM_DESTROY` で `App::settings_gui` を消さない）、写しはそのまま
 //!   新しいダイアログに出す。外の変更で言語が変わったときは、次に適用したときに組み直す。
@@ -29,11 +30,13 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 
 use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
 use shunsoku_core::monitors;
 use shunsoku_core::settings::editor::{Editor, Move};
+use shunsoku_core::settings::form::PauseChange;
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
@@ -42,16 +45,17 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmSetWindowAttribute,
 };
 use windows::Win32::UI::Controls::{
-    EM_GETSEL, EM_SETSEL, LVIS_SELECTED, LVN_ITEMCHANGED, NMHDR, NMLISTVIEW, TCN_SELCHANGE,
+    EM_GETSEL, EM_SETSEL, LVIS_SELECTED, LVN_ITEMCHANGED, NM_CUSTOMDRAW, NMHDR, NMLISTVIEW,
+    NMLVCUSTOMDRAW, TCN_SELCHANGE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CBN_SELCHANGE, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GetWindowRect,
-    IDCANCEL, IDOK, IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MSG,
-    MessageBoxW, PostMessageW, PostQuitMessage, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INITDIALOG, WM_NEXTDLGCTL,
-    WM_NOTIFY, WM_SETTINGCHANGE,
+    BN_CLICKED, CBN_SELCHANGE, DWLP_MSGRESULT, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS,
+    GetWindowRect, IDCANCEL, IDOK, IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING,
+    MB_OKCANCEL, MSG, MessageBoxW, PostMessageW, PostQuitMessage, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
 };
 use windows::core::{BOOL, PCWSTR};
 
@@ -62,9 +66,11 @@ use super::{
 };
 use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
 use crate::settings_dialog::regions::{self, ListButton};
-use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops};
+use crate::settings_dialog::{
+    self, ChordRow, During, Env, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops,
+};
 use crate::wide::to_wide;
-use crate::{menu, monitor_list, notify, panic_hook, save};
+use crate::{hotkey, menu, monitor_list, notify, panic_hook, save};
 
 /// 開いている設定 GUI。
 pub(super) struct SettingsGui {
@@ -74,6 +80,17 @@ pub(super) struct SettingsGui {
     editor: Editor,
     /// ダイアログを組んだときの UI の言語。
     language: Language,
+    /// ダイアログに渡す、外のこと（モニタは `refresh_monitors` で集め直す）。
+    env: Env,
+}
+
+impl SettingsGui {
+    /// 一覧の行で変わるキーの欄（ID `field`）を、設定の項目 `item` に結び直す。
+    fn rebind_chord_row(&mut self, field: i32, item: SettingsItem) {
+        if let Some(row) = self.rows.iter_mut().find(|r| r.field == field) {
+            row.item = item;
+        }
+    }
 }
 
 thread_local! {
@@ -105,17 +122,14 @@ pub(super) fn open_for_unset_hotkey() {
     open_with(Some(Page::Capture), Some(SettingsItem::SelectCaptureHotkey));
 }
 
-impl SettingsGui {
-    /// 開いている間にトレイの「定型領域を追加…」で登録する定型領域（名前は写しの定型領域とも重ならない）。
-    pub(super) fn new_registered_region(
-        &self,
-        applied: &Settings,
-        base: &str,
-        monitor: &str,
-        rect: Rect,
-    ) -> Region {
-        self.editor
-            .new_registered_region(applied, base, monitor, rect)
+/// トレイの「定型領域を追加…」で登録する定型領域。名前は `"{base} N"` で、適用済みの設定とも、開いていれば
+/// 写しの定型領域とも重ならない。`monitor` はモニタの識別子、`rect` はモニタ相対の範囲。
+pub(super) fn region_to_register(app: &App, base: &str, monitor: &str, rect: Rect) -> Region {
+    match &app.settings_gui {
+        Some(gui) => gui
+            .editor
+            .new_registered_region(&app.settings, base, monitor, rect),
+        None => settings::new_region(&app.settings, base, monitor, rect),
     }
 }
 
@@ -175,16 +189,20 @@ fn open_with(page: Option<Page>, focus: Option<SettingsItem>) {
         }
         return;
     }
-    regions::refresh_monitors();
+    let env = Env {
+        monitors: monitor_list::list(),
+        default_dir: save::default_dir().ok(),
+        file_name: file_name_in,
+    };
     // ダイアログを作る間にプロシージャが呼ばれるので、借りずに作る
-    let dialog =
-        match settings_dialog::create(module, page.unwrap_or_default(), text, Some(dialog_proc)) {
-            Ok(dialog) => dialog,
-            Err(e) => {
-                log::error!("could not open the settings GUI: {e}");
-                return;
-            }
-        };
+    let page = page.unwrap_or_default();
+    let dialog = match settings_dialog::create(module, page, text, &env, Some(dialog_proc)) {
+        Ok(dialog) => dialog,
+        Err(e) => {
+            log::error!("could not open the settings GUI: {e}");
+            return;
+        }
+    };
     let hwnd = dialog.hwnd;
     let focus = focus
         .and_then(|item| dialog.rows.iter().find(|row| row.item == item))
@@ -198,6 +216,7 @@ fn open_with(page: Option<Page>, focus: Option<SettingsItem>) {
         fields: dialog.fields,
         editor,
         language: language(),
+        env,
     };
     if with_app(|app| app.settings_gui = Some(gui)).is_none() {
         // SAFETY: 作ったばかりの自分のダイアログ
@@ -256,22 +275,51 @@ fn refresh(hwnd: HWND) {
     let list = with_app(|app| {
         app.settings_gui
             .as_ref()
-            .map(|gui| (gui.editor.clone(), gui.fields.region()))
+            .map(|gui| (gui.editor.clone(), gui.fields.region(), gui.env.clone()))
     })
     .flatten();
-    if let Some((editor, bound)) = list {
-        regions::sync_list(hwnd, &editor, bound, text);
+    if let Some((editor, bound, env)) = list {
+        regions::sync_list(hwnd, &editor, bound, text, &env);
     }
     let snapshot = with_app(|app| {
-        app.settings_gui
-            .as_ref()
-            .map(|gui| (gui.rows.clone(), gui.fields.clone(), gui.editor.clone()))
+        app.settings_gui.as_mut().map(|gui| {
+            let pass = gui.fields.begin_fill();
+            let fields = gui.fields.clone();
+            (
+                gui.rows.clone(),
+                fields,
+                pass,
+                gui.editor.clone(),
+                gui.env.clone(),
+            )
+        })
     })
     .flatten();
-    if let Some((rows, fields, editor)) = snapshot {
+    if let Some((rows, fields, pass, editor, env)) = snapshot {
         // コントロールにメッセージを送るので、借りずに出す
-        settings_dialog::fill(hwnd, &rows, &editor, text);
-        fields::fill(hwnd, &fields, &editor, text);
+        settings_dialog::fill(hwnd, &rows, &editor, text, &env);
+        fields::fill(hwnd, &fields, pass, &editor, text, &env);
+    }
+}
+
+/// モニタの一覧を集め直す（開いたとき、行を選び直したとき、画面の構成が変わったとき）。
+fn refresh_monitors() {
+    let monitors = monitor_list::list();
+    with_app(|app| {
+        if let Some(gui) = app.settings_gui.as_mut() {
+            gui.env.monitors = monitors;
+        }
+    });
+}
+
+/// `dir` に `template` でいま撮ったら付く名前（欄のプレビュー。`Env::file_name`）。
+fn file_name_in(dir: &Path, template: &str, name: &str) -> Option<String> {
+    match save::destination(dir, template, name, save::now(), &[]) {
+        Ok(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        Err(e) => {
+            log::debug!("could not list {}: {e}", dir.display());
+            None
+        }
     }
 }
 
@@ -313,33 +361,29 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
         WM_NOTIFY => {
             // SAFETY: WM_NOTIFY の lparam は NMHDR を指す
             let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.idFrom == regions::list_id() as usize && header.code == NM_CUSTOMDRAW {
+                // SAFETY: 一覧の NM_CUSTOMDRAW の lparam は NMLVCUSTOMDRAW を指す
+                let draw = unsafe { &*(lparam.0 as *const NMLVCUSTOMDRAW) };
+                let result = regions::custom_draw(draw);
+                // SAFETY: 自分のダイアログの結果を置く
+                unsafe {
+                    SetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(DWLP_MSGRESULT as i32), result)
+                };
+                return true;
+            }
             if header.idFrom == ID_TAB as usize && header.code == TCN_SELCHANGE {
                 settings_dialog::show_page(hwnd, settings_dialog::current_page(hwnd));
-            } else if header.idFrom == scrap_ops::list_id() as usize
-                && header.code == LVN_ITEMCHANGED
+            } else if header.idFrom == scrap_ops::list_id() as usize && row_selected(header, lparam)
             {
-                // SAFETY: LVN_ITEMCHANGED の lparam は NMLISTVIEW を指す
-                let change = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
-                if change.uNewState & LVIS_SELECTED.0 != 0
-                    && change.uOldState & LVIS_SELECTED.0 == 0
-                {
-                    on_scrap_op_selected(hwnd);
-                }
-            } else if header.idFrom == regions::list_id() as usize && header.code == LVN_ITEMCHANGED
-            {
-                // SAFETY: LVN_ITEMCHANGED の lparam は NMLISTVIEW を指す
-                let change = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
-                if change.uNewState & LVIS_SELECTED.0 != 0
-                    && change.uOldState & LVIS_SELECTED.0 == 0
-                {
-                    on_region_selected(hwnd);
-                }
+                on_scrap_op_selected(hwnd);
+            } else if header.idFrom == regions::list_id() as usize && row_selected(header, lparam) {
+                on_region_selected(hwnd);
             }
             false
         }
         WM_DISPLAYCHANGE => {
             // 定型領域の警告とモニタの名前を出し直す
-            regions::refresh_monitors();
+            refresh_monitors();
             refresh(hwnd);
             false
         }
@@ -377,13 +421,31 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
     }
 }
 
+/// 一覧の通知 `header`（`lparam` が指す）が、行が選ばれた（選ばれていなかった行が選ばれた）ことか。
+fn row_selected(header: &NMHDR, lparam: LPARAM) -> bool {
+    if header.code != LVN_ITEMCHANGED {
+        return false;
+    }
+    // SAFETY: LVN_ITEMCHANGED の lparam は NMLISTVIEW を指す
+    let change = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
+    change.uNewState & LVIS_SELECTED.0 != 0 && change.uOldState & LVIS_SELECTED.0 == 0
+}
+
 fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
     if id == IDOK.0 {
         if code == BN_CLICKED {
-            if apply(hwnd) {
-                destroy(hwnd);
-            } else {
-                rebuild_if_language_changed(hwnd);
+            // 書けたら閉じる。登録できなかったホットキーは、欄の印が見えなくなるので通知で知らせる
+            match apply(hwnd) {
+                Some(failed) => {
+                    destroy(hwnd);
+                    if !failed.is_empty() {
+                        let chords: Vec<String> =
+                            failed.iter().map(|f| f.chord.to_string()).collect();
+                        let body = format!("{}{}", text("hotkey.failed"), chords.join(", "));
+                        notify_user(notify::Level::Warning, &body);
+                    }
+                }
+                None => rebuild_if_language_changed(hwnd),
             }
         }
         return;
@@ -446,18 +508,28 @@ fn on_field(hwnd: HWND, id: i32, code: u32, control: HWND) {
     let Some(row) = fields.row(id) else {
         return;
     };
+    let mut rejected = None;
     let changed = match (row.kind, code) {
         (Kind::Check, BN_CLICKED)
         | (Kind::Text { .. } | Kind::Number { .. }, EN_CHANGE)
         | (Kind::Choice, CBN_SELCHANGE) => true,
-        // 読めない入力は、フォーカスが外れたら写しの値に戻す
-        (Kind::Text { .. } | Kind::Number { .. }, EN_KILLFOCUS) => false,
+        // 読めない入力は、フォーカスが外れたら写しの値に戻し、書き方を吹き出しで知らせる
+        (Kind::Text { .. } | Kind::Number { .. }, EN_KILLFOCUS) => {
+            if let Input::Text(s) = fields::input(row, control) {
+                rejected = fields::rejected(row.field, &s);
+            }
+            false
+        }
         _ => return,
     };
     if changed {
         set_field(row.field, fields::input(row, control));
     }
     refresh(hwnd);
+    // 戻した後に出す（欄の文字を書き換えると吹き出しは消える）
+    if let Some(rejected) = rejected {
+        fields::show_rejected(control, rejected, text);
+    }
 }
 
 /// 写しの項目 `field` を `input` にする。
@@ -471,22 +543,21 @@ fn set_field(field: fields::Field, input: Input) {
 
 /// 欄の横のボタンが押された。ダイアログとメニューはモーダルなので、`App` を借りずに出す。
 fn on_button(hwnd: HWND, fields: &Fields, action: Action) {
-    let Some(draft) = with_app(|app| {
+    let Some((draft, default_dir)) = with_app(|app| {
         app.settings_gui
             .as_ref()
-            .map(|gui| gui.editor.draft().clone())
+            .map(|gui| (gui.editor.draft().clone(), gui.env.default_dir.clone()))
     })
     .flatten() else {
         return;
     };
+    let folder_of = |field| fields::folder_of(&draft, field, default_dir.as_deref());
     match action {
-        Action::BrowseFolder(field) => {
-            match save::ask_folder(hwnd, &fields::folder_of(&draft, field)) {
-                Ok(Some(dir)) => set_field(field, Input::Text(dir.to_string_lossy().into_owned())),
-                Ok(None) => {}
-                Err(e) => log::error!("could not show the folder dialog: {e}"),
-            }
-        }
+        Action::BrowseFolder(field) => match save::ask_folder(hwnd, &folder_of(field)) {
+            Ok(Some(dir)) => set_field(field, Input::Text(dir.to_string_lossy().into_owned())),
+            Ok(None) => {}
+            Err(e) => log::error!("could not show the folder dialog: {e}"),
+        },
         Action::PickColor(field) => {
             let Some(current) = fields::color_of(&draft, field) else {
                 return;
@@ -497,7 +568,7 @@ fn on_button(hwnd: HWND, fields: &Fields, action: Action) {
         }
         Action::InsertVariable(of) => insert_variable(hwnd, fields, of),
         Action::OpenFolder(field) => {
-            let dir = fields::folder_of(&draft, field);
+            let dir = folder_of(field);
             if !save::open_folder(&dir) {
                 log::warn!("could not open the folder {}", dir.display());
             }
@@ -580,7 +651,11 @@ fn rebuild_if_language_changed(hwnd: HWND) {
 /// 今のダイアログ `old` を壊し、いまの言語で組み直して写しを出す。ダイアログを作る間にプロシージャが呼ばれる
 /// ので、借りずに作る（`open_with` と同じ）。
 fn rebuild(old: HWND) {
-    let Some(module) = with_app(|app| app.module) else {
+    let Some((module, env)) = with_app(|app| {
+        let env = app.settings_gui.as_ref()?.env.clone();
+        Some((app.module, env))
+    })
+    .flatten() else {
         return;
     };
     let page = settings_dialog::current_page(old);
@@ -589,11 +664,12 @@ fn rebuild(old: HWND) {
     unsafe {
         let _ = GetWindowRect(old, &mut rect);
     }
-    REBUILDING.set(true);
-    destroy(old);
-    DIALOG.set(None);
-    let created = settings_dialog::create(module, page, text, Some(dialog_proc));
-    REBUILDING.set(false);
+    let created = {
+        let _rebuilding = During::enter(&REBUILDING);
+        destroy(old);
+        DIALOG.set(None);
+        settings_dialog::create(module, page, text, &env, Some(dialog_proc))
+    };
     let dialog = match created {
         Ok(dialog) => dialog,
         Err(e) => {
@@ -677,14 +753,12 @@ fn on_region_selected(hwnd: HWND) {
     with_app(|app| {
         if let Some(gui) = app.settings_gui.as_mut() {
             gui.fields.bind_region(index);
-            if let Some(chord_row) = gui.rows.iter_mut().find(|r| r.field == field) {
-                chord_row.item = SettingsItem::RegionHotkey(index);
-            }
+            gui.rebind_chord_row(field, SettingsItem::RegionHotkey(index));
         }
     });
     // 一覧を揃えている途中なら、揃えたあとで出す（`refresh`）
     if !regions::is_syncing() {
-        regions::refresh_monitors();
+        refresh_monitors();
         refresh(hwnd);
     }
 }
@@ -694,7 +768,14 @@ fn on_region_list_button(hwnd: HWND, button: ListButton) {
     let selected = regions::selected(hwnd);
     let target = match button {
         ListButton::Add => {
-            let Some((monitor, rect)) = regions::new_region_place() else {
+            let monitors = with_app(|app| {
+                app.settings_gui
+                    .as_ref()
+                    .map(|gui| gui.env.monitors.clone())
+            })
+            .flatten()
+            .unwrap_or_default();
+            let Some((monitor, rect)) = regions::new_region_place(&monitors) else {
                 log::warn!("no monitor to add a region on");
                 return;
             };
@@ -768,7 +849,7 @@ pub(super) fn region_reselected(index: usize, rect: Rect) {
         "region {} reselected on monitor {id} at {relative:?}",
         index + 1
     );
-    regions::refresh_monitors();
+    refresh_monitors();
     refresh(hwnd);
 }
 
@@ -777,16 +858,20 @@ fn on_test_capture(hwnd: HWND) {
     let Some(index) = regions::selected(hwnd) else {
         return;
     };
-    let Some(region) = with_app(|app| {
-        app.settings_gui
-            .as_ref()
-            .and_then(|gui| gui.editor.draft().regions.get(index).cloned())
+    let Some((region, general_dir)) = with_app(|app| {
+        app.settings_gui.as_ref().and_then(|gui| {
+            let draft = gui.editor.draft();
+            let region = draft.regions.get(index).cloned()?;
+            let general_dir = draft.general.save_dir.clone();
+            Some((region, general_dir.or_else(|| gui.env.default_dir.clone())))
+        })
     })
     .flatten() else {
         return;
     };
+    // 領域に保存先がなければ、写しの全体の保存先（それもなければピクチャ）に保存する。欄のプレビューと同じ
     hide_for_capture(hwnd);
-    if !super::request_trial(&region) {
+    if !super::request_trial(&region, general_dir) {
         log::info!("trial capture while another capture is in progress; ignored");
         capture_done();
     }
@@ -831,21 +916,19 @@ fn on_scrap_op_selected(hwnd: HWND) {
     };
     let field = scrap_ops::field_id();
     with_app(|app| {
-        if let Some(gui) = app.settings_gui.as_mut()
-            && let Some(chord_row) = gui.rows.iter_mut().find(|r| r.field == field)
-        {
-            chord_row.item = shunsoku_core::settings::SettingsItem::Shortcut(row.op.id.to_owned());
+        if let Some(gui) = app.settings_gui.as_mut() {
+            gui.rebind_chord_row(field, SettingsItem::Shortcut(row.op.id.to_owned()));
         }
     });
     refresh(hwnd);
 }
 
-/// 写しを適用する。適用でき、ホットキーを全部登録できたら true（OK で閉じてよい）。
+/// 写しを適用する。書けたら（書くものがなかったときも）、登録できなかったホットキーを返す（OK で閉じてよい）。
 ///
 /// その時点のファイルを読み、GUI で変えた項目だけを当てる（3 者の突き合わせ、`settings::merge`）。外と GUI の両方で
 /// 変えた項目があれば、`App` を借りずに確かめ、上書きを選ばれたら読み直してもう一度突き合わせる（確かめている間に
 /// 新しい衝突が増えていれば、また確かめる）。
-fn apply(hwnd: HWND) -> bool {
+fn apply(hwnd: HWND) -> Option<Vec<hotkey::Failed>> {
     let mut confirmed: Vec<Field> = Vec::new();
     let result = loop {
         match with_app(|app| apply_merged(app, &confirmed)).flatten() {
@@ -871,16 +954,16 @@ fn apply(hwnd: HWND) -> bool {
         sync_autostart();
     }
     match result {
-        Some(Ok(all_registered)) => all_registered,
+        Some(Ok(failed)) => Some(failed),
         Some(Err(e)) => {
             log::error!("could not write the settings: {e}");
             notify_user(
                 notify::Level::Error,
                 &format!("{}\n{e}", text("settings_gui.write_failed")),
             );
-            false
+            None
         }
-        None => false,
+        None => None,
     }
 }
 
@@ -888,8 +971,8 @@ fn apply(hwnd: HWND) -> bool {
 enum Step {
     /// 確かめていない衝突がある。
     Confirm(Vec<Field>),
-    /// 書いた（か、書くものがなかった）。ホットキーを全部登録できたら Ok(true)。
-    Done(Result<bool, String>),
+    /// 書いた（か、書くものがなかった）。Ok は登録できなかったホットキー。
+    Done(Result<Vec<hotkey::Failed>, String>),
 }
 
 /// ファイルを読んで写しと突き合わせ、衝突が `confirmed` に収まっていれば書いて反映する。
@@ -912,14 +995,14 @@ fn apply_merged(app: &mut App, confirmed: &[Field]) -> Option<Step> {
         if let Some(gui) = app.settings_gui.as_mut() {
             gui.editor.applied(new, []);
         }
-        return Some(Step::Done(Ok(true)));
+        return Some(Step::Done(Ok(Vec::new())));
     }
     let old = app.settings.clone();
     if let Err(e) = write_settings(app, &new) {
         return Some(Step::Done(Err(e)));
     }
     // 適用では登録し直して結果を見る。欄にフォーカスが残っていれば、`check_focus` で外し直す
-    app.hotkeys_suspended = false;
+    app.hotkey_pause.reregistering();
     let (_, failed) = adopt_settings(app, &old, true);
     let unregistered = app.unregistered.clone();
     let applied = app.settings.clone();
@@ -927,7 +1010,7 @@ fn apply_merged(app: &mut App, confirmed: &[Field]) -> Option<Step> {
         gui.editor.applied(applied, unregistered);
     }
     log::info!("settings applied from the GUI");
-    Some(Step::Done(Ok(failed.is_empty())))
+    Some(Step::Done(Ok(failed)))
 }
 
 /// 突き合わせに使う、今のファイルの設定。ファイルがなければ既定値。読めないか TOML でなければ、常駐側の設定
@@ -974,21 +1057,24 @@ fn check_focus() {
     let focus = unsafe { GetFocus() };
     let in_field = chord_field::is_field(focus);
     with_app(|app| {
-        if in_field && !app.hotkeys_suspended {
-            app.hotkeys.reregister(&BTreeMap::new());
-            app.hotkeys_suspended = true;
-            log::info!("hotkeys suspended while a chord field has focus");
-        } else if !in_field && app.hotkeys_suspended {
-            resume_hotkeys(app);
-        }
+        let change = app.hotkey_pause.focus_changed(in_field);
+        pause_hotkeys(app, change);
     });
 }
 
-fn resume_hotkeys(app: &mut App) {
-    app.hotkeys_suspended = false;
-    let failed = register_hotkeys(app);
-    log_failed(&failed);
-    log::info!("hotkeys registered again");
+fn pause_hotkeys(app: &mut App, change: Option<PauseChange>) {
+    match change {
+        Some(PauseChange::Pause) => {
+            app.hotkeys.reregister(&BTreeMap::new());
+            log::info!("hotkeys suspended while a chord field has focus");
+        }
+        Some(PauseChange::Resume) => {
+            let failed = register_hotkeys(app);
+            log_failed(&failed);
+            log::info!("hotkeys registered again");
+        }
+        None => {}
+    }
 }
 
 /// ダイアログが壊れた。範囲選択キャプチャのホットキーが未設定のまま（キャンセルで）閉じたら、通知で知らせる。
@@ -996,9 +1082,8 @@ fn closed() {
     DIALOG.set(None);
     let notice = with_app(|app| {
         app.settings_gui = None;
-        if app.hotkeys_suspended {
-            resume_hotkeys(app);
-        }
+        let change = app.hotkey_pause.closed();
+        pause_hotkeys(app, change);
         if unset::prompt(unset::When::GuiClosed, &app.settings) == Some(unset::Prompt::Notify) {
             settings_notice(Moment::Reload, &[], &[], true, app.settings_path.as_deref())
         } else {

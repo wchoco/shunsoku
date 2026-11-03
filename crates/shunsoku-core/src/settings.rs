@@ -82,6 +82,7 @@ use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescri
 use crate::selection::Mode;
 
 pub mod editor;
+pub mod form;
 mod location;
 pub mod merge;
 pub mod unset;
@@ -853,8 +854,9 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     let root: &dyn TableLike = doc.as_table();
     let mut s = Settings::default();
 
-    // 形式が変わったら移行するための版。違う版でも、読める項目は読む
-    if root.get("version").and_then(Item::as_integer) != Some(VERSION) {
+    // 形式が変わったら移行するための版。違う版でも、読める項目は読む。
+    // 何も書いていない（空・空白・コメントだけの）ファイルは既定値として扱う
+    if !root.is_empty() && root.get("version").and_then(Item::as_integer) != Some(VERSION) {
         r.invalid("version");
     }
     if let Some(level) = r.value(Some(root), "", "log_level", log_level) {
@@ -1232,6 +1234,22 @@ mod tests {
         ] {
             assert!(bad.parse::<Rgb>().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn an_empty_file_gives_defaults_without_issues() {
+        // ポータブルモードは空の settings.toml を置いて始める（README）
+        for src in ["", "\n", "  \r\n\t\n", "# 設定\n\n# version = 1\n"] {
+            assert_eq!(load(src), (Settings::default(), vec![]), "{src:?}");
+        }
+        // 何か書いてあれば、版がないことを知らせる
+        let (_, issues) = load("[general]\nautostart = true\n");
+        assert_eq!(
+            issues,
+            vec![SettingsIssue::Invalid {
+                item: "version".into()
+            }]
+        );
     }
 
     #[test]

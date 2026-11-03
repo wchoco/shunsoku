@@ -49,6 +49,15 @@ pick_color = "Pick…"
 chord_none = "None"
 insert_variable = "Insert variable"
 
+
+[settings_gui.invalid]
+title = "This value cannot be used"
+number = "Enter a whole number from {min} to {max}. The field went back to its previous value."
+number_min = "Enter a whole number of {min} or more. The field went back to its previous value."
+color = "Enter a color as #RRGGBB (for example #FF0000). The field went back to its previous value."
+folder = "Enter a full folder path (for example C:\\Pictures), or leave it empty for the default. The field went back to its previous value."
+template = "The file name cannot be empty. The field went back to its previous value."
+
 [settings_gui.conflict]
 body = "While Settings was open, these items also changed in the settings file. You changed them in Settings too."
 choices = "OK: overwrite with the values in Settings\nCancel: stop applying (the settings file is not changed)"
@@ -215,7 +224,6 @@ monitor_not_found = "Could not capture because the monitor of the saved region w
 out_of_bounds = "Could not capture because the saved region goes past its monitor: "
 gone = "Could not capture because no saved region has that name: "
 default_name = "Region"
-registered = "Saved the region: "
 register_failed = "Could not save the region."
 
 [selection]

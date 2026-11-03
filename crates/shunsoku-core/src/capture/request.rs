@@ -235,11 +235,27 @@ impl CaptureRequest {
     }
 
     /// 設定 GUI の「試しに撮る」: 写しの定型領域 `region` の値（範囲・保存先・テンプレート・撮影後の動作）で、
-    /// 定型領域キャプチャ（`region`）と同じく撮る。
-    pub fn trial_region(region: &Region) -> CaptureRequest {
-        CaptureRequest {
+    /// 定型領域キャプチャ（`region`）と同じく撮る。領域に保存先がなければ `general_dir`（写しの全体の保存先。
+    /// 欄のプレビューと同じ場所）に保存する。
+    pub fn trial_region(region: &Region, general_dir: Option<PathBuf>) -> CaptureRequest {
+        let mut request = CaptureRequest {
             method: CaptureMethod::TrialRegion(Box::new(region.clone())),
             ..CaptureRequest::region(region)
+        };
+        if let Some(SaveTarget::Region { dir, .. }) = &mut request.outputs.save
+            && dir.is_none()
+        {
+            *dir = general_dir;
+        }
+        request
+    }
+
+    /// 定型領域キャプチャ（`Region` / `TrialRegion`）の領域の名前。ほかの依頼は None。
+    pub fn region_name(&self) -> Option<&str> {
+        match &self.method {
+            CaptureMethod::Region(id) => Some(&id.0),
+            CaptureMethod::TrialRegion(region) => Some(&region.name),
+            _ => None,
         }
     }
 
@@ -641,14 +657,43 @@ mod tests {
         let mut draft = region(false, true);
         draft.name = "まだ適用していない".to_owned();
         draft.rect = Rect::new(5, 5, 50, 50);
-        let request = CaptureRequest::trial_region(&draft);
+        let request = CaptureRequest::trial_region(&draft, Some(PathBuf::from(r"E:\draft")));
 
         assert_eq!(request.outputs, CaptureRequest::region(&draft).outputs);
+        assert_eq!(request.region_name(), Some("まだ適用していない"));
         // 適用済みの設定に同じ名前の領域がなくても、別の値の同じ名前の領域があっても、写しの値で撮る
         let mut applied = region(true, false);
         applied.name = draft.name.clone();
         assert_eq!(request.region_to_capture(&[]), Some(draft.clone()));
         assert_eq!(request.region_to_capture(&[applied]), Some(draft));
+    }
+
+    #[test]
+    fn a_trial_capture_of_a_region_without_a_folder_saves_to_the_drafts_general_folder() {
+        let mut draft = region(true, false);
+        draft.save_dir = None;
+        let request = CaptureRequest::trial_region(&draft, Some(PathBuf::from(r"E:\draft")));
+        assert_eq!(
+            request.outputs.save,
+            Some(SaveTarget::Region {
+                dir: Some(PathBuf::from(r"E:\draft")),
+                file_name_template: "{name}_{seq}".to_owned(),
+                name: "dash".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn region_requests_name_their_region_and_others_do_not() {
+        assert_eq!(
+            CaptureRequest::region(&region(true, false)).region_name(),
+            Some("dash")
+        );
+        assert_eq!(
+            CaptureRequest::from_source(Source::TrayClick).region_name(),
+            None
+        );
+        assert_eq!(CaptureRequest::reselect_region(0).region_name(), None);
     }
 
     #[test]
