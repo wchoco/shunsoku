@@ -76,7 +76,7 @@
   | `overlay_flushed` | 範囲選択の画面を出し、全モニタで `DwmFlush` が返った時点 |
   | `scrap_shown` | スクラップを 1 枚出し終えた時点 |
 
-- ハーネス（`tools/perf-harness`、開発専用で zip には入れない）は、一時フォルダを `APPDATA` にして本体を起動する。そこにハーネスのホットキーだけを書いた `settings.toml` を置くので、ユーザーの設定とログには触れない。途中で失敗したときは、その一時フォルダ（本体の `shunsoku.log` と区切りのログ）を残す。
+- ハーネス（`tools/perf-harness`、開発専用で zip には入れない）は、一時フォルダを `APPDATA` にして本体を起動する。そこにハーネスのホットキーだけを書いた `settings.toml` を置くので、ユーザーの設定とログには触れない。本体は起動時に自動起動の登録を同期するので、`SHUNSOKU_AUTOSTART_VALUE` を `shunsoku-perf-harness` にして、ユーザーの Run キーの値（`shunsoku`）にも触れさせない。途中で失敗したときは、その一時フォルダ（本体の `shunsoku.log` と区切りのログ）を残す。
 - QPC はプロセスをまたいで同じ時計なので、ハーネスの時刻（`SendInput` の直前、プロセスを作る直前）と本体の区切りの時刻をそのまま引き算する。
 - Private Working Set は `QueryWorkingSet` で本体のワーキング セットのページを列挙し、共有できないページを数えて求める。`GetProcessMemoryInfo` の `PrivateUsage` はコミット（Private Bytes）で、別の値なので使わない。
 - 測った時点のメモリには、ハーネスの操作で開いた画面の名残（GPU のメモリの戻り具合など）も入る。比べるのは同じハーネスで測った値どうしにする。

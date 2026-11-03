@@ -6,7 +6,7 @@
 //!   `SHUNSOKU_AUTOSTART_VALUE` で名前を差し替えられる（`docs/agents/windows-dev.md`）。
 
 use shunsoku_core::APP_NAME;
-use shunsoku_core::autostart::{Action, plan};
+use shunsoku_core::autostart::{Action, VALUE_NAME_VARIABLE, plan};
 use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE, WIN32_ERROR,
 };
@@ -19,8 +19,6 @@ use windows::core::PCWSTR;
 use crate::wide::to_wide;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-/// 値の名前を差し替える環境変数（実機の試験用）。
-const VALUE_NAME_ENV: &str = "SHUNSOKU_AUTOSTART_VALUE";
 
 /// Run キーを設定（`enabled`）に合わせる。したことを返す。
 pub fn sync(enabled: bool) -> Result<Action, String> {
@@ -40,7 +38,7 @@ pub fn sync(enabled: bool) -> Result<Action, String> {
 }
 
 fn value_name() -> String {
-    std::env::var(VALUE_NAME_ENV)
+    std::env::var(VALUE_NAME_VARIABLE)
         .ok()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| APP_NAME.to_owned())
