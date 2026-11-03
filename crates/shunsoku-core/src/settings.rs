@@ -77,6 +77,7 @@ use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, Shortcuts};
 use crate::selection::Mode;
 
+pub mod editor;
 mod location;
 mod write;
 pub use location::{SettingsLocation, locate};

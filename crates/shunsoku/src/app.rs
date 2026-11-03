@@ -39,6 +39,9 @@
 //!   保存先・ファイル名テンプレート・通知のオン/オフは、使うときに `App::settings` から読むので、次から効く。
 //!   キーの割り当てと重なりは core の `settings::keymap` で決める。
 //!   問題（読めない・不正な項目・重なったキー・登録できないホットキー・未設定のホットキー）は、まとめて 1 回だけ通知する。
+//! - 設定 GUI（トレイの「設定…」・2 つ目の起動）は `settings_gui` が開き、ダイアログの組み立ては `settings_dialog`。
+//!   適用は `write_settings` で書いてから `adopt_settings` で読み込み直しと同じ反映をする。キーの入力欄に
+//!   フォーカスがある間はホットキーの登録を外す（`App::hotkeys_suspended`）。
 //! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。通知のクリックは
 //!   中身を持たないので、クリックで開くフォルダ（`App::notice_folder`）を覚えておき、新しい通知を出したら忘れる。
 //! - コピーと保存の画像は `render::render_image` で表示と同じ描き方で作る。保存先とファイル名は UI スレッドで
@@ -142,6 +145,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 mod cli;
+mod settings_gui;
 
 use crate::{
     clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook, perf,
@@ -168,6 +172,8 @@ const WM_APP_TRASH: u32 = WM_APP + 5;
 const WM_APP_PIPE: u32 = WM_APP + 6;
 /// 待っている定型領域キャプチャの依頼（`App::regions_waiting`）を進める。
 const WM_APP_REGION: u32 = WM_APP + 7;
+/// 設定 GUI のキーの組み合わせの欄のフォーカスが変わった（設定 GUI が自分に送る。`settings_gui::check_focus`）。
+const WM_APP_SETTINGS_FOCUS: u32 = WM_APP + 8;
 
 /// 2 つのウィンドウのクラス名。2 つ目のプロセスはこの名前でメッセージ専用ウィンドウを探す。
 const CLASS_NAME: PCWSTR = w!("shunsoku.app");
@@ -181,6 +187,7 @@ const CMD_CLOSE_ALL: u32 = 3;
 const CMD_HIDE_ALL: u32 = 4;
 const CMD_SHOW_ALL: u32 = 5;
 const CMD_ADD_REGION: u32 = 6;
+const CMD_SETTINGS: u32 = 7;
 /// ごみ箱の一覧の項目の番号は、これに一覧の添字を足したもの。
 const CMD_TRASH_FIRST: u32 = 100;
 /// 「定型領域」の項目の番号は、これに `Settings::regions` の添字を足したもの。
@@ -273,6 +280,12 @@ struct App {
     /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
     notice_folder: Option<PathBuf>,
     gpu: grab::Gpu,
+    /// 開いている設定 GUI。
+    settings_gui: Option<settings_gui::SettingsGui>,
+    /// 設定 GUI のキーの組み合わせの欄にフォーカスがあり、全体のホットキーの登録を外している。
+    hotkeys_suspended: bool,
+    /// 最後に登録したときに登録できなかったホットキー（設定 GUI の印にする）。
+    unregistered: Vec<settings::SettingsItem>,
     hotkeys: hotkey::Registered,
     windows: Windows,
     module: HINSTANCE,
@@ -867,6 +880,9 @@ fn start(
         carryover: Carryover::default(),
         notice_folder: None,
         gpu: grab::Gpu::default(),
+        settings_gui: None,
+        hotkeys_suspended: false,
+        unregistered: failed.iter().map(|f| f.action.into()).collect(),
         hotkeys,
         windows,
         module,
@@ -889,6 +905,8 @@ fn message_loop() -> i32 {
                 );
                 return 1;
             }
+            // 設定 GUI へのメッセージ（Tab の移動など）はダイアログに任せる
+            _ if settings_gui::is_dialog_message(&msg) => {}
             _ => unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -1056,8 +1074,8 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
             Some(LRESULT(0))
         }
         _ if Some(&msg) == SECOND_INSTANCE.get() => {
-            // M1 では何もしない（M5 で設定 GUI を開く）
-            log::info!("another instance was launched");
+            log::info!("another instance was launched; opening the settings GUI");
+            settings_gui::open(None);
             Some(LRESULT(0))
         }
         _ => None,
@@ -1141,6 +1159,8 @@ fn on_tray(owner: HWND, event: tray::Event) {
                 },
                 menu::Entry::item(CMD_CLOSE_ALL, text("tray.menu.close_all"), any_scrap),
                 hide_or_show,
+                menu::Entry::Separator,
+                menu::Entry::item(CMD_SETTINGS, text("tray.menu.settings"), true),
                 menu::Entry::item(CMD_EXIT, text("tray.menu.exit"), true),
             ];
             // モーダルなので App を借りずに呼ぶ
@@ -1187,6 +1207,7 @@ fn on_command(command: u32) {
         CMD_CLOSE_ALL => close_all_scraps(),
         CMD_HIDE_ALL => set_scraps_visible(false),
         CMD_SHOW_ALL => set_scraps_visible(true),
+        CMD_SETTINGS => settings_gui::open(None),
         CMD_EXIT => {
             log::info!("exit requested from the tray menu");
             // SAFETY: UI スレッドで呼ぶ
@@ -3706,26 +3727,13 @@ fn on_settings_changed() {
                 (current.clone(), vec![SettingsIssue::NotToml { message }])
             }
         };
-        let changes = settings::diff(current, &new);
-        log::info!("settings reloaded: {changes:?}");
+        log::info!("settings reloaded");
         log_issues(&issues);
-        let keymap = settings::keymap(&new, ops::OPERATIONS);
-        log_issues(&keymap.issues);
-        issues.extend(keymap.issues);
-        let failed = if changes.hotkeys {
-            app.hotkeys.reregister(&keymap.hotkeys.bound)
-        } else {
-            Vec::new()
-        };
-        log_failed(&failed);
-        app.shortcuts = keymap.shortcuts;
-        app.mouse = keymap.mouse;
         let unset =
             app.settings.hotkeys.select_capture.is_some() && new.hotkeys.select_capture.is_none();
-        app.carryover
-            .settings_changed(&app.settings.annotation, &new.annotation);
-        app.settings = new;
-        apply_changes(app, &changes);
+        let old = std::mem::replace(&mut app.settings, new);
+        let (keymap_issues, failed) = adopt_settings(app, &old, false);
+        issues.extend(keymap_issues);
         settings_notice(
             Moment::Reload,
             &issues,
@@ -3738,6 +3746,43 @@ fn on_settings_changed() {
     if let Some((level, body)) = notice {
         notify_user(level, &body);
     }
+}
+
+/// 新しくした設定（`app.settings`、前は `old`）を反映する。読み込み直しと設定 GUI の適用で使う。
+///
+/// - 変わったものだけを反映する（`settings::diff`）。ホットキーは、変わったとき（`reregister` なら必ず）に登録し直す。
+///   ただし、設定 GUI の欄にフォーカスがあって外している間は登録しない（フォーカスが外れたら登録し直す）。
+/// - ショートカットとマウスの対応表は毎回作り直す。書き込みの既定値の変化を `Carryover` に伝える。
+/// - キーの割り当ての問題と、登録できなかったホットキーを返す。
+fn adopt_settings(
+    app: &mut App,
+    old: &Settings,
+    reregister: bool,
+) -> (Vec<SettingsIssue>, Vec<hotkey::Failed>) {
+    let changes = settings::diff(old, &app.settings);
+    log::info!("settings changed: {changes:?}");
+    let keymap = settings::keymap(&app.settings, ops::OPERATIONS);
+    log_issues(&keymap.issues);
+    let failed = if (changes.hotkeys || reregister) && !app.hotkeys_suspended {
+        register_hotkeys(app)
+    } else {
+        Vec::new()
+    };
+    log_failed(&failed);
+    app.shortcuts = keymap.shortcuts;
+    app.mouse = keymap.mouse;
+    app.carryover
+        .settings_changed(&old.annotation, &app.settings.annotation);
+    apply_changes(app, &changes);
+    (keymap.issues, failed)
+}
+
+/// いまの設定（`app.settings`）のホットキーを登録し直す。登録できなかったものを `App::unregistered` に覚えて返す。
+fn register_hotkeys(app: &mut App) -> Vec<hotkey::Failed> {
+    let keymap = settings::keymap(&app.settings, ops::OPERATIONS);
+    let failed = app.hotkeys.reregister(&keymap.hotkeys.bound);
+    app.unregistered = failed.iter().map(|f| f.action.into()).collect();
+    failed
 }
 
 /// 読み込み直した設定（`app.settings`）のうち、使うときに読むのでは足りないものを反映する。
