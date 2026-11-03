@@ -8,6 +8,8 @@
 //! - 欄にキーが入ったら（`EN_CHANGE`）写しの項目を変え、印とボタンを出し直す。ほかの欄（`settings_dialog::fields`）
 //!   も同じく、チェック・入力・選択のたびに写しを変えて出し直す（`on_field`）。欄の横のボタン（「参照…」「選ぶ…」
 //!   「変数を挿入」）はモーダルなので、`App` を借りずに出す（`on_button`）。
+//! - 「スクラップ操作」タブ（`settings_dialog::scrap_ops`）: 一覧で行を選んだら、ショートカットの欄の `ChordRow::item`
+//!   をその行の操作に差し替える。マウスのドロップダウンと「既定に戻す」は写しの行を変える。
 //! - キーの組み合わせの欄にフォーカスがある間は、全体のホットキーの登録を外す（`App::hotkeys_suspended`）。欄の
 //!   フォーカスの出入りで `WM_APP_SETTINGS_FOCUS` を自分に送り、届いた時点のフォーカスで決める（`check_focus`）。
 //! - 適用（`apply`）: その時点のファイルと写しを 3 者で突き合わせ（`settings::merge`）、両方で変えた項目があれば
@@ -25,8 +27,9 @@ use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::{self, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::Controls::{EM_GETSEL, EM_SETSEL};
-use windows::Win32::UI::Controls::{NMHDR, TCN_SELCHANGE};
+use windows::Win32::UI::Controls::{
+    EM_GETSEL, EM_SETSEL, LVIS_SELECTED, LVN_ITEMCHANGED, NMHDR, NMLISTVIEW, TCN_SELCHANGE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CBN_SELCHANGE, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GetWindowRect,
@@ -42,7 +45,7 @@ use super::{
     register_hotkeys, settings_notice, text, with_app, write_settings,
 };
 use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
-use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field};
+use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops};
 use crate::wide::to_wide;
 use crate::{menu, notify, panic_hook, save};
 
@@ -233,6 +236,16 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
             let header = unsafe { &*(lparam.0 as *const NMHDR) };
             if header.idFrom == ID_TAB as usize && header.code == TCN_SELCHANGE {
                 settings_dialog::show_page(hwnd, settings_dialog::current_page(hwnd));
+            } else if header.idFrom == scrap_ops::list_id() as usize
+                && header.code == LVN_ITEMCHANGED
+            {
+                // SAFETY: LVN_ITEMCHANGED の lparam は NMLISTVIEW を指す
+                let change = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
+                if change.uNewState & LVIS_SELECTED.0 != 0
+                    && change.uOldState & LVIS_SELECTED.0 == 0
+                {
+                    on_scrap_op_selected(hwnd);
+                }
             }
             false
         }
@@ -269,6 +282,16 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
         _ if id == IDCANCEL.0 => destroy(hwnd),
         ID_APPLY if code == BN_CLICKED => {
             apply(hwnd);
+        }
+        _ if id == scrap_ops::mouse_id() && code == CBN_SELCHANGE => {
+            if let Some((row, gesture)) = scrap_ops::chosen_mouse(hwnd) {
+                edit(hwnd, |editor| editor.set_mouse(&row, gesture));
+            }
+        }
+        _ if id == scrap_ops::reset_id() && code == BN_CLICKED => {
+            if let Some(row) = scrap_ops::selected(hwnd) {
+                edit(hwnd, |editor| editor.reset_binding(&row));
+            }
         }
         _ if chord_field::is_field(control) => match code {
             EN_CHANGE => on_chord_changed(hwnd, id, chord_field::value(control)),
@@ -435,6 +458,32 @@ fn on_chord_changed(hwnd: HWND, field: i32, chord: Option<shunsoku_core::keys::C
             && let Some(row) = gui.rows.iter().find(|row| row.field == field)
         {
             gui.editor.set_chord(&row.item, chord);
+        }
+    });
+    refresh(hwnd);
+}
+
+/// 写しを `change` で変えて、欄に出し直す。
+fn edit(hwnd: HWND, change: impl FnOnce(&mut Editor)) {
+    with_app(|app| {
+        if let Some(gui) = app.settings_gui.as_mut() {
+            change(&mut gui.editor);
+        }
+    });
+    refresh(hwnd);
+}
+
+/// 「スクラップ操作」タブの一覧で行を選んだ。ショートカットの欄をその行の操作に結び直す。
+fn on_scrap_op_selected(hwnd: HWND) {
+    let Some(row) = scrap_ops::selected(hwnd) else {
+        return;
+    };
+    let field = scrap_ops::field_id();
+    with_app(|app| {
+        if let Some(gui) = app.settings_gui.as_mut()
+            && let Some(chord_row) = gui.rows.iter_mut().find(|r| r.field == field)
+        {
+            chord_row.item = shunsoku_core::settings::SettingsItem::Shortcut(row.op.id.to_owned());
         }
     });
     refresh(hwnd);

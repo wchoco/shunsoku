@@ -5,11 +5,15 @@
 //! - 適用で書けたら `applied` で写しを新しい base にし、登録できなかったホットキーを覚える。
 //! - キーの組み合わせの欄（ホットキー・ショートカット）は `chord` / `set_chord` で `SettingsItem` を指して読み書きする。
 //!   ほかの項目は `draft_mut` で写しを直接変える。
+//! - 「スクラップ操作」タブの行（`scrap::ops::BindingRow`）は、上書きがなければ表の既定を出す（`shortcut` /
+//!   `mouse`）。ショートカットの欄にキーを入れたら、その 1 つで上書きする（`set_chord`）。マウスは候補から選ぶ
+//!   （`set_mouse`。既定と同じなら上書きを消す）。行の「既定に戻す」は両方の上書きを消す（`reset_binding`）。
 
 use std::collections::BTreeSet;
 
 use super::{Problem, Settings, SettingsItem};
 use crate::keys::Chord;
+use crate::scrap::ops::{BindingRow, MouseGesture};
 
 /// 設定 GUI の写し。
 #[derive(Debug, Clone)]
@@ -50,6 +54,15 @@ impl Mark {
             Mark::Problem(Problem::DuplicateName) => "settings_gui.mark.duplicate_name",
         }
     }
+}
+
+/// 「スクラップ操作」タブのショートカットの欄に出す値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutValue {
+    /// 上書きがない。表の既定（複数のこともあり、空なら割り当てなし）をまとめて表示だけする。
+    Defaults(&'static [Chord]),
+    /// 上書きがある。None は割り当てを外した（設定ファイルの `""`）。
+    Set(Option<Chord>),
 }
 
 /// OK と適用のボタンを押せるか。
@@ -126,6 +139,42 @@ impl Editor {
         }
     }
 
+    /// 行 `row` のショートカットの欄に出す値。
+    pub fn shortcut(&self, row: &BindingRow) -> ShortcutValue {
+        match self.draft.shortcuts.get(row.op.id) {
+            Some(&chord) => ShortcutValue::Set(chord),
+            None => ShortcutValue::Defaults(row.default_shortcut.unwrap_or_default()),
+        }
+    }
+
+    /// 行 `row` のマウスの割り当て。上書きが候補にない値なら、スクラップと同じく表の既定にする。
+    pub fn mouse(&self, row: &BindingRow) -> Option<MouseGesture> {
+        match self.draft.mouse.get(row.op.id) {
+            Some(&gesture) if gesture.is_none_or(|g| row.mouse_choices().contains(&g)) => gesture,
+            _ => row.op.default_mouse,
+        }
+    }
+
+    /// 行 `row` のマウスの割り当てを `gesture`（None は割り当てなし）にする。表の既定と同じなら上書きを消す。
+    pub fn set_mouse(&mut self, row: &BindingRow, gesture: Option<MouseGesture>) {
+        if gesture == row.op.default_mouse {
+            self.draft.mouse.remove(row.op.id);
+        } else {
+            self.draft.mouse.insert(row.op.id.to_owned(), gesture);
+        }
+    }
+
+    /// 行 `row` のショートカットとマウスの上書きを消し、表の既定に戻す。
+    pub fn reset_binding(&mut self, row: &BindingRow) {
+        self.draft.shortcuts.remove(row.op.id);
+        self.draft.mouse.remove(row.op.id);
+    }
+
+    /// 行 `row` にショートカットかマウスの上書きがあるか（「既定に戻す」を押せるか）。
+    pub fn is_overridden(&self, row: &BindingRow) -> bool {
+        self.draft.shortcuts.contains_key(row.op.id) || self.draft.mouse.contains_key(row.op.id)
+    }
+
     /// OK と適用を押せるか。OK は適用を止める問題がないとき、適用はそれに加えて写しが base と違うとき。
     pub fn buttons(&self) -> Buttons {
         let ok = !super::validate(&self.draft)
@@ -192,6 +241,7 @@ fn chord_slot<'a>(
 mod tests {
     use super::*;
     use crate::keys::Chord;
+    use crate::scrap::ops::{BindingRow, MouseGesture, OPERATIONS, binding_rows};
     use crate::settings::{Settings, SettingsItem};
 
     fn chord(s: &str) -> Chord {
@@ -422,5 +472,124 @@ mod tests {
             let key = mark.label_key();
             assert_ne!(catalog.text(key), key, "{mark:?}");
         }
+    }
+
+    fn row(id: &str) -> BindingRow {
+        binding_rows(OPERATIONS)
+            .into_iter()
+            .find(|row| row.op.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn several_default_shortcuts_are_shown_until_a_key_overrides_them_and_come_back_on_reset() {
+        let mut settings = Settings::default();
+        settings.hotkeys.select_capture = Some(chord("Ctrl+Shift+A"));
+        let mut editor = Editor::new(settings);
+        let zoom_in = row("zoom_in");
+        let ShortcutValue::Defaults(defaults) = editor.shortcut(&zoom_in) else {
+            panic!("zoom_in should show its defaults");
+        };
+        assert_eq!(defaults.len(), 3);
+        assert!(!editor.is_overridden(&zoom_in));
+
+        let item = SettingsItem::Shortcut("zoom_in".into());
+        editor.set_chord(&item, Some(chord("Ctrl+Up")));
+        assert_eq!(
+            editor.shortcut(&zoom_in),
+            ShortcutValue::Set(Some(chord("Ctrl+Up")))
+        );
+        assert!(editor.is_overridden(&zoom_in));
+        assert!(editor.buttons().apply);
+
+        editor.reset_binding(&zoom_in);
+        assert_eq!(editor.shortcut(&zoom_in), ShortcutValue::Defaults(defaults));
+        assert_eq!(editor.draft(), editor.base());
+    }
+
+    #[test]
+    fn a_shortcut_unbound_in_the_file_is_shown_as_unset() {
+        let mut settings = Settings::default();
+        settings.shortcuts.insert("copy".into(), None);
+        let editor = Editor::new(settings);
+        assert_eq!(editor.shortcut(&row("copy")), ShortcutValue::Set(None));
+        assert!(editor.is_overridden(&row("copy")));
+    }
+
+    #[test]
+    fn the_same_shortcut_on_two_operations_marks_both_rows_and_blocks_apply() {
+        let mut settings = Settings::default();
+        settings.hotkeys.select_capture = Some(chord("Ctrl+Shift+A"));
+        let mut editor = Editor::new(settings);
+        editor.set_chord(
+            &SettingsItem::Shortcut("trim".into()),
+            Some(chord("Ctrl+Q")),
+        );
+        editor.set_chord(
+            &SettingsItem::Shortcut("close".into()),
+            Some(chord("Ctrl+Q")),
+        );
+
+        let conflict = Some(Mark::Problem(Problem::Conflict(chord("Ctrl+Q"))));
+        assert_eq!(
+            editor.mark(&SettingsItem::Shortcut("trim".into())),
+            conflict
+        );
+        assert_eq!(
+            editor.mark(&SettingsItem::Shortcut("close".into())),
+            conflict
+        );
+        assert!(!editor.buttons().ok);
+    }
+
+    #[test]
+    fn the_mouse_choice_shows_the_default_and_choosing_the_default_again_drops_the_override() {
+        let mut editor = Editor::new(Settings::default());
+        let close = row("close");
+        assert_eq!(editor.mouse(&close), Some(MouseGesture::MiddleClick));
+
+        editor.set_mouse(&close, Some(MouseGesture::DoubleClick));
+        assert_eq!(editor.mouse(&close), Some(MouseGesture::DoubleClick));
+        assert!(editor.is_overridden(&close));
+
+        editor.set_mouse(&close, None);
+        assert_eq!(editor.mouse(&close), None);
+
+        editor.set_mouse(&close, Some(MouseGesture::MiddleClick));
+        assert_eq!(editor.mouse(&close), Some(MouseGesture::MiddleClick));
+        assert!(!editor.is_overridden(&close));
+        assert_eq!(editor.draft(), editor.base());
+    }
+
+    #[test]
+    fn a_mouse_override_outside_the_choices_shows_the_default() {
+        let mut settings = Settings::default();
+        settings
+            .mouse
+            .insert("close".into(), Some(MouseGesture::LeftDrag));
+        let editor = Editor::new(settings);
+        assert_eq!(editor.mouse(&row("close")), Some(MouseGesture::MiddleClick));
+    }
+
+    #[test]
+    fn the_same_mouse_choice_on_two_operations_marks_both_rows() {
+        let mut settings = Settings::default();
+        settings.hotkeys.select_capture = Some(chord("Ctrl+Shift+A"));
+        let mut editor = Editor::new(settings);
+        // toggle_compact の既定はダブルクリック
+        editor.set_mouse(&row("close"), Some(MouseGesture::DoubleClick));
+
+        let conflict = Some(Mark::Problem(Problem::MouseConflict(
+            MouseGesture::DoubleClick,
+        )));
+        assert_eq!(editor.mark(&SettingsItem::Mouse("close".into())), conflict);
+        assert_eq!(
+            editor.mark(&SettingsItem::Mouse("toggle_compact".into())),
+            conflict
+        );
+        assert!(!editor.buttons().ok);
+
+        editor.reset_binding(&row("close"));
+        assert_eq!(editor.mark(&SettingsItem::Mouse("close".into())), None);
     }
 }

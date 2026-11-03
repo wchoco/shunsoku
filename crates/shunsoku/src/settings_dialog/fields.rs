@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCOUNT,
     CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_RESETCONTENT, CB_SETCURSEL, CBS_DROPDOWNLIST,
     ES_AUTOHSCROLL, ES_NUMBER, GetWindowTextLengthW, GetWindowTextW, SendMessageW, SetDlgItemTextW,
-    SetWindowTextW, WINDOW_EX_STYLE, WINDOW_STYLE, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
+    SetWindowTextW, WINDOW_STYLE, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -697,90 +697,58 @@ pub fn pick_color(owner: HWND, current: Rgb) -> Option<Rgb> {
 }
 
 impl PageBuilder<'_> {
-    fn field_item(&mut self, class: Class, style: WINDOW_STYLE, rect: (i16, i16, i16, i16)) -> i32 {
+    /// テキストの欄（枠付き）。ほかのコントロールは `PageBuilder::control` で置く。
+    fn edit(&mut self, style: WINDOW_STYLE, x: i16, y: i16, cx: i16) -> i32 {
         let id = self.next_id();
-        let (x, y, cx, cy) = rect;
         self.template.item(Item {
-            class,
+            class: Class::Edit,
             text: "",
             id,
-            style,
-            ex_style: if matches!(class, Class::Edit) {
-                WS_EX_CLIENTEDGE
-            } else {
-                WINDOW_EX_STYLE(0)
-            },
-            rect: (PAGE_X + x, PAGE_Y + y, cx, cy),
+            style: WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32) | style,
+            ex_style: WS_EX_CLIENTEDGE,
+            rect: (PAGE_X + x, PAGE_Y + y, cx, 14),
         });
         id
     }
 
     /// 文言のキー `key` のチェックボックス。
     pub fn check(&mut self, field: Field, key: &'static str, x: i16, y: i16, cx: i16) {
-        let id = self.next_id();
         let text = (self.text)(key);
-        self.template.item(Item {
-            class: Class::Button,
-            text,
-            id,
-            style: WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-            ex_style: WINDOW_EX_STYLE(0),
-            rect: (PAGE_X + x, PAGE_Y + y, cx, 12),
-        });
+        let style = WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32);
+        let id = self.control(Class::Button, text, style, x, y, cx, 12);
         self.push(field, id, Kind::Check);
     }
 
     /// テキストの欄。
     pub fn text(&mut self, field: Field, x: i16, y: i16, cx: i16) -> i32 {
-        let id = self.field_item(
-            Class::Edit,
-            WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-            (x, y, cx, 14),
-        );
+        let id = self.edit(WINDOW_STYLE(0), x, y, cx);
         self.push(field, id, kind(field));
         id
     }
 
     /// 数の欄（上下のボタン付き）。
     pub fn number(&mut self, field: Field, x: i16, y: i16, cx: i16) {
-        let id = self.field_item(
-            Class::Edit,
-            WS_TABSTOP | WINDOW_STYLE((ES_AUTOHSCROLL | ES_NUMBER) as u32),
-            (x, y, cx, 14),
-        );
+        let id = self.edit(WINDOW_STYLE(ES_NUMBER as u32), x, y, cx);
         // 上下のボタンは直前の欄（Z 順の前）に付く
-        let updown = self.field_item(
-            Class::UpDown,
-            WINDOW_STYLE(
-                UDS_AUTOBUDDY | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_SETBUDDYINT | UDS_NOTHOUSANDS,
-            ),
-            (x + cx, y, 10, 14),
+        let style = WINDOW_STYLE(
+            UDS_AUTOBUDDY | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_SETBUDDYINT | UDS_NOTHOUSANDS,
         );
+        let updown = self.control(Class::UpDown, "", style, x + cx, y, 10, 14);
         self.push(field, id, Kind::Number { updown });
     }
 
     /// ドロップダウン（`list` は開いたときの一覧の高さ）。
     pub fn choice(&mut self, field: Field, x: i16, y: i16, cx: i16, list: i16) {
-        let id = self.field_item(
-            Class::ComboBox,
-            WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
-            (x, y, cx, list),
-        );
+        let style = WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32);
+        let id = self.control(Class::ComboBox, "", style, x, y, cx, list);
         self.push(field, id, Kind::Choice);
     }
 
     /// 欄の横のボタン。
     pub fn button(&mut self, action: Action, key: &'static str, x: i16, y: i16, cx: i16) {
-        let id = self.next_id();
         let text = (self.text)(key);
-        self.template.item(Item {
-            class: Class::Button,
-            text,
-            id,
-            style: WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            ex_style: WINDOW_EX_STYLE(0),
-            rect: (PAGE_X + x, PAGE_Y + y, cx, 14),
-        });
+        let style = WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
+        let id = self.control(Class::Button, text, style, x, y, cx, 14);
         self.fields.buttons.push(ButtonRow { id, action });
     }
 
@@ -820,15 +788,7 @@ impl PageBuilder<'_> {
             y,
             SIDE_BUTTON,
         );
-        let preview = self.next_id();
-        self.template.item(Item {
-            class: Class::Static,
-            text: "",
-            id: preview,
-            style: SS_LEFT,
-            ex_style: WINDOW_EX_STYLE(0),
-            rect: (PAGE_X + x, PAGE_Y + y + 17, cx, 10),
-        });
+        let preview = self.control(Class::Static, "", SS_LEFT, x, y + 17, cx, 10);
         if let Some(row) = self.fields.rows.iter_mut().find(|r| r.control == id) {
             row.kind = Kind::Text {
                 preview: Some(preview),

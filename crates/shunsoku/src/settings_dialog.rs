@@ -17,6 +17,7 @@
 pub mod chord_field;
 pub mod fields;
 mod pages;
+pub mod scrap_ops;
 
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::Editor;
@@ -24,9 +25,9 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Controls::{
-    EnableThemeDialogTexture, ICC_HOTKEY_CLASS, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
-    ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, TCIF_TEXT, TCITEMW,
-    TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL,
+    EnableThemeDialogTexture, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
+    ICC_TAB_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, TCIF_TEXT,
+    TCITEMW, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -73,6 +74,7 @@ pub enum Page {
     #[default]
     Capture,
     Scrap,
+    ScrapOps,
     Annotation,
 }
 
@@ -99,6 +101,11 @@ const PAGES: &[PageDef] = &[
         page: Page::Scrap,
         label_key: "settings_gui.tab.scrap",
         build: pages::scrap,
+    },
+    PageDef {
+        page: Page::ScrapOps,
+        label_key: "settings_gui.tab.scrap_ops",
+        build: scrap_ops::build,
     },
     PageDef {
         page: Page::Annotation,
@@ -181,7 +188,11 @@ pub struct Dialog {
 pub fn create(module: HINSTANCE, page: Page, text: Text, proc: DLGPROC) -> Result<Dialog> {
     let icc = INITCOMMONCONTROLSEX {
         dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_HOTKEY_CLASS | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_UPDOWN_CLASS,
+        dwICC: ICC_HOTKEY_CLASS
+            | ICC_STANDARD_CLASSES
+            | ICC_TAB_CLASSES
+            | ICC_LISTVIEW_CLASSES
+            | ICC_UPDOWN_CLASS,
     };
     // SAFETY: 構造体はこの呼び出しの間生きている
     unsafe {
@@ -283,6 +294,12 @@ pub fn create(module: HINSTANCE, page: Page, text: Text, proc: DLGPROC) -> Resul
     Ok(Dialog { hwnd, rows, fields })
 }
 
+/// ページ `page` のコントロールの ID の帯の最初。
+fn page_first_id(page: Page) -> i32 {
+    let index = PAGES.iter().position(|def| def.page == page).unwrap_or(0);
+    PAGE_ID_FIRST + index as i32 * PAGE_ID_SPAN
+}
+
 /// 選んでいるタブのページ。
 pub fn current_page(hwnd: HWND) -> Page {
     let index = item(hwnd, ID_TAB)
@@ -353,6 +370,7 @@ pub fn fill(hwnd: HWND, rows: &[ChordRow], editor: &Editor, text: Text) {
             let _ = SetDlgItemTextW(hwnd, row.mark, PCWSTR(mark.as_ptr()));
         }
     }
+    scrap_ops::fill(hwnd, editor, text);
     let buttons = editor.buttons();
     for (id, enabled) in [(IDOK.0, buttons.ok), (ID_APPLY, buttons.apply)] {
         if let Some(button) = item(hwnd, id) {
@@ -443,6 +461,30 @@ impl PageBuilder<'_> {
         });
     }
 
+    /// クラス `class` のコントロールを置き、その ID を返す。
+    #[allow(clippy::too_many_arguments)]
+    fn control(
+        &mut self,
+        class: Class,
+        text: &str,
+        style: WINDOW_STYLE,
+        x: i16,
+        y: i16,
+        cx: i16,
+        cy: i16,
+    ) -> i32 {
+        let id = self.next_id();
+        self.template.item(Item {
+            class,
+            text,
+            id,
+            style,
+            ex_style: WINDOW_EX_STYLE(0),
+            rect: (PAGE_X + x, PAGE_Y + y, cx, cy),
+        });
+        id
+    }
+
     /// 項目 `item` のキーの組み合わせの欄（幅 `cx`）と、その下の印の欄。
     pub fn chord_field(&mut self, item: SettingsItem, x: i16, y: i16, cx: i16) {
         let field = self.next_id();
@@ -473,10 +515,11 @@ enum Class {
     Button,
     Static,
     Edit,
-    ComboBox,
     UpDown,
     HotKey,
     Tab,
+    ListView,
+    ComboBox,
 }
 
 impl Class {
@@ -485,10 +528,11 @@ impl Class {
             Class::Button => "Button",
             Class::Static => "Static",
             Class::Edit => "Edit",
-            Class::ComboBox => "ComboBox",
             Class::UpDown => "msctls_updown32",
             Class::HotKey => "msctls_hotkey32",
             Class::Tab => "SysTabControl32",
+            Class::ListView => "SysListView32",
+            Class::ComboBox => "ComboBox",
         }
     }
 }
