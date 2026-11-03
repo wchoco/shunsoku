@@ -39,6 +39,8 @@
 //!   保存先・ファイル名テンプレート・通知のオン/オフは、使うときに `App::settings` から読むので、次から効く。
 //!   キーの割り当てと重なりは core の `settings::keymap` で決める。
 //!   問題（読めない・不正な項目・重なったキー・登録できないホットキー・未設定のホットキー）は、まとめて 1 回だけ通知する。
+//!   範囲選択キャプチャのホットキーが未設定なら、起動時は通知せずに設定 GUI を開き、読み込み直しで空になったときと
+//!   未設定のまま GUI を閉じたときは通知する（core の `settings::unset::prompt`）。
 //! - 設定 GUI（トレイの「設定…」・2 つ目の起動）は `settings_gui` が開き、ダイアログの組み立ては `settings_dialog`。
 //!   適用は `write_settings` で書いてから `adopt_settings` で読み込み直しと同じ反映をする。キーの入力欄に
 //!   フォーカスがある間はホットキーの登録を外す（`App::hotkeys_suspended`）。
@@ -99,7 +101,9 @@ use shunsoku_core::scrap::{
     Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
 use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
-use shunsoku_core::settings::{self, LogLevel, Rgb, Settings, SettingsChanges, SettingsIssue};
+use shunsoku_core::settings::{
+    self, LogLevel, Rgb, Settings, SettingsChanges, SettingsIssue, unset,
+};
 use shunsoku_core::trash::TrashId;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
@@ -680,7 +684,8 @@ pub fn run() -> i32 {
     let (settings, issues) = read_settings(settings_path.as_deref());
     log::set_max_level(level_filter(settings.log_level));
 
-    let unset = settings.hotkeys.select_capture.is_none();
+    // 未設定なら、通知ではなく設定 GUI を開いて促す（初回起動の流れ）
+    let open_gui = unset::prompt(unset::When::Startup, &settings) == Some(unset::Prompt::OpenGui);
     let (app, key_issues, failed) = match start(instance, settings, settings_path) {
         Ok(started) => started,
         Err(e) => {
@@ -693,7 +698,7 @@ pub fn run() -> i32 {
         Moment::Startup,
         &issues,
         &failed,
-        unset,
+        false,
         app.settings_path.as_deref(),
     );
     #[cfg(debug_assertions)]
@@ -715,6 +720,10 @@ pub fn run() -> i32 {
     }
     if let Some((level, body)) = notice {
         notify_user(level, &body);
+    }
+    if open_gui {
+        log::info!("the select-capture hotkey is unset; opening the settings GUI");
+        settings_gui::open_for_unset_hotkey();
     }
     log::info!("started");
 
@@ -3729,8 +3738,13 @@ fn on_settings_changed() {
         };
         log::info!("settings reloaded");
         log_issues(&issues);
-        let unset =
-            app.settings.hotkeys.select_capture.is_some() && new.hotkeys.select_capture.is_none();
+        // 空になっても GUI は開かず、通知だけ出す
+        let unset = unset::prompt(
+            unset::When::Reload {
+                before: &app.settings,
+            },
+            &new,
+        ) == Some(unset::Prompt::Notify);
         let old = std::mem::replace(&mut app.settings, new);
         let (keymap_issues, failed) = adopt_settings(app, &old, false);
         issues.extend(keymap_issues);
