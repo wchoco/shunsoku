@@ -56,6 +56,8 @@ pub struct OperationDescriptor {
     /// ドラッグの量（`OpContext::drag`）を引数に取る操作。ドラッグでしか呼べないので、メニューにも
     /// ショートカットの対応表にも出さない。
     pub drag_only: bool,
+    /// レシピのどこに置けるか（ADR-0007）。引数のある操作とドラッグ専用の操作は `Never` にする。
+    pub in_recipe: InRecipe,
     /// 右クリックメニューに出すか。キーやマウスで足りる操作（移動、拡大・縮小）は出さず、メニューを spec の
     /// 並びに保つ。
     pub in_menu: bool,
@@ -72,9 +74,20 @@ pub struct OperationDescriptor {
 
 impl OperationDescriptor {
     /// ショートカットとマウスの割り当てを設定で変えられるか。引数のない操作だけ。
-    fn takes_binding(&self) -> bool {
+    pub(crate) fn takes_binding(&self) -> bool {
         self.choices.is_none() && !self.drag_only
     }
+}
+
+/// スクラップ操作をレシピのどこに置けるか（`OperationDescriptor::in_recipe`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InRecipe {
+    /// どこにでも置ける。
+    Anywhere,
+    /// 最後にだけ置ける（`close`。閉じたあとの手は実行できない）。
+    Last,
+    /// 置けない。引数を取る操作と、モードを切り替えて入力を奪う操作（`trim`、`annotate`）。
+    Never,
 }
 
 impl std::fmt::Debug for OperationDescriptor {
@@ -589,6 +602,7 @@ const fn keyboard_move(
         group: Group::Move,
         order,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: normal,
         checked: None,
@@ -607,6 +621,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 10,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: normal,
         checked: None,
@@ -621,6 +636,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 20,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: not_compact,
         checked: None,
@@ -635,6 +651,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 30,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: not_compact,
         checked: None,
@@ -649,6 +666,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Edit,
         order: 10,
         drag_only: false,
+        in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
         checked: None,
@@ -663,6 +681,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Edit,
         order: 20,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: trimmed,
         checked: None,
@@ -677,6 +696,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Edit,
         order: 30,
         drag_only: false,
+        in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: can_annotate,
         checked: Some(editing),
@@ -741,6 +761,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Move,
         order: 0,
         drag_only: true,
+        in_recipe: InRecipe::Never,
         in_menu: false,
         can_execute: normal,
         checked: None,
@@ -755,6 +776,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 10,
         drag_only: false,
+        in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
         checked: None,
@@ -769,6 +791,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 11,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
         checked: None,
@@ -783,6 +806,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 12,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
         checked: None,
@@ -797,6 +821,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 13,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
         checked: None,
@@ -811,6 +836,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 20,
         drag_only: false,
+        in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
         checked: None,
@@ -825,6 +851,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 21,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
         checked: None,
@@ -839,6 +866,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 22,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
         checked: None,
@@ -853,6 +881,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 23,
         drag_only: false,
+        in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
         checked: None,
@@ -867,6 +896,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 24,
         drag_only: false,
+        in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
         checked: None,
@@ -881,6 +911,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 30,
         drag_only: false,
+        in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: normal,
         checked: None,
@@ -895,6 +926,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Close,
         order: 10,
         drag_only: false,
+        in_recipe: InRecipe::Last,
         in_menu: true,
         can_execute: normal,
         checked: None,
@@ -2545,6 +2577,7 @@ mod tests {
             group,
             order,
             drag_only: false,
+            in_recipe: InRecipe::Anywhere,
             in_menu: true,
             can_execute: normal,
             checked: None,
