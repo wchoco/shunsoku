@@ -33,6 +33,7 @@ conflicts = "Disabled keys assigned to more than one item, for all of those item
 mouse_conflicts = "Disabled mouse actions assigned to more than one item, for all of those items: "
 overlaps = "Hotkeys and shortcuts overlap (the hotkey wins and the shortcut does not work): "
 watch_stopped = "Stopped watching the settings file. After fixing the settings file, restart shunsoku."
+autostart_failed = "Could not update the autostart registration to match the settings."
 items_open = " ("
 items_close = ")"
 
@@ -62,6 +63,7 @@ annotation = "Drawing"
 [settings_gui.general]
 language = "Language:"
 language_auto = "Match the OS"
+autostart = "Start when signing in to Windows"
 notifications = "Show notifications"
 save_dir = "Save to:"
 default_dir = "Default: "

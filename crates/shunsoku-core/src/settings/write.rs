@@ -132,6 +132,14 @@ fn write_general(t: &mut dyn TableLike, g: &General) {
     );
     put(
         t,
+        "autostart",
+        Item::as_bool,
+        Some(d.autostart),
+        &g.autostart,
+        |&v| Some(v.into()),
+    );
+    put(
+        t,
         "notifications",
         Item::as_bool,
         Some(d.notifications),
@@ -493,6 +501,7 @@ notifications = false
         s.general.language = Some(crate::i18n::Language::English);
         s.general.save_dir = Some(PathBuf::from(r"D:\shots"));
         s.general.file_name_template = "cap_{seq:3}".to_owned();
+        s.general.autostart = true;
         s.general.notifications = false;
         s.general.trash_limit = 0;
         s.general.dpi_scaling = DpiScaling::KeepApparentSize;

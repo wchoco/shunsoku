@@ -32,6 +32,7 @@ unreadable_kept = "設定ファイルを TOML として読めないため、直�
 conflicts = "重なったキーを、重なった項目のすべてで無効にしました: "
 mouse_conflicts = "重なったマウス操作を、重なった項目のすべてで無効にしました: "
 overlaps = "ホットキーとショートカットが重なっています（ホットキーが優先され、そのショートカットは効きません）: "
+autostart_failed = "自動起動の登録を設定に合わせられませんでした。"
 watch_stopped = "設定ファイルの監視が止まりました。設定ファイルを直したら shunsoku を起動し直してください。"
 # 重なったキーの後ろに付ける、重なった項目の一覧の括弧（「Ctrl+A（copy, close）」）
 items_open = "（"
@@ -69,6 +70,7 @@ annotation = "書き込み"
 language = "言語:"
 # 言語の一覧の先頭。OS の表示言語に合わせる（日本語でなければ英語）
 language_auto = "OS に合わせる"
+autostart = "Windows にサインインしたときに起動する"
 notifications = "通知を出す"
 save_dir = "保存先:"
 # 保存先の欄が空のときに薄く出す（後ろに既定のフォルダが付く）

@@ -49,6 +49,8 @@ use crate::wide::to_wide;
 pub enum Field {
     /// `[general] language`。
     Language,
+    /// `[general] autostart`。
+    Autostart,
     /// `[general] notifications`。
     Notifications,
     /// `[general] save_dir`。空なら既定（ピクチャ フォルダの下）。
@@ -163,7 +165,8 @@ impl Fields {
 
 fn kind(field: Field) -> Kind {
     match field {
-        Field::Notifications
+        Field::Autostart
+        | Field::Notifications
         | Field::CaptureCursor
         | Field::Crosshair
         | Field::Border
@@ -238,6 +241,7 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
         selected,
     };
     match field {
+        Field::Autostart => Shown::Check(d.general.autostart),
         Field::Notifications => Shown::Check(d.general.notifications),
         Field::CaptureCursor => Shown::Check(d.general.capture_cursor),
         Field::Crosshair => Shown::Check(d.selection.crosshair),
@@ -306,6 +310,7 @@ pub enum Input {
 /// 欄 `field` の入力 `input` を写しに入れる。読めない入力なら何もしない。
 pub fn set(field: Field, draft: &mut Settings, input: Input) {
     match (field, input) {
+        (Field::Autostart, Input::Check(v)) => draft.general.autostart = v,
         (Field::Notifications, Input::Check(v)) => draft.general.notifications = v,
         (Field::CaptureCursor, Input::Check(v)) => draft.general.capture_cursor = v,
         (Field::Crosshair, Input::Check(v)) => draft.selection.crosshair = v,

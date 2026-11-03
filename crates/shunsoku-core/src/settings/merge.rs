@@ -82,6 +82,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         language,
         save_dir,
         file_name_template,
+        autostart,
         notifications,
         trash_limit,
         dpi_scaling,
@@ -123,6 +124,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         file_name_template,
         general.file_name_template
     );
+    value!("general.autostart", autostart, general.autostart);
     value!(
         "general.notifications",
         notifications,
@@ -318,6 +320,7 @@ mod tests {
             ("general.file_name_template", |s| {
                 s.general.file_name_template = "x_{date}".into()
             }),
+            ("general.autostart", |s| s.general.autostart = true),
             ("general.notifications", |s| s.general.notifications = false),
             ("general.trash_limit", |s| s.general.trash_limit = 3),
             ("general.dpi_scaling", |s| {
