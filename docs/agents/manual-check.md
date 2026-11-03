@@ -1,6 +1,6 @@
 # 実機の手動確認（エージェント向け）
 
-`docs/manual-checks.md` の項目を実機で確かめるときの決まり。操作は `tools/win-driver` を通す（組み方と呼び方は [windows-dev.md](windows-dev.md) の 5.、コマンドの一覧は `scripts/win-driver.sh --help`）。
+`docs/manual-checks.md` の項目を実機で確かめるときの決まり。操作は `tools/win-driver` を通す（組み方と呼び方は [windows-dev.md](windows-dev.md) の「実機を道具で操作する」、コマンドの一覧は `scripts/win-driver.sh --help`）。
 
 ## 安全の決まり
 
@@ -23,6 +23,7 @@
   - ファイルとログ: `now` で時刻を控えてから `wait-file <path> --since <時刻>`、`lines <file>` で行数を控えてから `wait-log <file> <部分> --skip <行数>`。
 - 目視: 画像を見ないと判定できないものだけを `scripts/win-screenshot.sh` で撮って見る。目視の項目でも、値で決まる部分（例: M5-10 の、一覧の文字が切れないこと）は値で確かめる。
 - 人: エージェントは確かめない。結果に「人」と書いて残す。
+- 自動・自動（実機）: 手では通さない。「自動（実機）」は `cargo.exe test --workspace -- --ignored` の結果を書く（windows-dev.md の「実機でだけ走らせるテスト」）。
 
 ## 結果の書き方
 
