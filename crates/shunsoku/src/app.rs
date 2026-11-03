@@ -31,7 +31,8 @@
 //!   `App::shortcuts`、`ops::mouse_operation`、`ops::menu`）でスクラップ操作に変え、`run_scrap_operation` で
 //!   実行する。操作が返す `Effect` を実行するのはここ（`run_scrap_operation`）。操作を足すときは core の表に
 //!   行を足し、新しい `Effect` があればそこに足す。
-//! - 設定（`%APPDATA%\shunsoku\settings.toml`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
+//! - 設定（`%APPDATA%\shunsoku\settings.toml`、ポータブルモードでは exe の横のもの。場所は core の
+//!   `settings::locate`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
 //!   読み込み直す。アプリから書き戻すときは `write_settings` で変わった項目だけを書き、書いた直後の中身を監視が
 //!   拾っても読み込み直さない（`App::own_writes`）。読み込み直しでは core の `settings::diff` で変わった部分を調べ、
 //!   ホットキーの登録し直し・スクラップの描き直しなど、変わったものだけを反映する（`on_settings_changed`）。
@@ -228,7 +229,7 @@ thread_local! {
 /// アプリの状態。UI スレッドだけが持つ。drop の順（宣言の順）で設定ファイルの監視を止め、トレイを消し、
 /// 範囲選択の画面を閉じ、ホットキーの登録を外してからウィンドウを壊す。
 struct App {
-    /// 設定ファイルの監視。`APPDATA` がないときや始められなかったときは None。
+    /// 設定ファイルの監視。設定ファイルの場所が決まらないときや始められなかったときは None。
     watcher: Option<settings_watch::Watcher>,
     tray: tray::Tray,
     /// トレイの登録に 1 度でも成功したか。性能の区切り `TrayRegistered` は最初の成功のときだけ書く。
@@ -585,13 +586,33 @@ fn text(key: &'static str) -> &'static str {
     CATALOG.get().map_or(key, |c| c.text(key))
 }
 
+/// 設定ファイルの場所を決める（core の `settings::locate`）。exe の横に `settings.toml` があればそれ
+/// （ポータブルモード）、なければ `%APPDATA%\shunsoku\settings.toml`。ポータブルモードで書けなくても
+/// `%APPDATA%` には逃がさない（`write_settings` がエラーを返し、呼び出し側が通知する）。
+fn locate_settings() -> Option<settings::SettingsLocation> {
+    // ロガーはまだ無いので、取れなければ黙って %APPDATA% にする
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(Path::parent);
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    settings::locate(exe_dir, appdata.as_deref(), Path::is_file)
+}
+
 /// 常駐本体を動かし、終了コードを返す。
 pub fn run() -> i32 {
     let perf_started = perf::start();
-    // 設定ファイルとログを置くフォルダ
-    let app_dir = std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join(APP_NAME));
-    let log_path = app_dir.as_deref().and_then(|dir| logger::init(dir).ok());
+    // 設定ファイルの場所（ポータブルモードの判定）。ログも同じフォルダに書く
+    let location = locate_settings();
+    let log_path = location
+        .as_ref()
+        .and_then(|location| logger::init(location.dir()).ok());
     log::info!("starting {APP_NAME} v{}", env!("CARGO_PKG_VERSION"));
+    match &location {
+        Some(location) if location.portable => {
+            log::info!("portable mode: using {}", location.settings_file.display())
+        }
+        Some(_) => {}
+        None => log::warn!("neither the exe folder nor APPDATA is known"),
+    }
     if let Err(e) = perf_started {
         log::warn!("could not open the perf log: {e}");
     }
@@ -642,7 +663,7 @@ pub fn run() -> i32 {
         log::warn!("could not initialize COM: {com:?}");
     }
 
-    let settings_path = app_dir.map(|dir| dir.join("settings.toml"));
+    let settings_path = location.map(|location| location.settings_file);
     let (settings, issues) = read_settings(settings_path.as_deref());
     log::set_max_level(level_filter(settings.log_level));
 
@@ -3564,7 +3585,7 @@ fn float_scrap(at: Point, image: Image, focus: bool) -> std::result::Result<(), 
 /// ときと同じ問題にする。
 fn read_settings(path: Option<&Path>) -> (Settings, Vec<SettingsIssue>) {
     let Some(path) = path else {
-        log::warn!("APPDATA is not set; using the default settings");
+        log::warn!("no settings file location; using the default settings");
         return (Settings::default(), Vec::new());
     };
     let (settings, issues) = match std::fs::read_to_string(path) {
@@ -3596,7 +3617,7 @@ fn write_settings(app: &mut App, new: &Settings) -> std::result::Result<(), Stri
     let path = app
         .settings_path
         .clone()
-        .ok_or_else(|| "APPDATA is not set".to_owned())?;
+        .ok_or_else(|| "the settings file location is unknown".to_owned())?;
     let src = match std::fs::read_to_string(&path) {
         Ok(src) => src,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

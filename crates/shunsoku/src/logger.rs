@@ -1,4 +1,5 @@
-//! `log` のファサードの書き出し先。`%APPDATA%\shunsoku\shunsoku.log` に書き、1MB を超えたら `.old` に回す。
+//! `log` のファサードの書き出し先。設定ファイルと同じフォルダ（`%APPDATA%\shunsoku`、ポータブルモードでは
+//! exe の横）の `shunsoku.log` に書き、1MB を超えたら `.old` に回す。
 
 use std::io;
 use std::path::{Path, PathBuf};
