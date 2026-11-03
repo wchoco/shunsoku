@@ -70,6 +70,7 @@ capture = "Capture"
 regions = "Saved regions"
 scrap = "Scraps"
 scrap_ops = "Scrap actions"
+recipes = "Recipes"
 annotation = "Drawing"
 
 [settings_gui.general]
@@ -150,6 +151,18 @@ shortcut_label = "Shortcut:"
 mouse_label = "Mouse:"
 reset = "Reset to default"
 none = "None"
+
+[settings_gui.recipes]
+name = "Name"
+shortcut = "Shortcut"
+add = "Add"
+remove = "Remove"
+name_label = "Name:"
+steps_label = "Actions:"
+add_step = "Add"
+shortcut_label = "Shortcut:"
+# Name of a recipe added with "Add" (a number follows)
+default_name = "Recipe"
 
 [settings_gui.mark]
 unset = "Not set"
