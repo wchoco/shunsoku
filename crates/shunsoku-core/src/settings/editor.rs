@@ -56,6 +56,9 @@ impl Mark {
             Mark::Problem(Problem::Overlap(_)) => "settings_gui.mark.overlap",
             Mark::Problem(Problem::EmptyName) => "settings_gui.mark.empty_name",
             Mark::Problem(Problem::DuplicateName) => "settings_gui.mark.duplicate_name",
+            Mark::Problem(Problem::NoSteps) => "settings_gui.mark.no_steps",
+            Mark::Problem(Problem::NotAStep) => "settings_gui.mark.not_a_step",
+            Mark::Problem(Problem::CloseNotLast) => "settings_gui.mark.close_not_last",
         }
     }
 }
@@ -314,7 +317,11 @@ fn chord_of(settings: &Settings, item: &SettingsItem) -> Option<Chord> {
         SettingsItem::ActiveWindowCaptureHotkey => settings.hotkeys.active_window_capture,
         SettingsItem::RegionHotkey(i) => settings.regions.get(*i).and_then(|r| r.hotkey),
         SettingsItem::Shortcut(id) => settings.shortcuts.get(id).copied().flatten(),
-        SettingsItem::Mouse(_) | SettingsItem::RegionName(_) => None,
+        SettingsItem::RecipeShortcut(i) => settings.recipes.get(*i).and_then(|r| r.shortcut),
+        SettingsItem::Mouse(_)
+        | SettingsItem::RegionName(_)
+        | SettingsItem::RecipeName(_)
+        | SettingsItem::RecipeSteps(_) => None,
     }
 }
 
@@ -331,7 +338,11 @@ fn chord_slot<'a>(
         }
         SettingsItem::RegionHotkey(i) => settings.regions.get_mut(*i).map(|r| &mut r.hotkey),
         SettingsItem::Shortcut(id) => Some(settings.shortcuts.entry(id.clone()).or_default()),
-        SettingsItem::Mouse(_) | SettingsItem::RegionName(_) => None,
+        SettingsItem::RecipeShortcut(i) => settings.recipes.get_mut(*i).map(|r| &mut r.shortcut),
+        SettingsItem::Mouse(_)
+        | SettingsItem::RegionName(_)
+        | SettingsItem::RecipeName(_)
+        | SettingsItem::RecipeSteps(_) => None,
     }
 }
 

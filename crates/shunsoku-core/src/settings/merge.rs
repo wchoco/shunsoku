@@ -87,6 +87,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         selection,
         log_level,
         regions,
+        recipes,
     } = ours;
     let General {
         language,
@@ -179,6 +180,8 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         selection.crosshair_color
     );
     value!("log_level", log_level, log_level);
+    // レシピは並び全体を 1 つの値として突き合わせる
+    value!("recipes", recipes, recipes);
     for (id, changed, both) in take_map(&base.shortcuts, shortcuts, &mut out.shortcuts) {
         m(Field::Shortcut(id), changed, both);
     }

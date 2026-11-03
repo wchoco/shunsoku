@@ -159,6 +159,9 @@ overlap = "Overlaps a shortcut (the hotkey wins)"
 not_registered = "Could not register (another app may be using it)"
 empty_name = "The name is empty"
 duplicate_name = "The name is used twice"
+no_steps = "No operations"
+not_a_step = "Has an operation that cannot go in a recipe"
+close_not_last = "Close can only be the last operation"
 
 [hotkey]
 failed = "Could not register these hotkeys (another app may be using them): "

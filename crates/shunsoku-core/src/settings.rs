@@ -79,7 +79,10 @@ use toml_edit::{DocumentMut, Item, TableLike};
 use crate::geometry::Rect;
 use crate::i18n::Language;
 use crate::keys::Chord;
-use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, Shortcuts};
+use crate::recipe::{self, Recipe};
+use crate::scrap::ops::{
+    MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, ShortcutOwner, Shortcuts,
+};
 use crate::selection::Mode;
 
 pub mod columns;
@@ -133,6 +136,8 @@ pub struct Settings {
     pub log_level: LogLevel,
     /// 定型領域（`[[regions]]`）。ファイルの並び順。
     pub regions: Vec<Region>,
+    /// レシピ（`[[recipes]]`）。ファイルの並び順。中身の検査（`recipe::plan`）はまだしていない。
+    pub recipes: Vec<Recipe>,
 }
 
 impl Settings {
@@ -566,6 +571,12 @@ pub enum SettingsItem {
     RegionHotkey(usize),
     /// 定型領域の名前。`Settings::regions` の中の位置。
     RegionName(usize),
+    /// レシピの名前。`Settings::recipes` の中の位置。
+    RecipeName(usize),
+    /// レシピの操作の並び。`Settings::recipes` の中の位置。
+    RecipeSteps(usize),
+    /// レシピのショートカット。`Settings::recipes` の中の位置。
+    RecipeShortcut(usize),
 }
 
 impl From<HotkeyAction> for SettingsItem {
@@ -592,6 +603,9 @@ impl std::fmt::Display for SettingsItem {
             SettingsItem::Mouse(id) => write!(f, "mouse.{id}"),
             SettingsItem::RegionHotkey(i) => write!(f, "regions[{}].hotkey", i + 1),
             SettingsItem::RegionName(i) => write!(f, "regions[{}].name", i + 1),
+            SettingsItem::RecipeName(i) => write!(f, "recipes[{}].name", i + 1),
+            SettingsItem::RecipeSteps(i) => write!(f, "recipes[{}].steps", i + 1),
+            SettingsItem::RecipeShortcut(i) => write!(f, "recipes[{}].shortcut", i + 1),
         }
     }
 }
@@ -615,10 +629,16 @@ pub enum Problem {
     MouseConflict(MouseGesture),
     /// ホットキーとショートカットの重なり。警告だけ。
     Overlap(Chord),
-    /// 定型領域の名前が空。
+    /// 定型領域かレシピの名前が空。
     EmptyName,
-    /// 定型領域の名前がほかの定型領域と同じ。
+    /// 定型領域かレシピの名前が、ほかの定型領域（レシピならほかのレシピ）と同じ。
     DuplicateName,
+    /// レシピの操作の並びが空。
+    NoSteps,
+    /// レシピに入れられない操作がある。
+    NotAStep,
+    /// レシピの `close` が最後以外にある。
+    CloseNotLast,
 }
 
 impl Problem {
@@ -701,6 +721,23 @@ pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
             problem,
         });
     }
+    let mut recipe_issues: Vec<ValidationIssue> = recipe::plan(&settings.recipes, OPERATIONS)
+        .problems
+        .iter()
+        .map(|(i, problem)| ValidationIssue {
+            item: recipe_problem_item(*i, problem),
+            problem: match problem {
+                recipe::Problem::EmptyName => Problem::EmptyName,
+                recipe::Problem::DuplicateName => Problem::DuplicateName,
+                recipe::Problem::NoSteps => Problem::NoSteps,
+                recipe::Problem::NotAStep(_) => Problem::NotAStep,
+                recipe::Problem::CloseNotLast => Problem::CloseNotLast,
+            },
+        })
+        .collect();
+    // 入れられない操作がいくつあっても、欄には 1 つだけ出す
+    recipe_issues.dedup();
+    issues.extend(recipe_issues);
     issues
 }
 
@@ -737,24 +774,38 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
             .filter_map(|action| Some((settings.hotkeys.get(action)?, action)))
             .chain(region_hotkeys),
     );
-    let shortcuts = Shortcuts::new(ops, &settings.shortcuts);
-    let shortcut_item = |id: &str| SettingsItem::Shortcut(id.to_owned());
+    let recipes = recipe::plan(&settings.recipes, ops);
+    let shortcuts = Shortcuts::with_recipes(ops, &settings.shortcuts, &recipes.plans);
+    let shortcut_item = |owner: ShortcutOwner| match owner {
+        ShortcutOwner::Operation(id) => SettingsItem::Shortcut(id.to_owned()),
+        ShortcutOwner::Recipe(i) => SettingsItem::RecipeShortcut(i),
+    };
     let hotkey_item = SettingsItem::from;
 
     let mut issues: Vec<SettingsIssue> = shortcuts
         .ignored_overrides()
         .iter()
         .map(|id| SettingsIssue::Invalid {
-            item: shortcut_item(id).to_string(),
+            item: SettingsItem::Shortcut(id.clone()).to_string(),
         })
         .collect();
+    // 問題のあるレシピは、`[shortcuts]` で知らない操作名を書いたときと同じく、項目名だけを知らせて使わない
+    let mut recipe_items: Vec<SettingsItem> = recipes
+        .problems
+        .iter()
+        .map(|(i, problem)| recipe_problem_item(*i, problem))
+        .collect();
+    recipe_items.dedup();
+    issues.extend(recipe_items.iter().map(|item| SettingsIssue::Invalid {
+        item: item.to_string(),
+    }));
     issues.extend(
         shortcuts
             .conflicts()
             .iter()
             .map(|c| SettingsIssue::Conflict {
                 chord: c.chord,
-                items: c.owners.iter().map(|id| shortcut_item(id)).collect(),
+                items: c.owners.iter().map(|&owner| shortcut_item(owner)).collect(),
             }),
     );
     issues.extend(hotkeys.conflicts.iter().map(|c| SettingsIssue::Conflict {
@@ -762,11 +813,11 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
         items: c.owners.iter().map(|&a| hotkey_item(a)).collect(),
     }));
     for (&chord, &action) in &hotkeys.bound {
-        if let Some(op) = shortcuts.operation(chord) {
+        if let Some(owner) = shortcuts.owner(chord) {
             issues.push(SettingsIssue::Overlap {
                 chord,
                 hotkey: hotkey_item(action),
-                shortcut: shortcut_item(op.id),
+                shortcut: shortcut_item(owner),
             });
         }
     }
@@ -797,12 +848,21 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
     }
 }
 
+/// レシピの問題が載る欄。
+fn recipe_problem_item(index: usize, problem: &recipe::Problem) -> SettingsItem {
+    if problem.is_about_name() {
+        SettingsItem::RecipeName(index)
+    } else {
+        SettingsItem::RecipeSteps(index)
+    }
+}
+
 /// 読み込み直しで変わった部分（`diff`）。`app` はこれを見て、変わったものだけを反映し直す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SettingsChanges {
     /// `[hotkeys]` か、定型領域のホットキー（位置ごと）。ホットキーを登録し直す。
     pub hotkeys: bool,
-    /// `[shortcuts]`。ショートカットの対応表とメニューを作り直す。
+    /// `[shortcuts]` か `[[recipes]]`。ショートカットの対応表とメニューを作り直す。
     pub shortcuts: bool,
     /// `[mouse]`。マウスの対応表を作り直す。
     pub mouse: bool,
@@ -833,7 +893,7 @@ impl SettingsChanges {
 pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
     SettingsChanges {
         hotkeys: old.hotkeys != new.hotkeys || region_hotkeys(old) != region_hotkeys(new),
-        shortcuts: old.shortcuts != new.shortcuts,
+        shortcuts: old.shortcuts != new.shortcuts || old.recipes != new.recipes,
         mouse: old.mouse != new.mouse,
         save: old.general.save_dir != new.general.save_dir
             || old.general.file_name_template != new.general.file_name_template,
@@ -982,6 +1042,7 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
 
     s.regions = regions(root, &mut r);
+    s.recipes = recipes(root, &mut r);
 
     (s, r.issues)
 }
@@ -1050,6 +1111,45 @@ fn read_regions_at(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(us
         ));
     }
     regions
+}
+
+/// `[[recipes]]` を読む。名前か操作の並びが読めないレシピは捨てる。ショートカットが読めなければ割り当てなしにする。
+/// 項目名は `recipes[N].key`（N は 1 から）。空の名前・空の並び・入れられない操作などの中身の問題は、ここでは
+/// 見ない（`recipe::plan` が見る。設定 GUI で直せるように、書いたまま残す）。
+fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
+    let Some(item) = root.get("recipes") else {
+        return Vec::new();
+    };
+    let Some(tables) = item.as_array_of_tables() else {
+        r.invalid("recipes");
+        return Vec::new();
+    };
+    let mut recipes = Vec::new();
+    for (i, table) in tables.iter().enumerate() {
+        let path = format!("recipes[{}]", i + 1);
+        let name = r.required(table, &path, "name", |i| i.as_str().map(str::to_owned));
+        let steps = r.required(table, &path, "steps", recipe_steps);
+        let shortcut = r
+            .value(Some(table), &path, "shortcut", optional_chord)
+            .flatten();
+        let (Some(name), Some(steps)) = (name, steps) else {
+            continue;
+        };
+        recipes.push(Recipe {
+            name,
+            steps,
+            shortcut,
+        });
+    }
+    recipes
+}
+
+/// レシピの操作の並び。文字列の配列。
+fn recipe_steps(item: &Item) -> Option<Vec<String>> {
+    item.as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// 定型領域の範囲（`x` / `y` / `width` / `height`）。どれかが読めなければ None。
@@ -1382,6 +1482,7 @@ shadow = false
                 selection: SelectionScreen::default(),
                 log_level: LogLevel::Debug,
                 regions: Vec::new(),
+                recipes: Vec::new(),
             }
         );
     }
