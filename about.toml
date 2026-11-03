@@ -1,0 +1,18 @@
+# cargo-about の設定。リリースの workflow（.github/workflows/release.yml）が、zip に入れる
+# THIRD-PARTY-LICENSES.md を about.hbs から作る。出力はリポジトリにコミットしない。
+
+# 配る exe は x86_64-pc-windows-msvc だけ。ほかの target でだけ使うクレートは載せない。
+targets = ["x86_64-pc-windows-msvc"]
+ignore-dev-dependencies = true
+# workspace のクレート（publish = false）は shunsoku そのもので、LICENSE に書いてある。
+private = { ignore = true }
+
+# 依存のライセンスがこの一覧に無いものだけになったら、生成が失敗する。足すときは中身を確かめる。
+accepted = [
+    "0BSD",
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
