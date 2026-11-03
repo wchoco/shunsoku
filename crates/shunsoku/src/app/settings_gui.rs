@@ -1,6 +1,8 @@
 //! 設定 GUI（`settings_dialog`）と `App` をつなぐ。
 //!
-//! - 開くのは `open`（トレイの「設定…」、2 つ目のプロセスの登録メッセージ）。開いていれば前に出すだけ。ダイアログは
+//! - 開くのは `open`（トレイの「設定…」、2 つ目のプロセスの登録メッセージ）と、範囲選択キャプチャのホットキーが
+//!   未設定のまま起動したときの `open_for_unset_hotkey`（その欄にフォーカスを置く）。開いていれば前に出すだけ。
+//!   未設定のまま閉じたら（キャンセル）、通知で知らせる（`closed`）。ダイアログは
 //!   `App` を借りずに作り（作る間にダイアログ プロシージャが呼ばれるため）、できたら `App::settings_gui` に置く。
 //! - 写し（core の `Editor`）は `App::settings_gui` が持つ。欄に出すとき（`refresh`）は写しを写してから、借りずに出す。
 //! - 欄にキーが入ったら（`EN_CHANGE`）写しの項目を変え、印とボタンを出し直す。
@@ -16,6 +18,7 @@ use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use shunsoku_core::settings::editor::Editor;
+use shunsoku_core::settings::{SettingsItem, unset};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{NMHDR, TCN_SELCHANGE};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
@@ -28,8 +31,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 use super::{
-    App, EXIT_PANIC, WM_APP_SETTINGS_FOCUS, adopt_settings, log_failed, notify_user,
-    register_hotkeys, text, with_app, write_settings,
+    App, EXIT_PANIC, Moment, WM_APP_SETTINGS_FOCUS, adopt_settings, log_failed, notify_user,
+    register_hotkeys, settings_notice, text, with_app, write_settings,
 };
 use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field};
 use crate::{notify, panic_hook};
@@ -57,6 +60,16 @@ pub(super) fn is_dialog_message(msg: &MSG) -> bool {
 
 /// 設定 GUI を開く（`page` が None なら最初のタブ）。開いていれば前に出す。
 pub(super) fn open(page: Option<Page>) {
+    open_with(page, None);
+}
+
+/// 範囲選択キャプチャのホットキーが未設定のまま起動した: 「キャプチャ」タブで開き、その欄にフォーカスを置く。
+pub(super) fn open_for_unset_hotkey() {
+    open_with(Some(Page::Capture), Some(SettingsItem::SelectCaptureHotkey));
+}
+
+/// 設定 GUI を `page` のタブで開き、`focus` の欄（None ならタブ）にフォーカスを置く。開いていれば前に出す。
+fn open_with(page: Option<Page>, focus: Option<SettingsItem>) {
     let Some((existing, module, settings, unregistered)) = with_app(|app| {
         (
             app.settings_gui.as_ref().map(|gui| gui.hwnd),
@@ -72,6 +85,17 @@ pub(super) fn open(page: Option<Page>) {
             settings_dialog::show_page(hwnd, page);
         }
         bring_to_front(hwnd);
+        if let Some(item) = focus {
+            let field = with_app(|app| {
+                app.settings_gui
+                    .as_ref()
+                    .and_then(|gui| field_of(gui, &item))
+            })
+            .flatten();
+            if let Some(field) = field {
+                set_focus(hwnd, field);
+            }
+        }
         return;
     }
     // ダイアログを作る間にプロシージャが呼ばれるので、借りずに作る
@@ -84,6 +108,9 @@ pub(super) fn open(page: Option<Page>) {
             }
         };
     let hwnd = dialog.hwnd;
+    let focus = focus
+        .and_then(|item| dialog.rows.iter().find(|row| row.item == item))
+        .map_or(ID_TAB, |row| row.field);
     let mut editor = Editor::new(settings.clone());
     // 起動時などに登録できなかったホットキーも印にする
     editor.applied(settings, unregistered);
@@ -101,20 +128,37 @@ pub(super) fn open(page: Option<Page>) {
     }
     DIALOG.set(Some(hwnd));
     refresh(hwnd);
-    // SAFETY: 自分のダイアログ。フォーカスはタブに置く（開いただけでホットキーを外さない）
+    // SAFETY: 自分のダイアログ
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
-        if let Some(tab) = settings_dialog::item(hwnd, ID_TAB) {
+    }
+    // 既定ではタブに置く（開いただけでホットキーを外さない）。欄に置けば、欄のフォーカスでホットキーを外す
+    set_focus(hwnd, focus);
+    log::info!("settings GUI opened");
+}
+
+/// 写しの項目 `item` の欄の ID。
+fn field_of(gui: &SettingsGui, item: &SettingsItem) -> Option<i32> {
+    gui.rows
+        .iter()
+        .find(|row| &row.item == item)
+        .map(|row| row.field)
+}
+
+/// ダイアログの中の ID `id` のコントロールにフォーカスを置く。
+fn set_focus(hwnd: HWND, id: i32) {
+    if let Some(control) = settings_dialog::item(hwnd, id) {
+        // SAFETY: 自分のダイアログと、その子のコントロール
+        unsafe {
             SendMessageW(
                 hwnd,
                 WM_NEXTDLGCTL,
-                Some(WPARAM(tab.0 as usize)),
+                Some(WPARAM(control.0 as usize)),
                 Some(LPARAM(1)),
             );
         }
     }
-    log::info!("settings GUI opened");
 }
 
 fn bring_to_front(hwnd: HWND) {
@@ -317,14 +361,23 @@ fn resume_hotkeys(app: &mut App) {
     log::info!("hotkeys registered again");
 }
 
-/// ダイアログが壊れた。
+/// ダイアログが壊れた。範囲選択キャプチャのホットキーが未設定のまま（キャンセルで）閉じたら、通知で知らせる。
 fn closed() {
     DIALOG.set(None);
-    with_app(|app| {
+    let notice = with_app(|app| {
         app.settings_gui = None;
         if app.hotkeys_suspended {
             resume_hotkeys(app);
         }
-    });
+        if unset::prompt(unset::When::GuiClosed, &app.settings) == Some(unset::Prompt::Notify) {
+            settings_notice(Moment::Reload, &[], &[], true, app.settings_path.as_deref())
+        } else {
+            None
+        }
+    })
+    .flatten();
     log::info!("settings GUI closed");
+    if let Some((level, body)) = notice {
+        notify_user(level, &body);
+    }
 }

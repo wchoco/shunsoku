@@ -79,6 +79,7 @@ use crate::selection::Mode;
 
 pub mod editor;
 mod location;
+pub mod unset;
 mod write;
 pub use location::{SettingsLocation, locate};
 pub use write::{OwnWrites, rewrite, write};
