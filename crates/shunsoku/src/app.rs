@@ -154,6 +154,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 mod cli;
 mod settings_gui;
+#[cfg(test)]
+mod tests;
 
 use crate::{
     autostart, clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook,
@@ -636,7 +638,16 @@ fn locate_settings() -> Option<settings::SettingsLocation> {
     let exe = std::env::current_exe().ok();
     let exe_dir = exe.as_deref().and_then(Path::parent);
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-    settings::locate(exe_dir, appdata.as_deref(), Path::is_file)
+    locate_settings_at(exe_dir, appdata.as_deref())
+}
+
+/// exe のフォルダ `exe_dir` と `%APPDATA%`（`appdata`）から、設定ファイルの場所を決める。ファイルの有無は
+/// 実際のファイルで確かめる。
+fn locate_settings_at(
+    exe_dir: Option<&Path>,
+    appdata: Option<&Path>,
+) -> Option<settings::SettingsLocation> {
+    settings::locate(exe_dir, appdata, Path::is_file)
 }
 
 /// 常駐本体を動かし、終了コードを返す。
@@ -3712,6 +3723,21 @@ fn write_settings(
     app: &mut App,
     new: &Settings,
 ) -> std::result::Result<(), settings::WriteFailure> {
+    let path = app
+        .settings_path
+        .clone()
+        .ok_or(settings::WriteFailure::NoLocation)?;
+    write_settings_file(&path, new, &mut app.own_writes)?;
+    app.settings = new.as_written();
+    Ok(())
+}
+
+/// `write_settings` のうち、ファイルを書く部分。書いた中身を `own_writes` に覚える。
+fn write_settings_file(
+    path: &Path,
+    new: &Settings,
+    own_writes: &mut settings::OwnWrites,
+) -> std::result::Result<(), settings::WriteFailure> {
     use settings::WriteFailure;
     // 通知には断られたファイルと OS の文言だけを出す（`WriteFailure::detail`）。どの段階で断られたかはログに残す
     let refused_by_os = |stage: &str, path: &std::path::Path, e: std::io::Error| {
@@ -3724,11 +3750,10 @@ fn write_settings(
             error: e.to_string(),
         }
     };
-    let path = app.settings_path.clone().ok_or(WriteFailure::NoLocation)?;
-    let src = match std::fs::read_to_string(&path) {
+    let src = match std::fs::read_to_string(path) {
         Ok(src) => src,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(refused_by_os("read back", &path, e)),
+        Err(e) => return Err(refused_by_os("read back", path, e)),
     };
     let text = settings::rewrite(&src, new).ok_or_else(|| WriteFailure::NotToml {
         path: path.display().to_string(),
@@ -3739,14 +3764,13 @@ fn write_settings(
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, &text).map_err(|e| refused_by_os("write", &tmp, e))?;
     // 名前を変える前に覚える（監視の知らせは UI スレッドのこの関数が返ってから処理されるが、念のため）
-    app.own_writes.wrote(&text);
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        app.own_writes.forget();
+    own_writes.wrote(&text);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        own_writes.forget();
         let _ = std::fs::remove_file(&tmp);
-        return Err(refused_by_os("replace", &path, e));
+        return Err(refused_by_os("replace", path, e));
     }
     log::info!("settings written to {}", path.display());
-    app.settings = new.as_written();
     Ok(())
 }
 

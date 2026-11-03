@@ -43,6 +43,19 @@ scripts/win-screenshot.sh <out.png> [x y width height]   # 範囲は仮想スク
 - 出力は scratchpad に置く。リポジトリには入れない。
 - スクラップを出す・ドラッグするなどの操作は `SendInput` で送る。手本は `tools/perf-harness/src/measure.rs` の `drag` と `send_hotkey`。
 
+## 実機でだけ走らせるテスト
+
+ユーザーのレジストリやデスクトップに触れるテストには `#[ignore]` を付けてあり、CI では走らない。`docs/manual-checks.md` で「自動（実機）」の項目がそれ。通しの前と、そのテストの辺りを変えたときに、実機で 1 回走らせる。
+
+```sh
+# 2. と同じく Windows 側の cargo.exe で、CARGO_TARGET_DIR を NTFS に置いて
+cargo.exe test --workspace -- --ignored
+```
+
+- 値の名前は試験用のもの（`shunsoku-test-<pid>`）だけを使い、終わったら（落ちても）消す。ユーザーの登録（`shunsoku`）には触れない。
+- 走らせる前と後で `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run` と `%APPDATA%\shunsoku` の一覧を控え、同じであることを確かめる。
+- `#[ignore]` の付かない Windows のテストも、ユーザーの環境は変えない。`%APPDATA%` や exe のフォルダには `%TEMP%` の下に作った試験用のフォルダを渡し、終わったら消す。
+
 ## Win32 の落とし穴
 
 実装で踏んだもの。該当する API を触るときに読む。
