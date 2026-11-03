@@ -20,6 +20,7 @@
 //! [general]
 //! save_dir = 'D:\shots'                        # 既定: ピクチャ フォルダの下の shunsoku
 //! file_name_template = "shunsoku_{date}-{time}"
+//! autostart = false                            # サインインしたときに常駐する（HKCU の Run キーに登録）
 //! notifications = true                         # false で止まるのは成功の通知だけ
 //! trash_limit = 10                             # ごみ箱の上限（0〜100 件）。0 なら閉じたらすぐに破棄
 //! dpi_scaling = "keep_pixels"                  # DPI の違うモニタへ動かしたとき: keep_pixels（画素を等倍に保つ）
@@ -176,6 +177,9 @@ pub struct General {
     pub save_dir: Option<PathBuf>,
     /// 全体のファイル名テンプレート。
     pub file_name_template: String,
+    /// 自動起動。Windows にサインインしたときに常駐する。正本はこの値で、起動と適用のときに Run キーを
+    /// 合わせる（`autostart`）。
+    pub autostart: bool,
     /// 通知。オフで止めるのは成功の通知だけで、エラーと警告は常に出す（spec #32）。
     pub notifications: bool,
     /// ごみ箱の上限（件）。0 なら閉じたらすぐに破棄する。
@@ -191,6 +195,7 @@ impl Default for General {
         General {
             save_dir: None,
             file_name_template: DEFAULT_FILE_NAME_TEMPLATE.to_owned(),
+            autostart: false,
             notifications: true,
             trash_limit: DEFAULT_TRASH_LIMIT,
             dpi_scaling: DpiScaling::default(),
@@ -729,6 +734,8 @@ pub struct SettingsChanges {
     pub mouse: bool,
     /// 全体の保存先かファイル名テンプレート。次の保存から使う。
     pub save: bool,
+    /// 自動起動。Run キーを設定に合わせ直す。
+    pub autostart: bool,
     /// 通知のオン/オフ。
     pub notifications: bool,
     /// ごみ箱の上限。下げたら超えた分を古いものから捨てる。
@@ -754,6 +761,7 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
         mouse: old.mouse != new.mouse,
         save: old.general.save_dir != new.general.save_dir
             || old.general.file_name_template != new.general.file_name_template,
+        autostart: old.general.autostart != new.general.autostart,
         notifications: old.general.notifications != new.general.notifications,
         trash: old.general.trash_limit != new.general.trash_limit,
         appearance: old.scrap != new.scrap,
@@ -800,6 +808,9 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
     if let Some(t) = r.value(general, "general", "file_name_template", non_empty_str) {
         s.general.file_name_template = t;
+    }
+    if let Some(on) = r.value(general, "general", "autostart", Item::as_bool) {
+        s.general.autostart = on;
     }
     if let Some(on) = r.value(general, "general", "notifications", Item::as_bool) {
         s.general.notifications = on;
@@ -1220,6 +1231,7 @@ shadow = false
                 general: General {
                     save_dir: Some(PathBuf::from(r"D:\shots")),
                     file_name_template: "cap_{datetime:yyyy}".to_owned(),
+                    autostart: false,
                     notifications: false,
                     trash_limit: 3,
                     dpi_scaling: DpiScaling::KeepApparentSize,
@@ -1250,6 +1262,17 @@ shadow = false
                 regions: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn autostart_is_off_by_default_and_read_from_general() {
+        assert!(!Settings::default().general.autostart);
+        let (settings, issues) = load("version = 1\n[general]\nautostart = true\n");
+        assert_eq!(issues, vec![]);
+        assert!(settings.general.autostart);
+        let (settings, issues) = load("version = 1\n[general]\nautostart = \"yes\"\n");
+        assert_eq!(issues, vec![invalid("general.autostart")]);
+        assert!(!settings.general.autostart);
     }
 
     #[test]
@@ -1605,6 +1628,13 @@ a = 1
             changed(|s| s.general.file_name_template = "x_{date}".to_owned()),
             SettingsChanges {
                 save: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
+            changed(|s| s.general.autostart = true),
+            SettingsChanges {
+                autostart: true,
                 ..SettingsChanges::default()
             }
         );

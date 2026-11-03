@@ -42,7 +42,7 @@ use windows::core::PCWSTR;
 
 use super::{
     App, EXIT_PANIC, Moment, WM_APP_SETTINGS_FOCUS, adopt_settings, log_failed, notify_user,
-    register_hotkeys, settings_notice, text, with_app, write_settings,
+    register_hotkeys, settings_notice, sync_autostart, text, with_app, write_settings,
 };
 use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
 use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops};
@@ -516,6 +516,10 @@ fn apply(hwnd: HWND) -> bool {
         let _ = PostMessageW(Some(hwnd), WM_APP_SETTINGS_FOCUS, WPARAM(0), LPARAM(0));
     }
     refresh(hwnd);
+    if matches!(result, Some(Ok(_))) {
+        // 正本は設定ファイル。適用したら、変わっていなくても Run キーを合わせ直す
+        sync_autostart();
+    }
     match result {
         Some(Ok(all_registered)) => all_registered,
         Some(Err(e)) => {
