@@ -84,6 +84,7 @@ use std::time::Instant;
 use shunsoku_core::APP_NAME;
 use shunsoku_core::annotate::toolbar::{self, Button as ToolbarButton, Layout as ToolbarLayout};
 use shunsoku_core::annotate::{Carryover, EditInput, EditOutput, Style};
+use shunsoku_core::app_window;
 use shunsoku_core::capture::request::{
     self, CaptureMethod, CaptureRequest, OnSaveFailure, ReplyTo, SaveTarget, Source,
 };
@@ -154,6 +155,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 mod cli;
 mod settings_gui;
+#[cfg(test)]
+mod tests;
 
 use crate::{
     autostart, clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook,
@@ -164,8 +167,8 @@ use cli::{
     REPLIER, capture_rect, on_pipe_requests, reply, reply_cancelled, reply_failed, waiting_reply,
 };
 
-/// トレイのアイコンへの操作（`tray::event` で読む）。
-const WM_APP_TRAY: u32 = WM_APP + 1;
+/// トレイのアイコンへの操作（`tray::event` で読む）。道具も送るので、番号は `app_window` に置く。
+const WM_APP_TRAY: u32 = WM_APP + app_window::TRAY_MESSAGE_FROM_WM_APP;
 /// 環境変数 `SHUNSOKU_TEST_PANIC=ui` のとき、UI スレッドでパニックを起こす（手で確かめる用。デバッグ ビルドだけ）。
 #[cfg(debug_assertions)]
 const WM_APP_TEST_PANIC: u32 = WM_APP + 2;
@@ -186,7 +189,7 @@ const WM_APP_SETTINGS_FOCUS: u32 = WM_APP + 8;
 const WM_APP_SETTINGS_DPI: u32 = WM_APP + 9;
 
 /// 2 つのウィンドウのクラス名。2 つ目のプロセスはこの名前でメッセージ専用ウィンドウを探す。
-const CLASS_NAME: PCWSTR = w!("shunsoku.app");
+const CLASS_NAME: PCWSTR = PCWSTR(app_window::APP_CLASS_WIDE.as_ptr());
 /// 2 つ目のプロセスが送る登録メッセージの名前。
 const SECOND_INSTANCE_MESSAGE: PCWSTR = w!("shunsoku.SecondInstance");
 
@@ -636,7 +639,16 @@ fn locate_settings() -> Option<settings::SettingsLocation> {
     let exe = std::env::current_exe().ok();
     let exe_dir = exe.as_deref().and_then(Path::parent);
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-    settings::locate(exe_dir, appdata.as_deref(), Path::is_file)
+    locate_settings_at(exe_dir, appdata.as_deref())
+}
+
+/// exe のフォルダ `exe_dir` と `%APPDATA%`（`appdata`）から、設定ファイルの場所を決める。ファイルの有無は
+/// 実際のファイルで確かめる。
+fn locate_settings_at(
+    exe_dir: Option<&Path>,
+    appdata: Option<&Path>,
+) -> Option<settings::SettingsLocation> {
+    settings::locate(exe_dir, appdata, Path::is_file)
 }
 
 /// 常駐本体を動かし、終了コードを返す。
@@ -3712,6 +3724,21 @@ fn write_settings(
     app: &mut App,
     new: &Settings,
 ) -> std::result::Result<(), settings::WriteFailure> {
+    let path = app
+        .settings_path
+        .clone()
+        .ok_or(settings::WriteFailure::NoLocation)?;
+    write_settings_file(&path, new, &mut app.own_writes)?;
+    app.settings = new.as_written();
+    Ok(())
+}
+
+/// `write_settings` のうち、ファイルを書く部分。書いた中身を `own_writes` に覚える。
+fn write_settings_file(
+    path: &Path,
+    new: &Settings,
+    own_writes: &mut settings::OwnWrites,
+) -> std::result::Result<(), settings::WriteFailure> {
     use settings::WriteFailure;
     // 通知には断られたファイルと OS の文言だけを出す（`WriteFailure::detail`）。どの段階で断られたかはログに残す
     let refused_by_os = |stage: &str, path: &std::path::Path, e: std::io::Error| {
@@ -3724,11 +3751,10 @@ fn write_settings(
             error: e.to_string(),
         }
     };
-    let path = app.settings_path.clone().ok_or(WriteFailure::NoLocation)?;
-    let src = match std::fs::read_to_string(&path) {
+    let src = match std::fs::read_to_string(path) {
         Ok(src) => src,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(refused_by_os("read back", &path, e)),
+        Err(e) => return Err(refused_by_os("read back", path, e)),
     };
     let text = settings::rewrite(&src, new).ok_or_else(|| WriteFailure::NotToml {
         path: path.display().to_string(),
@@ -3739,14 +3765,13 @@ fn write_settings(
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, &text).map_err(|e| refused_by_os("write", &tmp, e))?;
     // 名前を変える前に覚える（監視の知らせは UI スレッドのこの関数が返ってから処理されるが、念のため）
-    app.own_writes.wrote(&text);
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        app.own_writes.forget();
+    own_writes.wrote(&text);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        own_writes.forget();
         let _ = std::fs::remove_file(&tmp);
-        return Err(refused_by_os("replace", &path, e));
+        return Err(refused_by_os("replace", path, e));
     }
     log::info!("settings written to {}", path.display());
-    app.settings = new.as_written();
     Ok(())
 }
 
