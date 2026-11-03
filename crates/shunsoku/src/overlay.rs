@@ -23,7 +23,7 @@ use shunsoku_core::geometry::{Point, Rect};
 use shunsoku_core::image::Fragment;
 use shunsoku_core::magnifier;
 use shunsoku_core::selection::{CursorShape, MonitorInfo, Part, Selection};
-use shunsoku_core::settings::Rgb;
+use shunsoku_core::settings::{DEFAULT_CROSSHAIR_COLOR, Rgb};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
@@ -259,7 +259,7 @@ impl Overlay {
             painter: None,
             banner: None,
             size_plus: size_plus.to_owned(),
-            crosshair_color: Rgb(0xFF, 0xFF, 0xFF),
+            crosshair_color: DEFAULT_CROSSHAIR_COLOR,
         };
         // 途中で失敗したら、overlay の drop で作った分を片付ける
         for shot in shots {
@@ -987,7 +987,7 @@ impl D2dTarget {
                 highlight_fill: context.CreateSolidColorBrush(&HIGHLIGHT_FILL, None)?,
                 // 色は描くたびに十字線の設定の色にする
                 crosshair: context
-                    .CreateSolidColorBrush(&rgb_color(Rgb(0xFF, 0xFF, 0xFF)), None)?,
+                    .CreateSolidColorBrush(&rgb_color(DEFAULT_CROSSHAIR_COLOR), None)?,
                 pixel: context.CreateSolidColorBrush(&MAGNIFIER_OUTSIDE, None)?,
                 _target: target,
                 context,

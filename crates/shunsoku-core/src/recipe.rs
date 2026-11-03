@@ -2,7 +2,7 @@
 
 use crate::keys::Chord;
 use crate::scrap::ScrapModel;
-use crate::scrap::ops::{Effect, OpContext, OperationDescriptor, OperationId};
+use crate::scrap::ops::{Effect, InRecipe, OpContext, OperationDescriptor, OperationId};
 
 /// 設定ファイルの `[[recipes]]` の 1 つ。中身の検査はまだしていない（書いたまま）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -12,12 +12,6 @@ pub struct Recipe {
     pub steps: Vec<String>,
     pub shortcut: Option<Chord>,
 }
-
-/// レシピに入れられない操作。`trim` と `annotate` はモードを切り替えて入力を奪う（ADR-0007）。
-const NOT_STEPS: &[OperationId] = &["trim", "annotate"];
-
-/// レシピの最後にだけ置ける操作。
-pub const CLOSE: OperationId = "close";
 
 /// 検査を通ったレシピ。ショートカットから実行できる。
 #[derive(Debug, Clone)]
@@ -38,9 +32,9 @@ pub enum Problem {
     DuplicateName,
     /// 操作の並びが空。
     NoSteps,
-    /// レシピに入れられない操作（表にない、引数を取る、`NOT_STEPS`、別のレシピ）。書いた id。
+    /// レシピに入れられない操作（表にない、`InRecipe::Never`、別のレシピ）。書いた id。
     NotAStep(String),
-    /// `close` が最後以外にある。
+    /// 最後にだけ置ける操作（`InRecipe::Last`。`close`）が最後以外にある。
     CloseNotLast,
 }
 
@@ -60,9 +54,15 @@ pub struct Checked {
     pub problems: Vec<(usize, Problem)>,
 }
 
-/// レシピに入れられる操作か。引数のない操作（ショートカットを持てるもの）のうち、`NOT_STEPS` でないもの。
+/// レシピに入れられる操作か。引数のない操作（ショートカットを持てるもの）のうち、`InRecipe::Never` でないもの。
 pub fn can_be_step(op: &OperationDescriptor) -> bool {
-    op.choices.is_none() && !op.drag_only && !NOT_STEPS.contains(&op.id)
+    op.takes_binding() && op.in_recipe != InRecipe::Never
+}
+
+/// 最後にだけ置ける操作（`InRecipe::Last`）の id か。`ops` は `plan` と同じ表。
+pub fn is_last_only(id: &str, ops: &[OperationDescriptor]) -> bool {
+    ops.iter()
+        .any(|op| op.id == id && op.in_recipe == InRecipe::Last)
 }
 
 /// レシピを検査し、`ops`（ふつうは `scrap::ops::OPERATIONS`）の行に結び付ける。同じ操作を 2 回以上入れるのは
@@ -91,7 +91,7 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
             }
         }
         if let Some((_, before_last)) = recipe.steps.split_last()
-            && before_last.iter().any(|id| id == CLOSE)
+            && before_last.iter().any(|id| is_last_only(id, ops))
         {
             problems.push(Problem::CloseNotLast);
         }

@@ -448,12 +448,16 @@ pub struct SelectionScreen {
     pub crosshair_color: Rgb,
 }
 
+/// 十字線の色の既定値（`[selection] crosshair_color`）。設定を読む前に描くとき（範囲選択の画面を開いた直後、
+/// 設定のないスクラップ）もこの色にする。
+pub const DEFAULT_CROSSHAIR_COLOR: Rgb = Rgb(0xFF, 0xFF, 0xFF);
+
 impl Default for SelectionScreen {
     fn default() -> SelectionScreen {
         SelectionScreen {
             mode: Mode::default(),
             crosshair: false,
-            crosshair_color: Rgb(0xFF, 0xFF, 0xFF),
+            crosshair_color: DEFAULT_CROSSHAIR_COLOR,
         }
     }
 }
@@ -2481,7 +2485,7 @@ width = 0
         let uncommented: String = SAMPLE
             .lines()
             .map(|line| match line.strip_prefix("# ") {
-                Some(rest @ "[[regions]]") => rest,
+                Some(rest @ ("[[regions]]" | "[[recipes]]")) => rest,
                 Some(rest)
                     if rest.split_once(" = ").is_some_and(|(key, _)| {
                         key.bytes()
@@ -2511,6 +2515,14 @@ width = 0
         );
         assert_eq!(names(&settings), vec!["ダッシュボード"]);
         assert_eq!(settings.regions[0].rect, Rect::new(0, 0, 800, 600));
+        assert_eq!(
+            settings.recipes,
+            vec![Recipe {
+                name: "コピーして閉じる".to_owned(),
+                steps: vec!["copy".to_owned(), "close".to_owned()],
+                shortcut: Some("Ctrl+Q".parse().unwrap()),
+            }]
+        );
     }
 
     fn named(names: &[&str]) -> Settings {

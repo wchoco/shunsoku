@@ -21,7 +21,7 @@ use super::{Problem, Region, Settings, SettingsItem, new_region};
 use crate::geometry::Rect;
 use crate::keys::Chord;
 use crate::recipe::{self, Recipe};
-use crate::scrap::ops::{BindingRow, MouseGesture, OPERATIONS, OperationDescriptor};
+use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationDescriptor};
 
 /// 設定 GUI の写し。
 #[derive(Debug, Clone)]
@@ -313,11 +313,14 @@ impl Editor {
         let Some(r) = self.draft.recipes.get(index) else {
             return Vec::new();
         };
-        let ends_with_close = r.steps.last().is_some_and(|id| id == recipe::CLOSE);
+        let ends_with_last_only = r
+            .steps
+            .last()
+            .is_some_and(|id| recipe::is_last_only(id, OPERATIONS));
         OPERATIONS
             .iter()
             .filter(|op| recipe::can_be_step(op))
-            .filter(|op| !(ends_with_close && op.id == recipe::CLOSE))
+            .filter(|op| !(ends_with_last_only && op.in_recipe == InRecipe::Last))
             .collect()
     }
 
@@ -325,7 +328,10 @@ impl Editor {
     /// だけ置けるため）。入れた位置を返す。`index` のレシピがなければ何もせず None。
     pub fn add_step(&mut self, index: usize, id: &str) -> Option<usize> {
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
-        let at = if steps.last().is_some_and(|s| s == recipe::CLOSE) {
+        let at = if steps
+            .last()
+            .is_some_and(|s| recipe::is_last_only(s, OPERATIONS))
+        {
             steps.len() - 1
         } else {
             steps.len()

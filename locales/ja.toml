@@ -173,7 +173,7 @@ add = "追加"
 remove = "削除"
 name_label = "名前:"
 steps_label = "操作:"
-add_step = "足す"
+add_step = "追加"
 shortcut_label = "ショートカット:"
 # 「追加」で足すレシピの名前（後ろに番号が付く）
 default_name = "レシピ"
