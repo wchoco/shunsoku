@@ -9,16 +9,17 @@
 //! - フォーカスを得た・失ったら、親に `WM_COMMAND`（`EN_SETFOCUS` / `EN_KILLFOCUS`）を送る。
 //! - コントロールで表せない組み合わせ（設定ファイルに書いた Win キー・PrintScreen）は、`set` で入れると文字で
 //!   描くだけにする（`WM_PAINT`）。キーを入れたら上書きする。
+//! - 値が空の間は、`set_placeholder` で入れた文字を灰色で描く（スクラップ操作の、上書きのない既定の一覧）。
 //! - IME は切り離す（変換中のキーが欄に届かなくなるため）。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use shunsoku_core::keys::{Chord, Modifiers};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DrawTextW,
-    EndPaint, FillRect, GetSysColor, GetSysColorBrush, HFONT, InvalidateRect, PAINTSTRUCT,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    DrawTextW, EndPaint, FillRect, GetSysColor, GetSysColorBrush, HFONT, InvalidateRect,
+    PAINTSTRUCT, SYS_COLOR_INDEX, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::HKM_SETHOTKEY;
 use windows::Win32::UI::Input::Ime::{HIMC, ImmAssociateContext};
@@ -37,12 +38,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const SUBCLASS_ID: usize = 1;
 
-/// 欄の値。サブクラスの参照データとして持つ。
-type State = Cell<Option<Chord>>;
+/// 欄の値と、空の間に描く文字。サブクラスの参照データとして持つ。
+#[derive(Default)]
+struct State {
+    chord: Cell<Option<Chord>>,
+    placeholder: RefCell<String>,
+}
 
 /// hot key control `hwnd` を入力欄にする。ダイアログを作った直後に 1 回呼ぶ。
 pub fn attach(hwnd: HWND) {
-    let state = Box::into_raw(Box::new(State::new(None)));
+    let state = Box::into_raw(Box::<State>::default());
     // SAFETY: state は WM_NCDESTROY で 1 回だけ戻す。IME の切り離しは自分のコントロールに対して
     unsafe {
         if !SetWindowSubclass(hwnd, Some(subclass), SUBCLASS_ID, state as usize).as_bool() {
@@ -61,7 +66,7 @@ pub fn is_field(hwnd: HWND) -> bool {
 
 /// 欄の値。入力欄でなければ None。
 pub fn value(hwnd: HWND) -> Option<Chord> {
-    state(hwnd).and_then(Cell::get)
+    state(hwnd).and_then(|s| s.chord.get())
 }
 
 /// 欄に `chord` を入れる。None は空（コントロールの「なし」）。コントロールで表せない組み合わせは文字で描く。
@@ -69,12 +74,26 @@ pub fn set(hwnd: HWND, chord: Option<Chord>) {
     let Some(state) = state(hwnd) else {
         return;
     };
-    state.set(chord);
+    state.chord.set(chord);
     let shown = chord.and_then(Chord::to_hotkey_control).unwrap_or(0);
     // SAFETY: 自分のコントロールへのメッセージ
     unsafe {
         SendMessageW(hwnd, HKM_SETHOTKEY, Some(WPARAM(usize::from(shown))), None);
         let _ = InvalidateRect(Some(hwnd), None, true);
+    }
+}
+
+/// 値が空の間に描く文字を `text` にする（空なら描かない）。
+pub fn set_placeholder(hwnd: HWND, text: &str) {
+    let Some(state) = state(hwnd) else {
+        return;
+    };
+    if *state.placeholder.borrow() != text {
+        *state.placeholder.borrow_mut() = text.to_owned();
+        // SAFETY: 自分のコントロールの描き直しを頼むだけ
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, true);
+        }
     }
 }
 
@@ -120,9 +139,9 @@ fn notify_parent(hwnd: HWND, code: u32) {
     }
 }
 
-/// コントロールで表せない値を文字で描く。
-fn paint_text(hwnd: HWND, chord: Chord) {
-    let mut text: Vec<u16> = chord.to_string().encode_utf16().collect();
+/// コントロールで表せない値や、空の間の文字 `text` を `color` で描く。
+fn paint_text(hwnd: HWND, text: &str, color: SYS_COLOR_INDEX) {
+    let mut text: Vec<u16> = text.encode_utf16().collect();
     // SAFETY: BeginPaint と EndPaint を対にする。フォントはコントロールのもの（ダイアログが持つ）
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -133,10 +152,7 @@ fn paint_text(hwnd: HWND, chord: Chord) {
         let font = HFONT(SendMessageW(hwnd, WM_GETFONT, None, None).0 as *mut _);
         let old = (!font.is_invalid()).then(|| SelectObject(dc, font.into()));
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(
-            dc,
-            windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_WINDOWTEXT)),
-        );
+        SetTextColor(dc, windows::Win32::Foundation::COLORREF(GetSysColor(color)));
         rect.left += 2;
         DrawTextW(
             dc,
@@ -185,9 +201,13 @@ unsafe extern "system" fn subclass(
             }
             WM_PAINT => {
                 let state = &*(data as *const State);
-                match state.get() {
+                match state.chord.get() {
                     Some(chord) if chord.to_hotkey_control().is_none() => {
-                        paint_text(hwnd, chord);
+                        paint_text(hwnd, &chord.to_string(), COLOR_WINDOWTEXT);
+                        LRESULT(0)
+                    }
+                    None if !state.placeholder.borrow().is_empty() => {
+                        paint_text(hwnd, &state.placeholder.borrow(), COLOR_GRAYTEXT);
                         LRESULT(0)
                     }
                     _ => DefSubclassProc(hwnd, msg, wparam, lparam),
