@@ -46,6 +46,8 @@ const LABEL_WIDTH: i16 = 55;
 const FIELD_X: i16 = LABEL_WIDTH + 3;
 const FIELD_WIDTH: i16 = 110;
 const RESET_WIDTH: i16 = 60;
+/// ショートカットの欄は「既定に戻す」の手前まで（既定が 3 つある操作も切れずに出るように）。
+const SHORTCUT_WIDTH: i16 = PAGE_WIDTH - RESET_WIDTH - 6 - FIELD_X;
 /// 一覧の列の幅（ダイアログ単位）。最後の列（印）は残り。
 const COLUMNS: [(&str, i16); 4] = [
     ("settings_gui.scrap_ops.operation", 80),
@@ -81,7 +83,7 @@ pub(super) fn build(b: &mut PageBuilder) {
         SettingsItem::Shortcut(first_row.op.id.to_owned()),
         FIELD_X,
         SHORTCUT_Y,
-        FIELD_WIDTH,
+        SHORTCUT_WIDTH,
     );
     let reset_text = (b.text)("settings_gui.scrap_ops.reset");
     let reset = b.control(
