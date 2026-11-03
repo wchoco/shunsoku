@@ -115,6 +115,18 @@ impl SettingsGui {
         self.entry.applying(field, text, readable)
     }
 
+    /// 「レシピ」タブのショートカットの欄が結ばれているレシピの位置。
+    fn bound_recipe(&self) -> Option<usize> {
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.field == recipes::shortcut_id())?;
+        match row.item {
+            SettingsItem::RecipeShortcut(i) => Some(i),
+            _ => None,
+        }
+    }
+
     /// 一覧の行で変わるキーの欄（ID `field`）を、設定の項目 `item` に結び直す。
     fn rebind_chord_row(&mut self, field: i32, item: SettingsItem) {
         if let Some(row) = self.rows.iter_mut().find(|r| r.field == field) {
@@ -898,19 +910,9 @@ fn on_region_selected(hwnd: HWND) {
 
 /// 「レシピ」タブのショートカットの欄が指しているレシピの位置（一覧を揃えて選ぶ行）。
 fn bound_recipe() -> usize {
-    with_app(|app| {
-        app.settings_gui.as_ref().and_then(|gui| {
-            gui.rows
-                .iter()
-                .find(|row| row.field == recipes::shortcut_id())
-                .and_then(|row| match row.item {
-                    SettingsItem::RecipeShortcut(i) => Some(i),
-                    _ => None,
-                })
-        })
-    })
-    .flatten()
-    .unwrap_or(0)
+    with_app(|app| app.settings_gui.as_ref()?.bound_recipe())
+        .flatten()
+        .unwrap_or(0)
 }
 
 /// 「レシピ」タブの一覧で行を選んだ。ショートカットの欄をそのレシピに結び直す。
@@ -936,6 +938,19 @@ fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
     let selected = recipes::selected(hwnd);
     let step = recipes::selected_step(hwnd);
     let in_range = |editor: &Editor| selected.filter(|&i| i < editor.draft().recipes.len());
+    // 選んでいるレシピの選んでいる手を `change(editor, レシピ, 手)` で変え、移った手を選ぶ
+    let change_step = |change: fn(&mut Editor, usize, usize) -> Option<usize>| {
+        let to = edit(hwnd, |editor| {
+            let i = in_range(editor)?;
+            let s = step.filter(|&s| s < editor.draft().recipes[i].steps.len())?;
+            change(editor, i, s)
+        })
+        .flatten();
+        if let Some(to) = to {
+            recipes::select_step(hwnd, to);
+        }
+        refresh(hwnd);
+    };
     match button {
         Button::Add => {
             let base = text("settings_gui.recipes.default_name");
@@ -951,22 +966,9 @@ fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
                 recipes::select(hwnd, index);
             }
         }
-        Button::StepUp | Button::StepDown | Button::StepRemove => {
-            let to = edit(hwnd, |editor| {
-                let i = in_range(editor)?;
-                let s = step.filter(|&s| s < editor.draft().recipes[i].steps.len())?;
-                match button {
-                    Button::StepUp => Some(editor.move_step(i, s, Move::Up)),
-                    Button::StepDown => Some(editor.move_step(i, s, Move::Down)),
-                    _ => editor.remove_step(i, s),
-                }
-            })
-            .flatten();
-            if let Some(to) = to {
-                recipes::select_step(hwnd, to);
-            }
-            refresh(hwnd);
-        }
+        Button::StepUp => change_step(|editor, i, s| Some(editor.move_step(i, s, Move::Up))),
+        Button::StepDown => change_step(|editor, i, s| Some(editor.move_step(i, s, Move::Down))),
+        Button::StepRemove => change_step(|editor, i, s| editor.remove_step(i, s)),
         Button::StepAdd => {
             let Some(id) = recipes::chosen_step(hwnd) else {
                 return;
