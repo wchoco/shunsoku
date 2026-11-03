@@ -136,6 +136,9 @@ pub struct Selection {
     adjusted: Option<Rect>,
     /// 調整の状態でつかんでいるもの。左ボタンを押している間だけ Some。
     grab: Option<Grab>,
+    /// 調整の状態で範囲の外を押した画素。押している間だけ Some。そこから動かしたら選び直し、動かさずに
+    /// 離したら今の範囲を残す（トリムと同じ）。
+    pressed_outside: Option<Point>,
     /// 定型領域の登録（`registering`）。
     registering: bool,
 }
@@ -183,6 +186,7 @@ impl Selection {
             crosshair: false,
             adjusted: None,
             grab: None,
+            pressed_outside: None,
             registering: false,
         }
     }
@@ -413,20 +417,23 @@ impl Selection {
                             start: rect,
                         })
                     }
-                    None => self.reselect(at),
+                    None => self.pressed_outside = Some(at),
                 }
             }
             Input::DoubleClick { at } => {
                 self.cursor = at;
                 match self.hit(rect, at) {
                     Some(_) => self.confirm(rect),
-                    None => self.reselect(at),
+                    // 範囲の外なら押したのと同じ
+                    None => self.pressed_outside = Some(at),
                 }
             }
             Input::Move { at } => {
                 self.cursor = at;
                 if let Some(grab) = self.grab {
                     self.adjusted = Some(grab.dragged(at, self.bounds()));
+                } else if let Some(from) = self.pressed_outside.filter(|&from| from != at) {
+                    self.reselect(from);
                 }
             }
             Input::Release {
@@ -434,6 +441,8 @@ impl Selection {
                 at,
             } => {
                 self.cursor = at;
+                // 範囲の外を動かさずに押して離しただけなら、今の範囲を残す
+                self.pressed_outside = None;
                 if let Some(grab) = self.grab.take() {
                     self.adjusted = Some(grab.dragged(at, self.bounds()));
                 }
@@ -463,10 +472,11 @@ impl Selection {
         }
     }
 
-    /// 調整の状態で範囲の外を押した。そこを始点に選び直す。
+    /// 調整の状態で範囲の外を押して動かした。押した画素を始点に選び直す。
     fn reselect(&mut self, at: Point) {
         self.adjusted = None;
         self.grab = None;
+        self.pressed_outside = None;
         self.anchor = Some(at);
         self.state = State::Selecting;
     }
@@ -546,6 +556,7 @@ impl Selection {
         self.anchor = None;
         self.adjusted = None;
         self.grab = None;
+        self.pressed_outside = None;
         self.state = State::Idle;
     }
 
@@ -1232,8 +1243,9 @@ mod tests {
             button: Button::Left,
             at: p(500, 500),
         });
-        assert_eq!(s.state(), State::Selecting);
+        assert_eq!(s.state(), State::Adjusting);
         s.handle(Input::Move { at: p(549, 529) });
+        assert_eq!(s.state(), State::Selecting);
         assert_eq!(s.rect(), Some(Rect::new(500, 500, 550, 530)));
         assert_eq!(
             s.handle(Input::Release {
@@ -1251,9 +1263,24 @@ mod tests {
     }
 
     #[test]
-    fn a_click_outside_the_adjusted_range_cancels() {
+    fn a_click_outside_the_adjusted_range_keeps_the_range() {
         let mut s = adjusting();
-        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Cancelled);
+        let before = s.rect();
+        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Adjusting);
+        assert_eq!(s.rect(), before);
+    }
+
+    #[test]
+    fn a_double_click_outside_the_adjusted_range_keeps_the_range() {
+        let mut s = adjusting();
+        let before = s.rect();
+        s.handle(Input::DoubleClick { at: p(500, 500) });
+        s.handle(Input::Release {
+            button: Button::Left,
+            at: p(500, 500),
+        });
+        assert_eq!(s.state(), State::Adjusting);
+        assert_eq!(s.rect(), before);
     }
 
     #[test]
