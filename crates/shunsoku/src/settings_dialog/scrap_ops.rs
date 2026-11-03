@@ -14,22 +14,17 @@
 
 use shunsoku_core::scrap::ops::{BindingRow, MouseGesture, OPERATIONS, binding_rows};
 use shunsoku_core::settings::SettingsItem;
-use shunsoku_core::settings::columns::column_widths;
 use shunsoku_core::settings::editor::{Editor, ShortcutValue};
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_GETCOLUMNW, LVM_GETCOLUMNWIDTH,
-    LVM_GETITEMCOUNT, LVM_GETSTRINGWIDTHW, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER,
-    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, LVSCW_AUTOSIZE,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_GETITEMCOUNT, LVM_INSERTCOLUMNW,
+    LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
 };
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBS_DROPDOWNLIST,
-    GetClientRect, SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WM_SETREDRAW, WS_BORDER,
-    WS_TABSTOP, WS_VSCROLL,
+    SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -63,8 +58,6 @@ const COLUMNS: [&str; 4] = [
     "settings_gui.scrap_ops.mouse",
     "settings_gui.scrap_ops.mark",
 ];
-/// 見出しの文言の左右の余白の合計（96 DPI のピクセル）。
-const HEADER_PADDING: i32 = 14;
 
 /// タブのコントロールを置く。
 pub(super) fn build(b: &mut PageBuilder) {
@@ -345,59 +338,5 @@ pub fn fit_columns(hwnd: HWND) {
     let Some(list) = item(hwnd, list_id()) else {
         return;
     };
-    let mut client = RECT::default();
-    // SAFETY: 自分のダイアログの一覧へのメッセージ。バッファと構造体は呼び出しの間生きている
-    let needed: Vec<i32> = unsafe {
-        let _ = GetClientRect(list, &mut client);
-        let padding = HEADER_PADDING * GetDpiForWindow(list) as i32 / 96;
-        SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), None);
-        (0..COLUMNS.len())
-            .map(|i| {
-                // 行の文言の幅は一覧に測らせる（列の余白込み）
-                SendMessageW(
-                    list,
-                    LVM_SETCOLUMNWIDTH,
-                    Some(WPARAM(i)),
-                    Some(LPARAM(LVSCW_AUTOSIZE as isize)),
-                );
-                let rows = SendMessageW(list, LVM_GETCOLUMNWIDTH, Some(WPARAM(i)), None).0 as i32;
-                let mut label = [0u16; 64];
-                let mut column = LVCOLUMNW {
-                    mask: LVCF_TEXT,
-                    pszText: PWSTR(label.as_mut_ptr()),
-                    cchTextMax: label.len() as i32,
-                    ..Default::default()
-                };
-                SendMessageW(
-                    list,
-                    LVM_GETCOLUMNW,
-                    Some(WPARAM(i)),
-                    Some(LPARAM(&mut column as *mut LVCOLUMNW as isize)),
-                );
-                let header = SendMessageW(
-                    list,
-                    LVM_GETSTRINGWIDTHW,
-                    None,
-                    Some(LPARAM(label.as_ptr() as isize)),
-                )
-                .0 as i32
-                    + padding;
-                rows.max(header)
-            })
-            .collect()
-    };
-    let widths = column_widths(&needed, client.right - client.left);
-    // SAFETY: 自分のダイアログの一覧へのメッセージ
-    unsafe {
-        for (i, width) in widths.into_iter().enumerate() {
-            SendMessageW(
-                list,
-                LVM_SETCOLUMNWIDTH,
-                Some(WPARAM(i)),
-                Some(LPARAM(width as isize)),
-            );
-        }
-        SendMessageW(list, WM_SETREDRAW, Some(WPARAM(1)), None);
-        let _ = InvalidateRect(Some(list), None, true);
-    }
+    list_view::fit_columns(list, COLUMNS.len(), &[], 0);
 }
