@@ -57,7 +57,8 @@
 //! - トリムの範囲を選んでいる間（`Effect::EnterTrimMode` から）は、左ボタン・カーソルの移動・Enter・`Esc`・
 //!   ダブルクリックを core の `ScrapModel::trim_input` に渡し、範囲を描き直す（`on_trim_input`）。
 //! - 書き込みの編集モードの間（`Effect::EnterEditMode` から）は、左ボタン・カーソルの移動・キーを core の
-//!   `ScrapModel::edit_input` に渡し、描き直す（`on_edit_input`）。ショートカットとマウスの割り当て（ホイール・
+//!   `ScrapModel::edit_input` に渡し、描き直す（`on_edit_input`）。ホイールは core の `annotate::toolbar::wheel_pick`
+//!   で道具・色・太さを選ぶ（`on_edit_wheel`、割り当ては固定）。ショートカットとマウスの割り当て（ホイール・
 //!   中クリック・ダブルクリックも）は効かない。ほかのウィンドウにフォーカスが移ったら（`WM_ACTIVATE`）抜ける。
 //! - 編集モードの間は、スクラップの直下にツールバー（`toolbar_window`、`Scrap::toolbar`）を出す。押してもスクラップの
 //!   フォーカスは動かない。道具・色・太さを選ぶ（`EditInput::Pick`）、完了（`EditInput::Leave`）、つまみのドラッグで
@@ -1862,7 +1863,8 @@ fn on_trim_input(hwnd: HWND, input: TrimInput) -> bool {
 }
 
 /// `WM_MOUSEWHEEL`: ホイールを、ノッチごとにホイールの操作（`MouseGesture::wheel`）にする（基準点はカーソルの
-/// 位置）。対応のない修飾キーつきは false（DefWindowProcW に任せる）。
+/// 位置）。書き込みの編集モードの間は、ノッチごとに道具・色・太さを選ぶ（`on_edit_wheel`）。対応のない
+/// 修飾キーつきは false（DefWindowProcW に任せる）。
 fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
     // wparam の下位は押されているキーとボタン（MK_*）、上位は回転量（上が正）
     const MK_SHIFT: usize = 0x0004;
@@ -1875,6 +1877,9 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
         shift: wparam.0 & MK_SHIFT != 0,
         ..held
     };
+    if is_editing(hwnd) {
+        return on_edit_wheel(hwnd, modifiers, delta);
+    }
     let Some(gesture) = MouseGesture::wheel(modifiers, delta) else {
         return false;
     };
@@ -1894,6 +1899,43 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
     };
     for _ in 0..notches.unsigned_abs() {
         run_mouse_operation(hwnd, gesture, context.clone());
+    }
+    true
+}
+
+/// 書き込みの編集モードのホイール: ノッチごとに、core の `toolbar::wheel_pick` が選ぶ道具・色・太さを、
+/// ツールバーで選んだのと同じに渡す。対応のない修飾キーつきは false。
+fn on_edit_wheel(hwnd: HWND, modifiers: Modifiers, delta: i32) -> bool {
+    let pick = |rotation: i32| {
+        with_app(|app| {
+            let scrap = app.scrap(hwnd)?;
+            let state = scrap.model.edit_state()?;
+            match &scrap.toolbar {
+                Some(toolbar) => toolbar::wheel_pick(state, &toolbar.colours, modifiers, rotation),
+                // ツールバーを作れなかったときも、ツールバーに並べるはずだった色で選ぶ
+                None => {
+                    let colours = toolbar::palette(app.settings.annotation.color);
+                    toolbar::wheel_pick(state, &colours, modifiers, rotation)
+                }
+            }
+        })
+        .flatten()
+    };
+    if pick(delta).is_none() {
+        return false;
+    }
+    let Some(notches) = with_app(|app| Some(app.scrap_mut(hwnd)?.wheel.turn(delta))).flatten()
+    else {
+        return true;
+    };
+    // 1 ノッチで 1 段。選ぶたびに状態が変わるので、ノッチごとに選び直す
+    for _ in 0..notches.unsigned_abs() {
+        match pick(notches.signum()) {
+            Some(p) => {
+                on_edit_input(hwnd, EditInput::Pick(p));
+            }
+            None => break,
+        }
     }
     true
 }
