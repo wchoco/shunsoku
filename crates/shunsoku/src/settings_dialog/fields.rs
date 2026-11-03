@@ -5,8 +5,10 @@
 //!   `template_field`（ファイル名テンプレートと「変数を挿入」とプレビュー）。
 //! - 写しの値を欄に出すのは `fill`、欄の入力を写しに入れるのは `set`。どちらも `Field` の `match` で項目と結ぶ。
 //!   項目を足すときは `Field` に足し、`kind`・`shown`・`set` の腕を足す。
-//! - ファイル名テンプレートの欄は、どのテンプレートかを `TemplateOf` で指す。定型領域タブ（#98）は
-//!   `TemplateOf::Region(i)` を足し、`template_of` / `template_slot` / `preview_target` に腕を足して使い回す。
+//! - ファイル名テンプレートの欄は、どのテンプレートかを `TemplateOf` で指す。
+//! - 定型領域タブの詳細の欄は `Field::Region(i, key)` と `TemplateOf::Region(i)` で、一覧で選んだ領域 i を指す。
+//!   選び直したら `Fields::bind_region` で、欄と横のボタンの i をまとめて差し替える。i が写しの外（領域がない）
+//!   なら、欄は空を出し、入力は捨てる。
 //! - フォーカスのあるテキストの欄は `fill` で書き換えない（打っている途中のキャレットを動かさない）。読めない入力
 //!   （範囲の外の数、`#RRGGBB` でない色、空のテンプレート）は写しを変えず、フォーカスが外れたら写しの値に戻る。
 
@@ -15,11 +17,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use shunsoku_core::annotate::toolbar::{FONT_SIZES, WIDTHS};
+use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
 use shunsoku_core::selection::Mode;
 use shunsoku_core::settings::editor::{Editor, choices};
 use shunsoku_core::settings::{
-    BORDER_WIDTH_RANGE, DpiScaling, OPACITY_RANGE, Rgb, Settings, TRASH_LIMIT_RANGE,
+    BORDER_WIDTH_RANGE, DpiScaling, OPACITY_RANGE, Region, Rgb, Settings, TRASH_LIMIT_RANGE,
 };
 use shunsoku_core::template;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
@@ -85,6 +88,44 @@ pub enum Field {
     AnnotationFontSize,
     /// `[annotation] font`。
     AnnotationFont,
+    /// 定型領域 i（`Settings::regions` の位置）の項目。
+    Region(usize, RegionKey),
+}
+
+/// 定型領域の詳細の項目（テンプレートは `TemplateOf::Region`、ホットキーは `ChordRow`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionKey {
+    Name,
+    /// 範囲の左上（モニタ相対の物理ピクセル）。変えても大きさは保つ。
+    X,
+    Y,
+    Width,
+    Height,
+    /// 保存先。空なら全体の保存先。
+    SaveDir,
+    /// 撮ったら保存する。スクラップとの両方は外せない。
+    Save,
+    /// 撮ったらスクラップとして表示する。
+    Scrap,
+}
+
+impl Field {
+    /// 定型領域の詳細の欄か。
+    fn is_region(self) -> bool {
+        matches!(
+            self,
+            Field::Region(..) | Field::Template(TemplateOf::Region(_))
+        )
+    }
+
+    /// 定型領域の項目なら、領域 `index` の同じ項目にする。
+    fn with_region(self, index: usize) -> Field {
+        match self {
+            Field::Region(_, key) => Field::Region(index, key),
+            Field::Template(TemplateOf::Region(_)) => Field::Template(TemplateOf::Region(index)),
+            field => field,
+        }
+    }
 }
 
 /// どのファイル名テンプレートか。
@@ -92,6 +133,8 @@ pub enum Field {
 pub enum TemplateOf {
     /// `[general] file_name_template`。
     General,
+    /// 定型領域 i の `file_name_template`。
+    Region(usize),
 }
 
 /// 欄の種類。
@@ -128,6 +171,8 @@ pub enum Action {
     PickColor(Field),
     /// 変数のメニューを出し、テンプレートの欄に入れる。
     InsertVariable(TemplateOf),
+    /// `Field` の保存先をエクスプローラーで開く。
+    OpenFolder(Field),
 }
 
 /// ボタン 1 つ。
@@ -144,6 +189,10 @@ pub struct Fields {
     pub buttons: Vec<ButtonRow>,
     /// インストール済みの書体（昇順）。書体のドロップダウンの候補。
     fonts: Rc<Vec<String>>,
+    /// 定型領域の詳細の欄が指す領域（`bind_region`）。
+    region: usize,
+    /// `bind_region` で結び直してから、まだ欄に出していない。フォーカスのある欄も書き換える（前の領域の値が残るため）。
+    rebound: Cell<bool>,
 }
 
 impl Fields {
@@ -161,6 +210,31 @@ impl Fields {
     pub fn button(&self, id: i32) -> Option<ButtonRow> {
         self.buttons.iter().find(|b| b.id == id).copied()
     }
+
+    /// 定型領域の詳細の欄と横のボタンを、領域 `index` に結び直す。
+    pub fn bind_region(&mut self, index: usize) {
+        self.region = index;
+        self.rebound.set(true);
+        for row in &mut self.rows {
+            row.field = row.field.with_region(index);
+        }
+        for button in &mut self.buttons {
+            button.action = match button.action {
+                Action::BrowseFolder(f) => Action::BrowseFolder(f.with_region(index)),
+                Action::PickColor(f) => Action::PickColor(f.with_region(index)),
+                Action::OpenFolder(f) => Action::OpenFolder(f.with_region(index)),
+                Action::InsertVariable(TemplateOf::Region(_)) => {
+                    Action::InsertVariable(TemplateOf::Region(index))
+                }
+                action @ Action::InsertVariable(TemplateOf::General) => action,
+            };
+        }
+    }
+
+    /// 定型領域の詳細の欄が指す領域。
+    pub fn region(&self) -> usize {
+        self.region
+    }
 }
 
 fn kind(field: Field) -> Kind {
@@ -170,11 +244,19 @@ fn kind(field: Field) -> Kind {
         | Field::CaptureCursor
         | Field::Crosshair
         | Field::Border
-        | Field::Shadow => Kind::Check,
-        Field::SaveDir | Field::Template(_) | Field::BorderColor | Field::AnnotationColor => {
-            Kind::Text { preview: None }
+        | Field::Shadow
+        | Field::Region(_, RegionKey::Save | RegionKey::Scrap) => Kind::Check,
+        Field::SaveDir
+        | Field::Template(_)
+        | Field::BorderColor
+        | Field::AnnotationColor
+        | Field::Region(_, RegionKey::Name | RegionKey::SaveDir) => Kind::Text { preview: None },
+        Field::Opacity
+        | Field::BorderWidth
+        | Field::TrashLimit
+        | Field::Region(_, RegionKey::X | RegionKey::Y | RegionKey::Width | RegionKey::Height) => {
+            Kind::Number { updown: 0 }
         }
-        Field::Opacity | Field::BorderWidth | Field::TrashLimit => Kind::Number { updown: 0 },
         Field::Language
         | Field::SelectionMode
         | Field::DpiScaling
@@ -190,6 +272,8 @@ fn number_range(field: Field) -> (u32, u32) {
     match field {
         Field::Opacity => r(OPACITY_RANGE),
         Field::TrashLimit => r(TRASH_LIMIT_RANGE),
+        Field::Region(_, RegionKey::X | RegionKey::Y) => (0, i32::MAX as u32),
+        Field::Region(_, _) => (1, i32::MAX as u32),
         _ => (*BORDER_WIDTH_RANGE.start(), *BORDER_WIDTH_RANGE.end()),
     }
 }
@@ -255,6 +339,7 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
                 .unwrap_or_default(),
         ),
         Field::Template(of) => Shown::Text(template_of(d, of).to_owned()),
+        Field::Region(i, key) => region_shown(d.regions.get(i), key),
         Field::BorderColor => Shown::Text(d.scrap.border.color.to_string()),
         Field::AnnotationColor => Shown::Text(d.annotation.color.to_string()),
         Field::Opacity => Shown::Text(d.scrap.opacity.to_string()),
@@ -299,6 +384,31 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
     }
 }
 
+/// 定型領域 `region` の項目 `key` を欄に出す形にする。領域がなければ空。
+fn region_shown(region: Option<&Region>, key: RegionKey) -> Shown {
+    let Some(r) = region else {
+        return match key {
+            RegionKey::Save | RegionKey::Scrap => Shown::Check(false),
+            _ => Shown::Text(String::new()),
+        };
+    };
+    match key {
+        RegionKey::Name => Shown::Text(r.name.clone()),
+        RegionKey::X => Shown::Text(r.rect.left.to_string()),
+        RegionKey::Y => Shown::Text(r.rect.top.to_string()),
+        RegionKey::Width => Shown::Text(r.rect.width().to_string()),
+        RegionKey::Height => Shown::Text(r.rect.height().to_string()),
+        RegionKey::SaveDir => Shown::Text(
+            r.save_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+        RegionKey::Save => Shown::Check(r.save),
+        RegionKey::Scrap => Shown::Check(r.scrap),
+    }
+}
+
 /// 欄の入力。
 pub enum Input {
     Check(bool),
@@ -325,7 +435,14 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
             }
         }
         (Field::Template(of), Input::Text(s)) if !s.trim().is_empty() => {
-            *template_slot(draft, of) = s;
+            if let Some(slot) = template_slot(draft, of) {
+                *slot = s;
+            }
+        }
+        (Field::Region(i, key), input) => {
+            if let Some(region) = draft.regions.get_mut(i) {
+                set_region(region, key, input);
+            }
         }
         (Field::BorderColor, Input::Text(s)) => {
             if let Ok(c) = s.trim().parse::<Rgb>() {
@@ -385,6 +502,43 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
     }
 }
 
+/// 定型領域 `region` の項目 `key` を `input` にする。読めない入力と、保存とスクラップの両方を外す入力は捨てる。
+fn set_region(region: &mut Region, key: RegionKey, input: Input) {
+    match (key, input) {
+        (RegionKey::Name, Input::Text(s)) => region.name = s.trim().to_owned(),
+        (RegionKey::SaveDir, Input::Text(s)) => {
+            let s = s.trim();
+            if s.is_empty() {
+                region.save_dir = None;
+            } else if is_absolute_dir(s) {
+                region.save_dir = Some(PathBuf::from(s));
+            }
+        }
+        (RegionKey::X | RegionKey::Y | RegionKey::Width | RegionKey::Height, Input::Text(s)) => {
+            let (min, max) = number_range(Field::Region(0, key));
+            let Some(n) = s
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (min..=max).contains(n))
+            else {
+                return;
+            };
+            let (mut origin, mut size) = (region.rect.origin(), region.rect.size());
+            match key {
+                RegionKey::X => origin.x = n as i32,
+                RegionKey::Y => origin.y = n as i32,
+                RegionKey::Width => size.width = n,
+                _ => size.height = n,
+            }
+            region.rect = Rect::from_origin_size(origin, size);
+        }
+        (RegionKey::Save, Input::Check(v)) if v || region.scrap => region.save = v,
+        (RegionKey::Scrap, Input::Check(v)) if v || region.save => region.scrap = v,
+        _ => {}
+    }
+}
+
 /// 色の欄 `field` の写しの値。
 pub fn color_of(settings: &Settings, field: Field) -> Option<Rgb> {
     match field {
@@ -398,6 +552,11 @@ pub fn color_of(settings: &Settings, field: Field) -> Option<Rgb> {
 pub fn folder_of(settings: &Settings, field: Field) -> PathBuf {
     let set = match field {
         Field::SaveDir => settings.general.save_dir.clone(),
+        Field::Region(i, RegionKey::SaveDir) => settings
+            .regions
+            .get(i)
+            .and_then(|r| r.save_dir.clone())
+            .or_else(|| settings.general.save_dir.clone()),
         _ => None,
     };
     set.or_else(|| save::default_dir().ok()).unwrap_or_default()
@@ -416,12 +575,20 @@ fn is_absolute_dir(s: &str) -> bool {
 pub fn template_of(settings: &Settings, of: TemplateOf) -> &str {
     match of {
         TemplateOf::General => &settings.general.file_name_template,
+        TemplateOf::Region(i) => settings
+            .regions
+            .get(i)
+            .map_or("", |r| r.file_name_template.as_str()),
     }
 }
 
-fn template_slot(settings: &mut Settings, of: TemplateOf) -> &mut String {
+fn template_slot(settings: &mut Settings, of: TemplateOf) -> Option<&mut String> {
     match of {
-        TemplateOf::General => &mut settings.general.file_name_template,
+        TemplateOf::General => Some(&mut settings.general.file_name_template),
+        TemplateOf::Region(i) => settings
+            .regions
+            .get_mut(i)
+            .map(|r| &mut r.file_name_template),
     }
 }
 
@@ -429,6 +596,15 @@ fn template_slot(settings: &mut Settings, of: TemplateOf) -> &mut String {
 fn preview_target(settings: &Settings, of: TemplateOf) -> (Option<PathBuf>, String) {
     match of {
         TemplateOf::General => (settings.general.save_dir.clone(), String::new()),
+        TemplateOf::Region(i) => match settings.regions.get(i) {
+            Some(r) => (
+                r.save_dir
+                    .clone()
+                    .or_else(|| settings.general.save_dir.clone()),
+                r.name.clone(),
+            ),
+            None => (settings.general.save_dir.clone(), String::new()),
+        },
     }
 }
 
@@ -436,6 +612,7 @@ fn preview_target(settings: &Settings, of: TemplateOf) -> (Option<PathBuf>, Stri
 pub fn variables(of: TemplateOf) -> impl Iterator<Item = &'static template::Variable> {
     let region = match of {
         TemplateOf::General => false,
+        TemplateOf::Region(_) => true,
     };
     template::VARIABLES
         .iter()
@@ -476,6 +653,7 @@ pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
     FILLING.set(true);
     // SAFETY: 引数なし
     let focus = unsafe { GetFocus() };
+    let rebound = fields.rebound.replace(false);
     for row in &fields.rows {
         let Some(control) = item(hwnd, row.control) else {
             continue;
@@ -493,7 +671,8 @@ pub fn fill(hwnd: HWND, fields: &Fields, editor: &Editor, text: Text) {
                 }
             }
             Shown::Text(value) => {
-                if control != focus && window_text(control) != value {
+                let keep_typing = control == focus && !(rebound && row.field.is_region());
+                if !keep_typing && window_text(control) != value {
                     set_window_text(control, &value);
                 }
             }
@@ -693,6 +872,8 @@ impl Fields {
             rows: Vec::new(),
             buttons: Vec::new(),
             fonts: Rc::new(installed_fonts()),
+            region: 0,
+            rebound: Cell::new(false),
         }
     }
 }

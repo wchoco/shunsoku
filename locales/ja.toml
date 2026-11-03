@@ -62,6 +62,7 @@ choices = "OK: GUI の値で上書きする\nキャンセル: 適用をやめる
 [settings_gui.tab]
 general = "一般"
 capture = "キャプチャ"
+regions = "定型領域"
 scrap = "スクラップ"
 scrap_ops = "スクラップ操作"
 annotation = "書き込み"
@@ -91,6 +92,37 @@ mode_normal = "通常（離すと確定）"
 mode_precise = "精密（調整してから確定）"
 crosshair = "範囲選択の画面に十字線を出す"
 hint = "欄を選んでキーを押すと割り当てます。Tab で次の欄へ移ります。"
+
+[settings_gui.regions]
+# 一覧の列
+name = "名前"
+hotkey = "ホットキー"
+range = "範囲"
+# 一覧の下のボタン
+add = "追加"
+duplicate = "複製"
+remove = "削除"
+up = "上へ"
+down = "下へ"
+# 複製した定型領域の名前（元の名前の後ろに付ける。重なれば、さらに後ろに番号を付ける）
+copy_suffix = " のコピー"
+# 詳細
+name_label = "名前:"
+hotkey_label = "ホットキー:"
+monitor_label = "モニタ:"
+x = "X:"
+y = "Y:"
+width = "幅:"
+height = "高さ:"
+reselect = "範囲を選び直す"
+test_capture = "試しに撮る"
+monitor_not_found = "登録したモニタが見つかりません。撮れません。"
+out_of_bounds = "範囲がモニタからはみ出しています。撮れません。"
+save_dir_label = "保存先:"
+open_folder = "フォルダを開く"
+template_label = "ファイル名:"
+save = "保存する"
+scrap = "スクラップとして表示する"
 
 [settings_gui.scrap]
 opacity = "透明度（%）:"

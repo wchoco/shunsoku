@@ -3685,7 +3685,7 @@ fn write_settings(app: &mut App, new: &Settings) -> std::result::Result<(), Stri
         return Err(format!("{}: {e}", path.display()));
     }
     log::info!("settings written to {}", path.display());
-    app.settings = new.clone();
+    app.settings = new.as_written();
     Ok(())
 }
 

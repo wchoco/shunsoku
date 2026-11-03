@@ -514,6 +514,7 @@ mod tests {
             file_name_template: "{name}_{seq}".to_owned(),
             save,
             scrap,
+            loaded_name: None,
         }
     }
 

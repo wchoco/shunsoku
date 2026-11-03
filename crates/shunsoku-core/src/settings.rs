@@ -129,11 +129,25 @@ pub struct Settings {
     pub regions: Vec<Region>,
 }
 
+impl Settings {
+    /// ファイルに書いた（`write`・`rewrite`）あとの設定。定型領域を、書いた名前でファイルの要素に結び付け直す
+    /// （`Region::loaded_name` を今の名前にする）。
+    pub fn as_written(&self) -> Settings {
+        let mut s = self.clone();
+        for region in &mut s.regions {
+            region.loaded_name = Some(region.name.clone());
+        }
+        s
+    }
+}
+
 /// 定型領域のファイル名テンプレートの既定値。
 pub const DEFAULT_REGION_FILE_NAME_TEMPLATE: &str = "{name}_{date}-{time}";
 
 /// 定型領域（`[[regions]]` の 1 つ）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 比べる（`==`）ときは `loaded_name` を見ない（中身が同じなら同じ定型領域）。
+#[derive(Debug, Clone, Eq)]
 pub struct Region {
     /// 名前。空でなく、ほかの定型領域と重ならない。
     pub name: String,
@@ -149,6 +163,34 @@ pub struct Region {
     pub save: bool,
     /// 撮ったらスクラップとして表示する。`save` と両方 false にはならない（読み込みで `save` を true に戻す）。
     pub scrap: bool,
+    /// ファイルで付いている名前（読み込んだ・書いたときの `name`）。ファイルにまだない定型領域は None。
+    /// 書き戻し（`write`）と 3-way マージは、これで定型領域とファイルの `[[regions]]` の要素を結び付ける
+    /// （名前を変えても、手で書いたコメントは元の要素ごと残る）。
+    pub loaded_name: Option<String>,
+}
+
+impl PartialEq for Region {
+    fn eq(&self, other: &Self) -> bool {
+        let Region {
+            name,
+            hotkey,
+            monitor,
+            rect,
+            save_dir,
+            file_name_template,
+            save,
+            scrap,
+            loaded_name: _,
+        } = self;
+        *name == other.name
+            && *hotkey == other.hotkey
+            && *monitor == other.monitor
+            && *rect == other.rect
+            && *save_dir == other.save_dir
+            && *file_name_template == other.file_name_template
+            && *save == other.save
+            && *scrap == other.scrap
+    }
 }
 
 /// 範囲選択の画面で登録する定型領域。名前は `"{base} N"`（N は、ほかの定型領域と重ならない最も小さい
@@ -169,6 +211,7 @@ pub fn new_region(settings: &Settings, base: &str, monitor: &str, rect: Rect) ->
         file_name_template: settings.general.file_name_template.clone(),
         save: true,
         scrap: false,
+        loaded_name: None,
     }
 }
 
@@ -936,7 +979,15 @@ fn regions(root: &dyn TableLike, r: &mut Reader) -> Vec<Region> {
 
 /// `[[regions]]` の要素のうち読み込みで残る定型領域。
 fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<Region> {
-    let mut regions: Vec<Region> = Vec::new();
+    read_regions_at(tables, r)
+        .into_iter()
+        .map(|(_, region)| region)
+        .collect()
+}
+
+/// `[[regions]]` の要素のうち読み込みで残る定型領域と、その要素の添字。
+fn read_regions_at(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(usize, Region)> {
+    let mut regions: Vec<(usize, Region)> = Vec::new();
     for (i, table) in tables.iter().enumerate() {
         let path = format!("regions[{}]", i + 1);
         let t: Option<&dyn TableLike> = Some(table);
@@ -957,20 +1008,24 @@ fn read_regions(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<Region
         let (Some(name), Some(monitor), Some(rect)) = (name, monitor, rect) else {
             continue;
         };
-        if regions.iter().any(|region| region.name == name) {
+        if regions.iter().any(|(_, region)| region.name == name) {
             r.invalid(format!("{path}.name"));
             continue;
         }
-        regions.push(Region {
-            name,
-            hotkey,
-            monitor,
-            rect,
-            save_dir,
-            file_name_template,
-            save,
-            scrap,
-        });
+        regions.push((
+            i,
+            Region {
+                loaded_name: Some(name.clone()),
+                name,
+                hotkey,
+                monitor,
+                rect,
+                save_dir,
+                file_name_template,
+                save,
+                scrap,
+            },
+        ));
     }
     regions
 }
@@ -1890,6 +1945,7 @@ height = 1
                     file_name_template: "dash_{seq:3}".to_owned(),
                     save: false,
                     scrap: true,
+                    loaded_name: None,
                 },
                 Region {
                     name: "game".to_owned(),
@@ -1900,6 +1956,7 @@ height = 1
                     file_name_template: "{name}_{date}-{time}".to_owned(),
                     save: true,
                     scrap: false,
+                    loaded_name: None,
                 },
             ]
         );
@@ -2303,6 +2360,7 @@ width = 0
             file_name_template: DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned(),
             save: true,
             scrap: false,
+            loaded_name: None,
         };
         Settings {
             regions: names.iter().map(|n| region(n)).collect(),
@@ -2345,6 +2403,7 @@ width = 0
                 file_name_template: "cap_{seq:3}".to_owned(),
                 save: true,
                 scrap: false,
+                loaded_name: None,
             }
         );
     }
