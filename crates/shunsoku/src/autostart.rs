@@ -5,6 +5,8 @@
 //! - 値の名前は `shunsoku`。実機の試験でユーザーの登録を書き換えないよう、環境変数
 //!   `SHUNSOKU_AUTOSTART_VALUE` で名前を差し替えられる（`docs/agents/windows-dev.md`）。
 
+use std::path::Path;
+
 use shunsoku_core::APP_NAME;
 use shunsoku_core::autostart::{Action, VALUE_NAME_VARIABLE, plan, without_verbatim_prefix};
 use windows::Win32::Foundation::{
@@ -23,14 +25,18 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 /// Run キーを設定（`enabled`）に合わせる。したことを返す。
 pub fn sync(enabled: bool) -> Result<Action, String> {
     let exe = std::env::current_exe().map_err(|e| format!("could not get the exe path: {e}"))?;
-    let name = value_name();
-    let current = read(&name).map_err(|e| format!("could not read the Run key: {e:?}"))?;
-    let action = plan(enabled, current.as_deref(), &exe, normalize);
+    sync_value(&value_name(), &exe, enabled)
+}
+
+/// Run キーの値 `name` を、`exe` の設定（`enabled`）に合わせる。したことを返す。
+fn sync_value(name: &str, exe: &Path, enabled: bool) -> Result<Action, String> {
+    let current = read(name).map_err(|e| format!("could not read the Run key: {e:?}"))?;
+    let action = plan(enabled, current.as_deref(), exe, normalize);
     match &action {
-        Action::Register { command } | Action::Reregister { command } => write(&name, command)
+        Action::Register { command } | Action::Reregister { command } => write(name, command)
             .map_err(|e| format!("could not register {command} in the Run key: {e:?}"))?,
         Action::Remove => {
-            remove(&name).map_err(|e| format!("could not remove from the Run key: {e:?}"))?
+            remove(name).map_err(|e| format!("could not remove from the Run key: {e:?}"))?
         }
         Action::Nothing => {}
     }
@@ -138,5 +144,58 @@ fn remove(name: &str) -> Result<(), WIN32_ERROR> {
         Ok(())
     } else {
         Err(e)
+    }
+}
+
+/// Run キーに触れるので、実機でだけ走らせる（`docs/agents/windows-dev.md`）。値の名前は試験用のものだけを使い、
+/// ユーザーの登録（`shunsoku`）には触れない。
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// 試験用の値の名前。落ちても消す。
+    struct TestValue(String);
+
+    impl TestValue {
+        fn new() -> TestValue {
+            let name = format!("shunsoku-test-{}", std::process::id());
+            remove(&name).unwrap();
+            TestValue(name)
+        }
+    }
+
+    impl Drop for TestValue {
+        fn drop(&mut self) {
+            let _ = remove(&self.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "HKCU の Run キーに書く。実機でだけ走らせる"]
+    fn off_from_another_portable_copy_leaves_the_registration_of_the_copy_that_is_on() {
+        let value = TestValue::new();
+        let on = PathBuf::from(r"C:\shunsoku-test\a\shunsoku.exe");
+        let off = PathBuf::from(r"C:\shunsoku-test\b\shunsoku.exe");
+
+        let registered = sync_value(&value.0, &on, true).unwrap();
+        assert!(
+            matches!(registered, Action::Register { .. }),
+            "{registered:?}"
+        );
+        assert_eq!(
+            read(&value.0).unwrap().as_deref(),
+            Some(r#""C:\shunsoku-test\a\shunsoku.exe""#)
+        );
+
+        assert_eq!(sync_value(&value.0, &off, false).unwrap(), Action::Nothing);
+        assert_eq!(
+            read(&value.0).unwrap().as_deref(),
+            Some(r#""C:\shunsoku-test\a\shunsoku.exe""#)
+        );
+
+        assert_eq!(sync_value(&value.0, &on, false).unwrap(), Action::Remove);
+        assert_eq!(read(&value.0).unwrap(), None);
     }
 }
