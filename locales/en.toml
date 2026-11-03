@@ -215,7 +215,6 @@ monitor_not_found = "Could not capture because the monitor of the saved region w
 out_of_bounds = "Could not capture because the saved region goes past its monitor: "
 gone = "Could not capture because no saved region has that name: "
 default_name = "Region"
-registered = "Saved the region: "
 register_failed = "Could not save the region."
 
 [selection]

@@ -3597,11 +3597,12 @@ fn register_region(rect: Rect) {
     };
     let monitor = &monitors[index];
     let result = with_app(|app| {
-        let base = text("region.default_name");
-        let region = match &app.settings_gui {
-            Some(gui) => gui.new_registered_region(&app.settings, base, &monitor.id, relative),
-            None => settings::new_region(&app.settings, base, &monitor.id, relative),
-        };
+        let region = settings_gui::region_to_register(
+            app,
+            text("region.default_name"),
+            &monitor.id,
+            relative,
+        );
         let mut new = app.settings.clone();
         new.regions.push(region.clone());
         write_settings(app, &new).map(|()| region)
@@ -3614,10 +3615,7 @@ fn register_region(rect: Rect) {
                 region.monitor,
                 region.rect
             );
-            notify_user(
-                notify::Level::Success,
-                &format!("{}{}", text("region.registered"), region.name),
-            );
+            // 通知は出さない（設定 GUI でその領域を開くので、登録したことはそこでわかる）
             // 書いた定型領域はファイルの要素に結び付いている（`Settings::as_written`）
             let name = region.name.clone();
             settings_gui::region_registered(settings::Region {

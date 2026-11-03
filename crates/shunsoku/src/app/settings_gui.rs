@@ -111,17 +111,14 @@ pub(super) fn open_for_unset_hotkey() {
     open_with(Some(Page::Capture), Some(SettingsItem::SelectCaptureHotkey));
 }
 
-impl SettingsGui {
-    /// 開いている間にトレイの「定型領域を追加…」で登録する定型領域（名前は写しの定型領域とも重ならない）。
-    pub(super) fn new_registered_region(
-        &self,
-        applied: &Settings,
-        base: &str,
-        monitor: &str,
-        rect: Rect,
-    ) -> Region {
-        self.editor
-            .new_registered_region(applied, base, monitor, rect)
+/// トレイの「定型領域を追加…」で登録する定型領域。名前は `"{base} N"` で、適用済みの設定とも、開いていれば
+/// 写しの定型領域とも重ならない。`monitor` はモニタの識別子、`rect` はモニタ相対の範囲。
+pub(super) fn region_to_register(app: &App, base: &str, monitor: &str, rect: Rect) -> Region {
+    match &app.settings_gui {
+        Some(gui) => gui
+            .editor
+            .new_registered_region(&app.settings, base, monitor, rect),
+        None => settings::new_region(&app.settings, base, monitor, rect),
     }
 }
 

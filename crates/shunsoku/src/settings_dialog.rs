@@ -71,11 +71,11 @@ pub const PAGE_Y: i16 = MARGIN + 20;
 /// ページに使える幅。
 pub const PAGE_WIDTH: i16 = WIDTH - 2 * PAGE_X;
 
-/// タブのページ。
+/// タブのページ。既定（開くページを指定しないとき）は最初の「全般」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
-    General,
     #[default]
+    General,
     Capture,
     Regions,
     Scrap,
