@@ -33,6 +33,8 @@
 //!   行を足し、新しい `Effect` があればそこに足す。
 //! - ショートカットに付いたレシピ（`[[recipes]]`）は `run_recipe` で実行する。手を進めるのは core の
 //!   `recipe::Run`（ADR-0007）で、ここは手ごとに `Effect` を実行し（`perform`）、その結果（`Outcome`）を返す。
+//!   保存の手は、裏のスレッドの書き込みの結果（`WM_APP_SAVED`）を受けるまで `App::recipe` に預けて待つ。待って
+//!   いる間にそのスクラップを閉じるか、ほかのレシピを始めたら、待っているレシピは捨てる。
 //! - 設定（`%APPDATA%\shunsoku\settings.toml`、ポータブルモードでは exe の横のもの。場所は core の
 //!   `settings::locate`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
 //!   読み込み直す。アプリから書き戻すときは `write_settings` で変わった項目だけを書き、書いた直後の中身を監視が
@@ -56,8 +58,10 @@
 //!   `ScrapModel` のまま入れる。画素は裏のスレッドで一時ファイルに書き、書き終えたら `WM_APP_TRASH` で受ける。
 //!   トレイメニューの「ごみ箱」から選ぶと、その状態のまま浮かべ直してフォーカスを移す（`restore_scrap`）。
 //!   ごみ箱に入れる画素は元の画像（トリム前）で、トリムの範囲は `ScrapModel` に残るので、戻すとトリムしたまま戻る。
-//! - トリムの範囲を選んでいる間（`Effect::EnterTrimMode` から）は、左ボタン・カーソルの移動・Enter・`Esc`・
-//!   ダブルクリックを core の `ScrapModel::trim_input` に渡し、範囲を描き直す（`on_trim_input`）。
+//! - トリムの範囲を選んでいる間（`Effect::EnterTrimMode` から）は、左ボタン・カーソルの移動・ダブルクリック・
+//!   Enter・Space・`Esc`・矢印（Ctrl で大きさ、Shift で 10 画素）を core の `ScrapModel::trim_input` に渡し、範囲を
+//!   描き直す（`on_trim_input`）。つまみ・十字線・拡大鏡は core の `ScrapModel::trim_view` のとおりに描き、カーソルの
+//!   形は `ScrapModel::trim_cursor_shape` で当てる。十字線の色は入ったときの `[selection] crosshair_color`。
 //! - 書き込みの編集モードの間（`Effect::EnterEditMode` から）は、左ボタン・カーソルの移動・キーを core の
 //!   `ScrapModel::edit_input` に渡し、描き直す（`on_edit_input`）。ホイールは core の `annotate::toolbar::wheel_pick`
 //!   で道具・色・太さを選ぶ（`on_edit_wheel`、割り当ては固定）。ショートカットとマウスの割り当て（ホイール・
@@ -99,7 +103,7 @@ use shunsoku_core::monitors::{self, LocateError};
 use shunsoku_core::notice::Notices;
 use shunsoku_core::perf::Mark;
 use shunsoku_core::protocol::{ErrorKind, Response};
-use shunsoku_core::recipe::{Advance, Outcome, Run};
+use shunsoku_core::recipe::{Advance, Outcome, Parked, Run};
 use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseBindings, MouseGesture, OpContext,
     OperationDescriptor, OperationId, Shortcuts,
@@ -290,6 +294,8 @@ struct App {
     /// 書き込み中の保存のうち、失敗したらスクラップを浮かべるもの（定型領域キャプチャの
     /// `OnSaveFailure::FallbackToScrap`）。結果（`WM_APP_SAVED`）を受けたら外す。
     save_fallbacks: Vec<(PathBuf, Fallback)>,
+    /// 保存の結果（`WM_APP_SAVED`）を待っているレシピ。スクラップのウィンドウ（番号）と保存先で見分ける。
+    recipe: Parked<isize, PathBuf>,
     /// スクラップの中身を描く Direct2D の描き手。描き直しのたびに作らないよう使い回す（`paint_scrap`）。
     renderer: Option<render::Renderer>,
     /// 書き込みの編集モードで最後に選んだ道具・色・太さ。アプリが動いている間、次の編集モードに引き継ぐ。
@@ -361,6 +367,8 @@ struct Scrap {
     zoom_label: bool,
     /// 最後に描いたキャレットの矩形（ウィンドウの中の座標）。打っていなければ None。
     caret: std::cell::Cell<Option<Rect>>,
+    /// トリムの十字線の色。トリムに入ったときの `[selection] crosshair_color`。
+    crosshair: Rgb,
 }
 
 /// 書き込みの編集モードのツールバー。
@@ -525,6 +533,7 @@ impl Scrap {
             &self.model,
             appearance,
             label,
+            self.crosshair,
         )?;
         self.caret.set(caret);
         self.sync_toolbar(appearance, renderer, true);
@@ -539,7 +548,7 @@ impl Scrap {
 /// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
 /// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
 /// 文字を打っていれば、IME の変換中の文字（`EditState::composition`）をつなげて描き、キャレットの矩形（ウィンドウの
-/// 中の座標）を返す。
+/// 中の座標）を返す。トリムの最中は、範囲・つまみ・十字線（色は `crosshair`）・拡大鏡を重ねる。
 fn paint_scrap(
     renderer: &mut Option<render::Renderer>,
     window: &scrap_window::ScrapWindow,
@@ -547,6 +556,7 @@ fn paint_scrap(
     model: &ScrapModel,
     appearance: &Appearance,
     label: Option<render::ZoomLabel>,
+    crosshair: Rgb,
 ) -> Result<Option<Rect>> {
     let rect = model.window_rect(appearance);
     let appearance = &model.appearance(appearance);
@@ -564,12 +574,25 @@ fn paint_scrap(
         None => image,
     };
     let display = model.image_rect().size();
-    let trim = model.is_trimming().then(|| render::TrimOverlay {
-        // 画像の左上から、ウィンドウの中の画像の位置へ
-        selection: model.trim_selection().map(|r| {
-            let margin = appearance.margin();
-            r.offset(margin - model.position.x, margin - model.position.y)
-        }),
+    let scale = window.dpi() as f32 / 96.0;
+    let trim = model.trim_view().map(|view| {
+        // スクリーン座標から、ウィンドウの中の座標へ
+        let margin = appearance.margin();
+        let (dx, dy) = (margin - model.position.x, margin - model.position.y);
+        let local = |p: Point| Point::new(p.x + dx, p.y + dy);
+        render::TrimOverlay {
+            selection: view.selection.map(|r| r.offset(dx, dy)),
+            handles: view.handles.iter().map(|r| r.offset(dx, dy)).collect(),
+            crosshair: view.crosshair.map(|at| (local(at), crosshair)),
+            magnifier: view.crosshair.zip(view.magnifier).map(|(at, pixel)| {
+                render::TrimMagnifier {
+                    cursor: local(at),
+                    pixel,
+                    label: view.cursor_label.clone(),
+                }
+            }),
+            scale,
+        }
     });
     let annotations = model.annotations_to_draw();
     let typing = model.typing_annotation();
@@ -584,10 +607,10 @@ fn paint_scrap(
                 composition: composition.map_or("", |c| c.text.as_str()),
                 cursor: composition.map_or(0, |c| c.cursor),
             }),
-            scale: window.dpi() as f32 / 96.0,
+            scale,
         },
         label,
-        trim,
+        trim: trim.as_ref(),
     };
     let caret = painter.paint_scrap(&canvas, image, display, appearance, overlays)?;
     *renderer = Some(painter);
@@ -922,6 +945,7 @@ fn start(
         pipe: None,
         pending_saves: Vec::new(),
         save_fallbacks: Vec::new(),
+        recipe: Parked::default(),
         renderer: None,
         carryover: Carryover::default(),
         notices: Notices::default(),
@@ -1406,7 +1430,11 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
                 on_edit_input(hwnd, EditInput::DoubleClick(at));
                 return Some(LRESULT(0));
             }
-            if on_trim_input(hwnd, TrimInput::Confirm) {
+            // トリムの最中は、範囲の中なら確定、ほかはふつうの押下と同じ（core が決める）
+            if is_trimming(hwnd) {
+                // SAFETY: 自分のウィンドウ
+                unsafe { SetCapture(hwnd) };
+                on_trim_input(hwnd, TrimInput::DoubleClick(at));
                 return Some(LRESULT(0));
             }
             let context = OpContext {
@@ -1427,7 +1455,15 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             Some(LRESULT(0))
         }
         // Alt との組み合わせは WM_SYSKEYDOWN で来る。対応表にないキーは DefWindowProcW に任せる
-        WM_KEYDOWN | WM_SYSKEYDOWN => on_scrap_key(hwnd, wparam).then_some(LRESULT(0)),
+        WM_KEYDOWN | WM_SYSKEYDOWN => on_scrap_key(hwnd, wparam, lparam).then_some(LRESULT(0)),
+        // トリムの最中は、範囲のつまみや中の上でカーソルの形を変える
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && is_trimming(hwnd) => {
+            let shape = with_app(|app| app.scrap(hwnd).map(|s| s.model.trim_cursor_shape()))
+                .flatten()
+                .unwrap_or(CursorShape::Cross);
+            overlay::set_cursor(shape);
+            Some(LRESULT(1))
+        }
         // 文字を打っている間の文字（TranslateMessage が作る）
         WM_CHAR => on_scrap_char(hwnd, wparam).then_some(LRESULT(0)),
         // 変換中の文字は IME の窓に出さず、スクラップに描く。App は借りない（IME の呼び出しの中でも届く）
@@ -1996,13 +2032,12 @@ fn run_mouse_operation(hwnd: HWND, gesture: MouseGesture, context: OpContext) {
 }
 
 /// キーをショートカットの対応表で引いて実行する。対応表になければ false。
-fn on_scrap_key(hwnd: HWND, wparam: WPARAM) -> bool {
-    // トリムの最中は Enter で確定、Esc で中止。ほかのキーの操作は効かない（どの操作も実行できない）
+fn on_scrap_key(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
+    // トリムの最中は Enter・Space で確定、Esc で中止、矢印で範囲を直す。ほかのキーの操作は効かない（どの操作も
+    // 実行できない）
     if is_trimming(hwnd) {
-        let input = match VIRTUAL_KEY(wparam.0 as u16) {
-            VK_RETURN => TrimInput::Confirm,
-            VK_ESCAPE => TrimInput::Cancel,
-            _ => return false,
+        let Some(input) = trim_key(wparam, lparam) else {
+            return false;
         };
         return on_trim_input(hwnd, input);
     }
@@ -2044,14 +2079,22 @@ enum Bound {
 }
 
 /// レシピを実行する。手を 1 つずつ実行し、その手の `Effect` を実行し終えてから結果を返して次の手へ進む
-/// （ADR-0007）。失敗・取り消し・今は実行できない手で止まる。止まったわけはログに書く（失敗の通知はその手の
-/// `Effect` を実行した側が出している）。
+/// （ADR-0007）。保存の結果を待っているレシピがあれば捨てる。
 fn run_recipe(hwnd: HWND, name: &str, steps: Vec<&'static OperationDescriptor>) {
+    if with_app(|app| app.recipe.discard()).flatten().is_some() {
+        log::info!("the recipe waiting for a save was discarded");
+    }
     log::info!("recipe {name:?} started");
-    let mut run = Run::new(steps);
+    drive_recipe(hwnd, Run::new(steps));
+}
+
+/// レシピを進められるところまで進める。失敗・取り消し・今は実行できない手で止まる。止まったわけはログに書く
+/// （失敗の通知はその手の `Effect` を実行した側が出している）。保存を裏のスレッドに渡した手は、結果を受ける
+/// まで `App::recipe` に預けて返る（`on_saved` が続きを進める）。
+fn drive_recipe(hwnd: HWND, mut run: Run) {
     loop {
         let mut advance = None;
-        let outcome = perform(hwnd, OpContext::default(), |model, context| {
+        let performed = perform(hwnd, OpContext::default(), |model, context| {
             let next = run.advance(model, context);
             let step = match &next {
                 Advance::Step { op, effects } => Some((op.id, effects.clone())),
@@ -2062,26 +2105,38 @@ fn run_recipe(hwnd: HWND, name: &str, steps: Vec<&'static OperationDescriptor>) 
         });
         match advance {
             Some(Advance::Step { op, .. }) => {
-                let outcome = outcome.unwrap_or(Outcome::Succeeded);
-                log::info!("recipe {name:?} step {} -> {outcome:?}", op.id);
-                run.settle(outcome);
+                let performed = performed.unwrap_or_default();
+                match performed.saving {
+                    Some(path) if performed.outcome == Outcome::Succeeded => {
+                        log::info!("recipe step {} is waiting for {}", op.id, path.display());
+                        let parked = with_app(|app| app.recipe.park(hwnd.0 as isize, path, run));
+                        if parked.is_none() {
+                            log::warn!("could not keep the recipe waiting for the save");
+                        }
+                        return;
+                    }
+                    _ => {
+                        log::info!("recipe step {} -> {:?}", op.id, performed.outcome);
+                        run.settle(performed.outcome);
+                    }
+                }
             }
-            // 結果はその場で返しているので、待つことはない
+            // 結果を待っている手はここで預けて返るので、待ったまま来ることはない
             Some(Advance::Waiting(id)) => {
-                log::warn!("recipe {name:?} is still waiting for {id}");
+                log::warn!("recipe is still waiting for {id}");
                 return;
             }
             Some(Advance::Finished) => {
-                log::info!("recipe {name:?} finished");
+                log::info!("recipe finished");
                 return;
             }
             Some(Advance::Stopped(stop)) => {
-                log::info!("recipe {name:?} stopped: {stop:?}");
+                log::info!("recipe stopped: {stop:?}");
                 return;
             }
             // スクラップがもうない（最後の手の「閉じる」で閉じたなど）
             None => {
-                log::info!("recipe {name:?} ended with the scrap gone");
+                log::info!("recipe ended with the scrap gone");
                 return;
             }
         }
@@ -2192,6 +2247,15 @@ fn scrap_menu_entries(
     items
 }
 
+/// `perform` で実行した 1 手の結果。
+#[derive(Default)]
+struct Performed {
+    /// その場でわかった結果（`Outcome::of`）。
+    outcome: Outcome,
+    /// 裏のスレッドに渡した保存の保存先。書き込みの結果は `WM_APP_SAVED` で届く。
+    saving: Option<PathBuf>,
+}
+
 /// `App` を返したあとに行う `Effect`。
 enum Deferred {
     Copy(Image),
@@ -2235,16 +2299,18 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
 /// `step` でスクラップの `ScrapModel` を変え、返った `Effect` を実行する。`step` は操作の id（描き直しに
 /// 失敗したときのログ用）と `Effect` を返す。スクラップがないか `step` が None なら何もせず None。
 ///
-/// 返すのは `Effect` の結果をまとめたもの（`Outcome::of`）。コピーに失敗した・画像を作れなかったら失敗、
-/// ほかは成功。保存は裏のスレッドに渡した時点で成功とする（結果を待つのは #126）。
+/// 返すのは `Effect` の結果をまとめたもの（`Outcome::of`）と、裏のスレッドに渡した保存の保存先。コピーに
+/// 失敗した・画像を作れなかった・保存先を決められなかったら失敗、名前を付けて保存のダイアログを取り消したら
+/// 取り消し、ほかは成功。保存の書き込みの結果は、あとから `WM_APP_SAVED` で届く。
 fn perform(
     hwnd: HWND,
     context: OpContext,
     step: impl FnOnce(&mut ScrapModel, &OpContext) -> Option<(OperationId, Vec<Effect>)>,
-) -> Option<Outcome> {
+) -> Option<Performed> {
     let deferred = with_app(|app| {
         let annotation = Style::from(&app.settings.annotation);
         let font = Font::from(&app.settings.annotation);
+        let crosshair = app.settings.selection.crosshair_color;
         let carryover = app.carryover;
         let module = app.module;
         let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
@@ -2277,6 +2343,7 @@ fn perform(
                 }
                 Effect::EnterTrimMode => {
                     log::info!("trim started");
+                    scrap.crosshair = crosshair;
                     if let Err(e) = scrap.paint(&appearance, renderer) {
                         log::warn!("could not show the trim mode: {e}");
                     }
@@ -2331,18 +2398,20 @@ fn perform(
     // 編集モードを抜けたら IME を使えないようにする（core が変換中の文字も書き込みにしてある）
     sync_ime(hwnd, true);
     // クリップボード・通知・ウィンドウを壊すのはメッセージが届くことがあるので、App を借りずに行う
+    let mut saving = None;
+    let mut save = |started: Saving| match started {
+        Saving::Started(path) => {
+            saving = Some(path);
+            Outcome::Succeeded
+        }
+        Saving::Ended(outcome) => outcome,
+    };
     let outcomes: Vec<Outcome> = deferred
         .into_iter()
         .map(|action| match action {
             Deferred::Copy(image) => copy_to_clipboard(&image),
-            Deferred::Save(image) => {
-                save_default(image);
-                Outcome::Succeeded
-            }
-            Deferred::SaveAs(image) => {
-                save_as(hwnd, image);
-                Outcome::Succeeded
-            }
+            Deferred::Save(image) => save(save_default(image)),
+            Deferred::SaveAs(image) => save(save_as(hwnd, image)),
             Deferred::RenderFailed { failed_key, reason } => {
                 log::error!("could not render the scrap image ({failed_key}): {reason}");
                 notify_user(
@@ -2357,7 +2426,10 @@ fn perform(
             }
         })
         .collect();
-    Some(Outcome::of(outcomes))
+    Some(Performed {
+        outcome: Outcome::of(outcomes),
+        saving,
+    })
 }
 
 /// `Effect::CopyToClipboard`: 画像をクリップボードに置く。失敗したらエラーの通知を出し、失敗を返す。
@@ -2395,25 +2467,38 @@ fn copy_image(image: &Image) -> std::result::Result<(), String> {
 /// `Effect::SaveDefault`: 全体設定の保存先に、全体のファイル名テンプレートの名前で保存する。
 /// 保存先とファイル名はここ（UI スレッド）で決め、PNG の書き出しと書き込みは裏のスレッドで行う。
 /// 失敗してもスクラップはそのまま残る。
-fn save_default(image: Image) {
-    if let Some(path) = default_destination() {
-        start_save(path, image, save::Overwrite::Deny, None, None, true);
+fn save_default(image: Image) -> Saving {
+    match default_destination() {
+        Some(path) => start_save(path, image, save::Overwrite::Deny, None, None, true),
+        None => Saving::Ended(Outcome::Failed),
     }
+}
+
+/// 保存を始めたか（`start_save`）。
+enum Saving {
+    /// 裏のスレッドに渡した。結果は `WM_APP_SAVED` で届く。
+    Started(PathBuf),
+    /// 始める前に終わった（失敗の通知は出してある。取り消しなら出さない）。
+    Ended(Outcome),
 }
 
 /// `Effect::ShowSaveDialog`: 「名前を付けて保存」のダイアログを出し、選ばれた場所に保存する。初期フォルダと
 /// ファイル名は既定の保存（`default_destination`）と同じ。キャンセルしたら何もしない。失敗は既定の保存と同じく通知する。
-fn save_as(owner: HWND, image: Image) {
+fn save_as(owner: HWND, image: Image) -> Saving {
     let Some(proposed) = default_destination() else {
-        return;
+        return Saving::Ended(Outcome::Failed);
     };
     // モーダルなので App を借りずに呼ぶ
     match save::ask_path(owner, &proposed, text("save.png_filter")) {
         Ok(Some(path)) => start_save(path, image, save::Overwrite::Allow, None, None, true),
-        Ok(None) => log::info!("save as cancelled"),
+        Ok(None) => {
+            log::info!("save as cancelled");
+            Saving::Ended(Outcome::Cancelled)
+        }
         Err(e) => {
             log::error!("could not show the save dialog: {e}");
             save_failed(None, &e.to_string());
+            Saving::Ended(Outcome::Failed)
         }
     }
 }
@@ -2488,11 +2573,11 @@ fn start_save(
     fallback: Option<Fallback>,
     reply: Option<ReplyTo>,
     notify: bool,
-) {
+) -> Saving {
     let Some((sender, message_window)) = with_app(|app| (app.saves.0.clone(), app.windows.message))
     else {
         reply_failed(reply, text("job.panicked"));
-        return;
+        return Saving::Ended(Outcome::Failed);
     };
     // 書き終えるまでの間に次の保存が同じ名前を選ばないように、結果を受けるまで覚えておく
     let remembered = with_app(|app| {
@@ -2541,7 +2626,9 @@ fn start_save(
             let _ = float_scrap(fallback.at, fallback.image, false);
         }
         reply_failed(reply, &e.to_string());
+        return Saving::Ended(Outcome::Failed);
     }
+    Saving::Started(path)
 }
 
 /// 保存先を、書き込み中の保存先から外す。失敗したときに浮かべるスクラップがあれば返す。
@@ -2561,6 +2648,13 @@ fn on_saved() {
     };
     for saved in results {
         let fallback = forget_pending_save(&saved.path);
+        // この保存を待っていたレシピ。通知を出してから続きを進める
+        let recipe = with_app(|app| app.recipe.resume(&saved.path)).flatten();
+        let outcome = if saved.result.is_ok() {
+            Outcome::Succeeded
+        } else {
+            Outcome::Failed
+        };
         match saved.result {
             Ok(()) => {
                 log::info!("saved {}", saved.path.display());
@@ -2603,6 +2697,11 @@ fn on_saved() {
                 }
             }
         }
+        if let Some((scrap, mut run)) = recipe {
+            log::info!("recipe step {:?} -> {outcome:?}", run.waiting_for());
+            run.settle(outcome);
+            drive_recipe(HWND(scrap as *mut _), run);
+        }
     }
 }
 
@@ -2619,6 +2718,10 @@ fn save_failed(path: Option<&Path>, reason: &str) {
 /// スクラップを閉じて、閉じる直前の状態のままごみ箱に移す（上限が 0 なら破棄する）。
 fn close_scrap(hwnd: HWND) {
     let removed = with_app(|app| {
+        // 保存を待っているレシピは、スクラップと一緒に捨てる
+        if app.recipe.discard_for(&(hwnd.0 as isize)).is_some() {
+            log::info!("the recipe waiting for a save was discarded with its scrap");
+        }
         let index = app.scraps.iter().position(|s| s.window.hwnd() == hwnd)?;
         let mut scrap = app.scraps.remove(index);
         // トリムの範囲を選んでいる途中で閉じたら選ぶ前の状態で、書き込みの編集モードなら抜けてから入れる
@@ -2767,6 +2870,31 @@ fn held_selection_modifiers() -> Input {
 }
 
 /// 範囲選択の画面での `WM_KEYDOWN` を入力にする。対象でないキーは None。
+/// トリムの最中のキーを、トリムの入力にする。範囲選択の画面の精密モード（`selection_key`）と同じ割り当て。
+fn trim_key(wparam: WPARAM, lparam: LPARAM) -> Option<TrimInput> {
+    // SAFETY: GetKeyState は引数のキーの状態を読むだけ
+    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
+    // 押しっぱなしの自動リピート（lParam の bit 30 = 直前も押されていた）
+    let repeat = lparam.0 & (1 << 30) != 0;
+    let shift = down(VK_SHIFT);
+    let arrow = |direction| {
+        Some(if down(VK_CONTROL) {
+            TrimInput::ResizeArrow { direction, shift }
+        } else {
+            TrimInput::Arrow { direction, shift }
+        })
+    };
+    match VIRTUAL_KEY(wparam.0 as u16) {
+        VK_ESCAPE => Some(TrimInput::Cancel),
+        VK_RETURN | VK_SPACE if !repeat => Some(TrimInput::Confirm),
+        VK_LEFT => arrow(Direction::Left),
+        VK_RIGHT => arrow(Direction::Right),
+        VK_UP => arrow(Direction::Up),
+        VK_DOWN => arrow(Direction::Down),
+        _ => None,
+    }
+}
+
 fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
     // SAFETY: GetKeyState は引数のキーの状態を読むだけ
     let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
@@ -2952,9 +3080,20 @@ fn open_scrap(
             &model,
             appearance,
             None,
+            shunsoku_core::settings::SelectionScreen::default().crosshair_color,
         )
     })
-    .unwrap_or_else(|| paint_scrap(&mut None, &window, visible, &model, appearance, None));
+    .unwrap_or_else(|| {
+        paint_scrap(
+            &mut None,
+            &window,
+            visible,
+            &model,
+            appearance,
+            None,
+            shunsoku_core::settings::SelectionScreen::default().crosshair_color,
+        )
+    });
     painted?;
     window.show(focus);
     Ok(Scrap {
@@ -2967,6 +3106,7 @@ fn open_scrap(
         wheel: Wheel::default(),
         zoom_label: false,
         caret: Default::default(),
+        crosshair: shunsoku_core::settings::SelectionScreen::default().crosshair_color,
     })
 }
 
@@ -3142,7 +3282,9 @@ fn output(request: CaptureRequest, area: Rect, image: Image) {
         image: image.clone(),
     });
     match resolve_save_target(target) {
-        Ok(path) => start_save(path, image, overwrite, fallback, reply_to, notify),
+        Ok(path) => {
+            start_save(path, image, overwrite, fallback, reply_to, notify);
+        }
         Err((dir, reason)) if strict => {
             let mut reason = reason;
             if let Some(dir) = dir {

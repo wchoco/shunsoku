@@ -13,9 +13,8 @@ pub struct Recipe {
     pub shortcut: Option<Chord>,
 }
 
-/// レシピに入れられない操作。`trim` と `annotate` はモードを切り替えて入力を奪う（ADR-0007）。保存の 2 つは、
-/// 結果（裏のスレッドの書き込み、ダイアログの取り消し）を待つ仕組みができるまで入れない（#126）。
-const NOT_STEPS: &[OperationId] = &["trim", "annotate", "save_default", "save_as"];
+/// レシピに入れられない操作。`trim` と `annotate` はモードを切り替えて入力を奪う（ADR-0007）。
+const NOT_STEPS: &[OperationId] = &["trim", "annotate"];
 
 /// レシピの最後にだけ置ける操作。
 pub const CLOSE: OperationId = "close";
@@ -113,9 +112,10 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
 }
 
 /// 1 手の結果。Win32 層がその手の `Effect` を実行して決め、`Run::settle` で返す。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Outcome {
     /// 成功した。結果を返さない `Effect`（移動、描き直しなど）もこれ。
+    #[default]
     Succeeded,
     /// 取り消した（名前を付けて保存のダイアログなど）。通知は出さない。
     Cancelled,
@@ -251,6 +251,55 @@ impl Run {
     }
 }
 
+/// あとから届く結果（裏のスレッドの保存）を待っているレシピ。待たせるのは 1 つだけ。
+///
+/// Win32 層は、結果を待つ手を実行したら `Run` をここに預け、結果の知らせ（`ticket`。保存先など）が届いたら
+/// `resume` で取り出して `Run::settle` し、`Run::advance` を続ける。待っている間にそのスクラップを閉じたら
+/// `discard_for`、ほかのレシピを始めたら `discard` で捨てる（捨てたレシピは、結果が届いても進めない）。
+/// `S` はスクラップを、`T` は結果の知らせを見分けるもの。
+#[derive(Debug, Clone)]
+pub struct Parked<S, T> {
+    waiting: Option<(S, T, Run)>,
+}
+
+impl<S, T> Default for Parked<S, T> {
+    fn default() -> Parked<S, T> {
+        Parked { waiting: None }
+    }
+}
+
+impl<S: PartialEq, T: PartialEq> Parked<S, T> {
+    /// `scrap` のレシピ `run` を、`ticket` の結果が届くまで待たせる。前に待っていたレシピがあれば捨てて返す。
+    pub fn park(&mut self, scrap: S, ticket: T, run: Run) -> Option<Run> {
+        self.waiting
+            .replace((scrap, ticket, run))
+            .map(|(_, _, run)| run)
+    }
+
+    /// `ticket` の結果を待っていたレシピを取り出す（スクラップと一緒に）。待っていなければ None。
+    pub fn resume(&mut self, ticket: &T) -> Option<(S, Run)> {
+        match &self.waiting {
+            Some((_, waiting, _)) if waiting == ticket => {
+                self.waiting.take().map(|(scrap, _, run)| (scrap, run))
+            }
+            _ => None,
+        }
+    }
+
+    /// `scrap` のレシピが待っていれば捨てて返す。
+    pub fn discard_for(&mut self, scrap: &S) -> Option<Run> {
+        match &self.waiting {
+            Some((waiting, _, _)) if waiting == scrap => self.discard(),
+            _ => None,
+        }
+    }
+
+    /// 待っているレシピを捨てて返す。
+    pub fn discard(&mut self) -> Option<Run> {
+        self.waiting.take().map(|(_, _, run)| run)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,13 +349,11 @@ mod tests {
 
     #[test]
     fn steps_that_cannot_go_in_a_recipe_make_it_an_error() {
-        // trim と annotate はモードを変える。save_* は結果を待つ仕組みがまだない。zoom は選択肢を持ち、move は
-        // ドラッグ専用。fly は表にない（別のレシピの名前も同じ）
+        // trim と annotate はモードを変える。zoom は選択肢を持ち、move はドラッグ専用。fly は表にない（別の
+        // レシピの名前も同じ）
         for step in [
             "trim",
             "annotate",
-            "save_default",
-            "save_as",
             "zoom",
             "move",
             "fly",
@@ -330,6 +377,20 @@ mod tests {
                 "{step}"
             );
         }
+    }
+
+    #[test]
+    fn saves_go_in_a_recipe() {
+        let checked = plan(
+            &[
+                recipe("保存して閉じる", &["save_default", "close"]),
+                recipe("名前を付けて保存して閉じる", &["save_as", "close"]),
+            ],
+            OPERATIONS,
+        );
+        assert_eq!(checked.problems, vec![]);
+        assert_eq!(ids(&checked.plans[0]), ["save_default", "close"]);
+        assert_eq!(ids(&checked.plans[1]), ["save_as", "close"]);
     }
 
     #[test]
@@ -597,6 +658,99 @@ mod tests {
                 Advance::Stopped(stop)
             );
         }
+    }
+
+    #[test]
+    fn save_then_close_closes_only_after_the_save_succeeds() {
+        for (save, effect) in [
+            ("save_default", Effect::SaveDefault),
+            ("save_as", Effect::ShowSaveDialog),
+        ] {
+            let mut run = run_of(&[save, "close"]);
+            let mut model = model();
+            assert_eq!(step(&mut run, &mut model), (save, vec![effect]));
+            // 書き込みの知らせが届くまでは閉じない
+            assert_eq!(
+                run.advance(&mut model, &OpContext::default()),
+                Advance::Waiting(save)
+            );
+            run.settle(Outcome::Succeeded);
+            assert_eq!(
+                step(&mut run, &mut model),
+                ("close", vec![Effect::MoveToTrash])
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_save_leaves_the_scrap_open() {
+        for (save, outcome, stop) in [
+            (
+                "save_default",
+                Outcome::Failed,
+                Stop::Failed("save_default"),
+            ),
+            ("save_as", Outcome::Failed, Stop::Failed("save_as")),
+            ("save_as", Outcome::Cancelled, Stop::Cancelled("save_as")),
+        ] {
+            let mut run = run_of(&[save, "close"]);
+            let mut model = model();
+            step(&mut run, &mut model);
+            run.settle(outcome);
+            assert_eq!(
+                run.advance(&mut model, &OpContext::default()),
+                Advance::Stopped(stop)
+            );
+        }
+    }
+
+    /// 保存を待っているレシピ。スクラップは 1 から、保存の知らせは "a.png" などで見分ける。
+    fn parked_save(scrap: u32, ticket: &str) -> Parked<u32, String> {
+        let mut run = run_of(&["save_default", "close"]);
+        step(&mut run, &mut model());
+        let mut parked = Parked::default();
+        assert!(parked.park(scrap, ticket.to_owned(), run).is_none());
+        parked
+    }
+
+    #[test]
+    fn the_save_result_resumes_the_recipe_waiting_for_it() {
+        let mut parked = parked_save(1, "a.png");
+        // 別の保存の知らせでは進めない
+        assert!(parked.resume(&"b.png".to_owned()).is_none());
+        let (scrap, mut run) = parked.resume(&"a.png".to_owned()).unwrap();
+        assert_eq!(scrap, 1);
+        assert_eq!(run.waiting_for(), Some("save_default"));
+        run.settle(Outcome::Succeeded);
+        assert_eq!(
+            step(&mut run, &mut model()),
+            ("close", vec![Effect::MoveToTrash])
+        );
+        // 1 度しか進めない
+        assert!(parked.resume(&"a.png".to_owned()).is_none());
+    }
+
+    #[test]
+    fn closing_the_scrap_discards_the_recipe_waiting_on_it() {
+        let mut parked = parked_save(1, "a.png");
+        assert!(parked.discard_for(&2).is_none());
+        assert!(parked.discard_for(&1).is_some());
+        assert!(parked.resume(&"a.png".to_owned()).is_none());
+    }
+
+    #[test]
+    fn starting_another_recipe_discards_the_waiting_one() {
+        let mut parked = parked_save(1, "a.png");
+        assert!(parked.discard().is_some());
+        assert!(parked.discard().is_none());
+        assert!(parked.resume(&"a.png".to_owned()).is_none());
+        // 待たせるのも 1 つだけ。前のは捨てて返す
+        let mut parked = parked_save(1, "a.png");
+        let mut run = run_of(&["save_as"]);
+        step(&mut run, &mut model());
+        assert!(parked.park(2, "b.png".to_owned(), run).is_some());
+        assert!(parked.resume(&"a.png".to_owned()).is_none());
+        assert_eq!(parked.resume(&"b.png".to_owned()).map(|(s, _)| s), Some(2));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! shunsoku のロジック層。`windows` クレートに依存せず、Windows API なしでテストできる（ADR-0005）。
 
+pub mod adjust;
 pub mod annotate;
 pub mod app_window;
 pub mod autostart;
