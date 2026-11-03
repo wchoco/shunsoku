@@ -6,6 +6,8 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod autostart;
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod grab;

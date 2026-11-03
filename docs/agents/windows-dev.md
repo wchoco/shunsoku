@@ -29,6 +29,8 @@ scripts/win-build.sh [worktree-dir=.]   # env: PKG（既定 shunsoku）、PROFIL
 - `cargo.exe` は WSL の PATH にない。スクリプトの外で使うなら `%USERPROFILE%\.cargo\bin` を足す。
 - zsh では `time` が予約語で、`VAR=x time cmd` は構文エラーになる。先に `export` する。
 
+- 自動起動を試すときは、環境変数 `SHUNSOKU_AUTOSTART_VALUE` で Run キーの値の名前を試験用のもの（`shunsoku-test` など）に差し替え、ユーザーの登録（`shunsoku`）を書き換えない。試す前に `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run` を控え、終わったら同じであることを確かめる。
+
 ## 4. 描画を見て確かめる
 
 描画（スクラップ、範囲選択の画面、メニュー）を変えたら、3. の exe を動かして画面を撮り、Read で画像を見る。テストは見た目の違い（灰色の正方形、太さの違う枠）を捕まえない。

@@ -32,6 +32,7 @@ unreadable_kept = "設定ファイルを TOML として読めないため、直�
 conflicts = "重なったキーを、重なった項目のすべてで無効にしました: "
 mouse_conflicts = "重なったマウス操作を、重なった項目のすべてで無効にしました: "
 overlaps = "ホットキーとショートカットが重なっています（ホットキーが優先され、そのショートカットは効きません）: "
+autostart_failed = "自動起動の登録を設定に合わせられませんでした。"
 watch_stopped = "設定ファイルの監視が止まりました。設定ファイルを直したら shunsoku を起動し直してください。"
 
 # 設定 GUI（ダイアログ）
@@ -61,6 +62,7 @@ scrap_ops = "スクラップ操作"
 annotation = "書き込み"
 
 [settings_gui.general]
+autostart = "Windows にサインインしたときに起動する"
 notifications = "通知を出す"
 save_dir = "保存先:"
 # 保存先の欄が空のときに薄く出す（後ろに既定のフォルダが付く）

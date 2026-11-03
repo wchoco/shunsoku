@@ -152,8 +152,8 @@ mod cli;
 mod settings_gui;
 
 use crate::{
-    clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook, perf,
-    pipe_server, render, save, scrap_window, settings_watch, single_instance, toolbar_window,
+    autostart, clipboard, grab, hotkey, logger, menu, monitor_list, notify, overlay, panic_hook,
+    perf, pipe_server, render, save, scrap_window, settings_watch, single_instance, toolbar_window,
     trash_store, tray, window_list,
 };
 use cli::{
@@ -721,6 +721,7 @@ pub fn run() -> i32 {
     if let Some((level, body)) = notice {
         notify_user(level, &body);
     }
+    sync_autostart();
     if open_gui {
         log::info!("the select-capture hotkey is unset; opening the settings GUI");
         settings_gui::open_for_unset_hotkey();
@@ -3716,6 +3717,7 @@ fn on_settings_changed() {
     let Some(content) = content else {
         return;
     };
+    let mut autostart_changed = false;
     let notice = with_app(|app| {
         let own = match &content {
             settings_watch::Content::Text(src) => app.own_writes.is_own(src),
@@ -3747,6 +3749,7 @@ fn on_settings_changed() {
         ) == Some(unset::Prompt::Notify);
         let old = std::mem::replace(&mut app.settings, new);
         let (keymap_issues, failed) = adopt_settings(app, &old, false);
+        autostart_changed = old.general.autostart != app.settings.general.autostart;
         issues.extend(keymap_issues);
         settings_notice(
             Moment::Reload,
@@ -3759,6 +3762,9 @@ fn on_settings_changed() {
     .flatten();
     if let Some((level, body)) = notice {
         notify_user(level, &body);
+    }
+    if autostart_changed {
+        sync_autostart();
     }
 }
 
@@ -3910,6 +3916,24 @@ fn settings_notice(
 fn join_items(items: &[settings::SettingsItem]) -> String {
     let names: Vec<String> = items.iter().map(ToString::to_string).collect();
     names.join(", ")
+}
+
+/// 自動起動の登録（Run キー）をいまの設定に合わせる。起動したとき、設定 GUI で適用したとき、読み込み直しで
+/// 自動起動が変わったときに呼ぶ。合わせられなければ通知する。通知を出すので `App` を借りずに呼ぶ。
+fn sync_autostart() {
+    let Some(enabled) = with_app(|app| app.settings.general.autostart) else {
+        return;
+    };
+    match autostart::sync(enabled) {
+        Ok(action) => log::info!("autostart (enabled: {enabled}): {action:?}"),
+        Err(e) => {
+            log::error!("autostart: {e}");
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{e}", text("settings.autostart_failed")),
+            );
+        }
+    }
 }
 
 /// トレイの通知を出す。出したら true。設定で通知をオフにしたときは、成功の通知だけを止める（エラーと警告は出す）。

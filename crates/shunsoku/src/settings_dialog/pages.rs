@@ -8,9 +8,17 @@ const ROW: i16 = 20;
 /// 欄の幅（ページの右端まで）。
 const FIELD_WIDTH: i16 = PAGE_WIDTH - FIELD_X;
 
-/// 「一般」タブ。言語（#102）と自動起動（#101）の欄は、通知の前に `y` を進めて足す。
+/// 「一般」タブ。言語（#102）の欄は、自動起動の前に `y` を進めて足す。
 pub(super) fn general(b: &mut PageBuilder) {
     let mut y = 0;
+    b.check(
+        Field::Autostart,
+        "settings_gui.general.autostart",
+        0,
+        y,
+        PAGE_WIDTH,
+    );
+    y += ROW;
     b.check(
         Field::Notifications,
         "settings_gui.general.notifications",
