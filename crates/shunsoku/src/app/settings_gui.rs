@@ -10,6 +10,10 @@
 //!   「変数を挿入」）はモーダルなので、`App` を借りずに出す（`on_button`）。
 //! - 「スクラップ操作」タブ（`settings_dialog::scrap_ops`）: 一覧で行を選んだら、ショートカットの欄の `ChordRow::item`
 //!   をその行の操作に差し替える。マウスのドロップダウンと「既定に戻す」は写しの行を変える。
+//! - 「定型領域」タブ（`settings_dialog::regions`）: 一覧で行を選んだら、詳細の欄（`Fields::bind_region`）と
+//!   ホットキーの欄の `ChordRow::item` をその領域に結び直す。一覧の下のボタンは写しの領域を足す・写す・消す・
+//!   動かし（`Editor::add_region` など）、移った行を選ぶ。出し直す（`refresh`）ときは一覧の行を先に写しに揃える。
+//!   定型領域を選んで名前の欄にフォーカスを置いて開くのは `open_region`。
 //! - キーの組み合わせの欄にフォーカスがある間は、全体のホットキーの登録を外す（`App::hotkeys_suspended`）。欄の
 //!   フォーカスの出入りで `WM_APP_SETTINGS_FOCUS` を自分に送り、届いた時点のフォーカスで決める（`check_focus`）。
 //! - 適用（`apply`）: その時点のファイルと写しを 3 者で突き合わせ（`settings::merge`）、両方で変えた項目があれば
@@ -22,7 +26,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use shunsoku_core::settings::editor::Editor;
+use shunsoku_core::settings::editor::{Editor, Move};
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::{self, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
@@ -35,8 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CBN_SELCHANGE, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GetWindowRect,
     IDCANCEL, IDOK, IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MSG,
     MessageBoxW, PostMessageW, PostQuitMessage, SW_RESTORE, SW_SHOW, SendMessageW,
-    SetForegroundWindow, ShowWindow, WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NEXTDLGCTL,
-    WM_NOTIFY, WM_SETTINGCHANGE,
+    SetForegroundWindow, ShowWindow, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_INITDIALOG,
+    WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
 };
 use windows::core::PCWSTR;
 
@@ -45,6 +49,7 @@ use super::{
     register_hotkeys, settings_notice, text, with_app, write_settings,
 };
 use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
+use crate::settings_dialog::regions::{self, ListButton};
 use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops};
 use crate::wide::to_wide;
 use crate::{menu, notify, panic_hook, save};
@@ -81,6 +86,20 @@ pub(super) fn open_for_unset_hotkey() {
     open_with(Some(Page::Capture), Some(SettingsItem::SelectCaptureHotkey));
 }
 
+/// 「定型領域」タブで開き、写しの定型領域 `index` を選んで名前の欄にフォーカスを置く。開いていれば前に出す。
+#[expect(
+    dead_code,
+    reason = "#99 で、トレイの「定型領域を追加…」で登録したあとに呼ぶ"
+)]
+pub(super) fn open_region(index: usize) {
+    open(Some(Page::Regions));
+    let Some(hwnd) = DIALOG.get() else {
+        return;
+    };
+    regions::select(hwnd, index);
+    set_focus(hwnd, regions::name_id());
+}
+
 /// 設定 GUI を `page` のタブで開き、`focus` の欄（None ならタブ）にフォーカスを置く。開いていれば前に出す。
 fn open_with(page: Option<Page>, focus: Option<SettingsItem>) {
     let Some((existing, module, settings, unregistered)) = with_app(|app| {
@@ -111,6 +130,7 @@ fn open_with(page: Option<Page>, focus: Option<SettingsItem>) {
         }
         return;
     }
+    regions::refresh_monitors();
     // ダイアログを作る間にプロシージャが呼ばれるので、借りずに作る
     let dialog =
         match settings_dialog::create(module, page.unwrap_or_default(), text, Some(dialog_proc)) {
@@ -185,8 +205,17 @@ fn bring_to_front(hwnd: HWND) {
     }
 }
 
-/// 写しを欄に出す。
+/// 写しを欄に出す。定型領域の一覧の行を先に揃える（揃えて行を選び直すと、欄を結び直すため）。
 fn refresh(hwnd: HWND) {
+    let list = with_app(|app| {
+        app.settings_gui
+            .as_ref()
+            .map(|gui| (gui.editor.clone(), gui.fields.region()))
+    })
+    .flatten();
+    if let Some((editor, bound)) = list {
+        regions::sync_list(hwnd, &editor, bound, text);
+    }
     let snapshot = with_app(|app| {
         app.settings_gui
             .as_ref()
@@ -246,7 +275,22 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
                 {
                     on_scrap_op_selected(hwnd);
                 }
+            } else if header.idFrom == regions::list_id() as usize && header.code == LVN_ITEMCHANGED
+            {
+                // SAFETY: LVN_ITEMCHANGED の lparam は NMLISTVIEW を指す
+                let change = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
+                if change.uNewState & LVIS_SELECTED.0 != 0
+                    && change.uOldState & LVIS_SELECTED.0 == 0
+                {
+                    on_region_selected(hwnd);
+                }
             }
+            false
+        }
+        WM_DISPLAYCHANGE => {
+            // 定型領域の警告とモニタの名前を出し直す
+            regions::refresh_monitors();
+            refresh(hwnd);
             false
         }
         WM_SETTINGCHANGE => {
@@ -291,6 +335,11 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
         _ if id == scrap_ops::reset_id() && code == BN_CLICKED => {
             if let Some(row) = scrap_ops::selected(hwnd) {
                 edit(hwnd, |editor| editor.reset_binding(&row));
+            }
+        }
+        _ if code == BN_CLICKED && regions::list_button(id).is_some() => {
+            if let Some(button) = regions::list_button(id) {
+                on_region_list_button(hwnd, button);
             }
         }
         _ if chord_field::is_field(control) => match code {
@@ -378,6 +427,12 @@ fn on_button(hwnd: HWND, fields: &Fields, action: Action) {
             }
         }
         Action::InsertVariable(of) => insert_variable(hwnd, fields, of),
+        Action::OpenFolder(field) => {
+            let dir = fields::folder_of(&draft, field);
+            if !save::open_folder(&dir) {
+                log::warn!("could not open the folder {}", dir.display());
+            }
+        }
     }
     refresh(hwnd);
 }
@@ -464,14 +519,79 @@ fn on_chord_changed(hwnd: HWND, field: i32, chord: Option<shunsoku_core::keys::C
     refresh(hwnd);
 }
 
-/// 写しを `change` で変えて、欄に出し直す。
-fn edit(hwnd: HWND, change: impl FnOnce(&mut Editor)) {
+/// 写しを `change` で変えて、欄に出し直す。`change` の結果を返す。
+fn edit<T>(hwnd: HWND, change: impl FnOnce(&mut Editor) -> T) -> Option<T> {
+    let result =
+        with_app(|app| app.settings_gui.as_mut().map(|gui| change(&mut gui.editor))).flatten();
+    refresh(hwnd);
+    result
+}
+
+/// 「定型領域」タブの一覧で行を選んだ。詳細の欄とホットキーの欄をその領域に結び直す。
+fn on_region_selected(hwnd: HWND) {
+    let Some(index) = regions::selected(hwnd) else {
+        return;
+    };
+    let field = regions::hotkey_id();
     with_app(|app| {
         if let Some(gui) = app.settings_gui.as_mut() {
-            change(&mut gui.editor);
+            gui.fields.bind_region(index);
+            if let Some(chord_row) = gui.rows.iter_mut().find(|r| r.field == field) {
+                chord_row.item = SettingsItem::RegionHotkey(index);
+            }
         }
     });
-    refresh(hwnd);
+    // 一覧を揃えている途中なら、揃えたあとで出す（`refresh`）
+    if !regions::is_syncing() {
+        regions::refresh_monitors();
+        refresh(hwnd);
+    }
+}
+
+/// 「定型領域」タブの一覧の下のボタン。写しを変えて、移った行を選ぶ。足した・写した行は名前の欄にフォーカスを置く。
+fn on_region_list_button(hwnd: HWND, button: ListButton) {
+    let selected = regions::selected(hwnd);
+    let target = match button {
+        ListButton::Add => {
+            let Some((monitor, rect)) = regions::new_region_place() else {
+                log::warn!("no monitor to add a region on");
+                return;
+            };
+            edit(hwnd, |editor| {
+                Some(editor.add_region(text("region.default_name"), &monitor, rect))
+            })
+        }
+        ListButton::Duplicate => edit(hwnd, |editor| {
+            let i = selected?;
+            let name = format!(
+                "{}{}",
+                editor.draft().regions.get(i)?.name,
+                text("settings_gui.regions.copy_suffix")
+            );
+            Some(editor.duplicate_region(i, &name))
+        }),
+        ListButton::Remove => edit(hwnd, |editor| {
+            let i = selected.filter(|&i| i < editor.draft().regions.len())?;
+            editor.remove_region(i)
+        }),
+        ListButton::Up | ListButton::Down => edit(hwnd, |editor| {
+            let i = selected.filter(|&i| i < editor.draft().regions.len())?;
+            let to = if button == ListButton::Up {
+                Move::Up
+            } else {
+                Move::Down
+            };
+            Some(editor.move_region(i, to))
+        }),
+    }
+    .flatten();
+    let Some(index) = target else {
+        return;
+    };
+    regions::select(hwnd, index);
+    if matches!(button, ListButton::Add | ListButton::Duplicate) {
+        set_focus(hwnd, regions::name_id());
+    }
 }
 
 /// 「スクラップ操作」タブの一覧で行を選んだ。ショートカットの欄をその行の操作に結び直す。

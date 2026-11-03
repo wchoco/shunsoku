@@ -11,12 +11,13 @@
 //! - キーの組み合わせの欄（ホットキー・ショートカット）は `PageBuilder::chord_field` で置く。欄（`chord_field`）と、
 //!   その横の印の欄を組にして `ChordRow` として返す。呼び出し側は `ChordRow::item` で写しの項目と結ぶ。
 //! - それ以外の欄（チェックボックス・テキスト・数・ドロップダウンと、横の「参照…」などのボタン）は `fields`。
-//!   一般・スクラップ・書き込みのタブは `pages`。
+//!   一般・スクラップ・書き込みのタブは `pages`、定型領域のタブは `regions`、スクラップ操作のタブは `scrap_ops`。
 //! - タイトルバーだけダークモードに合わせる（`apply_dark`）。DPI の変化は PMv2 のダイアログマネージャに任せる。
 
 pub mod chord_field;
 pub mod fields;
 mod pages;
+pub mod regions;
 pub mod scrap_ops;
 
 use shunsoku_core::settings::SettingsItem;
@@ -73,6 +74,7 @@ pub enum Page {
     General,
     #[default]
     Capture,
+    Regions,
     Scrap,
     ScrapOps,
     Annotation,
@@ -96,6 +98,11 @@ const PAGES: &[PageDef] = &[
         page: Page::Capture,
         label_key: "settings_gui.tab.capture",
         build: capture_page,
+    },
+    PageDef {
+        page: Page::Regions,
+        label_key: "settings_gui.tab.regions",
+        build: regions::build,
     },
     PageDef {
         page: Page::Scrap,
@@ -371,6 +378,7 @@ pub fn fill(hwnd: HWND, rows: &[ChordRow], editor: &Editor, text: Text) {
         }
     }
     scrap_ops::fill(hwnd, editor, text);
+    regions::fill(hwnd, editor, text);
     let buttons = editor.buttons();
     for (id, enabled) in [(IDOK.0, buttons.ok), (ID_APPLY, buttons.apply)] {
         if let Some(button) = item(hwnd, id) {
