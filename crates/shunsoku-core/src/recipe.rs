@@ -18,7 +18,7 @@ pub struct Recipe {
 const NOT_STEPS: &[OperationId] = &["trim", "annotate", "save_default", "save_as"];
 
 /// レシピの最後にだけ置ける操作。
-const CLOSE: OperationId = "close";
+pub const CLOSE: OperationId = "close";
 
 /// 検査を通ったレシピ。ショートカットから実行できる。
 #[derive(Debug, Clone)]

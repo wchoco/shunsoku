@@ -1136,7 +1136,7 @@ font = "Meiryo"     # 書体
     fn a_recipe_added_to_a_file_reads_back_the_same() {
         let wanted = vec![
             recipe("コピーして閉じる", &["copy", "close"], Some("Ctrl+Shift+C")),
-            recipe("影を消す", &["toggle_shadow"], None),
+            recipe("影を消す", &["shadow"], None),
         ];
         let out = written("version = 1\n", |s| s.recipes = wanted.clone());
         let (read, issues) = load(&out);
@@ -1155,7 +1155,7 @@ shortcut = "Ctrl+Shift+C"
 # 影
 [[recipes]]
 name = "影を消す"
-steps = ["toggle_shadow"]
+steps = ["shadow"]
 "#;
 
     #[test]
@@ -1186,7 +1186,7 @@ steps = ["toggle_shadow"]
         });
         assert_eq!(
             out,
-            "version = 1\n\n# 影\n[[recipes]]\nname = \"影を消す\"\nsteps = [\"toggle_shadow\"]\n"
+            "version = 1\n\n# 影\n[[recipes]]\nname = \"影を消す\"\nsteps = [\"shadow\"]\n"
         );
         let out = written(RECIPES, |s| s.recipes.clear());
         assert_eq!(out, "version = 1\n");
