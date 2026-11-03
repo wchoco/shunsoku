@@ -4,6 +4,17 @@
 //! 預かるもの `T` の中身は問わない。Win32 層の `trash_store` が、閉じる直前の `ScrapModel` と、一時ファイルに
 //! 退避した画素をまとめて預ける。捨てたもの（`Pushed::discarded`、`set_limit` と `clear` の戻り値）は
 //! 呼び出し側に返すので、呼び出し側がその一時ファイルを消す。
+//!
+//! 一覧の項目に付けるサムネイルの大きさ（`thumbnail_side`）もここで決める。縮める計算は `Image::thumbnail`。
+
+/// ごみ箱の一覧に付けるサムネイルの長い辺（96 DPI での画面の画素）。
+const THUMBNAIL_SIDE: u32 = 64;
+
+/// サムネイルの長い辺を、`dpi` のモニタの物理ピクセルにしたもの。`dpi` が 0（分からない）なら 96 DPI とみなす。
+pub fn thumbnail_side(dpi: u32) -> u32 {
+    let dpi = if dpi == 0 { 96 } else { dpi };
+    (THUMBNAIL_SIDE * dpi + 48) / 96
+}
 
 /// 閉じたものを預かるごみ箱。
 #[derive(Debug, Clone)]
@@ -176,5 +187,14 @@ mod tests {
         trash.push("b");
         assert_eq!(trash.clear(), vec!["a", "b"]);
         assert_eq!(ids(&trash), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn the_thumbnail_side_is_64px_at_100_percent_and_follows_the_dpi() {
+        assert_eq!(thumbnail_side(96), 64);
+        assert_eq!(thumbnail_side(144), 96);
+        assert_eq!(thumbnail_side(120), 80);
+        // DPI が分からない（0）ときは 96 DPI とみなす
+        assert_eq!(thumbnail_side(0), 64);
     }
 }

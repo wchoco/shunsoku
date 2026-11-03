@@ -18,6 +18,7 @@ pub mod monitors;
 pub mod notice;
 pub mod perf;
 pub mod protocol;
+pub mod recipe;
 pub mod scrap;
 pub mod selection;
 pub mod settings;

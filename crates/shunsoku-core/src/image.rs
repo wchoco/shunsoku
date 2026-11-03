@@ -162,6 +162,46 @@ impl Image {
         out
     }
 
+    /// 長い辺を `longest` 画素に縮めた画像（縦横の比を保つ）。もともと収まる画像は、そのままの大きさで返す。
+    pub fn thumbnail(&self, longest: u32) -> Image {
+        let size = thumbnail_size(self.size, longest);
+        if size == self.size {
+            return self.clone();
+        }
+        // 縮めた 1 画素が覆う元の画素の平均。色はアルファで重み付けし、透明な画素の色を混ぜない
+        let span = |i: u32, out: u32, whole: u32| {
+            let from = (u64::from(i) * u64::from(whole) / u64::from(out)) as u32;
+            let to = (u64::from(i + 1) * u64::from(whole) / u64::from(out)) as u32;
+            from..to.max(from + 1)
+        };
+        let mut out = Image::transparent(size);
+        for oy in 0..size.height {
+            let ys = span(oy, size.height, self.height());
+            for ox in 0..size.width {
+                let xs = span(ox, size.width, self.width());
+                let (mut color, mut alpha, mut count) = ([0u64; 3], 0u64, 0u64);
+                for y in ys.clone() {
+                    for x in xs.clone() {
+                        let [b, g, r, a] = self.pixel(x, y);
+                        let a = u64::from(a);
+                        for (sum, c) in color.iter_mut().zip([b, g, r]) {
+                            *sum += u64::from(c) * a;
+                        }
+                        alpha += a;
+                        count += 1;
+                    }
+                }
+                let round = |n: u64, d: u64| (n + d / 2).checked_div(d).unwrap_or(0) as u8;
+                let d = out.offset(ox, oy);
+                for (k, sum) in color.iter().enumerate() {
+                    out.pixels[d + k] = round(*sum, alpha);
+                }
+                out.pixels[d + 3] = round(alpha, count);
+            }
+        }
+        out
+    }
+
     /// 断片を `bounds`（スクリーン座標）の 1 枚の画像に並べる。断片のない部分は透明。
     /// `bounds` からはみ出した部分は捨てる。
     pub fn compose(bounds: Rect, fragments: &[Fragment]) -> Image {
@@ -189,6 +229,18 @@ impl Image {
             self.pixels[d..d + len].copy_from_slice(&src.pixels[s..s + len]);
         }
     }
+}
+
+/// `size` の長い辺を `longest` に収めた大きさ。比を保ち、端数は四捨五入し、辺は 1 画素より細くしない。
+fn thumbnail_size(size: Size, longest: u32) -> Size {
+    let side = size.width.max(size.height);
+    if side <= longest || side == 0 {
+        return size;
+    }
+    let fit = |n: u32| {
+        ((u64::from(n) * u64::from(longest) + u64::from(side) / 2) / u64::from(side)).max(1) as u32
+    };
+    Size::new(fit(size.width), fit(size.height))
 }
 
 #[cfg(test)]
@@ -365,5 +417,56 @@ mod tests {
             vec![vec![[1, 2, 3, 255], [100, 199, 50, 128], [0, 0, 0, 0]]]
         );
         assert_eq!(Image::from_premultiplied(Size::new(2, 1), vec![0; 4]), None);
+    }
+
+    #[test]
+    fn a_thumbnail_fits_the_longest_side_and_keeps_the_aspect_ratio() {
+        assert_eq!(
+            filled(640, 320, RED).thumbnail(64).size(),
+            Size::new(64, 32)
+        );
+        assert_eq!(
+            filled(100, 400, RED).thumbnail(64).size(),
+            Size::new(16, 64)
+        );
+        // 端数は四捨五入し、細くても 1 画素は残す
+        assert_eq!(
+            filled(300, 200, RED).thumbnail(64).size(),
+            Size::new(64, 43)
+        );
+        assert_eq!(filled(1000, 3, RED).thumbnail(64).size(), Size::new(64, 1));
+    }
+
+    #[test]
+    fn a_thumbnail_averages_the_pixels_each_of_its_pixels_covers() {
+        // 左の 2 列が赤、右の 2 列が青。黒と白を並べた灰色の行もある
+        let mut pixels = Vec::new();
+        for row in [[RED, RED, BLUE, BLUE], [RED, RED, BLUE, BLUE]] {
+            pixels.extend(row.concat());
+        }
+        let halves = Image::from_bgra(Size::new(4, 2), pixels).unwrap();
+        assert_eq!(rows(&halves.thumbnail(2)), vec![vec![RED, BLUE]]);
+
+        let black_white = Image::from_bgra(
+            Size::new(2, 1),
+            [[0, 0, 0, 255], [255, 255, 255, 255]].concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows(&black_white.thumbnail(1)),
+            vec![vec![[128, 128, 128, 255]]]
+        );
+    }
+
+    #[test]
+    fn a_transparent_pixel_does_not_darken_the_thumbnail() {
+        // 透明な画素の色（黒）は混ぜず、アルファだけ薄くなる
+        let half = Image::from_bgra(Size::new(2, 1), [RED, CLEAR].concat()).unwrap();
+        assert_eq!(rows(&half.thumbnail(1)), vec![vec![[0, 0, 255, 128]]]);
+    }
+
+    #[test]
+    fn an_image_that_already_fits_is_its_own_thumbnail() {
+        assert_eq!(numbered().thumbnail(64), numbered());
     }
 }
