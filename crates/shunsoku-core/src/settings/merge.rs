@@ -89,8 +89,10 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         regions,
     } = ours;
     let General {
+        language,
         save_dir,
         file_name_template,
+        autostart,
         notifications,
         trash_limit,
         dpi_scaling,
@@ -125,12 +127,14 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
             m(Field::Key($key), changed, both);
         }};
     }
+    value!("general.language", language, general.language);
     value!("general.save_dir", save_dir, general.save_dir);
     value!(
         "general.file_name_template",
         file_name_template,
         general.file_name_template
     );
+    value!("general.autostart", autostart, general.autostart);
     value!(
         "general.notifications",
         notifications,
@@ -615,12 +619,16 @@ mod tests {
         use crate::selection::Mode;
         use crate::settings::{DpiScaling, LogLevel, Region, Rgb};
         vec![
+            ("general.language", |s| {
+                s.general.language = Some(crate::i18n::Language::English)
+            }),
             ("general.save_dir", |s| {
                 s.general.save_dir = Some("D:\\shots".into())
             }),
             ("general.file_name_template", |s| {
                 s.general.file_name_template = "x_{date}".into()
             }),
+            ("general.autostart", |s| s.general.autostart = true),
             ("general.notifications", |s| s.general.notifications = false),
             ("general.trash_limit", |s| s.general.trash_limit = 3),
             ("general.dpi_scaling", |s| {

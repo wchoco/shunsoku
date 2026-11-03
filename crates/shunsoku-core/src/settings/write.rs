@@ -17,9 +17,10 @@ use super::{
     ANNOTATION_FONT_SIZE_RANGE, ANNOTATION_WIDTH_RANGE, AnnotationDefaults, BORDER_WIDTH_RANGE,
     DEFAULT_REGION_FILE_NAME_TEMPLATE, DpiScaling, General, HotkeyAction, Hotkeys, LogLevel,
     OPACITY_RANGE, Reader, Region, ScrapAppearance, SelectionScreen, Settings, TRASH_LIMIT_RANGE,
-    VERSION, dpi_scaling, in_range, log_level, non_empty_str, optional_chord, optional_gesture,
-    read_regions_at, region_number, rgb, save_dir, selection_mode,
+    VERSION, dpi_scaling, in_range, language, log_level, non_empty_str, optional_chord,
+    optional_gesture, read_regions_at, region_number, rgb, save_dir, selection_mode,
 };
+use crate::i18n::Language;
 use crate::selection::Mode;
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
@@ -105,6 +106,14 @@ fn write_general(t: &mut dyn TableLike, g: &General) {
     let d = General::default();
     put(
         t,
+        "language",
+        language,
+        Some(d.language),
+        &g.language,
+        |v| Some(v.map_or("auto", Language::code).into()),
+    );
+    put(
+        t,
         "save_dir",
         |i| save_dir(i).map(Some),
         Some(None),
@@ -121,6 +130,14 @@ fn write_general(t: &mut dyn TableLike, g: &General) {
         Some(d.file_name_template),
         &g.file_name_template,
         |s| Some(s.as_str().into()),
+    );
+    put(
+        t,
+        "autostart",
+        Item::as_bool,
+        Some(d.autostart),
+        &g.autostart,
+        |&v| Some(v.into()),
     );
     put(
         t,
@@ -541,8 +558,10 @@ notifications = false
             log_level: LogLevel::Debug,
             ..Settings::default()
         };
+        s.general.language = Some(crate::i18n::Language::English);
         s.general.save_dir = Some(PathBuf::from(r"D:\shots"));
         s.general.file_name_template = "cap_{seq:3}".to_owned();
+        s.general.autostart = true;
         s.general.notifications = false;
         s.general.trash_limit = 0;
         s.general.dpi_scaling = DpiScaling::KeepApparentSize;
@@ -641,6 +660,23 @@ select_capture = ""
 [scrap]
 opacity = 100
 "##
+        );
+    }
+
+    #[test]
+    fn the_language_set_back_to_follow_the_os_is_written_as_auto() {
+        let src = "version = 1\n[general]\nlanguage = \"en\" # 英語にする\n";
+        let out = written(src, |s| s.general.language = None);
+        assert_eq!(
+            out,
+            "version = 1\n[general]\nlanguage = \"auto\" # 英語にする\n"
+        );
+        let out = written(src, |s| {
+            s.general.language = Some(crate::i18n::Language::Japanese)
+        });
+        assert_eq!(
+            out,
+            "version = 1\n[general]\nlanguage = \"ja\" # 英語にする\n"
         );
     }
 

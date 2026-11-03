@@ -18,8 +18,10 @@
 //! log_level = "info"                           # 隠し項目: off / error / warn / info / debug / trace
 //!
 //! [general]
+//! language = "auto"                            # UI の言語: auto（OS の表示言語。日本語でなければ英語）/ ja / en
 //! save_dir = 'D:\shots'                        # 既定: ピクチャ フォルダの下の shunsoku
 //! file_name_template = "shunsoku_{date}-{time}"
+//! autostart = false                            # サインインしたときに常駐する（HKCU の Run キーに登録）
 //! notifications = true                         # false で止まるのは成功の通知だけ
 //! trash_limit = 10                             # ごみ箱の上限（0〜100 件）。0 なら閉じたらすぐに破棄
 //! dpi_scaling = "keep_pixels"                  # DPI の違うモニタへ動かしたとき: keep_pixels（画素を等倍に保つ）
@@ -74,6 +76,7 @@ use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::geometry::Rect;
+use crate::i18n::Language;
 use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, Shortcuts};
 use crate::selection::Mode;
@@ -215,10 +218,15 @@ pub fn new_region(settings: &Settings, base: &str, monitor: &str, rect: Rect) ->
 /// 全体設定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct General {
+    /// UI の言語。None なら OS の表示言語に合わせる（`ui_language`）。
+    pub language: Option<Language>,
     /// 全体の保存先。None ならピクチャ フォルダの下の `shunsoku`（Win32 層で解決する）。
     pub save_dir: Option<PathBuf>,
     /// 全体のファイル名テンプレート。
     pub file_name_template: String,
+    /// 自動起動。Windows にサインインしたときに常駐する。正本はこの値で、起動と適用のときに Run キーを
+    /// 合わせる（`autostart`）。
+    pub autostart: bool,
     /// 通知。オフで止めるのは成功の通知だけで、エラーと警告は常に出す（spec #32）。
     pub notifications: bool,
     /// ごみ箱の上限（件）。0 なら閉じたらすぐに破棄する。
@@ -232,8 +240,10 @@ pub struct General {
 impl Default for General {
     fn default() -> General {
         General {
+            language: None,
             save_dir: None,
             file_name_template: DEFAULT_FILE_NAME_TEMPLATE.to_owned(),
+            autostart: false,
             notifications: true,
             trash_limit: DEFAULT_TRASH_LIMIT,
             dpi_scaling: DpiScaling::default(),
@@ -423,6 +433,14 @@ pub struct SelectionScreen {
     pub mode: Mode,
     /// 通常モードでも十字線を出す。精密モードでは設定によらず出す。
     pub crosshair: bool,
+}
+
+impl General {
+    /// 使う UI の言語。言語が OS に合わせる（None）なら、OS の表示言語の LANGID（`langid`）から決める。
+    pub fn ui_language(&self, langid: u16) -> Language {
+        self.language
+            .unwrap_or_else(|| Language::from_ui_language(langid))
+    }
 }
 
 /// DPI の違うモニタへスクラップを動かしたときの見え方（`[general] dpi_scaling`）。
@@ -772,6 +790,8 @@ pub struct SettingsChanges {
     pub mouse: bool,
     /// 全体の保存先かファイル名テンプレート。次の保存から使う。
     pub save: bool,
+    /// 自動起動。Run キーを設定に合わせ直す。
+    pub autostart: bool,
     /// 通知のオン/オフ。
     pub notifications: bool,
     /// ごみ箱の上限。下げたら超えた分を古いものから捨てる。
@@ -780,6 +800,8 @@ pub struct SettingsChanges {
     pub appearance: bool,
     /// ログのレベル。
     pub log_level: bool,
+    /// UI の言語の設定（OS に合わせるかどうかを含む）。メニュー・通知・設定 GUI の文言を変える。
+    pub language: bool,
 }
 
 impl SettingsChanges {
@@ -797,10 +819,12 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
         mouse: old.mouse != new.mouse,
         save: old.general.save_dir != new.general.save_dir
             || old.general.file_name_template != new.general.file_name_template,
+        autostart: old.general.autostart != new.general.autostart,
         notifications: old.general.notifications != new.general.notifications,
         trash: old.general.trash_limit != new.general.trash_limit,
         appearance: old.scrap != new.scrap,
         log_level: old.log_level != new.log_level,
+        language: old.general.language != new.general.language,
     }
 }
 
@@ -838,11 +862,17 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
 
     let general = r.table(root, "general");
+    if let Some(language) = r.value(general, "general", "language", language) {
+        s.general.language = language;
+    }
     if let Some(dir) = r.value(general, "general", "save_dir", save_dir) {
         s.general.save_dir = Some(dir);
     }
     if let Some(t) = r.value(general, "general", "file_name_template", non_empty_str) {
         s.general.file_name_template = t;
+    }
+    if let Some(on) = r.value(general, "general", "autostart", Item::as_bool) {
+        s.general.autostart = on;
     }
     if let Some(on) = r.value(general, "general", "notifications", Item::as_bool) {
         s.general.notifications = on;
@@ -1154,6 +1184,14 @@ fn selection_mode(item: &Item) -> Option<Mode> {
     }
 }
 
+/// `auto` は None（OS に合わせる）。
+fn language(item: &Item) -> Option<Option<Language>> {
+    match item.as_str()? {
+        "auto" => Some(None),
+        code => Language::from_code(code).map(Some),
+    }
+}
+
 fn dpi_scaling(item: &Item) -> Option<DpiScaling> {
     match item.as_str()? {
         "keep_pixels" => Some(DpiScaling::KeepPixels),
@@ -1242,6 +1280,7 @@ version = 1
 log_level = "debug"
 
 [general]
+language = "en"
 save_dir = 'D:\shots'
 file_name_template = "cap_{datetime:yyyy}"
 notifications = false
@@ -1273,8 +1312,10 @@ shadow = false
             settings,
             Settings {
                 general: General {
+                    language: Some(Language::English),
                     save_dir: Some(PathBuf::from(r"D:\shots")),
                     file_name_template: "cap_{datetime:yyyy}".to_owned(),
+                    autostart: false,
                     notifications: false,
                     trash_limit: 3,
                     dpi_scaling: DpiScaling::KeepApparentSize,
@@ -1305,6 +1346,17 @@ shadow = false
                 regions: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn autostart_is_off_by_default_and_read_from_general() {
+        assert!(!Settings::default().general.autostart);
+        let (settings, issues) = load("version = 1\n[general]\nautostart = true\n");
+        assert_eq!(issues, vec![]);
+        assert!(settings.general.autostart);
+        let (settings, issues) = load("version = 1\n[general]\nautostart = \"yes\"\n");
+        assert_eq!(issues, vec![invalid("general.autostart")]);
+        assert!(!settings.general.autostart);
     }
 
     #[test]
@@ -1435,6 +1487,37 @@ shadow = 1
         let (settings, issues) = load("version = 1\n[general]\ncapture_cursor = \"yes\"\n");
         assert_eq!(issues, vec![invalid("general.capture_cursor")]);
         assert!(!settings.general.capture_cursor);
+    }
+
+    #[test]
+    fn the_language_defaults_to_the_os_display_language_and_can_be_japanese_or_english() {
+        assert_eq!(load("version = 1\n").0.general.language, None);
+        for (value, language) in [
+            ("auto", None),
+            ("ja", Some(Language::Japanese)),
+            ("en", Some(Language::English)),
+        ] {
+            let (settings, issues) =
+                load(&format!("version = 1\n[general]\nlanguage = \"{value}\"\n"));
+            assert_eq!(issues, vec![], "{value}");
+            assert_eq!(settings.general.language, language, "{value}");
+        }
+        for value in ["\"fr\"", "\"\"", "\"JA\"", "true", "1"] {
+            let (settings, issues) = load(&format!("version = 1\n[general]\nlanguage = {value}\n"));
+            assert_eq!(issues, vec![invalid("general.language")], "{value}");
+            assert_eq!(settings.general.language, None, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_language_that_follows_the_os_is_decided_by_the_os_display_language() {
+        let mut general = General::default();
+        assert_eq!(general.ui_language(0x0411), Language::Japanese);
+        assert_eq!(general.ui_language(0x0409), Language::English);
+        general.language = Some(Language::English);
+        assert_eq!(general.ui_language(0x0411), Language::English);
+        general.language = Some(Language::Japanese);
+        assert_eq!(general.ui_language(0x0409), Language::Japanese);
     }
 
     #[test]
@@ -1664,6 +1747,13 @@ a = 1
             }
         );
         assert_eq!(
+            changed(|s| s.general.autostart = true),
+            SettingsChanges {
+                autostart: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
             changed(|s| s.general.notifications = false),
             SettingsChanges {
                 notifications: true,
@@ -1696,6 +1786,13 @@ a = 1
             changed(|s| s.log_level = LogLevel::Trace),
             SettingsChanges {
                 log_level: true,
+                ..SettingsChanges::default()
+            }
+        );
+        assert_eq!(
+            changed(|s| s.general.language = Some(Language::English)),
+            SettingsChanges {
+                language: true,
                 ..SettingsChanges::default()
             }
         );

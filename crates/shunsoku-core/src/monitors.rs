@@ -60,8 +60,9 @@ pub fn numbered(mut monitors: Vec<Monitor>) -> Vec<Monitor> {
     monitors
 }
 
-/// `monitors` の出力。1 行に 1 枚、番号の順に、番号・名前・解像度・拡大率（とメインモニタの印）をタブで区切る。
-pub fn listing(monitors: &[Monitor]) -> String {
+/// `monitors` の出力。1 行に 1 枚、番号の順に、番号・名前・解像度・拡大率（とメインモニタの印 `main`。文言の
+/// `monitors.main`）をタブで区切る。
+pub fn listing(monitors: &[Monitor], main: &str) -> String {
     let mut out = String::new();
     for (i, m) in numbered(monitors.to_vec()).iter().enumerate() {
         let size = m.rect.size();
@@ -75,7 +76,8 @@ pub fn listing(monitors: &[Monitor]) -> String {
             size.height
         ));
         if m.primary {
-            out.push_str("\tメイン");
+            out.push('\t');
+            out.push_str(main);
         }
         out.push('\n');
     }
@@ -164,7 +166,7 @@ mod tests {
         monitors[2].dpi = 120;
         monitors[2].name = r"\\.\DISPLAY3".to_owned();
         assert_eq!(
-            listing(&monitors),
+            listing(&monitors, "メイン"),
             "1\t\\\\.\\DISPLAY3\t1920x1080\t125%\n\
              2\tmain\t2560x1440\t150%\tメイン\n\
              3\tbelow\t1920x1080\t100%\n"

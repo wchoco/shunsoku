@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use shunsoku_core::annotate::toolbar::{FONT_SIZES, WIDTHS};
 use shunsoku_core::geometry::Rect;
+use shunsoku_core::i18n::Language;
 use shunsoku_core::selection::Mode;
 use shunsoku_core::settings::editor::{Editor, choices};
 use shunsoku_core::settings::{
@@ -49,6 +50,10 @@ use crate::wide::to_wide;
 /// 欄が結ぶ写しの項目（キーの組み合わせの項目は `SettingsItem` と `ChordRow`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
+    /// `[general] language`。
+    Language,
+    /// `[general] autostart`。
+    Autostart,
     /// `[general] notifications`。
     Notifications,
     /// `[general] save_dir`。空なら既定（ピクチャ フォルダの下）。
@@ -223,7 +228,8 @@ impl Fields {
 
 fn kind(field: Field) -> Kind {
     match field {
-        Field::Notifications
+        Field::Autostart
+        | Field::Notifications
         | Field::CaptureCursor
         | Field::Crosshair
         | Field::Border
@@ -240,7 +246,8 @@ fn kind(field: Field) -> Kind {
         | Field::Region(_, RegionKey::X | RegionKey::Y | RegionKey::Width | RegionKey::Height) => {
             Kind::Number { updown: 0 }
         }
-        Field::SelectionMode
+        Field::Language
+        | Field::SelectionMode
         | Field::DpiScaling
         | Field::AnnotationWidth
         | Field::AnnotationFontSize
@@ -260,7 +267,12 @@ fn number_range(field: Field) -> (u32, u32) {
     }
 }
 
-/// 列挙のドロップダウンの項目（値と文言のキー）。
+/// 列挙のドロップダウンの項目（値と文言のキー）。言語の名前は、どの言語の UI でもその言語で書いたもの。
+const LANGUAGES: [(Option<Language>, &str); 3] = [
+    (None, "settings_gui.general.language_auto"),
+    (Some(Language::Japanese), "language.ja"),
+    (Some(Language::English), "language.en"),
+];
 const SELECTION_MODES: [(Mode, &str); 2] = [
     (Mode::Normal, "settings_gui.capture.mode_normal"),
     (Mode::Precise, "settings_gui.capture.mode_precise"),
@@ -302,6 +314,7 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
         selected,
     };
     match field {
+        Field::Autostart => Shown::Check(d.general.autostart),
         Field::Notifications => Shown::Check(d.general.notifications),
         Field::CaptureCursor => Shown::Check(d.general.capture_cursor),
         Field::Crosshair => Shown::Check(d.selection.crosshair),
@@ -321,6 +334,13 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
         Field::Opacity => Shown::Text(d.scrap.opacity.to_string()),
         Field::BorderWidth => Shown::Text(d.scrap.border.width.to_string()),
         Field::TrashLimit => Shown::Text(d.general.trash_limit.to_string()),
+        Field::Language => labels(
+            &LANGUAGES.map(|(_, k)| k),
+            LANGUAGES
+                .iter()
+                .position(|(v, _)| *v == d.general.language)
+                .unwrap_or(0),
+        ),
         Field::SelectionMode => labels(
             &SELECTION_MODES.map(|(_, k)| k),
             SELECTION_MODES
@@ -389,6 +409,7 @@ pub enum Input {
 /// 欄 `field` の入力 `input` を写しに入れる。読めない入力なら何もしない。
 pub fn set(field: Field, draft: &mut Settings, input: Input) {
     match (field, input) {
+        (Field::Autostart, Input::Check(v)) => draft.general.autostart = v,
         (Field::Notifications, Input::Check(v)) => draft.general.notifications = v,
         (Field::CaptureCursor, Input::Check(v)) => draft.general.capture_cursor = v,
         (Field::Crosshair, Input::Check(v)) => draft.selection.crosshair = v,
@@ -436,6 +457,11 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
                 Field::Opacity => draft.scrap.opacity = n as u8,
                 Field::TrashLimit => draft.general.trash_limit = n as u8,
                 _ => draft.scrap.border.width = n,
+            }
+        }
+        (Field::Language, Input::Choice(i, _)) => {
+            if let Some((v, _)) = LANGUAGES.get(i) {
+                draft.general.language = *v;
             }
         }
         (Field::SelectionMode, Input::Choice(i, _)) => {

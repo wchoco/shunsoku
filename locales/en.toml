@@ -1,0 +1,259 @@
+# UI texts (English). Embedded into the exe with include_str!.
+# Keys are the tables joined with `.` ([tray.menu] exit is tray.menu.exit).
+# Keep the same keys as ja.toml (a core test checks it). The comments on each key are in ja.toml.
+
+[tray]
+tooltip = "shunsoku"
+
+[tray.menu]
+select_capture = "Region capture"
+regions = "Saved regions"
+regions_empty = "(None)"
+add_region = "Add saved region…"
+trash = "Trash"
+trash_empty = "(Empty)"
+close_all = "Close all scraps"
+hide_all = "Hide all"
+show_all = "Show all"
+settings = "Settings…"
+exit = "Exit"
+
+[panic]
+title = "shunsoku"
+body = "shunsoku hit an unexpected error and will exit. See the log for details."
+
+[notify]
+title = "shunsoku"
+
+[settings]
+unreadable = "Could not read the settings file, so shunsoku started with the defaults."
+invalid_items = "Reset invalid items to their defaults: "
+unreadable_kept = "The settings file is not valid TOML, so shunsoku keeps running with the previous settings."
+conflicts = "Disabled keys assigned to more than one item, for all of those items: "
+mouse_conflicts = "Disabled mouse actions assigned to more than one item, for all of those items: "
+overlaps = "Hotkeys and shortcuts overlap (the hotkey wins and the shortcut does not work): "
+watch_stopped = "Stopped watching the settings file. After fixing the settings file, restart shunsoku."
+autostart_failed = "Could not update the autostart registration to match the settings."
+items_open = " ("
+items_close = ")"
+
+[settings_gui]
+title = "shunsoku Settings"
+font = "Segoe UI"
+ok = "OK"
+cancel = "Cancel"
+apply = "Apply"
+write_failed = "Could not write the settings file. The changes in Settings are not applied yet."
+browse = "Browse…"
+pick_color = "Pick…"
+chord_none = "None"
+insert_variable = "Insert variable"
+
+[settings_gui.conflict]
+body = "While Settings was open, these items also changed in the settings file. You changed them in Settings too."
+choices = "OK: overwrite with the values in Settings\nCancel: stop applying (the settings file is not changed)"
+
+[settings_gui.tab]
+general = "General"
+capture = "Capture"
+regions = "Saved regions"
+scrap = "Scraps"
+scrap_ops = "Scrap actions"
+annotation = "Drawing"
+
+[settings_gui.general]
+language = "Language:"
+language_auto = "Match the OS"
+autostart = "Start when signing in to Windows"
+notifications = "Show notifications"
+save_dir = "Save to:"
+default_dir = "Default: "
+file_name_template = "File name:"
+
+[settings_gui.template]
+preview = "Example: "
+
+[settings_gui.capture]
+select_capture = "Region capture:"
+active_window_capture = "Active window:"
+restore_last = "Restore last closed:"
+capture_cursor = "Include the mouse cursor"
+mode = "Default selection mode:"
+mode_normal = "Normal (release to capture)"
+mode_precise = "Precise (adjust, then capture)"
+crosshair = "Show a crosshair when selecting"
+hint = "Select a field and press keys to assign them. Tab moves to the next field."
+
+[settings_gui.regions]
+name = "Name"
+hotkey = "Hotkey"
+range = "Range"
+add = "Add"
+duplicate = "Duplicate"
+remove = "Remove"
+up = "Up"
+down = "Down"
+copy_suffix = " copy"
+name_label = "Name:"
+hotkey_label = "Hotkey:"
+monitor_label = "Monitor:"
+x = "X:"
+y = "Y:"
+width = "Width:"
+height = "Height:"
+reselect = "Reselect range"
+test_capture = "Test capture"
+monitor_not_found = "The registered monitor was not found. Cannot capture."
+out_of_bounds = "The range extends beyond the monitor. Cannot capture."
+save_dir_label = "Save to:"
+open_folder = "Open folder"
+template_label = "File name:"
+save = "Save"
+scrap = "Show as a scrap"
+
+[settings_gui.scrap]
+opacity = "Opacity (%):"
+border = "Show a border"
+border_width = "Border width:"
+border_color = "Border color:"
+shadow = "Drop a shadow"
+trash_limit = "Scraps kept in Trash:"
+dpi_scaling = "Moved to another DPI:"
+dpi_keep_pixels = "Keep pixels 1:1"
+dpi_keep_apparent_size = "Keep the apparent size"
+
+[settings_gui.annotation]
+color = "Color:"
+width = "Width:"
+font_size = "Text size:"
+font = "Font:"
+hint = "Defaults for new drawings. Existing drawings do not change."
+
+[settings_gui.scrap_ops]
+operation = "Action"
+shortcut = "Shortcut"
+mouse = "Mouse"
+mark = "Note"
+shortcut_label = "Shortcut:"
+mouse_label = "Mouse:"
+reset = "Reset to default"
+none = "None"
+
+[settings_gui.mark]
+unset = "Not set"
+conflict = "Overlaps"
+mouse_conflict = "Overlaps"
+overlap = "Overlaps a shortcut (the hotkey wins)"
+not_registered = "Could not register (another app may be using it)"
+empty_name = "The name is empty"
+duplicate_name = "The name is used twice"
+
+[hotkey]
+failed = "Could not register these hotkeys (another app may be using them): "
+unset = "The region capture hotkey is not set. Set it on the Capture tab of Settings… in the tray menu (clicking the tray icon also captures)."
+
+[scrap.op]
+copy = "Copy"
+save_default = "Save to the default folder"
+save_as = "Save as…"
+trim = "Trim"
+untrim = "Undo trim"
+annotate = "Draw"
+move = "Move"
+move_left = "Move left (1px)"
+move_right = "Move right (1px)"
+move_up = "Move up (1px)"
+move_down = "Move down (1px)"
+move_left_10 = "Move left (10px)"
+move_right_10 = "Move right (10px)"
+move_up_10 = "Move up (10px)"
+move_down_10 = "Move down (10px)"
+zoom = "Zoom"
+zoom_in = "Zoom in"
+zoom_out = "Zoom out"
+zoom_actual = "Actual size"
+appearance = "Appearance"
+opacity = "Opacity"
+opacity_up = "More opaque"
+opacity_down = "More transparent"
+border = "Border"
+shadow = "Shadow"
+toggle_compact = "Compact view"
+close = "Close"
+
+[mouse_gesture]
+left_drag = "Left drag"
+middle_click = "Middle click"
+wheel_up = "Wheel up"
+wheel_down = "Wheel down"
+ctrl_wheel_up = "Ctrl+Wheel up"
+ctrl_wheel_down = "Ctrl+Wheel down"
+double_click = "Double-click"
+
+[scrap.border]
+none = "None"
+default = "Default color"
+gray = "Gray"
+black = "Black"
+white = "White"
+red = "Red"
+blue = "Blue"
+
+[scrap.shadow]
+on = "On"
+off = "Off"
+
+[job]
+panicked = "An unexpected error occurred. See the log for details."
+
+[capture]
+failed = "Could not capture the screen."
+window_partial = "The hidden parts could not be captured."
+
+[region]
+monitor_not_found = "Could not capture because the monitor of the saved region was not found: "
+out_of_bounds = "Could not capture because the saved region goes past its monitor: "
+gone = "Could not capture because no saved region has that name: "
+default_name = "Region"
+registered = "Saved the region: "
+register_failed = "Could not save the region."
+
+[selection]
+register_banner = "Save a region"
+size_plus = " + "
+
+[language]
+ja = "日本語"
+en = "English"
+
+[monitors]
+main = "Primary"
+
+[cli]
+selecting = "Cannot capture while the region selection screen is open."
+no_such_monitor = "No monitor has that number (see shunsoku-cli monitors): "
+no_main_monitor = "The primary monitor was not found."
+out_of_monitor = "The rectangle goes past the monitor."
+unreadable_monitor = "This monitor's screen cannot be captured as is (for example, a rotated monitor)."
+cancelled = "The region selection was cancelled."
+timed_out = "The request was dropped because the capture did not finish in time."
+no_active_window = "There is no active window to capture (the desktop and the taskbar are not captured)."
+
+[copy]
+failed = "Could not copy to the clipboard."
+
+[trash]
+restore_failed = "Could not restore from Trash."
+
+[save]
+saved = "Saved (click to open the folder):"
+failed = "Could not save. The scrap is still there."
+png_filter = "PNG image"
+
+[template.var]
+name = "{name}  Saved region name"
+date = "{date}  Date (20260307)"
+time = "{time}  Time (090504)"
+datetime = "{datetime:…}  Date and time format (2026-03-07_09-05-04)"
+seq = "{seq}  Sequence number (1, 2, …)"
+seq3 = "{seq:3}  3-digit sequence number (001, 002, …)"

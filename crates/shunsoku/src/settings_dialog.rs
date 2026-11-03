@@ -269,7 +269,7 @@ pub fn create(module: HINSTANCE, page: Page, text: Text, proc: DLGPROC) -> Resul
 
     for row in &rows {
         if let Some(field) = item(hwnd, row.field) {
-            chord_field::attach(field);
+            chord_field::attach(field, text("settings_gui.chord_none"));
         }
     }
     fields::init(hwnd, &fields, text);

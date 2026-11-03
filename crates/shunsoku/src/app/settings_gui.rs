@@ -19,13 +19,15 @@
 //! - 適用（`apply`）: その時点のファイルと写しを 3 者で突き合わせ（`settings::merge`）、両方で変えた項目があれば
 //!   借りずに確かめてから、結果を書き（`write_settings`）、読み込み直しと同じ反映をし（`adopt_settings`）、ホットキーは
 //!   必ず登録し直して、登録できなかった項目を写しの印にする（`Editor::applied`）。OK は適用して、全部登録できたら閉じる。
-//! - 言語の切り替え（#102）で組み直すときは、`settings_dialog::current_page` と位置を覚えて壊し、
-//!   `settings_dialog::create` と `refresh` をし直す（`WM_DESTROY` で `App::settings_gui` を消さないようにする）。
+//! - 適用で UI の言語が変わったら（`SettingsGui::language` と違ったら）、同じタブ・同じ位置で組み直す（`rebuild`）。
+//!   今のダイアログは `REBUILDING` を立てて壊し（`WM_DESTROY` で `App::settings_gui` を消さない）、写しはそのまま
+//!   新しいダイアログに出す。外の変更で言語が変わったときは、次に適用したときに組み直す。
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use shunsoku_core::i18n::Language;
 use shunsoku_core::settings::editor::{Editor, Move};
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::{self, Settings, SettingsItem, unset};
@@ -38,15 +40,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CBN_SELCHANGE, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GetWindowRect,
     IDCANCEL, IDOK, IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MSG,
-    MessageBoxW, PostMessageW, PostQuitMessage, SW_RESTORE, SW_SHOW, SendMessageW,
-    SetForegroundWindow, ShowWindow, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_INITDIALOG,
-    WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
+    MessageBoxW, PostMessageW, PostQuitMessage, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, WM_COMMAND,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
 };
 use windows::core::PCWSTR;
 
 use super::{
-    App, EXIT_PANIC, Moment, WM_APP_SETTINGS_FOCUS, adopt_settings, log_failed, notify_user,
-    register_hotkeys, settings_notice, text, with_app, write_settings,
+    App, EXIT_PANIC, Moment, WM_APP_SETTINGS_FOCUS, adopt_settings, language, log_failed,
+    notify_user, register_hotkeys, settings_notice, sync_autostart, text, with_app, write_settings,
 };
 use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
 use crate::settings_dialog::regions::{self, ListButton};
@@ -60,11 +62,16 @@ pub(super) struct SettingsGui {
     rows: Vec<ChordRow>,
     fields: Fields,
     editor: Editor,
+    /// ダイアログを組んだときの UI の言語。
+    language: Language,
 }
 
 thread_local! {
     /// 開いている設定 GUI のウィンドウ。メッセージ ループの `IsDialogMessageW` に渡す（`App` を借りずに読む）。
     static DIALOG: Cell<Option<HWND>> = const { Cell::new(None) };
+    /// 組み直すために今のダイアログを壊し、新しく作っている（その間の通知は無視する。`WM_DESTROY` で閉じた
+    /// ことにしない）。
+    static REBUILDING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// 設定 GUI へのメッセージ（Tab の移動など）なら処理して true。
@@ -152,6 +159,7 @@ fn open_with(page: Option<Page>, focus: Option<SettingsItem>) {
         rows: dialog.rows,
         fields: dialog.fields,
         editor,
+        language: language(),
     };
     if with_app(|app| app.settings_gui = Some(gui)).is_none() {
         // SAFETY: 作ったばかりの自分のダイアログ
@@ -251,6 +259,10 @@ unsafe extern "system" fn dialog_proc(
 
 /// ダイアログへのメッセージ。処理したら true（false なら既定のダイアログの処理）。
 fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+    // 組み直しの間（古いダイアログを壊し、新しいダイアログを作る間）の通知は、写しにも App にも当てない
+    if REBUILDING.get() {
+        return false;
+    }
     match msg {
         // フォーカスは開いたあとで置く（`open`）
         WM_INITDIALOG => false,
@@ -317,8 +329,12 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
 
 fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
     if id == IDOK.0 {
-        if code == BN_CLICKED && apply(hwnd) {
-            destroy(hwnd);
+        if code == BN_CLICKED {
+            if apply(hwnd) {
+                destroy(hwnd);
+            } else {
+                rebuild_if_language_changed(hwnd);
+            }
         }
         return;
     }
@@ -326,6 +342,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
         _ if id == IDCANCEL.0 => destroy(hwnd),
         ID_APPLY if code == BN_CLICKED => {
             apply(hwnd);
+            rebuild_if_language_changed(hwnd);
         }
         _ if id == scrap_ops::mouse_id() && code == CBN_SELCHANGE => {
             if let Some((row, gesture)) = scrap_ops::chosen_mouse(hwnd) {
@@ -500,6 +517,78 @@ fn insert_variable(hwnd: HWND, fields: &Fields, of: fields::TemplateOf) {
     }
 }
 
+/// 組んだときから UI の言語が変わっていたら、同じタブ・同じ位置で組み直す。
+fn rebuild_if_language_changed(hwnd: HWND) {
+    let built = with_app(|app| app.settings_gui.as_ref().map(|gui| gui.language)).flatten();
+    if built.is_some_and(|built| built != language()) {
+        rebuild(hwnd);
+    }
+}
+
+/// 今のダイアログ `old` を壊し、いまの言語で組み直して写しを出す。ダイアログを作る間にプロシージャが呼ばれる
+/// ので、借りずに作る（`open_with` と同じ）。
+fn rebuild(old: HWND) {
+    let Some(module) = with_app(|app| app.module) else {
+        return;
+    };
+    let page = settings_dialog::current_page(old);
+    let mut rect = RECT::default();
+    // SAFETY: 自分のダイアログの位置を読む
+    unsafe {
+        let _ = GetWindowRect(old, &mut rect);
+    }
+    REBUILDING.set(true);
+    destroy(old);
+    DIALOG.set(None);
+    let created = settings_dialog::create(module, page, text, Some(dialog_proc));
+    REBUILDING.set(false);
+    let dialog = match created {
+        Ok(dialog) => dialog,
+        Err(e) => {
+            log::error!("could not rebuild the settings GUI: {e}");
+            closed();
+            return;
+        }
+    };
+    let hwnd = dialog.hwnd;
+    let kept = with_app(|app| {
+        let gui = app.settings_gui.as_mut()?;
+        gui.hwnd = hwnd;
+        gui.rows = dialog.rows;
+        gui.fields = dialog.fields;
+        gui.language = language();
+        Some(())
+    })
+    .flatten();
+    if kept.is_none() {
+        destroy(hwnd);
+        return;
+    }
+    DIALOG.set(Some(hwnd));
+    refresh(hwnd);
+    // SAFETY: 自分のダイアログ
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            rect.left,
+            rect.top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+    }
+    set_focus(hwnd, ID_TAB);
+    // 壊したダイアログの欄にフォーカスがあれば、ホットキーは外したまま。いまのフォーカスで決め直す
+    // SAFETY: 自分のダイアログに送る
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_APP_SETTINGS_FOCUS, WPARAM(0), LPARAM(0));
+    }
+    log::info!("settings GUI rebuilt in {:?}", language());
+}
+
 fn destroy(hwnd: HWND) {
     // SAFETY: 自分のダイアログ。App を借りずに呼ぶ（WM_DESTROY で借りる）
     unsafe {
@@ -636,6 +725,10 @@ fn apply(hwnd: HWND) -> bool {
         let _ = PostMessageW(Some(hwnd), WM_APP_SETTINGS_FOCUS, WPARAM(0), LPARAM(0));
     }
     refresh(hwnd);
+    if matches!(result, Some(Ok(_))) {
+        // 正本は設定ファイル。適用したら、変わっていなくても Run キーを合わせ直す
+        sync_autostart();
+    }
     match result {
         Some(Ok(all_registered)) => all_registered,
         Some(Err(e)) => {
