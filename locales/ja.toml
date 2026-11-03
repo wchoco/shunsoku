@@ -44,6 +44,11 @@ cancel = "キャンセル"
 apply = "適用"
 write_failed = "設定ファイルに書けませんでした。設定 GUI の内容はまだ適用されていません。"
 
+# 適用で、設定 GUI を開いている間に設定ファイルでも変わった項目を GUI でも変えていたときの確認
+[settings_gui.conflict]
+body = "設定 GUI を開いている間に、次の項目が設定ファイルでも変わりました。GUI でも変えています。"
+choices = "OK: GUI の値で上書きする\nキャンセル: 適用をやめる（設定ファイルは変えません）"
+
 [settings_gui.tab]
 capture = "キャプチャ"
 
