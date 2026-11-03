@@ -1,0 +1,6 @@
+[package]
+name = "release-tools"
+description = "リリースの workflow の下ごしらえ（タグと version の照合、リリースノートの perf の行）。開発専用で zip には入れない"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true

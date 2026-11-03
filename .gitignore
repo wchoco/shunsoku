@@ -2,3 +2,6 @@ CLAUDE-SECURITY-*/
 /target/
 .claude/settings.local.json
 .claude/worktrees/
+# リリースの workflow が作る（about.toml / about.hbs から）。コミットしない
+/THIRD-PARTY-LICENSES.md
+/dist/

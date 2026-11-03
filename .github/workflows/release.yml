@@ -1,0 +1,136 @@
+# v* のタグの push で、zip と SHA256 の付いた draft のリリースを作る（spec #36）。
+# 公開はメンテナが中身を確かめてから手で行う。
+#
+# - build: タグと workspace の version を照合し、ビルドして zip・SHA256・本文を作る。書き込みの権限は持たない。
+# - release: build の成果物で draft のリリースを作る。contents: write はこのジョブだけ。
+# - タグ名などの外から来る値は env で渡し、run: に ${{ }} で直接埋め込まない。
+# - サードパーティの action は commit SHA で固定する。キャッシュはリリースのビルドに持ち込まない。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # THIRD-PARTY-LICENSES.md を作る cargo-about の版。上げるときは出力を確かめる。
+  CARGO_ABOUT_VERSION: "0.9.3"
+
+jobs:
+  build:
+    name: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml のツールチェーンと components を入れる
+      - run: rustup toolchain install
+
+      - name: タグと workspace の version を照合する
+        run: cargo run --locked --quiet -p release-tools -- check-version "$TAG"
+
+      # +crt-static は .cargo/config.toml で x86_64-pc-windows-msvc に付けている（ADR-0001）
+      - name: ビルドする
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p shunsoku -p shunsoku-cli
+
+      - name: THIRD-PARTY-LICENSES.md を作る
+        run: |
+          cargo install cargo-about --version "$CARGO_ABOUT_VERSION" --locked --features cli
+          cargo about generate --locked --fail about.hbs --output-file THIRD-PARTY-LICENSES.md
+
+      - name: zip と SHA256 を作る
+        run: |
+          set -euo pipefail
+          name="shunsoku-${TAG}-x64"
+          mkdir -p "dist/${name}"
+          cp target/x86_64-pc-windows-msvc/release/shunsoku.exe \
+             target/x86_64-pc-windows-msvc/release/shunsoku-cli.exe \
+             README.md LICENSE THIRD-PARTY-LICENSES.md \
+             "dist/${name}/"
+          (cd "dist/${name}" && 7z a -tzip -mx=9 "../${name}.zip" -- *)
+          # 設定ファイルと文言のファイルは入れない（設定ファイルがあると、展開しただけでポータブルモードになる）
+          expected=$'LICENSE\nREADME.md\nTHIRD-PARTY-LICENSES.md\nshunsoku-cli.exe\nshunsoku.exe'
+          actual=$(7z l -ba "dist/${name}.zip" | awk '{print $NF}' | LC_ALL=C sort)
+          if [ "$actual" != "$(LC_ALL=C sort <<<"$expected")" ]; then
+            echo "zip の中身が想定と違う:"; echo "$actual"; exit 1
+          fi
+          # Windows の sha256sum は名前の前に * を付けることがあるので、行は自分で組む
+          hash=$(sha256sum "dist/${name}.zip" | cut -d' ' -f1)
+          printf '%s  %s\n' "$hash" "${name}.zip" > "dist/${name}.zip.sha256"
+          cat "dist/${name}.zip.sha256"
+
+      - name: リリースの本文を作る
+        run: |
+          set -euo pipefail
+          name="shunsoku-${TAG}-x64"
+          sha=$(cut -d' ' -f1 "dist/${name}.zip.sha256")
+          perf=$(cargo run --locked --quiet -p release-tools -- perf-table docs/perf.md)
+          {
+            echo "<!-- 変更点はここに手で書き足す -->"
+            echo
+            echo "## 性能"
+            echo
+            echo "docs/perf.md の最新の行（20 回の中央値 / p90。メモリは MB、時間は ms）。"
+            echo
+            echo "$perf"
+            echo
+            echo "## SHA256"
+            echo
+            echo '```text'
+            echo "${sha}  ${name}.zip"
+            echo '```'
+          } > dist/notes.md
+          cat dist/notes.md
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+
+      - name: draft のリリースを作る
+        run: |
+          set -euo pipefail
+          prerelease=()
+          # - を含むタグ（v0.1.0-rc.1 など）はプレリリース
+          if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" \
+            --verify-tag --draft "${prerelease[@]}" \
+            --title "shunsoku $TAG" \
+            --notes-file dist/notes.md \
+            dist/*.zip dist/*.zip.sha256
