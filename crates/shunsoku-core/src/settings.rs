@@ -448,12 +448,16 @@ pub struct SelectionScreen {
     pub crosshair_color: Rgb,
 }
 
+/// 十字線の色の既定値（`[selection] crosshair_color`）。設定を読む前に描くとき（範囲選択の画面を開いた直後、
+/// 設定のないスクラップ）もこの色にする。
+pub const DEFAULT_CROSSHAIR_COLOR: Rgb = Rgb(0xFF, 0xFF, 0xFF);
+
 impl Default for SelectionScreen {
     fn default() -> SelectionScreen {
         SelectionScreen {
             mode: Mode::default(),
             crosshair: false,
-            crosshair_color: Rgb(0xFF, 0xFF, 0xFF),
+            crosshair_color: DEFAULT_CROSSHAIR_COLOR,
         }
     }
 }

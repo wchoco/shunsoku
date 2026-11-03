@@ -3101,7 +3101,7 @@ fn open_scrap(
             &model,
             appearance,
             None,
-            shunsoku_core::settings::SelectionScreen::default().crosshair_color,
+            shunsoku_core::settings::DEFAULT_CROSSHAIR_COLOR,
         )
     })
     .unwrap_or_else(|| {
@@ -3112,7 +3112,7 @@ fn open_scrap(
             &model,
             appearance,
             None,
-            shunsoku_core::settings::SelectionScreen::default().crosshair_color,
+            shunsoku_core::settings::DEFAULT_CROSSHAIR_COLOR,
         )
     });
     painted?;
@@ -3127,7 +3127,7 @@ fn open_scrap(
         wheel: Wheel::default(),
         zoom_label: false,
         caret: Default::default(),
-        crosshair: shunsoku_core::settings::SelectionScreen::default().crosshair_color,
+        crosshair: shunsoku_core::settings::DEFAULT_CROSSHAIR_COLOR,
     })
 }
 
