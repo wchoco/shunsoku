@@ -10,6 +10,8 @@
 //! - コントロールで表せない組み合わせ（設定ファイルに書いた Win キー・PrintScreen）は、`set` で入れると文字で
 //!   描くだけにする（`WM_PAINT`）。キーを入れたら上書きする。
 //! - 値が空の間は、`set_placeholder` で入れた文字を灰色で描く（スクラップ操作の、上書きのない既定の一覧）。
+//!   それもなければ `attach` で渡した「なし」の文字を描く（標準の描画は OS の表示言語の「なし」を出し、UI の
+//!   言語に合わないため。#102）。
 //! - IME は切り離す（変換中のキーが欄に届かなくなるため）。
 
 use std::cell::{Cell, RefCell};
@@ -39,15 +41,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const SUBCLASS_ID: usize = 1;
 
 /// 欄の値と、空の間に描く文字。サブクラスの参照データとして持つ。
-#[derive(Default)]
 struct State {
     chord: Cell<Option<Chord>>,
     placeholder: RefCell<String>,
+    /// 値が空で `placeholder` もない間に描く「なし」（UI の言語の文言）。
+    none: String,
 }
 
-/// hot key control `hwnd` を入力欄にする。ダイアログを作った直後に 1 回呼ぶ。
-pub fn attach(hwnd: HWND) {
-    let state = Box::into_raw(Box::<State>::default());
+/// hot key control `hwnd` を入力欄にする。ダイアログを作った直後に 1 回呼ぶ。`none` は空の間に描く「なし」。
+pub fn attach(hwnd: HWND, none: &str) {
+    let state = Box::into_raw(Box::new(State {
+        chord: Cell::new(None),
+        placeholder: RefCell::new(String::new()),
+        none: none.to_owned(),
+    }));
     // SAFETY: state は WM_NCDESTROY で 1 回だけ戻す。IME の切り離しは自分のコントロールに対して
     unsafe {
         if !SetWindowSubclass(hwnd, Some(subclass), SUBCLASS_ID, state as usize).as_bool() {
@@ -208,6 +215,10 @@ unsafe extern "system" fn subclass(
                     }
                     None if !state.placeholder.borrow().is_empty() => {
                         paint_text(hwnd, &state.placeholder.borrow(), COLOR_GRAYTEXT);
+                        LRESULT(0)
+                    }
+                    None => {
+                        paint_text(hwnd, &state.none, COLOR_WINDOWTEXT);
                         LRESULT(0)
                     }
                     _ => DefSubclassProc(hwnd, msg, wparam, lparam),

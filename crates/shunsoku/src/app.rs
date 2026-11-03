@@ -77,6 +77,7 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -87,7 +88,7 @@ use shunsoku_core::capture::request::{
     self, CaptureMethod, CaptureRequest, OnSaveFailure, ReplyTo, SaveTarget, Source,
 };
 use shunsoku_core::geometry::{Point, Rect};
-use shunsoku_core::i18n::Catalog;
+use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
 use shunsoku_core::monitors::{self, LocateError};
@@ -106,6 +107,7 @@ use shunsoku_core::settings::{
 };
 use shunsoku_core::trash::TrashId;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
@@ -230,8 +232,8 @@ const EXIT_PANIC: i32 = 101;
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 static SECOND_INSTANCE: OnceLock<u32> = OnceLock::new();
 
-/// 埋め込みの文言（`locales/ja.toml`）。
-static CATALOG: OnceLock<Catalog> = OnceLock::new();
+/// いまの UI の言語が英語か（`text` で引くカタログ）。裏のスレッドとパニックのフックも読むので atomic。
+static ENGLISH: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -598,9 +600,28 @@ impl Drop for Windows {
     }
 }
 
-/// キーの文言。キーがなければキーそのもの。
+/// いまの言語でのキーの文言。キーがなければキーそのもの。
 fn text(key: &'static str) -> &'static str {
-    CATALOG.get().map_or(key, |c| c.text(key))
+    i18n::catalog(language()).text(key)
+}
+
+/// いまの UI の言語。
+fn language() -> Language {
+    if ENGLISH.load(Ordering::Relaxed) {
+        Language::English
+    } else {
+        Language::Japanese
+    }
+}
+
+/// 設定 `settings` と OS の表示言語から、UI の言語を決める。変わったら true。
+fn set_language(settings: &Settings) -> bool {
+    // SAFETY: 引数なし
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    let language = settings.general.ui_language(langid);
+    let old = ENGLISH.swap(language == Language::English, Ordering::Relaxed);
+    log::info!("UI language: {language:?} (OS LANGID {langid:#06x})");
+    old != (language == Language::English)
 }
 
 /// 設定ファイルの場所を決める（core の `settings::locate`）。exe の横に `settings.toml` があればそれ
@@ -634,21 +655,15 @@ pub fn run() -> i32 {
         log::warn!("could not open the perf log: {e}");
     }
 
-    let catalog = Catalog::parse(include_str!("../../../locales/ja.toml")).unwrap_or_else(|e| {
-        log::error!("bundled locale is not valid TOML: {e}");
-        Catalog::default()
+    // 設定を読むまでは OS の表示言語。文言はパニックした時点の言語で引く
+    set_language(&Settings::default());
+    panic_hook::install(std::thread::current().id(), move || {
+        let body = match &log_path {
+            Some(path) => format!("{}\n{}", text("panic.body"), path.display()),
+            None => text("panic.body").to_owned(),
+        };
+        (text("panic.title").to_owned(), body)
     });
-    let _ = CATALOG.set(catalog);
-
-    let body = match &log_path {
-        Some(path) => format!("{}\n{}", text("panic.body"), path.display()),
-        None => text("panic.body").to_owned(),
-    };
-    panic_hook::install(
-        std::thread::current().id(),
-        text("panic.title").to_owned(),
-        body,
-    );
 
     // manifest で Per-Monitor V2 になっている。念のための呼び出しで、既に設定済みならエラーになる
     // SAFETY: 引数は定数
@@ -683,6 +698,7 @@ pub fn run() -> i32 {
     let settings_path = location.map(|location| location.settings_file);
     let (settings, issues) = read_settings(settings_path.as_deref());
     log::set_max_level(level_filter(settings.log_level));
+    set_language(&settings);
 
     // 未設定なら、通知ではなく設定 GUI を開いて促す（初回起動の流れ）
     let open_gui = unset::prompt(unset::When::Startup, &settings) == Some(unset::Prompt::OpenGui);
@@ -3117,7 +3133,7 @@ fn open_overlay() {
     let grab_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     // ウィンドウを作るとメッセージが届くので、App を借りずに開く
-    let overlay = match overlay::Overlay::open(shots, module) {
+    let overlay = match overlay::Overlay::open(shots, module, text("selection.size_plus")) {
         Ok(overlay) => {
             // open は全モニタで DwmFlush が返ってから戻る
             perf::mark(Mark::OverlayFlushed);
@@ -3810,6 +3826,10 @@ fn apply_changes(app: &mut App, changes: &SettingsChanges) {
     if changes.log_level {
         log::set_max_level(level_filter(app.settings.log_level));
     }
+    // メニューと通知は出すたびに文言を引く。開いている設定 GUI は、適用したときに組み直す（`settings_gui`）
+    if changes.language {
+        set_language(&app.settings);
+    }
     if changes.trash {
         app.trash.set_limit(app.settings.general.trash_limit);
     }
@@ -3860,6 +3880,7 @@ fn settings_notice(
     let mut conflicts = Vec::new();
     let mut overlaps = Vec::new();
     let mut mouse_conflicts = Vec::new();
+    let (open, close) = (text("settings.items_open"), text("settings.items_close"));
     for issue in issues {
         match issue {
             SettingsIssue::NotToml { .. } => {
@@ -3874,15 +3895,15 @@ fn settings_notice(
             }
             SettingsIssue::Invalid { item } => invalid.push(item.as_str()),
             SettingsIssue::Conflict { chord, items } => {
-                conflicts.push(format!("{chord}（{}）", join_items(items)));
+                conflicts.push(format!("{chord}{open}{}{close}", join_items(items)));
             }
             SettingsIssue::Overlap {
                 chord,
                 hotkey,
                 shortcut,
-            } => overlaps.push(format!("{chord}（{hotkey}, {shortcut}）")),
+            } => overlaps.push(format!("{chord}{open}{hotkey}, {shortcut}{close}")),
             SettingsIssue::MouseConflict { gesture, items } => {
-                mouse_conflicts.push(format!("{gesture}（{}）", join_items(items)));
+                mouse_conflicts.push(format!("{gesture}{open}{}{close}", join_items(items)));
             }
         }
     }
