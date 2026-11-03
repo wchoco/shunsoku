@@ -508,18 +508,28 @@ fn on_field(hwnd: HWND, id: i32, code: u32, control: HWND) {
     let Some(row) = fields.row(id) else {
         return;
     };
+    let mut rejected = None;
     let changed = match (row.kind, code) {
         (Kind::Check, BN_CLICKED)
         | (Kind::Text { .. } | Kind::Number { .. }, EN_CHANGE)
         | (Kind::Choice, CBN_SELCHANGE) => true,
-        // 読めない入力は、フォーカスが外れたら写しの値に戻す
-        (Kind::Text { .. } | Kind::Number { .. }, EN_KILLFOCUS) => false,
+        // 読めない入力は、フォーカスが外れたら写しの値に戻し、書き方を吹き出しで知らせる
+        (Kind::Text { .. } | Kind::Number { .. }, EN_KILLFOCUS) => {
+            if let Input::Text(s) = fields::input(row, control) {
+                rejected = fields::rejected(row.field, &s);
+            }
+            false
+        }
         _ => return,
     };
     if changed {
         set_field(row.field, fields::input(row, control));
     }
     refresh(hwnd);
+    // 戻した後に出す（欄の文字を書き換えると吹き出しは消える）
+    if let Some(rejected) = rejected {
+        fields::show_rejected(control, rejected, text);
+    }
 }
 
 /// 写しの項目 `field` を `input` にする。

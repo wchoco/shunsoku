@@ -32,8 +32,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::Dialogs::{CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::UI::Controls::{
-    EM_SETCUEBANNER, UDM_SETRANGE32, UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_AUTOBUDDY, UDS_NOTHOUSANDS,
-    UDS_SETBUDDYINT,
+    EDITBALLOONTIP, EM_SETCUEBANNER, EM_SHOWBALLOONTIP, TTI_WARNING, UDM_SETRANGE32,
+    UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_AUTOBUDDY, UDS_NOTHOUSANDS, UDS_SETBUDDYINT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -429,11 +429,8 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
         (Field::Border, Input::Check(v)) => draft.scrap.border.visible = v,
         (Field::Shadow, Input::Check(v)) => draft.scrap.shadow = v,
         (Field::SaveDir, Input::Text(s)) => {
-            let s = s.trim();
-            if s.is_empty() {
-                draft.general.save_dir = None;
-            } else if is_absolute_dir(s) {
-                draft.general.save_dir = Some(PathBuf::from(s));
+            if let Some(dir) = parse_folder(&s) {
+                draft.general.save_dir = dir;
             }
         }
         (Field::Template(of), Input::Text(s)) if !s.trim().is_empty() => {
@@ -457,13 +454,7 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
             }
         }
         (Field::Opacity | Field::BorderWidth | Field::TrashLimit, Input::Text(s)) => {
-            let (min, max) = number_range(field);
-            let Some(n) = s
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|n| (min..=max).contains(n))
-            else {
+            let Some(n) = parse_number(field, &s) else {
                 return;
             };
             match field {
@@ -509,21 +500,12 @@ fn set_region(region: &mut Region, key: RegionKey, input: Input) {
     match (key, input) {
         (RegionKey::Name, Input::Text(s)) => region.name = s.trim().to_owned(),
         (RegionKey::SaveDir, Input::Text(s)) => {
-            let s = s.trim();
-            if s.is_empty() {
-                region.save_dir = None;
-            } else if is_absolute_dir(s) {
-                region.save_dir = Some(PathBuf::from(s));
+            if let Some(dir) = parse_folder(&s) {
+                region.save_dir = dir;
             }
         }
         (RegionKey::X | RegionKey::Y | RegionKey::Width | RegionKey::Height, Input::Text(s)) => {
-            let (min, max) = number_range(Field::Region(0, key));
-            let Some(n) = s
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .filter(|n| (min..=max).contains(n))
-            else {
+            let Some(n) = parse_number(Field::Region(0, key), &s) else {
                 return;
             };
             let (mut origin, mut size) = (region.rect.origin(), region.rect.size());
@@ -566,6 +548,103 @@ pub fn folder_of(settings: &Settings, field: Field, default_dir: Option<&Path>) 
 }
 
 /// 保存先として受け付けるパス（設定の読み込みと同じく、`C:\…` か `\\server\share\…`）。
+/// 数の欄 `field` の入力。範囲（`number_range`）の外か、数でなければ None。
+fn parse_number(field: Field, s: &str) -> Option<u32> {
+    let (min, max) = number_range(field);
+    s.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (min..=max).contains(n))
+}
+
+/// フォルダの欄の入力。空は既定（`Some(None)`）、絶対パスでなければ None。
+fn parse_folder(s: &str) -> Option<Option<PathBuf>> {
+    let s = s.trim();
+    if s.is_empty() {
+        Some(None)
+    } else if is_absolute_dir(s) {
+        Some(Some(PathBuf::from(s)))
+    } else {
+        None
+    }
+}
+
+/// 読めずに捨てたテキストの欄の入力が、どう書けばよいか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejected {
+    /// `min` 以上 `max` 以下の整数。
+    Number { min: u32, max: u32 },
+    /// `#RRGGBB`。
+    Color,
+    /// 絶対パスのフォルダ（空なら既定）。
+    Folder,
+    /// 空でないテンプレート。
+    Template,
+}
+
+impl Rejected {
+    /// 知らせる文言（`text` で引き、数の範囲を埋める）。
+    pub fn message(self, text: Text) -> String {
+        match self {
+            // 上が実質ない（座標と大きさ）なら、下だけを書く
+            Rejected::Number { min, max } if max == i32::MAX as u32 => {
+                text("settings_gui.invalid.number_min").replace("{min}", &min.to_string())
+            }
+            Rejected::Number { min, max } => text("settings_gui.invalid.number")
+                .replace("{min}", &min.to_string())
+                .replace("{max}", &max.to_string()),
+            Rejected::Color => text("settings_gui.invalid.color").to_owned(),
+            Rejected::Folder => text("settings_gui.invalid.folder").to_owned(),
+            Rejected::Template => text("settings_gui.invalid.template").to_owned(),
+        }
+    }
+}
+
+/// テキストの欄 `field` に打った `s` を写しに入れられないなら、その理由（`set` が捨てる入力）。
+pub fn rejected(field: Field, s: &str) -> Option<Rejected> {
+    let number = |field| {
+        let (min, max) = number_range(field);
+        parse_number(field, s)
+            .is_none()
+            .then_some(Rejected::Number { min, max })
+    };
+    match field {
+        Field::Opacity | Field::BorderWidth | Field::TrashLimit => number(field),
+        Field::Region(_, RegionKey::X | RegionKey::Y | RegionKey::Width | RegionKey::Height) => {
+            number(field)
+        }
+        Field::SaveDir | Field::Region(_, RegionKey::SaveDir) => {
+            parse_folder(s).is_none().then_some(Rejected::Folder)
+        }
+        Field::Template(_) => s.trim().is_empty().then_some(Rejected::Template),
+        Field::BorderColor | Field::AnnotationColor => {
+            s.trim().parse::<Rgb>().is_err().then_some(Rejected::Color)
+        }
+        _ => None,
+    }
+}
+
+/// 欄 `control` に、読めずに捨てた入力の書き方 `rejected` を吹き出しで出す。
+pub fn show_rejected(control: HWND, rejected: Rejected, text: Text) {
+    let title = to_wide(text("settings_gui.invalid.title"));
+    let message = to_wide(&rejected.message(text));
+    let tip = EDITBALLOONTIP {
+        cbStruct: size_of::<EDITBALLOONTIP>() as u32,
+        pszTitle: PCWSTR(title.as_ptr()),
+        pszText: PCWSTR(message.as_ptr()),
+        ttiIcon: TTI_WARNING,
+    };
+    // SAFETY: 自分のエディットへのメッセージ。文字列と構造体は呼び出しの間生きている
+    unsafe {
+        SendMessageW(
+            control,
+            EM_SHOWBALLOONTIP,
+            None,
+            Some(LPARAM(&tip as *const EDITBALLOONTIP as isize)),
+        );
+    }
+}
+
 fn is_absolute_dir(s: &str) -> bool {
     let b = s.as_bytes();
     let sep = |c: u8| c == b'\\' || c == b'/';
