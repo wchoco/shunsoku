@@ -58,9 +58,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, IDCANCEL, IDOK, IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING,
     MB_OKCANCEL, MSG, MessageBoxW, PostMessageW, PostQuitMessage, SW_HIDE, SW_RESTORE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_INITDIALOG, WM_LBUTTONDOWN, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETFOCUS,
-    WM_SETTINGCHANGE,
+    SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WM_ACTIVATE, WM_COMMAND, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INITDIALOG, WM_LBUTTONDOWN, WM_NEXTDLGCTL, WM_NOTIFY,
+    WM_SETFOCUS, WM_SETTINGCHANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetDlgCtrlID, IsChild, WM_KEYDOWN};
 use windows::core::{BOOL, PCWSTR};
@@ -485,6 +485,8 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
         }
         // 外したフォーカスを、ダイアログの既定の処理で欄へ戻させない
         WM_SETFOCUS => settings_dialog::blurring(),
+        // 欄から外したまま前面から外れたら、戻ったときに欄へフォーカスを戻させない（#118）
+        WM_ACTIVATE => settings_dialog::on_activate(hwnd, wparam),
         WM_DPICHANGED => {
             // ダイアログが大きさと書体を直し終えてから、一覧の列の幅を合わせ直す
             // SAFETY: 自分のダイアログに送る

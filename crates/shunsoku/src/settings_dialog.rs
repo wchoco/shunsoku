@@ -17,6 +17,7 @@
 //!   Static はクリックを下に通すので、ページの中のクリックはタブに届く。タブはサブクラス化して見出しの外のクリックを
 //!   拾い、ダイアログの地のクリックはダイアログ プロシージャ（`app::settings_gui`）が拾う。ダイアログが
 //!   `WM_SETFOCUS` で前の欄にフォーカスを戻さないよう、移す間は `blurring` を立てておく。
+//!   外したまま前面から外れたら、前面に戻ったときもダイアログ本体にフォーカスを置き直す（`on_activate`）。
 //! - タイトルバーだけダークモードに合わせる（`apply_dark`）。DPI の変化は PMv2 のダイアログマネージャに任せる。
 
 pub mod chord_field;
@@ -52,7 +53,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DS_MODALFRAME, DS_SETFONT, EnumChildWindows, GWLP_ID, GetDlgItem, GetNextDlgTabItem, GetParent,
     GetWindowLongPtrW, IDCANCEL, IDOK, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetDlgItemTextW, SetWindowPos, ShowWindow,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_LBUTTONDOWN, WM_NCDESTROY, WS_CAPTION, WS_CHILD,
+    WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_LBUTTONDOWN, WM_NCDESTROY, WS_CAPTION, WS_CHILD,
     WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_GROUP,
     WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
@@ -224,6 +225,8 @@ pub struct Env {
 thread_local! {
     /// 欄からダイアログ本体へフォーカスを移している間（`blur_on_click`）。
     static BLURRING: Cell<bool> = const { Cell::new(false) };
+    /// ダイアログが前面から外れたとき、フォーカスがダイアログ本体にあった（欄から外したままだった）。
+    static BLURRED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// タブのサブクラスの ID。
@@ -242,6 +245,28 @@ pub fn blur_on_click(hwnd: HWND, place: ClickPlace) {
     unsafe {
         let _ = SetFocus(Some(hwnd));
     }
+}
+
+/// ダイアログ `hwnd` の `WM_ACTIVATE`。前面から外れるときにフォーカスがダイアログ本体にあれば、前面に戻ったときも
+/// 本体に置き直す。ダイアログの既定の処理は、外れる前に部品にあったフォーカスしか覚えないので、欄から外したあとに
+/// 前面から外れると、戻ったときに前の欄へフォーカスを戻してしまう（その間ホットキーが止まる）。
+/// 既定の処理を止めたら true。
+pub fn on_activate(hwnd: HWND, wparam: WPARAM) -> bool {
+    // SAFETY: フォーカスのあるウィンドウを読むだけ
+    let focus = unsafe { GetFocus() };
+    if u32::from(wparam.0 as u16) == WA_INACTIVE {
+        BLURRED.set(focus == hwnd);
+        return false;
+    }
+    if !BLURRED.replace(false) {
+        return false;
+    }
+    let _blurring = During::enter(&BLURRING);
+    // SAFETY: 自分のダイアログ
+    unsafe {
+        let _ = SetFocus(Some(hwnd));
+    }
+    true
 }
 
 /// `blur_on_click` がダイアログ本体へフォーカスを移している間か。この間の `WM_SETFOCUS` は、ダイアログの既定の
