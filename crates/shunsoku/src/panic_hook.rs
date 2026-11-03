@@ -20,10 +20,10 @@ pub fn ui_panicked() -> bool {
     UI_PANICKED.load(Ordering::SeqCst)
 }
 
-/// フックを入れる。`title` と `body` はメッセージ ボックスの文言（`i18n` で引いたもの）。
-pub fn install(ui_thread: ThreadId, title: String, body: String) {
+/// フックを入れる。`texts` はメッセージ ボックスの題と本文（`i18n` で引いたもの）を返す。パニックした時点の
+/// UI の言語で引くため、出すときに呼ぶ。
+pub fn install(ui_thread: ThreadId, texts: impl Fn() -> (String, String) + Send + Sync + 'static) {
     let default_hook = std::panic::take_hook();
-    let title = to_wide(&title);
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current();
         let message = info.payload_as_str().unwrap_or("(no message)");
@@ -37,6 +37,8 @@ pub fn install(ui_thread: ThreadId, title: String, body: String) {
 
         // メッセージ ボックスの間もメッセージは配られるので、先に旗を立てる
         if thread.id() == ui_thread && !UI_PANICKED.swap(true, Ordering::SeqCst) {
+            let (title, body) = texts();
+            let title = to_wide(&title);
             let text = to_wide(&format!("{body}\n\n{message}"));
             // SAFETY: 文字列はこの呼び出しの間生きている
             unsafe {

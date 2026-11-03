@@ -162,6 +162,8 @@ pub struct Overlay {
     painter: Option<Painter>,
     /// 各モニタの上端の中央に出す文字（`set_banner`）。
     banner: Option<String>,
+    /// モニタをまたいだ範囲のサイズの、モニタごとのサイズのつなぎ（文言の `selection.size_plus`）。
+    size_plus: String,
 }
 
 /// 1 モニタ分のウィンドウと、そこに出す固定された画面。
@@ -253,11 +255,13 @@ impl Overlay {
     /// 反映される（`DwmFlush` が返る）まで待つ。
     ///
     /// 作ったウィンドウにはメッセージが届くので、呼ぶ間はアプリの状態を借りないこと。
-    pub fn open(shots: Vec<Shot>, module: HINSTANCE) -> Result<Overlay> {
+    /// `size_plus` はモニタをまたいだ範囲のサイズのつなぎ（文言の `selection.size_plus`）。
+    pub fn open(shots: Vec<Shot>, module: HINSTANCE, size_plus: &str) -> Result<Overlay> {
         let mut overlay = Overlay {
             monitors: Vec::with_capacity(shots.len()),
             painter: None,
             banner: None,
+            size_plus: size_plus.to_owned(),
         };
         // 途中で失敗したら、overlay の drop で作った分を片付ける
         for shot in shots {
@@ -326,7 +330,7 @@ impl Overlay {
                 highlight_label_at(selection, highlight.rect),
                 highlight.label(),
             )),
-            (None, Some(rect), Some(text)) => Some((rect, text.clone())),
+            (None, Some(rect), Some(sizes)) => Some((rect, sizes.join(&self.size_plus))),
             _ => None,
         };
         let size_label = match text {
