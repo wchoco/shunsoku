@@ -33,7 +33,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use shunsoku_core::geometry::Rect;
-use shunsoku_core::i18n::Language;
+use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::monitors;
 use shunsoku_core::settings::editor::{Editor, Move};
 use shunsoku_core::settings::form::{FieldEntry, PauseChange};
@@ -976,10 +976,11 @@ fn apply(hwnd: HWND) -> Option<Vec<hotkey::Failed>> {
     match result {
         Some(Ok(failed)) => Some(failed),
         Some(Err(e)) => {
-            log::error!("could not write the settings: {e}");
+            log::error!("could not write the settings: {e:?}");
+            let detail = e.detail(i18n::catalog(language()));
             notify_user(
                 notify::Level::Error,
-                &format!("{}\n{e}", text("settings_gui.write_failed")),
+                &format!("{}\n{detail}", text("settings_gui.write_failed")),
             );
             None
         }
@@ -992,7 +993,7 @@ enum Step {
     /// 確かめていない衝突がある。
     Confirm(Vec<Field>),
     /// 書いた（か、書くものがなかった）。Ok は登録できなかったホットキー。
-    Done(Result<Vec<hotkey::Failed>, String>),
+    Done(Result<Vec<hotkey::Failed>, settings::WriteFailure>),
 }
 
 /// ファイルを読んで写しと突き合わせ、衝突が `confirmed` に収まっていれば書いて反映する。
