@@ -158,7 +158,7 @@ shortcut = "Shortcut"
 add = "Add"
 remove = "Remove"
 name_label = "Name:"
-steps_label = "Actions:"
+steps_label = "Operations:"
 add_step = "Add"
 shortcut_label = "Shortcut:"
 # Name of a recipe added with "Add" (a number follows)
