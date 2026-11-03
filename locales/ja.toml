@@ -51,10 +51,21 @@ choices = "OK: GUI の値で上書きする\nキャンセル: 適用をやめる
 
 [settings_gui.tab]
 capture = "キャプチャ"
+scrap_ops = "スクラップ操作"
 
 [settings_gui.capture]
 select_capture = "範囲選択キャプチャ:"
 hint = "欄を選んでキーを押すと割り当てます。Tab で次の欄へ移ります。"
+
+[settings_gui.scrap_ops]
+operation = "操作"
+shortcut = "ショートカット"
+mouse = "マウス"
+mark = "印"
+shortcut_label = "ショートカット:"
+mouse_label = "マウス:"
+reset = "既定に戻す"
+none = "なし"
 
 # 欄の横の印
 [settings_gui.mark]
@@ -99,6 +110,16 @@ border = "枠"
 shadow = "影"
 toggle_compact = "コンパクト表示"
 close = "閉じる"
+
+# マウスの操作（設定 GUI のドロップダウン）。キーは scrap::ops の MouseGesture::label_key
+[mouse_gesture]
+left_drag = "左ドラッグ"
+middle_click = "中クリック"
+wheel_up = "ホイール上"
+wheel_down = "ホイール下"
+ctrl_wheel_up = "Ctrl+ホイール上"
+ctrl_wheel_down = "Ctrl+ホイール下"
+double_click = "ダブルクリック"
 
 # 枠の一覧（scrap::ops の border の選択肢）
 [scrap.border]
