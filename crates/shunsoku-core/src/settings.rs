@@ -1,5 +1,6 @@
-//! 設定ファイル（`%APPDATA%\shunsoku\settings.toml`）の読み込み。
+//! 設定ファイル（`%APPDATA%\shunsoku\settings.toml`、ポータブルモードでは exe の横のもの）の読み込み。
 //!
+//! - どのファイルを使うかは `locate`（`settings/location.rs`）で決める。
 //! - `load` は項目ごとに値を取り出す。不正な項目はその項目だけ既定値にし、項目名を `SettingsIssue` に載せる。
 //!   知らないキーは無視する。ファイル全体が TOML として読めなければ、すべて既定値にする。
 //! - アプリから書き戻すときは `write`（`settings/write.rs`）で変わった項目だけを書き換え、手で書いたコメントと
@@ -75,7 +76,9 @@ use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OperationDescriptor, Shortcuts};
 use crate::selection::Mode;
 
+mod location;
 mod write;
+pub use location::{SettingsLocation, locate};
 pub use write::{OwnWrites, rewrite, write};
 
 /// 対応している設定ファイルの形式の版。
