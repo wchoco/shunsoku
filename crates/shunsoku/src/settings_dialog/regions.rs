@@ -46,7 +46,7 @@ use windows::core::{PCWSTR, PWSTR};
 use super::fields::{Action, Field, RegionKey, TemplateOf};
 use super::list_view::{self, set_cell};
 use super::{
-    Class, During, Env, PAGE_WIDTH, Page, PageBuilder, SS_LEFT, Text, item, page_first_id,
+    Class, During, Env, PAGE_WIDTH, Page, PageBuilder, STATIC_TEXT, Text, item, page_first_id,
 };
 use crate::wide::to_wide;
 
@@ -144,7 +144,7 @@ pub(super) fn build(b: &mut PageBuilder) {
         10,
     );
     let name = b.text(Field::Region(0, RegionKey::Name), FIELD_X, 0, FIELD_WIDTH);
-    let name_mark = b.control(Class::Static, "", SS_LEFT, FIELD_X, 16, FIELD_WIDTH, 10);
+    let name_mark = b.control(Class::Static, "", STATIC_TEXT, FIELD_X, 16, FIELD_WIDTH, 10);
     // ホットキー（印は欄の下）
     b.label(
         "settings_gui.regions.hotkey_label",
@@ -163,7 +163,7 @@ pub(super) fn build(b: &mut PageBuilder) {
         LABEL_WIDTH,
         10,
     );
-    let monitor = b.control(Class::Static, "", SS_LEFT, FIELD_X, 62, FIELD_WIDTH, 10);
+    let monitor = b.control(Class::Static, "", STATIC_TEXT, FIELD_X, 62, FIELD_WIDTH, 10);
     let mut range_buttons = Vec::new();
     let range_rows = [
         (
@@ -200,7 +200,15 @@ pub(super) fn build(b: &mut PageBuilder) {
             14,
         ));
     }
-    let warning = b.control(Class::Static, "", SS_LEFT, DETAIL_X, 106, DETAIL_WIDTH, 10);
+    let warning = b.control(
+        Class::Static,
+        "",
+        STATIC_TEXT,
+        DETAIL_X,
+        106,
+        DETAIL_WIDTH,
+        10,
+    );
     // 保存先と、その下の「参照…」「フォルダを開く」
     b.label(
         "settings_gui.regions.save_dir_label",

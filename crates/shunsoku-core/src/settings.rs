@@ -83,6 +83,7 @@ use crate::selection::Mode;
 
 pub mod editor;
 pub mod form;
+pub mod gui;
 mod location;
 pub mod merge;
 pub mod unset;
