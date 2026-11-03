@@ -9,7 +9,6 @@
 
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use shunsoku_core::APP_NAME;
@@ -18,14 +17,13 @@ use shunsoku_core::template::{self, LocalTime};
 use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::Common::{COMDLG_FILTERSPEC, ITEMIDLIST};
 use windows::Win32::UI::Shell::{
     FOLDERID_Pictures, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS,
-    FOS_STRICTFILETYPES, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog,
+    FOS_STRICTFILETYPES, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, ILFree,
     IShellItem, KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderPath,
-    SIGDN_FILESYSPATH, ShellExecuteW,
+    SHOpenFolderAndSelectItems, SHParseDisplayName, SIGDN_FILESYSPATH,
 };
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
 
 /// 保存画像の拡張子。形式は PNG だけ。
@@ -201,18 +199,23 @@ pub fn write_png(path: &Path, image: &Image, overwrite: Overwrite) -> std::io::R
 }
 
 /// フォルダをエクスプローラーで開く。UI スレッドで COM を初期化してから呼ぶ。
+///
+/// `ShellExecuteW` の "open" は渡したパスを既定の動作で開くので、覚えていたフォルダが実行ファイルに
+/// 差し替えられていると、それを起動してしまう。ディレクトリであることを確かめ、PIDL にしてから
+/// `SHOpenFolderAndSelectItems` でフォルダとしてだけ開く（ファイルを渡されても親を開いて選ぶだけで、起動しない）。
 pub fn open_folder(dir: &Path) -> bool {
-    let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
-    // SAFETY: path は呼び出しの間生きている
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(path.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        )
-    };
-    result.0 as isize > 32
+    if !dir.is_dir() {
+        return false;
+    }
+    let path = HSTRING::from(dir.as_os_str());
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    // SAFETY: path と pidl は呼び出しの間生きている。返った PIDL は ILFree で返す
+    unsafe {
+        if SHParseDisplayName(&path, None, &mut pidl, 0, None).is_err() || pidl.is_null() {
+            return false;
+        }
+        let opened = SHOpenFolderAndSelectItems(pidl, None, 0);
+        ILFree(Some(pidl));
+        opened.is_ok()
+    }
 }

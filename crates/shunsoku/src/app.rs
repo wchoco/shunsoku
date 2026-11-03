@@ -732,7 +732,7 @@ pub fn run() -> i32 {
         }
     };
 
-    // 通知のクリックでフォルダを開く ShellExecuteW のため
+    // 通知のクリックでフォルダを開くシェルの呼び出し（SHOpenFolderAndSelectItems）のため
     // SAFETY: UI スレッドで 1 回呼び、終わるときに CoUninitialize で対にする
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
     if com.is_err() {
@@ -1256,7 +1256,7 @@ fn on_tray(owner: HWND, event: tray::Event) {
         }
         tray::Event::NotificationClick => {
             let folder = with_app(|app| app.notices.clicked().map(Path::to_path_buf)).flatten();
-            // ShellExecuteW はメッセージを回すことがあるので、App を借りずに呼ぶ
+            // フォルダを開くシェルの呼び出しはメッセージを回すことがあるので、App を借りずに呼ぶ
             if let Some(folder) = folder
                 && !save::open_folder(&folder)
             {
