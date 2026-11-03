@@ -23,6 +23,7 @@ pub mod selection;
 pub mod settings;
 pub mod template;
 pub mod trash;
+pub mod tray;
 
 /// アプリの名前。
 pub const APP_NAME: &str = "shunsoku";

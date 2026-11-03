@@ -59,7 +59,8 @@
 //! - トリムの範囲を選んでいる間（`Effect::EnterTrimMode` から）は、左ボタン・カーソルの移動・Enter・`Esc`・
 //!   ダブルクリックを core の `ScrapModel::trim_input` に渡し、範囲を描き直す（`on_trim_input`）。
 //! - 書き込みの編集モードの間（`Effect::EnterEditMode` から）は、左ボタン・カーソルの移動・キーを core の
-//!   `ScrapModel::edit_input` に渡し、描き直す（`on_edit_input`）。ショートカットとマウスの割り当て（ホイール・
+//!   `ScrapModel::edit_input` に渡し、描き直す（`on_edit_input`）。ホイールは core の `annotate::toolbar::wheel_pick`
+//!   で道具・色・太さを選ぶ（`on_edit_wheel`、割り当ては固定）。ショートカットとマウスの割り当て（ホイール・
 //!   中クリック・ダブルクリックも）は効かない。ほかのウィンドウにフォーカスが移ったら（`WM_ACTIVATE`）抜ける。
 //! - 編集モードの間は、スクラップの直下にツールバー（`toolbar_window`、`Scrap::toolbar`）を出す。押してもスクラップの
 //!   フォーカスは動かない。道具・色・太さを選ぶ（`EditInput::Pick`）、完了（`EditInput::Leave`）、つまみのドラッグで
@@ -1129,21 +1130,24 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
 
 fn on_tray(owner: HWND, event: tray::Event) {
     match event {
-        tray::Event::ContextMenu { x, y } => {
+        tray::Event::Menu { x, y } => {
             // ごみ箱の一覧（新しいものから）。項目の番号は CMD_TRASH_FIRST + 添字
-            let trashed: Vec<(TrashId, String)> = with_app(|app| {
+            // サムネイルは小さいので写して持つ（メニューはモーダルなので App を借りたまま出せない）
+            let trashed: Vec<(TrashId, String, Image)> = with_app(|app| {
                 app.trash
                     .list()
                     .iter()
-                    .map(|listed| (listed.id, trash_label(listed)))
+                    .map(|listed| (listed.id, trash_label(listed), listed.thumbnail.clone()))
                     .collect()
             })
             .unwrap_or_default();
             let mut trash_entries: Vec<menu::Entry> = trashed
                 .iter()
                 .enumerate()
-                .map(|(i, (_, label))| {
-                    menu::Entry::item(CMD_TRASH_FIRST + i as u32, label.as_str(), true)
+                .map(|(i, (_, label, thumbnail))| menu::Entry::Picture {
+                    id: CMD_TRASH_FIRST + i as u32,
+                    label: label.as_str().into(),
+                    image: thumbnail,
                 })
                 .collect();
             if trash_entries.is_empty() {
@@ -1218,14 +1222,13 @@ fn on_tray(owner: HWND, event: tray::Event) {
             }
             match command.checked_sub(CMD_TRASH_FIRST) {
                 Some(i) => {
-                    if let Some(&(id, _)) = trashed.get(i as usize) {
+                    if let Some(&(id, ..)) = trashed.get(i as usize) {
                         restore_scrap(id);
                     }
                 }
                 None => on_command(command),
             }
         }
-        tray::Event::Select => request_capture(Source::TrayClick),
         tray::Event::NotificationClick => {
             let folder = with_app(|app| app.notices.clicked().map(Path::to_path_buf)).flatten();
             // ShellExecuteW はメッセージを回すことがあるので、App を借りずに呼ぶ
@@ -1863,7 +1866,8 @@ fn on_trim_input(hwnd: HWND, input: TrimInput) -> bool {
 }
 
 /// `WM_MOUSEWHEEL`: ホイールを、ノッチごとにホイールの操作（`MouseGesture::wheel`）にする（基準点はカーソルの
-/// 位置）。対応のない修飾キーつきは false（DefWindowProcW に任せる）。
+/// 位置）。書き込みの編集モードの間は、ノッチごとに道具・色・太さを選ぶ（`on_edit_wheel`）。対応のない
+/// 修飾キーつきは false（DefWindowProcW に任せる）。
 fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
     // wparam の下位は押されているキーとボタン（MK_*）、上位は回転量（上が正）
     const MK_SHIFT: usize = 0x0004;
@@ -1876,6 +1880,9 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
         shift: wparam.0 & MK_SHIFT != 0,
         ..held
     };
+    if is_editing(hwnd) {
+        return on_edit_wheel(hwnd, modifiers, delta);
+    }
     let Some(gesture) = MouseGesture::wheel(modifiers, delta) else {
         return false;
     };
@@ -1895,6 +1902,43 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
     };
     for _ in 0..notches.unsigned_abs() {
         run_mouse_operation(hwnd, gesture, context.clone());
+    }
+    true
+}
+
+/// 書き込みの編集モードのホイール: ノッチごとに、core の `toolbar::wheel_pick` が選ぶ道具・色・太さを、
+/// ツールバーで選んだのと同じに渡す。対応のない修飾キーつきは false。
+fn on_edit_wheel(hwnd: HWND, modifiers: Modifiers, delta: i32) -> bool {
+    let pick = |rotation: i32| {
+        with_app(|app| {
+            let scrap = app.scrap(hwnd)?;
+            let state = scrap.model.edit_state()?;
+            match &scrap.toolbar {
+                Some(toolbar) => toolbar::wheel_pick(state, &toolbar.colours, modifiers, rotation),
+                // ツールバーを作れなかったときも、ツールバーに並べるはずだった色で選ぶ
+                None => {
+                    let colours = toolbar::palette(app.settings.annotation.color);
+                    toolbar::wheel_pick(state, &colours, modifiers, rotation)
+                }
+            }
+        })
+        .flatten()
+    };
+    if pick(delta).is_none() {
+        return false;
+    }
+    let Some(notches) = with_app(|app| Some(app.scrap_mut(hwnd)?.wheel.turn(delta))).flatten()
+    else {
+        return true;
+    };
+    // 1 ノッチで 1 段。選ぶたびに状態が変わるので、ノッチごとに選び直す
+    for _ in 0..notches.unsigned_abs() {
+        match pick(notches.signum()) {
+            Some(p) => {
+                on_edit_input(hwnd, EditInput::Pick(p));
+            }
+            None => break,
+        }
     }
     true
 }
@@ -2576,17 +2620,19 @@ fn save_failed(path: Option<&Path>, reason: &str) {
 fn close_scrap(hwnd: HWND) {
     let removed = with_app(|app| {
         let index = app.scraps.iter().position(|s| s.window.hwnd() == hwnd)?;
+        let mut scrap = app.scraps.remove(index);
+        // トリムの範囲を選んでいる途中で閉じたら選ぶ前の状態で、書き込みの編集モードなら抜けてから入れる
+        scrap.model.settle();
+        let thumbnail = trash_thumbnail(&scrap);
         let Scrap {
             toolbar,
             window,
-            mut model,
+            model,
             image,
             ..
-        } = app.scraps.remove(index);
-        // トリムの範囲を選んでいる途中で閉じたら選ぶ前の状態で、書き込みの編集モードなら抜けてから入れる
-        model.settle();
+        } = scrap;
         // 一時ファイルは裏のスレッドで書くので、借りたままでよい
-        app.trash.push(model, image, save::now());
+        app.trash.push(model, image, thumbnail, save::now());
         Some((toolbar, window))
     })
     .flatten();
@@ -2595,6 +2641,26 @@ fn close_scrap(hwnd: HWND) {
         drop(toolbar);
         drop(window);
         log::info!("scrap closed");
+    }
+}
+
+/// ごみ箱の一覧に付けるサムネイル: 閉じたときの見た目（トリムと書き込みを反映したもの）を、閉じたモニタの
+/// DPI で長い辺 64px 相当に縮める。書き込みを描けなければ、画像だけを縮める。
+fn trash_thumbnail(scrap: &Scrap) -> Image {
+    let side = shunsoku_core::trash::thumbnail_side(scrap.window.dpi());
+    let layer = render::AnnotationLayer {
+        annotations: scrap.model.annotations().items(),
+        view: scrap.model.output_view(),
+        selected: None,
+        typing: None,
+        scale: 1.0,
+    };
+    match render::render_image(scrap.shown(), layer) {
+        Ok(image) => image.thumbnail(side),
+        Err(e) => {
+            log::warn!("could not draw the annotations for the trash thumbnail: {e}");
+            scrap.shown().thumbnail(side)
+        }
     }
 }
 
@@ -3281,6 +3347,7 @@ fn open_overlay() {
                 .with_mode(app.settings.selection.mode)
                 .with_crosshair(app.settings.selection.crosshair);
             let mut overlay = overlay;
+            overlay.set_crosshair_color(app.settings.selection.crosshair_color);
             if request.method.registers_region() {
                 // 定型領域の登録は常に精密モードで、画面の上端に登録だと出す
                 selection = selection.registering();

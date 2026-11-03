@@ -120,7 +120,11 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         font_size,
         font,
     } = annotation;
-    let SelectionScreen { mode, crosshair } = selection;
+    let SelectionScreen {
+        mode,
+        crosshair,
+        crosshair_color,
+    } = selection;
 
     macro_rules! value {
         ($key:literal, $ours:expr, $($path:ident).+) => {{
@@ -170,6 +174,11 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
     value!("annotation.font", font, annotation.font);
     value!("selection.mode", mode, selection.mode);
     value!("selection.crosshair", crosshair, selection.crosshair);
+    value!(
+        "selection.crosshair_color",
+        crosshair_color,
+        selection.crosshair_color
+    );
     value!("log_level", log_level, log_level);
     // レシピは並び全体を 1 つの値として突き合わせる
     value!("recipes", recipes, recipes);
@@ -668,6 +677,9 @@ mod tests {
             ("annotation.font", |s| s.annotation.font = "Meiryo".into()),
             ("selection.mode", |s| s.selection.mode = Mode::Precise),
             ("selection.crosshair", |s| s.selection.crosshair = true),
+            ("selection.crosshair_color", |s| {
+                s.selection.crosshair_color = Rgb(1, 2, 3)
+            }),
             ("log_level", |s| s.log_level = LogLevel::Debug),
             ("regions", |s| {
                 s.regions = vec![Region {

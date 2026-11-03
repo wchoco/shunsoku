@@ -3,6 +3,7 @@
 
 use super::{Annotations, EditState, Pick, Shape, Tool};
 use crate::geometry::{Point, Rect, Size};
+use crate::keys::Modifiers;
 use crate::settings::Rgb;
 
 /// ツールバーに並べる固定の色（赤・橙・黄・緑・青・紫・黒・白）。
@@ -89,6 +90,96 @@ impl ToolSlot {
     }
 }
 
+/// 編集モードのホイール 1 ノッチで選ぶもの。`modifiers` はそのとき押している修飾キー、`rotation` はノッチの
+/// 向き（上が正）。修飾キーなしで道具、Shift で色（`colours` の順）、Ctrl で太さ（文字の道具か打っている間は
+/// 文字の大きさ）を、下へ回すとツールバーの並びの次へ、上へ回すと前へ進め、端では反対の端へ回り込む。ほかの
+/// 修飾キーつきと回っていない（0）なら None。割り当ては固定（`[mouse]` では変えない）。
+pub fn wheel_pick(
+    state: &EditState,
+    colours: &[Rgb],
+    modifiers: Modifiers,
+    rotation: i32,
+) -> Option<Pick> {
+    let Modifiers {
+        win: false,
+        ctrl,
+        alt: false,
+        shift,
+    } = modifiers
+    else {
+        return None;
+    };
+    let (color, size) = shown_color_and_font_size(state);
+    match (ctrl, shift) {
+        (false, false) => {
+            let tools: Vec<Tool> = ToolSlot::ALL.iter().filter_map(|s| s.tool()).collect();
+            step(&tools, &state.tool, rotation).map(Pick::Tool)
+        }
+        (false, true) => step(colours, &color, rotation).map(Pick::Color),
+        (true, false) if shows_font_sizes(state) => {
+            step_size(&FONT_SIZES, size, rotation).map(Pick::FontSize)
+        }
+        (true, false) => step_size(&WIDTHS, state.style.width, rotation).map(Pick::Width),
+        (true, true) => None,
+    }
+}
+
+/// ツールバーで選ばれている色と文字の大きさ。文字を打っている間は、打っている文字のもの（打ち直しなら、その
+/// 文字の）。
+fn shown_color_and_font_size(state: &EditState) -> (Rgb, u32) {
+    let typing = state.typing();
+    let color = typing.as_ref().map_or(state.style.color, |a| a.style.color);
+    let size = match typing.map(|a| a.shape) {
+        Some(Shape::Text { font, .. }) => font.size,
+        _ => state.font.size,
+    };
+    (color, size)
+}
+
+/// 太さの欄に文字の大きさを並べるか（文字の道具を選んでいるか、文字を打っている間）。
+fn shows_font_sizes(state: &EditState) -> bool {
+    state.tool == Tool::Text || state.is_typing()
+}
+
+/// 小さい順の選択肢 `sizes` で、`current` から `rotation` の向きに 1 つ進んだもの。下へは次に大きいもの、上へは
+/// 次に小さいもの（`current` が選択肢になくても）。端を越えたら反対の端へ回り込む。
+fn step_size(sizes: &[u32], current: u32, rotation: i32) -> Option<u32> {
+    let (first, last) = (*sizes.first()?, *sizes.last()?);
+    match rotation.signum() {
+        -1 => Some(
+            sizes
+                .iter()
+                .copied()
+                .find(|&s| s > current)
+                .unwrap_or(first),
+        ),
+        1 => Some(
+            sizes
+                .iter()
+                .copied()
+                .rev()
+                .find(|&s| s < current)
+                .unwrap_or(last),
+        ),
+        _ => None,
+    }
+}
+
+/// `items` の中の `current` から、`rotation` の向きに 1 つ進んだもの（下へは次、上へは前）。端では反対の端へ
+/// 回り込む。`current` が `items` になければ、下へは先頭、上へは末尾。
+fn step<T: Copy + PartialEq>(items: &[T], current: &T, rotation: i32) -> Option<T> {
+    let len = items.len();
+    let at = items.iter().position(|x| x == current);
+    let next = match (rotation.signum(), at) {
+        (-1, Some(i)) => (i + 1) % len,
+        (-1, None) => 0,
+        (1, Some(i)) => (i + len - 1) % len,
+        (1, None) => len.checked_sub(1)?,
+        _ => return None,
+    };
+    items.get(next).copied()
+}
+
 /// ツールバーのボタン。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
@@ -136,12 +227,7 @@ impl Button {
     /// いま選ばれているか（`state` の道具・色・太さ・文字の大きさと同じ）。文字を打っている間の色と大きさは、
     /// 打っている文字のもの（打ち直しなら、その文字の）。
     pub fn is_current(self, state: &EditState) -> bool {
-        let typing = state.typing();
-        let color = typing.as_ref().map_or(state.style.color, |a| a.style.color);
-        let size = match typing.map(|a| a.shape) {
-            Some(Shape::Text { font, .. }) => font.size,
-            _ => state.font.size,
-        };
+        let (color, size) = shown_color_and_font_size(state);
         match self.pick() {
             Some(Pick::Tool(tool)) => state.tool == tool,
             Some(Pick::Color(c)) => color == c,
@@ -176,11 +262,7 @@ impl Layout {
     /// `state` に合わせた並び。文字の道具を選んでいるか文字を打っている間は、太さの代わりに文字の大きさを
     /// 同じ場所に並べる。
     pub fn for_state(colours: &[Rgb], scale: f64, state: &EditState) -> Layout {
-        Layout::with_sizes(
-            colours,
-            scale,
-            state.tool == Tool::Text || state.is_typing(),
-        )
+        Layout::with_sizes(colours, scale, shows_font_sizes(state))
     }
 
     fn with_sizes(colours: &[Rgb], scale: f64, font_sizes: bool) -> Layout {
@@ -240,6 +322,244 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotate::Style;
+
+    const PLAIN: Modifiers = Modifiers {
+        win: false,
+        ctrl: false,
+        alt: false,
+        shift: false,
+    };
+    const DOWN: i32 = -1;
+    const UP: i32 = 1;
+
+    fn editing(tool: Tool) -> EditState {
+        let mut state = EditState::new(Style::default());
+        state.tool = tool;
+        state
+    }
+
+    #[test]
+    fn the_wheel_steps_through_the_tools_in_the_toolbar_order() {
+        let state = editing(Tool::Rect);
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, PLAIN, DOWN),
+            Some(Pick::Tool(Tool::Ellipse))
+        );
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, PLAIN, UP),
+            Some(Pick::Tool(Tool::Select))
+        );
+    }
+
+    #[test]
+    fn the_tools_wrap_around_at_either_end() {
+        assert_eq!(
+            wheel_pick(&editing(Tool::Freehand), &PALETTE, PLAIN, DOWN),
+            Some(Pick::Tool(Tool::Select))
+        );
+        assert_eq!(
+            wheel_pick(&editing(Tool::Select), &PALETTE, PLAIN, UP),
+            Some(Pick::Tool(Tool::Freehand))
+        );
+    }
+
+    #[test]
+    fn shift_and_the_wheel_steps_through_the_palette_and_wraps_around() {
+        let shift = Modifiers {
+            shift: true,
+            ..PLAIN
+        };
+        let mut state = editing(Tool::Rect);
+        state.style.color = PALETTE[0];
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, shift, DOWN),
+            Some(Pick::Color(PALETTE[1]))
+        );
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, shift, UP),
+            Some(Pick::Color(PALETTE[7]))
+        );
+    }
+
+    const CTRL: Modifiers = Modifiers {
+        win: false,
+        ctrl: true,
+        alt: false,
+        shift: false,
+    };
+
+    #[test]
+    fn ctrl_and_the_wheel_steps_through_the_widths_and_wraps_around() {
+        let mut state = editing(Tool::Arrow);
+        state.style.width = 3;
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, CTRL, DOWN),
+            Some(Pick::Width(5))
+        );
+        state.style.width = 8;
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, CTRL, DOWN),
+            Some(Pick::Width(2))
+        );
+    }
+
+    #[test]
+    fn ctrl_and_the_wheel_steps_through_the_font_sizes_with_the_text_tool() {
+        let mut state = editing(Tool::Text);
+        state.font.size = 16;
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, CTRL, DOWN),
+            Some(Pick::FontSize(24))
+        );
+        state.font.size = 12;
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, CTRL, UP),
+            Some(Pick::FontSize(32))
+        );
+    }
+
+    #[test]
+    fn a_width_that_is_not_a_choice_steps_to_the_nearest_choice_in_that_direction() {
+        // 設定の太さは 1〜64 のどれでもよい
+        let mut state = editing(Tool::Rect);
+        state.style.width = 4;
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, CTRL, DOWN),
+            Some(Pick::Width(5))
+        );
+        assert_eq!(wheel_pick(&state, &PALETTE, CTRL, UP), Some(Pick::Width(3)));
+        state.style.width = 64;
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, CTRL, DOWN),
+            Some(Pick::Width(2))
+        );
+        state.style.width = 1;
+        assert_eq!(wheel_pick(&state, &PALETTE, CTRL, UP), Some(Pick::Width(8)));
+    }
+
+    #[test]
+    fn while_retyping_the_wheel_steps_from_the_colour_and_size_of_the_text_being_typed() {
+        use crate::annotate::{EditInput, Pick};
+        use crate::keys::{Chord, Key};
+        let mut state = editing(Tool::Text);
+        let mut annotations = Annotations::default();
+        let at = Point::new(10, 10);
+        state.input(EditInput::Pick(Pick::Color(PALETTE[3])), &mut annotations);
+        state.input(EditInput::Pick(Pick::FontSize(32)), &mut annotations);
+        state.input(EditInput::Press(at), &mut annotations);
+        state.input(EditInput::Char('a'), &mut annotations);
+        state.input(
+            EditInput::Key(Chord::plain(Key::known(0x1B))),
+            &mut annotations,
+        );
+        state.input(EditInput::Pick(Pick::Color(PALETTE[0])), &mut annotations);
+        state.input(EditInput::Pick(Pick::FontSize(16)), &mut annotations);
+        state.input(EditInput::DoubleClick(Point::new(12, 12)), &mut annotations);
+        assert_eq!(state.retyping(), Some(0));
+        let shift = Modifiers {
+            shift: true,
+            ..PLAIN
+        };
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, shift, DOWN),
+            Some(Pick::Color(PALETTE[4]))
+        );
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, CTRL, DOWN),
+            Some(Pick::FontSize(12))
+        );
+    }
+
+    #[test]
+    fn the_wheel_picks_nothing_with_other_modifiers() {
+        let state = editing(Tool::Rect);
+        for modifiers in [
+            Modifiers { alt: true, ..PLAIN },
+            Modifiers { win: true, ..PLAIN },
+            Modifiers {
+                shift: true,
+                ..CTRL
+            },
+        ] {
+            assert_eq!(wheel_pick(&state, &PALETTE, modifiers, DOWN), None);
+        }
+    }
+
+    #[test]
+    fn a_colour_that_is_not_in_the_palette_steps_to_either_end_of_it() {
+        let shift = Modifiers {
+            shift: true,
+            ..PLAIN
+        };
+        let mut state = editing(Tool::Rect);
+        state.style.color = Rgb(1, 2, 3);
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, shift, DOWN),
+            Some(Pick::Color(PALETTE[0]))
+        );
+        assert_eq!(
+            wheel_pick(&state, &PALETTE, shift, UP),
+            Some(Pick::Color(PALETTE[7]))
+        );
+    }
+
+    #[test]
+    fn a_colour_or_width_from_the_wheel_restyles_the_selected_annotation_and_can_be_undone() {
+        use crate::annotate::EditInput;
+        let mut state = editing(Tool::Rect);
+        state.style = Style {
+            color: PALETTE[0],
+            width: 3,
+        };
+        let mut annotations = Annotations::default();
+        state.input(EditInput::Press(Point::new(10, 10)), &mut annotations);
+        state.input(
+            EditInput::Move {
+                at: Point::new(50, 50),
+                shift: false,
+            },
+            &mut annotations,
+        );
+        state.input(EditInput::Release, &mut annotations);
+        state.input(EditInput::Pick(Pick::Tool(Tool::Select)), &mut annotations);
+        state.input(EditInput::Press(Point::new(10, 30)), &mut annotations);
+        state.input(EditInput::Release, &mut annotations);
+        assert_eq!(state.selected(), Some(0));
+        let shift = Modifiers {
+            shift: true,
+            ..PLAIN
+        };
+        for (modifiers, expected) in [
+            (
+                shift,
+                Style {
+                    color: PALETTE[1],
+                    width: 3,
+                },
+            ),
+            (
+                CTRL,
+                Style {
+                    color: PALETTE[1],
+                    width: 5,
+                },
+            ),
+        ] {
+            let pick = wheel_pick(&state, &PALETTE, modifiers, DOWN).unwrap();
+            state.input(EditInput::Pick(pick), &mut annotations);
+            assert_eq!(annotations.items()[0].style, expected);
+        }
+        state.input(EditInput::Undo, &mut annotations);
+        state.input(EditInput::Undo, &mut annotations);
+        assert_eq!(
+            annotations.items()[0].style,
+            Style {
+                color: PALETTE[0],
+                width: 3,
+            }
+        );
+    }
 
     #[test]
     fn the_palette_puts_a_default_colour_that_is_not_in_it_first() {

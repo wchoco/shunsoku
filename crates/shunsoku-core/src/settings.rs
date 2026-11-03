@@ -56,6 +56,7 @@
 //! [selection]                                  # 範囲選択の画面
 //! mode = "normal"                              # 開いたときのモード: normal / precise
 //! crosshair = false                            # 通常モードでも十字線を出す（精密モードでは常に出す）
+//! crosshair_color = "#FFFFFF"                  # 十字線の色（不透明）。トリム中の十字線も同じ色
 //! [[regions]]                                  # 定型領域。並び順がトレイのサブメニューの順
 //! name = "領域 1"                               # 必須。空と重複は不可（重複した後ろのものを捨てる）
 //! hotkey = "Ctrl+Alt+1"                        # 既定は空
@@ -437,12 +438,24 @@ impl std::str::FromStr for Rgb {
 }
 
 /// 範囲選択の画面（`[selection]`）。開くたびに読む。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionScreen {
     /// 開いたときのモード。`Tab` での切り替えはその回だけで、次に開いたらこれに戻る。
     pub mode: Mode,
     /// 通常モードでも十字線を出す。精密モードでは設定によらず出す。
     pub crosshair: bool,
+    /// 十字線の色。不透明の 1px で、縁は付けない。トリム中の十字線もこの色を使う。
+    pub crosshair_color: Rgb,
+}
+
+impl Default for SelectionScreen {
+    fn default() -> SelectionScreen {
+        SelectionScreen {
+            mode: Mode::default(),
+            crosshair: false,
+            crosshair_color: Rgb(0xFF, 0xFF, 0xFF),
+        }
+    }
 }
 
 impl General {
@@ -1023,6 +1036,9 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     }
     if let Some(on) = r.value(selection, "selection", "crosshair", Item::as_bool) {
         s.selection.crosshair = on;
+    }
+    if let Some(color) = r.value(selection, "selection", "crosshair_color", rgb) {
+        s.selection.crosshair_color = color;
     }
 
     s.regions = regions(root, &mut r);
@@ -1684,6 +1700,30 @@ shadow = 1
         let (settings, issues) = load("version = 1\n[selection]\nmode = \"normal\"\n");
         assert_eq!(issues, vec![]);
         assert_eq!(settings.selection.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn the_crosshair_is_white_by_default_and_reads_its_color_from_the_selection_section() {
+        let (settings, _) = load("version = 1\n");
+        assert_eq!(settings.selection.crosshair_color, Rgb(0xFF, 0xFF, 0xFF));
+        let (settings, issues) = load("version = 1\n[selection]\ncrosshair_color = \"#00ff80\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.selection.crosshair_color, Rgb(0x00, 0xFF, 0x80));
+        for value in ["\"white\"", "\"#FFF\"", "\"FFFFFF\"", "1"] {
+            let (settings, issues) = load(&format!(
+                "version = 1\n[selection]\ncrosshair_color = {value}\n"
+            ));
+            assert_eq!(
+                issues,
+                vec![invalid("selection.crosshair_color")],
+                "{value}"
+            );
+            assert_eq!(
+                settings.selection.crosshair_color,
+                Rgb(0xFF, 0xFF, 0xFF),
+                "{value}"
+            );
+        }
     }
 
     #[test]

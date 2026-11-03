@@ -12,6 +12,11 @@
 //!   その横の印の欄を組にして `ChordRow` として返す。呼び出し側は `ChordRow::item` で写しの項目と結ぶ。
 //! - それ以外の欄（チェックボックス・テキスト・数・ドロップダウンと、横の「参照…」などのボタン）は `fields`。
 //!   一般・スクラップ・書き込みのタブは `pages`、定型領域のタブは `regions`、スクラップ操作のタブは `scrap_ops`。
+//! - キーの組み合わせの欄にフォーカスがあるとき、欄の外（ダイアログの地・ラベル・タブのページの地）をクリックしたら、
+//!   フォーカスをダイアログ本体へ移して、どの部品も選ばれていない状態にする（`blur_on_click`。#118）。ラベルの
+//!   Static はクリックを下に通すので、ページの中のクリックはタブに届く。タブはサブクラス化して見出しの外のクリックを
+//!   拾い、ダイアログの地のクリックはダイアログ プロシージャ（`app::settings_gui`）が拾う。ダイアログが
+//!   `WM_SETFOCUS` で前の欄にフォーカスを戻さないよう、移す間は `blurring` を立てておく。
 //! - タイトルバーだけダークモードに合わせる（`apply_dark`）。DPI の変化は PMv2 のダイアログマネージャに任せる。
 
 pub mod chord_field;
@@ -28,25 +33,27 @@ use std::thread::LocalKey;
 use shunsoku_core::monitors::Monitor;
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::Editor;
+use shunsoku_core::settings::form::{ClickPlace, click_blurs};
 use shunsoku_core::settings::tab_step::TabStep;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
 use windows::Win32::UI::Controls::{
     EnableThemeDialogTexture, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
-    ICC_TAB_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, TCIF_TEXT,
-    TCITEMW, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL,
+    ICC_TAB_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, TCHITTESTINFO,
+    TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_HITTEST, TCM_INSERTITEMW, TCM_SETCURSEL,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateDialogIndirectParamW, DLGPROC, DLGTEMPLATE, DS_CENTER,
     DS_MODALFRAME, DS_SETFONT, EnumChildWindows, GWLP_ID, GetDlgItem, GetNextDlgTabItem, GetParent,
     GetWindowLongPtrW, IDCANCEL, IDOK, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetDlgItemTextW, SetWindowPos, ShowWindow,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_APPWINDOW,
-    WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_GROUP, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_LBUTTONDOWN, WM_NCDESTROY, WS_CAPTION, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_GROUP,
+    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -176,6 +183,16 @@ fn capture_page(b: &mut PageBuilder) {
         y,
         PAGE_WIDTH,
     );
+    // タブの下端（ページの y で 193 あたり）に収まるよう、行の間を詰める
+    y += 16;
+    b.label(
+        "settings_gui.capture.crosshair_color",
+        0,
+        y + 2,
+        LABEL_WIDTH,
+        10,
+    );
+    b.color_field(Field::CrosshairColor, FIELD_X, y);
     y += 18;
     b.label("settings_gui.capture.hint", 0, y, PAGE_WIDTH, 20);
 }
@@ -195,6 +212,80 @@ pub struct Env {
     /// 全体の保存先が空のときに保存する先（ピクチャ）。
     pub default_dir: Option<PathBuf>,
     pub file_name: FileName,
+}
+
+thread_local! {
+    /// 欄からダイアログ本体へフォーカスを移している間（`blur_on_click`）。
+    static BLURRING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// タブのサブクラスの ID。
+const TAB_SUBCLASS_ID: usize = 1;
+
+/// ダイアログ `hwnd` の `place` がクリックされた。キーの組み合わせの欄にフォーカスがあれば、ダイアログ本体へ移す。
+/// 欄は `EN_KILLFOCUS` を親に送るので、ホットキーはいつもの流れ（`check_focus`）で登録し直される。
+pub fn blur_on_click(hwnd: HWND, place: ClickPlace) {
+    // SAFETY: フォーカスのあるウィンドウを読むだけ
+    let focus = unsafe { GetFocus() };
+    if !click_blurs(chord_field::is_field(focus), place) {
+        return;
+    }
+    let _blurring = During::enter(&BLURRING);
+    // SAFETY: 自分のダイアログ
+    unsafe {
+        let _ = SetFocus(Some(hwnd));
+    }
+}
+
+/// `blur_on_click` がダイアログ本体へフォーカスを移している間か。この間の `WM_SETFOCUS` は、ダイアログの既定の
+/// 処理（前の欄か最初の欄へフォーカスを戻す）に渡さない。
+pub fn blurring() -> bool {
+    BLURRING.get()
+}
+
+/// タブの見出しの外（ページの地とラベル）のクリックを `blur_on_click` に回す。
+unsafe extern "system" fn tab_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    // SAFETY: 受け取った引数をそのまま渡す。親はダイアログ
+    unsafe {
+        match msg {
+            WM_LBUTTONDOWN => {
+                let mut hit = TCHITTESTINFO {
+                    pt: POINT {
+                        x: i32::from(lparam.0 as u16 as i16),
+                        y: i32::from((lparam.0 >> 16) as u16 as i16),
+                    },
+                    ..Default::default()
+                };
+                let index = SendMessageW(
+                    hwnd,
+                    TCM_HITTEST,
+                    None,
+                    Some(LPARAM(&mut hit as *mut TCHITTESTINFO as isize)),
+                );
+                let place = if index.0 < 0 {
+                    ClickPlace::Background
+                } else {
+                    ClickPlace::TabHeader
+                };
+                if let Ok(dialog) = GetParent(hwnd) {
+                    blur_on_click(dialog, place);
+                }
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+            WM_NCDESTROY => {
+                let _ = RemoveWindowSubclass(hwnd, Some(tab_subclass), TAB_SUBCLASS_ID);
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        }
+    }
 }
 
 /// 処理の間だけ旗を立てておく（その処理がコントロールに送ったメッセージで届く通知を、ダイアログが見分ける）。
@@ -321,6 +412,10 @@ pub fn create(
     }
     fields::init(hwnd, &fields, text, env);
     if let Some(tab) = item(hwnd, ID_TAB) {
+        // SAFETY: 自分のタブ。参照データは持たない
+        if !unsafe { SetWindowSubclass(tab, Some(tab_subclass), TAB_SUBCLASS_ID, 0) }.as_bool() {
+            log::warn!("could not subclass the tab");
+        }
         for (index, def) in PAGES.iter().enumerate() {
             let mut label = to_wide(text(def.label_key));
             let entry = TCITEMW {

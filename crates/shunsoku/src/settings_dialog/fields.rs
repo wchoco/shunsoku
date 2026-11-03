@@ -67,6 +67,8 @@ pub enum Field {
     SelectionMode,
     /// `[selection] crosshair`。
     Crosshair,
+    /// `[selection] crosshair_color`。
+    CrosshairColor,
     /// `[scrap] opacity`。
     Opacity,
     /// `[scrap] border`。
@@ -253,6 +255,7 @@ fn kind(field: Field) -> Kind {
         | Field::Template(_)
         | Field::BorderColor
         | Field::AnnotationColor
+        | Field::CrosshairColor
         | Field::Region(_, RegionKey::Name | RegionKey::SaveDir) => Kind::Text { preview: None },
         Field::Opacity
         | Field::BorderWidth
@@ -345,6 +348,7 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
         Field::Region(i, key) => region_shown(d.regions.get(i), key),
         Field::BorderColor => Shown::Text(d.scrap.border.color.to_string()),
         Field::AnnotationColor => Shown::Text(d.annotation.color.to_string()),
+        Field::CrosshairColor => Shown::Text(d.selection.crosshair_color.to_string()),
         Field::Opacity => Shown::Text(d.scrap.opacity.to_string()),
         Field::BorderWidth => Shown::Text(d.scrap.border.width.to_string()),
         Field::TrashLimit => Shown::Text(d.general.trash_limit.to_string()),
@@ -454,6 +458,11 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
                 draft.annotation.color = c;
             }
         }
+        (Field::CrosshairColor, Input::Text(s)) => {
+            if let Ok(c) = s.trim().parse::<Rgb>() {
+                draft.selection.crosshair_color = c;
+            }
+        }
         (Field::Opacity | Field::BorderWidth | Field::TrashLimit, Input::Text(s)) => {
             let Some(n) = parse_number(field, &s) else {
                 return;
@@ -529,6 +538,7 @@ pub fn color_of(settings: &Settings, field: Field) -> Option<Rgb> {
     match field {
         Field::BorderColor => Some(settings.scrap.border.color),
         Field::AnnotationColor => Some(settings.annotation.color),
+        Field::CrosshairColor => Some(settings.selection.crosshair_color),
         _ => None,
     }
 }
@@ -615,7 +625,7 @@ pub fn rejected(field: Field, s: &str) -> Option<Rejected> {
             parse_folder(s).is_none().then_some(Rejected::Folder)
         }
         Field::Template(_) => s.trim().is_empty().then_some(Rejected::Template),
-        Field::BorderColor | Field::AnnotationColor => {
+        Field::BorderColor | Field::AnnotationColor | Field::CrosshairColor => {
             s.trim().parse::<Rgb>().is_err().then_some(Rejected::Color)
         }
         _ => None,
