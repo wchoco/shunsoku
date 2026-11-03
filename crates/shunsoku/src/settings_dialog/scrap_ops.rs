@@ -14,8 +14,8 @@
 
 use shunsoku_core::scrap::ops::{BindingRow, MouseGesture, OPERATIONS, binding_rows};
 use shunsoku_core::settings::SettingsItem;
+use shunsoku_core::settings::columns::column_widths;
 use shunsoku_core::settings::editor::{Editor, ShortcutValue};
-use shunsoku_core::settings::gui;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::Controls::{
@@ -338,7 +338,7 @@ fn enable(hwnd: HWND, enabled: bool) {
     }
 }
 
-/// 一覧の列の幅を中身（見出しと全部の行の文言）に合わせ、余りは最後の列（印）に足す（`gui::column_widths`）。
+/// 一覧の列の幅を中身（見出しと全部の行の文言）に合わせ、余りは最後の列（印）に足す（`columns::column_widths`）。
 /// 一覧に入りきらなければ略さずに横にスクロールさせる。文言を入れ直したとき（`fill`）と、DPI が変わって
 /// ダイアログが大きさと書体を直し終えたときに呼ぶ。
 pub fn fit_columns(hwnd: HWND) {
@@ -386,7 +386,7 @@ pub fn fit_columns(hwnd: HWND) {
             })
             .collect()
     };
-    let widths = gui::column_widths(&needed, client.right - client.left);
+    let widths = column_widths(&needed, client.right - client.left);
     // SAFETY: 自分のダイアログの一覧へのメッセージ
     unsafe {
         for (i, width) in widths.into_iter().enumerate() {

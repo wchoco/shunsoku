@@ -28,10 +28,11 @@ use std::thread::LocalKey;
 use shunsoku_core::monitors::Monitor;
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::Editor;
-use shunsoku_core::settings::gui::TabStep;
+use shunsoku_core::settings::tab_step::TabStep;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
 use windows::Win32::UI::Controls::{
     EnableThemeDialogTexture, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
     ICC_TAB_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, TCIF_TEXT,
@@ -55,9 +56,9 @@ pub use fields::Fields;
 pub const ID_APPLY: i32 = 10;
 /// タブ。
 pub const ID_TAB: i32 = 100;
-/// ページの Static の書式: 左寄せ（`SS_LEFT` = 0）で、`&` を下線の印にしない（`SS_NOPREFIX` = 0x80）。
+/// ページの Static の書式: 左寄せ（`SS_LEFT`）で、`&` を下線の印にしない（`SS_NOPREFIX`）。
 /// 定型領域の名前やモニタの ID、ファイル名の例のように、ユーザーや OS から来た文字列もそのまま出すため。
-const STATIC_TEXT: WINDOW_STYLE = WINDOW_STYLE(0x80);
+const STATIC_TEXT: WINDOW_STYLE = WINDOW_STYLE(SS_LEFT.0 | SS_NOPREFIX.0);
 /// ダイアログの背景をタブの中の色で塗る（`ETDT_ENABLE | ETDT_USETABTEXTURE`）。ページの Static の背景がタブと揃う。
 const ETDT_ENABLETAB: u32 = 6;
 /// ページのコントロールの ID の帯。
@@ -370,7 +371,7 @@ pub fn step_page(hwnd: HWND, step: TabStep) {
         .iter()
         .position(|def| def.page == current)
         .unwrap_or(0);
-    if let Some(def) = PAGES.get(step.from(index, PAGES.len())) {
+    if let Some(def) = PAGES.get(step.next_index(index, PAGES.len())) {
         show_page(hwnd, def.page);
     }
 }

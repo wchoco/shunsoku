@@ -3712,7 +3712,7 @@ fn write_settings(
 ) -> std::result::Result<(), settings::WriteFailure> {
     use settings::WriteFailure;
     // 通知には断られたファイルと OS の文言だけを出す（`WriteFailure::detail`）。どの段階で断られたかはログに残す
-    let io = |stage: &str, path: &std::path::Path, e: std::io::Error| {
+    let refused_by_os = |stage: &str, path: &std::path::Path, e: std::io::Error| {
         log::warn!(
             "writing the settings: could not {stage} {}: {e}",
             path.display()
@@ -3726,22 +3726,22 @@ fn write_settings(
     let src = match std::fs::read_to_string(&path) {
         Ok(src) => src,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(io("read back", &path, e)),
+        Err(e) => return Err(refused_by_os("read back", &path, e)),
     };
     let text = settings::rewrite(&src, new).ok_or_else(|| WriteFailure::NotToml {
         path: path.display().to_string(),
     })?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| io("create", dir, e))?;
+        std::fs::create_dir_all(dir).map_err(|e| refused_by_os("create", dir, e))?;
     }
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, &text).map_err(|e| io("write", &tmp, e))?;
+    std::fs::write(&tmp, &text).map_err(|e| refused_by_os("write", &tmp, e))?;
     // 名前を変える前に覚える（監視の知らせは UI スレッドのこの関数が返ってから処理されるが、念のため）
     app.own_writes.wrote(&text);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         app.own_writes.forget();
         let _ = std::fs::remove_file(&tmp);
-        return Err(io("replace", &path, e));
+        return Err(refused_by_os("replace", &path, e));
     }
     log::info!("settings written to {}", path.display());
     app.settings = new.as_written();

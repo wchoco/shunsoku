@@ -44,7 +44,7 @@ pub fn show(hwnd: HWND, icon_id: u32, level: Level, title: &str, text: &str) -> 
         Level::Warning => NIIF_WARNING,
         Level::Error => NIIF_ERROR,
     };
-    let mut data = info(hwnd, icon_id);
+    let mut data = blank_balloon(hwnd, icon_id);
     data.dwInfoFlags = flags;
     copy_truncated(&mut data.szInfoTitle, title);
     copy_truncated(&mut data.szInfo, text);
@@ -55,7 +55,7 @@ pub fn show(hwnd: HWND, icon_id: u32, level: Level, title: &str, text: &str) -> 
 /// 今出ている（か、待っている）通知を消す。`szInfo` を空にした `NIF_INFO`（`show` の説明）。
 /// 出ていなくても害はないので、失敗は無視する。
 fn dismiss(hwnd: HWND, icon_id: u32) {
-    let data = info(hwnd, icon_id);
+    let data = blank_balloon(hwnd, icon_id);
     // SAFETY: data は呼び出しの間生きている
     let removed = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() };
     if !removed {
@@ -64,7 +64,7 @@ fn dismiss(hwnd: HWND, icon_id: u32) {
 }
 
 /// `NIF_INFO` の通知の型紙。`szInfo` は空（このまま送ると今の通知を消す）。
-fn info(hwnd: HWND, icon_id: u32) -> NOTIFYICONDATAW {
+fn blank_balloon(hwnd: HWND, icon_id: u32) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
