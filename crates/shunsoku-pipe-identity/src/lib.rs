@@ -30,6 +30,14 @@ impl Integrity {
         client >= self
     }
 
+    /// この整合性レベルで動く CLI が、`server` の整合性レベルで動くパイプの相手を常駐本体として信じてよいか。
+    ///
+    /// 低い側にパイプの名前を先に取られていたら、なりすまされる（応答を好きに返され、前面にする権利を渡す）。
+    /// 昇格した CLI が昇格していない常駐本体に頼むのは正しい使い方なので、求めるのは「自分か Medium の低いほう」以上。
+    pub fn trusts_server(self, server: Integrity) -> bool {
+        server >= self.min(Integrity::MEDIUM)
+    }
+
     /// パイプのセキュリティ記述子に足す SACL（SDDL）。この整合性レベルより低い相手には、読み書きで開けさせない。
     pub fn mandatory_label(self) -> String {
         format!("S:(ML;;NWNR;;;S-1-16-{})", self.0)
@@ -54,6 +62,22 @@ mod tests {
         assert!(!Integrity::HIGH.admits(Integrity(0x2100))); // medium plus
         assert!(!Integrity::MEDIUM.admits(Integrity::LOW));
         assert!(!Integrity::MEDIUM.admits(Integrity::UNTRUSTED));
+    }
+
+    #[test]
+    fn a_cli_trusts_a_server_at_its_own_level_or_medium() {
+        assert!(Integrity::MEDIUM.trusts_server(Integrity::MEDIUM));
+        assert!(Integrity::MEDIUM.trusts_server(Integrity::HIGH));
+        assert!(Integrity::HIGH.trusts_server(Integrity::MEDIUM)); // 昇格した CLI から常駐本体へ
+        assert!(Integrity::LOW.trusts_server(Integrity::LOW));
+    }
+
+    #[test]
+    fn a_cli_refuses_a_server_below_its_level_and_medium() {
+        assert!(!Integrity::MEDIUM.trusts_server(Integrity::LOW));
+        assert!(!Integrity::HIGH.trusts_server(Integrity::LOW));
+        assert!(!Integrity::MEDIUM.trusts_server(Integrity::UNTRUSTED));
+        assert!(!Integrity::LOW.trusts_server(Integrity::UNTRUSTED));
     }
 
     #[test]
