@@ -23,6 +23,7 @@ pub mod chord_field;
 pub mod fields;
 mod list_view;
 mod pages;
+pub mod recipes;
 pub mod regions;
 pub mod scrap_ops;
 
@@ -94,6 +95,7 @@ pub enum Page {
     Regions,
     Scrap,
     ScrapOps,
+    Recipes,
     Annotation,
 }
 
@@ -130,6 +132,11 @@ const PAGES: &[PageDef] = &[
         page: Page::ScrapOps,
         label_key: "settings_gui.tab.scrap_ops",
         build: scrap_ops::build,
+    },
+    PageDef {
+        page: Page::Recipes,
+        label_key: "settings_gui.tab.recipes",
+        build: recipes::build,
     },
     PageDef {
         page: Page::Annotation,
@@ -560,6 +567,7 @@ pub fn fill(hwnd: HWND, rows: &[ChordRow], editor: &Editor, text: Text, env: &En
     }
     scrap_ops::fill(hwnd, editor, text);
     regions::fill(hwnd, editor, text, env);
+    recipes::fill(hwnd, editor, text);
     let buttons = editor.buttons();
     for (id, enabled) in [(IDOK.0, buttons.ok), (ID_APPLY, buttons.apply)] {
         if let Some(button) = item(hwnd, id) {

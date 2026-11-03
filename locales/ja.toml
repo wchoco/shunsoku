@@ -77,6 +77,7 @@ capture = "キャプチャ"
 regions = "定型領域"
 scrap = "スクラップ"
 scrap_ops = "スクラップ操作"
+recipes = "レシピ"
 annotation = "書き込み"
 
 [settings_gui.general]
@@ -164,6 +165,18 @@ shortcut_label = "ショートカット:"
 mouse_label = "マウス:"
 reset = "既定に戻す"
 none = "なし"
+
+[settings_gui.recipes]
+name = "名前"
+shortcut = "ショートカット"
+add = "追加"
+remove = "削除"
+name_label = "名前:"
+steps_label = "操作:"
+add_step = "足す"
+shortcut_label = "ショートカット:"
+# 「追加」で足すレシピの名前（後ろに番号が付く）
+default_name = "レシピ"
 
 # 欄の横の印
 [settings_gui.mark]

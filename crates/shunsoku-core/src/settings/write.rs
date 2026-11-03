@@ -18,9 +18,10 @@ use super::{
     DEFAULT_REGION_FILE_NAME_TEMPLATE, DpiScaling, General, HotkeyAction, Hotkeys, LogLevel,
     OPACITY_RANGE, Reader, Region, ScrapAppearance, SelectionScreen, Settings, TRASH_LIMIT_RANGE,
     VERSION, dpi_scaling, in_range, language, log_level, non_empty_str, optional_chord,
-    optional_gesture, read_regions_at, region_number, rgb, save_dir, selection_mode,
+    optional_gesture, read_regions_at, recipe_steps, region_number, rgb, save_dir, selection_mode,
 };
 use crate::i18n::Language;
+use crate::recipe::Recipe;
 use crate::selection::Mode;
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
@@ -53,6 +54,7 @@ pub fn write(doc: &mut DocumentMut, settings: &Settings) {
         write_selection(t, &settings.selection)
     });
     write_regions(root, &settings.regions);
+    write_recipes(root, &settings.recipes);
 }
 
 /// 設定ファイルの中身 `src` に `settings` を書いた中身（`write` を文字列で行う）。ファイルがなければ `src` は空。
@@ -383,6 +385,101 @@ fn write_regions(root: &mut Table, regions: &[Region]) {
         }
     }
     tables.extend(out);
+}
+
+/// レシピ（`[[recipes]]`）。`recipes` の並びに要素を作り直す。
+///
+/// - レシピは名前でファイルの要素に結び付け、その要素に書く（変えていない項目と、手で書いたコメントが残る）。
+///   名前で結び付かなければ（名前を変えた）、同じ位置の、どれにも結び付いていない要素に結び付ける。どれにも
+///   結び付かなければ新しい要素を作る。
+/// - 結び付かなかった要素（消したレシピ）は消す。読み込みで捨てられる要素（名前か操作の並びが読めない）は消さず、
+///   書いたレシピの後ろに、手で書いたまま残す。
+fn write_recipes(root: &mut Table, recipes: &[Recipe]) {
+    let tables = match root
+        .get_mut("recipes")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        Some(tables) => tables,
+        None if recipes.is_empty() => return,
+        None => {
+            root.insert("recipes", Item::ArrayOfTables(ArrayOfTables::new()));
+            root.get_mut("recipes")
+                .and_then(Item::as_array_of_tables_mut)
+                .expect("just inserted")
+        }
+    };
+    // 読める要素の添字と名前（`settings::recipes` と同じ解釈）
+    let read: Vec<(usize, String)> = tables
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let name = t.get("name")?.as_str()?.to_owned();
+            recipe_steps(t.get("steps")?)?;
+            Some((i, name))
+        })
+        .collect();
+    let mut linked: Vec<Option<usize>> = vec![None; recipes.len()];
+    for (k, recipe) in recipes.iter().enumerate() {
+        linked[k] = read
+            .iter()
+            .find(|(i, n)| *n == recipe.name && !linked.contains(&Some(*i)))
+            .map(|&(i, _)| i);
+    }
+    for k in 0..recipes.len() {
+        if linked[k].is_none() {
+            linked[k] = read
+                .get(k)
+                .map(|&(i, _)| i)
+                .filter(|i| !linked.contains(&Some(*i)));
+        }
+    }
+    let mut old: Vec<Option<Table>> = std::mem::take(tables).into_iter().map(Some).collect();
+    let mut out: Vec<Table> = Vec::new();
+    for (recipe, link) in recipes.iter().zip(&linked) {
+        let mut table = link.and_then(|i| old[i].take()).unwrap_or_default();
+        write_recipe(&mut table, recipe);
+        out.push(table);
+    }
+    let readable = |i: usize| read.iter().any(|&(j, _)| j == i);
+    out.extend(
+        old.into_iter()
+            .enumerate()
+            .filter(|&(i, _)| !readable(i))
+            .filter_map(|(_, t)| t),
+    );
+    // 残った要素の位置を、並べた順に振り直す（位置の順に書き出されるため）
+    let mut positions: Vec<isize> = out.iter().filter_map(Table::position).collect();
+    positions.sort_unstable();
+    let mut positions = positions.into_iter();
+    for table in &mut out {
+        if table.position().is_some() {
+            table.set_position(positions.next());
+        }
+    }
+    tables.extend(out);
+}
+
+/// レシピ 1 つ。ショートカットがなければ項目を消す。
+fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
+    put(
+        t,
+        "name",
+        |i| i.as_str().map(str::to_owned),
+        None,
+        &r.name,
+        |s| Some(s.as_str().into()),
+    );
+    put(t, "steps", recipe_steps, None, &r.steps, |steps| {
+        Some(Value::Array(steps.iter().map(String::as_str).collect()))
+    });
+    put(
+        t,
+        "shortcut",
+        optional_chord,
+        Some(None),
+        &r.shortcut,
+        |c| c.map(|c| c.to_string().into()),
+    );
 }
 
 /// 定型領域 1 つ。名前・モニタ・範囲は既定値がないので、読めなければ常に書く。
@@ -1026,5 +1123,83 @@ font = "Meiryo"     # 書体
     fn a_missing_version_is_written() {
         let out = written("[scrap]\nshadow = false\n", |_| {});
         assert_eq!(load(&out).1, vec![]);
+    }
+    fn recipe(name: &str, steps: &[&str], shortcut: Option<&str>) -> crate::recipe::Recipe {
+        crate::recipe::Recipe {
+            name: name.to_owned(),
+            steps: steps.iter().map(|&s| s.to_owned()).collect(),
+            shortcut: shortcut.and_then(chord),
+        }
+    }
+
+    #[test]
+    fn a_recipe_added_to_a_file_reads_back_the_same() {
+        let wanted = vec![
+            recipe("コピーして閉じる", &["copy", "close"], Some("Ctrl+Shift+C")),
+            recipe("影を消す", &["shadow"], None),
+        ];
+        let out = written("version = 1\n", |s| s.recipes = wanted.clone());
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, wanted);
+        assert!(!out.contains("shortcut = \"\""), "{out}");
+    }
+    const RECIPES: &str = r#"version = 1
+
+# よく使う
+[[recipes]]
+name = "コピーして閉じる"   # いちばん使う
+steps = ["copy", "close"]
+shortcut = "Ctrl+Shift+C"
+
+# 影
+[[recipes]]
+name = "影を消す"
+steps = ["shadow"]
+"#;
+
+    #[test]
+    fn writing_the_recipes_that_were_read_changes_nothing() {
+        assert_eq!(written(RECIPES, |_| {}), RECIPES);
+    }
+
+    #[test]
+    fn an_edited_recipe_rewrites_only_its_changed_items_and_keeps_comments() {
+        let out = written(RECIPES, |s| {
+            s.recipes[0].name = "コピーだけ".to_owned();
+            s.recipes[0].steps = vec!["copy".to_owned()];
+            s.recipes[0].shortcut = None;
+        });
+        assert_eq!(
+            out,
+            RECIPES
+                .replace("\"コピーして閉じる\"", "\"コピーだけ\"")
+                .replace("[\"copy\", \"close\"]", "[\"copy\"]")
+                .replace("shortcut = \"Ctrl+Shift+C\"\n", "")
+        );
+    }
+
+    #[test]
+    fn a_deleted_recipe_takes_only_its_own_table_away() {
+        let out = written(RECIPES, |s| {
+            s.recipes.remove(0);
+        });
+        assert_eq!(
+            out,
+            "version = 1\n\n# 影\n[[recipes]]\nname = \"影を消す\"\nsteps = [\"shadow\"]\n"
+        );
+        let out = written(RECIPES, |s| s.recipes.clear());
+        assert_eq!(out, "version = 1\n");
+    }
+
+    #[test]
+    fn recipes_dropped_when_read_are_left_after_the_written_ones() {
+        let src = "version = 1\n[[recipes]]\nname = \"書きかけ\"\n[[recipes]]\nname = \"a\"\nsteps = [\"copy\"]\n";
+        let out = written(src, |s| s.recipes.push(recipe("b", &["close"], None)));
+        assert_eq!(
+            load(&out).0.recipes,
+            vec![recipe("a", &["copy"], None), recipe("b", &["close"], None)]
+        );
+        assert!(out.contains("name = \"書きかけ\""), "{out}");
     }
 }

@@ -984,7 +984,7 @@ pub fn pick_color(owner: HWND, current: Rgb) -> Option<Rgb> {
 
 impl PageBuilder<'_> {
     /// テキストの欄（枠付き）。ほかのコントロールは `PageBuilder::control` で置く。
-    fn edit(&mut self, style: WINDOW_STYLE, x: i16, y: i16, cx: i16) -> i32 {
+    pub(super) fn edit(&mut self, style: WINDOW_STYLE, x: i16, y: i16, cx: i16) -> i32 {
         let id = self.next_id();
         self.template.item(Item {
             class: Class::Edit,
