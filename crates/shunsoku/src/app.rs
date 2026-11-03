@@ -29,8 +29,10 @@
 //! - スクラップ（`Scrap`）は `App::scraps` に持つ。ウィンドウは `scrap_window`、中身の描画は `render`。
 //! - スクラップへのキーとマウスと右クリックメニューは、core の `scrap::ops` の表（ショートカットの対応表
 //!   `App::shortcuts`、`ops::mouse_operation`、`ops::menu`）でスクラップ操作に変え、`run_scrap_operation` で
-//!   実行する。操作が返す `Effect` を実行するのはここ（`run_scrap_operation`）。操作を足すときは core の表に
+//!   実行する。操作が返す `Effect` を実行するのはここ（`perform`）。操作を足すときは core の表に
 //!   行を足し、新しい `Effect` があればそこに足す。
+//! - ショートカットに付いたレシピ（`[[recipes]]`）は `run_recipe` で実行する。手を進めるのは core の
+//!   `recipe::Run`（ADR-0007）で、ここは手ごとに `Effect` を実行し（`perform`）、その結果（`Outcome`）を返す。
 //! - 設定（`%APPDATA%\shunsoku\settings.toml`、ポータブルモードでは exe の横のもの。場所は core の
 //!   `settings::locate`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
 //!   読み込み直す。アプリから書き戻すときは `write_settings` で変わった項目だけを書き、書いた直後の中身を監視が
@@ -96,6 +98,7 @@ use shunsoku_core::monitors::{self, LocateError};
 use shunsoku_core::notice::Notices;
 use shunsoku_core::perf::Mark;
 use shunsoku_core::protocol::{ErrorKind, Response};
+use shunsoku_core::recipe::{Advance, Outcome, Run};
 use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseBindings, MouseGesture, OpContext,
     OperationDescriptor, OperationId, Shortcuts,
@@ -1972,11 +1975,73 @@ fn on_scrap_key(hwnd: HWND, wparam: WPARAM) -> bool {
     if let Some(outputs) = on_edit_input(hwnd, EditInput::Key(chord)) {
         return outputs.iter().any(|o| *o != EditOutput::CompositionTaken);
     }
-    let Some(op) = with_app(|app| app.shortcuts.operation(chord)).flatten() else {
-        return false;
-    };
-    run_scrap_operation(hwnd, op, OpContext::default());
+    let bound = with_app(|app| {
+        if let Some(op) = app.shortcuts.operation(chord) {
+            Some(Bound::Operation(op))
+        } else {
+            let plan = app.shortcuts.recipe(chord)?;
+            Some(Bound::Recipe(plan.name.clone(), plan.steps.clone()))
+        }
+    })
+    .flatten();
+    match bound {
+        Some(Bound::Operation(op)) => run_scrap_operation(hwnd, op, OpContext::default()),
+        Some(Bound::Recipe(name, steps)) => run_recipe(hwnd, &name, steps),
+        None => return false,
+    }
     true
+}
+
+/// ショートカットに付いたもの（`on_scrap_key` で `App` を返してから実行するため、借りずに持てる形にする）。
+enum Bound {
+    Operation(&'static OperationDescriptor),
+    /// レシピの名前（ログ用）と手。
+    Recipe(String, Vec<&'static OperationDescriptor>),
+}
+
+/// レシピを実行する。手を 1 つずつ実行し、その手の `Effect` を実行し終えてから結果を返して次の手へ進む
+/// （ADR-0007）。失敗・取り消し・今は実行できない手で止まる。止まったわけはログに書く（失敗の通知はその手の
+/// `Effect` を実行した側が出している）。
+fn run_recipe(hwnd: HWND, name: &str, steps: Vec<&'static OperationDescriptor>) {
+    log::info!("recipe {name:?} started");
+    let mut run = Run::new(steps);
+    loop {
+        let mut advance = None;
+        let outcome = perform(hwnd, OpContext::default(), |model, context| {
+            let next = run.advance(model, context);
+            let step = match &next {
+                Advance::Step { op, effects } => Some((op.id, effects.clone())),
+                _ => None,
+            };
+            advance = Some(next);
+            step
+        });
+        match advance {
+            Some(Advance::Step { op, .. }) => {
+                let outcome = outcome.unwrap_or(Outcome::Succeeded);
+                log::info!("recipe {name:?} step {} -> {outcome:?}", op.id);
+                run.settle(outcome);
+            }
+            // 結果はその場で返しているので、待つことはない
+            Some(Advance::Waiting(id)) => {
+                log::warn!("recipe {name:?} is still waiting for {id}");
+                return;
+            }
+            Some(Advance::Finished) => {
+                log::info!("recipe {name:?} finished");
+                return;
+            }
+            Some(Advance::Stopped(stop)) => {
+                log::info!("recipe {name:?} stopped: {stop:?}");
+                return;
+            }
+            // スクラップがもうない（最後の手の「閉じる」で閉じたなど）
+            None => {
+                log::info!("recipe {name:?} ended with the scrap gone");
+                return;
+            }
+        }
+    }
 }
 
 /// いま押されている修飾キー（キーのメッセージを処理している時点の状態）。
@@ -2118,6 +2183,21 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
 
 /// スクラップ操作を実行し、返った `Effect` を実行する。スクラップのキー・マウス・メニューはすべてここを通る。
 fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext) {
+    perform(hwnd, context, |model, context| {
+        Some((op.id, ops::execute(op, model, context)))
+    });
+}
+
+/// `step` でスクラップの `ScrapModel` を変え、返った `Effect` を実行する。`step` は操作の id（描き直しに
+/// 失敗したときのログ用）と `Effect` を返す。スクラップがないか `step` が None なら何もせず None。
+///
+/// 返すのは `Effect` の結果をまとめたもの（`Outcome::of`）。コピーに失敗した・画像を作れなかったら失敗、
+/// ほかは成功。保存は裏のスレッドに渡した時点で成功とする（結果を待つのは #126）。
+fn perform(
+    hwnd: HWND,
+    context: OpContext,
+    step: impl FnOnce(&mut ScrapModel, &OpContext) -> Option<(OperationId, Vec<Effect>)>,
+) -> Option<Outcome> {
     let deferred = with_app(|app| {
         let annotation = Style::from(&app.settings.annotation);
         let font = Font::from(&app.settings.annotation);
@@ -2133,7 +2213,7 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
             carryover,
             ..context
         };
-        let effects = ops::execute(op, &mut scrap.model, &context);
+        let (op_id, effects) = step(&mut scrap.model, &context)?;
         let show_zoom = effects.contains(&Effect::ShowZoom);
         if show_zoom {
             scrap.zoom_label = true;
@@ -2149,7 +2229,7 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                 // ウィンドウを動かす・描き直すときに届くメッセージ（WM_WINDOWPOSCHANGED、WM_DPICHANGED など）では
                 // App を借りないので、借りたままでよい
                 Effect::Redraw => {
-                    scrap.redraw_or_revert(&before, &appearance, renderer, show_zoom, op.id);
+                    scrap.redraw_or_revert(&before, &appearance, renderer, show_zoom, op_id);
                 }
                 Effect::EnterTrimMode => {
                     log::info!("trim started");
@@ -2203,32 +2283,47 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
         }
         Some(deferred)
     })
-    .flatten()
-    .unwrap_or_default();
+    .flatten()?;
     // 編集モードを抜けたら IME を使えないようにする（core が変換中の文字も書き込みにしてある）
     sync_ime(hwnd, true);
     // クリップボード・通知・ウィンドウを壊すのはメッセージが届くことがあるので、App を借りずに行う
-    for action in deferred {
-        match action {
+    let outcomes: Vec<Outcome> = deferred
+        .into_iter()
+        .map(|action| match action {
             Deferred::Copy(image) => copy_to_clipboard(&image),
-            Deferred::Save(image) => save_default(image),
-            Deferred::SaveAs(image) => save_as(hwnd, image),
+            Deferred::Save(image) => {
+                save_default(image);
+                Outcome::Succeeded
+            }
+            Deferred::SaveAs(image) => {
+                save_as(hwnd, image);
+                Outcome::Succeeded
+            }
             Deferred::RenderFailed { failed_key, reason } => {
                 log::error!("could not render the scrap image ({failed_key}): {reason}");
                 notify_user(
                     notify::Level::Error,
                     &format!("{}\n{reason}", text(failed_key)),
                 );
+                Outcome::Failed
             }
-            Deferred::Close => close_scrap(hwnd),
-        }
-    }
+            Deferred::Close => {
+                close_scrap(hwnd);
+                Outcome::Succeeded
+            }
+        })
+        .collect();
+    Some(Outcome::of(outcomes))
 }
 
-/// `Effect::CopyToClipboard`: 画像をクリップボードに置く。失敗したらエラーの通知を出す。
-fn copy_to_clipboard(image: &Image) {
-    if let Err(reason) = copy_image(image) {
-        notify_user(notify::Level::Error, &reason);
+/// `Effect::CopyToClipboard`: 画像をクリップボードに置く。失敗したらエラーの通知を出し、失敗を返す。
+fn copy_to_clipboard(image: &Image) -> Outcome {
+    match copy_image(image) {
+        Ok(()) => Outcome::Succeeded,
+        Err(reason) => {
+            notify_user(notify::Level::Error, &reason);
+            Outcome::Failed
+        }
     }
 }
 
