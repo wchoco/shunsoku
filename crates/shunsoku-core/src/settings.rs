@@ -9,6 +9,7 @@
 //! - キーの重なりは `keymap` で見つける。同じ範囲（ホットキー同士、ショートカット同士）の重なりは `assign` の
 //!   規則で両方を無効にし、ホットキーとショートカットの重なりは警告だけにする。
 //! - 設定 GUI で適用できるかは `validate` で決める。問題の項目は `SettingsItem`（GUI の行）で指す。
+//! - 設定 GUI の適用では、開いた時点の設定・写し・その時点のファイルを `merge::merge` で 3 者で突き合わせる。
 //!
 //! スキーマ（書かなかった項目は既定値）:
 //!
@@ -79,6 +80,8 @@ use crate::selection::Mode;
 
 pub mod editor;
 mod location;
+pub mod merge;
+pub mod unset;
 mod write;
 pub use location::{SettingsLocation, locate};
 pub use write::{OwnWrites, rewrite, write};
