@@ -70,6 +70,31 @@ impl<K: PartialEq> FieldEntry<K> {
         let (entered, text) = self.entered.take()?;
         (entered == field && !readable).then_some(text)
     }
+
+    /// 適用（OK・適用・Enter）の前に、フォーカスのある欄 `field` を、欄から出たときと同じに確かめる（Enter は
+    /// フォーカスを動かさないので、出る前に適用が来る）。`text` は今の文字、`readable` はそれが読めるか。
+    ///
+    /// - 読めなければ、写しと欄に戻す文字（入ったときの文字）を返す。呼び出し側は適用しない。欄にいるままなので、
+    ///   入ったときの文字を覚えたままにする。
+    /// - 読めれば None。今の文字を入ったときの文字として覚え直す（適用した値が、次に戻す値になる）。
+    /// - 入ったのと違う欄なら何もしない。
+    pub fn applying(
+        &mut self,
+        field: K,
+        text: impl Into<String>,
+        readable: bool,
+    ) -> Option<String> {
+        let (entered, kept) = self.entered.as_mut()?;
+        if *entered != field {
+            return None;
+        }
+        if readable {
+            *kept = text.into();
+            None
+        } else {
+            Some(kept.clone())
+        }
+    }
 }
 
 /// 設定 GUI のキーの組み合わせの欄にフォーカスがある間、全体のホットキーの登録を外しておく（押したキーが
@@ -263,6 +288,43 @@ mod tests {
         entry.entered("save_dir", r"C:\shots");
         entry.entered("opacity", "80");
         assert_eq!(entry.left("opacity", false).as_deref(), Some("80"));
+    }
+
+    #[test]
+    fn applying_with_an_unreadable_value_in_the_focused_field_restores_it_and_stays() {
+        // Enter（既定の OK）はフォーカスを動かさないので、欄から出る前に適用が来る
+        let mut editor = Editor::new(Settings::default());
+        let mut entry = FieldEntry::default();
+        entry.entered("opacity", "100");
+        for typed in ["10", "1", "", "5", "50", "500"] {
+            type_opacity(&mut editor, typed);
+        }
+
+        // 打つ途中の 50 を書かず、入ったときの 100 に戻して適用しない
+        let restore = entry.applying("opacity", "500", false);
+        assert_eq!(restore.as_deref(), Some("100"));
+        type_opacity(&mut editor, restore.as_deref().unwrap_or_default());
+        assert_eq!(editor.draft(), editor.base());
+
+        // 欄にいるままなので、また読めない値で出たら同じ値に戻す
+        assert_eq!(entry.left("opacity", false).as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn applying_with_a_readable_value_remembers_it_as_the_value_to_return_to() {
+        let mut entry = FieldEntry::default();
+        entry.entered("opacity", "100");
+        assert_eq!(entry.applying("opacity", "80", true), None);
+        // 適用したあとに読めない値で出たら、適用した値に戻す
+        assert_eq!(entry.left("opacity", false).as_deref(), Some("80"));
+    }
+
+    #[test]
+    fn applying_with_focus_outside_the_entered_field_restores_nothing() {
+        let mut entry = FieldEntry::default();
+        assert_eq!(entry.applying("opacity", "500", false), None);
+        entry.entered("save_dir", r"C:\shots");
+        assert_eq!(entry.applying("opacity", "500", false), None);
     }
 
     #[test]

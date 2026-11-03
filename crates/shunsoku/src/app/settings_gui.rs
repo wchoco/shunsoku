@@ -58,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
 };
-use windows::Win32::UI::WindowsAndMessaging::{IsChild, WM_KEYDOWN};
+use windows::Win32::UI::WindowsAndMessaging::{GetDlgCtrlID, IsChild, WM_KEYDOWN};
 use windows::core::{BOOL, PCWSTR};
 
 use super::{
@@ -89,6 +89,27 @@ pub(super) struct SettingsGui {
 }
 
 impl SettingsGui {
+    /// テキストの欄 `field` に入った。`text` はそのときの欄の文字。
+    fn field_entered(&mut self, field: fields::Field, text: String) {
+        self.entry.entered(field, text);
+    }
+
+    /// テキストの欄 `field` から出た。読めなければ、写しと欄に戻す文字を返す（`FieldEntry::left`）。
+    fn field_left(&mut self, field: fields::Field, readable: bool) -> Option<String> {
+        self.entry.left(field, readable)
+    }
+
+    /// 適用の前に、フォーカスのある欄 `field` の今の文字 `text` を確かめる。読めなければ、写しと欄に戻す文字を
+    /// 返す（`FieldEntry::applying`）。
+    fn field_applying(
+        &mut self,
+        field: fields::Field,
+        text: String,
+        readable: bool,
+    ) -> Option<String> {
+        self.entry.applying(field, text, readable)
+    }
+
     /// 一覧の行で変わるキーの欄（ID `field`）を、設定の項目 `item` に結び直す。
     fn rebind_chord_row(&mut self, field: i32, item: SettingsItem) {
         if let Some(row) = self.rows.iter_mut().find(|r| r.field == field) {
@@ -451,7 +472,7 @@ fn row_selected(header: &NMHDR, lparam: LPARAM) -> bool {
 
 fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
     if id == IDOK.0 {
-        if code == BN_CLICKED {
+        if code == BN_CLICKED && focused_field_readable(hwnd) {
             // 書けたら閉じる。登録できなかったホットキーは、欄の印が見えなくなるので通知で知らせる
             match apply(hwnd) {
                 Some(failed) => {
@@ -471,6 +492,9 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
     match id {
         _ if id == IDCANCEL.0 => destroy(hwnd),
         ID_APPLY if code == BN_CLICKED => {
+            if !focused_field_readable(hwnd) {
+                return;
+            }
             apply(hwnd);
             rebuild_if_language_changed(hwnd);
         }
@@ -510,6 +534,38 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
     }
 }
 
+/// OK・適用の前に、フォーカスのあるテキストの欄を、欄から出たときと同じに確かめる。Enter（既定の OK）や
+/// ボタンのアクセスキーはフォーカスを動かさないので、読めない入力の欄から出る前に適用が来る。読めなければ、
+/// 入ったときの値に戻して書き方を吹き出しで知らせ、false を返す（適用しない・閉じない）。
+fn focused_field_readable(hwnd: HWND) -> bool {
+    // SAFETY: フォーカスのあるウィンドウとその ID を読むだけ
+    let control = unsafe { GetFocus() };
+    // SAFETY: 同上
+    let id = unsafe { GetDlgCtrlID(control) };
+    let row = with_gui(|gui| gui.fields.row(id)).flatten();
+    let Some(row) = row.filter(|row| matches!(row.kind, Kind::Text { .. } | Kind::Number { .. }))
+    else {
+        return true;
+    };
+    let Input::Text(s) = fields::input(row, control) else {
+        return true;
+    };
+    let rejected = fields::rejected(row.field, &s);
+    let Some(restore) =
+        with_gui(|gui| gui.field_applying(row.field, s, rejected.is_none())).flatten()
+    else {
+        return true;
+    };
+    // フォーカスのある欄は `refresh` では書き換わらないので、欄の文字を直に戻す（`EN_CHANGE` で写しにも入る）
+    fields::set_window_text(control, &restore);
+    set_field(row.field, Input::Text(restore));
+    refresh(hwnd);
+    if let Some(rejected) = rejected {
+        fields::show_rejected(control, rejected, text);
+    }
+    false
+}
+
 /// 欄（`settings_dialog::fields`）か、その横のボタンへの通知。
 fn on_field(hwnd: HWND, id: i32, code: u32, control: HWND) {
     let Some(fields) =
@@ -534,11 +590,7 @@ fn on_field(hwnd: HWND, id: i32, code: u32, control: HWND) {
         // 入ったときの文字を覚えておく
         (Kind::Text { .. } | Kind::Number { .. }, EN_SETFOCUS) => {
             if let Input::Text(s) = fields::input(row, control) {
-                with_app(|app| {
-                    if let Some(gui) = app.settings_gui.as_mut() {
-                        gui.entry.entered(row.field, s);
-                    }
-                });
+                with_gui(|gui| gui.field_entered(row.field, s));
             }
             return;
         }
@@ -548,12 +600,7 @@ fn on_field(hwnd: HWND, id: i32, code: u32, control: HWND) {
             if let Input::Text(s) = fields::input(row, control) {
                 rejected = fields::rejected(row.field, &s);
             }
-            let restore = with_app(|app| {
-                app.settings_gui
-                    .as_mut()
-                    .and_then(|gui| gui.entry.left(row.field, rejected.is_none()))
-            })
-            .flatten();
+            let restore = with_gui(|gui| gui.field_left(row.field, rejected.is_none())).flatten();
             if let Some(text) = restore {
                 set_field(row.field, Input::Text(text));
             }
@@ -569,11 +616,12 @@ fn on_field(hwnd: HWND, id: i32, code: u32, control: HWND) {
 
 /// 写しの項目 `field` を `input` にする。
 fn set_field(field: fields::Field, input: Input) {
-    with_app(|app| {
-        if let Some(gui) = app.settings_gui.as_mut() {
-            fields::set(field, gui.editor.draft_mut(), input);
-        }
-    });
+    with_gui(|gui| fields::set(field, gui.editor.draft_mut(), input));
+}
+
+/// 開いている設定 GUI を短く借りる（`with_app` と同じく、中でメッセージを送らない）。開いていなければ None。
+fn with_gui<R>(f: impl FnOnce(&mut SettingsGui) -> R) -> Option<R> {
+    with_app(|app| app.settings_gui.as_mut().map(f)).flatten()
 }
 
 /// 欄の横のボタンが押された。ダイアログとメニューはモーダルなので、`App` を借りずに出す。
