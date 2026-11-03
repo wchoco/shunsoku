@@ -10,7 +10,8 @@
 //!   選び直したら `Fields::bind_region` で、欄と横のボタンの i をまとめて差し替える。i が写しの外（領域がない）
 //!   なら、欄は空を出し、入力は捨てる。
 //! - フォーカスのあるテキストの欄は `fill` で書き換えない（打っている途中のキャレットを動かさない）。読めない入力
-//!   （範囲の外の数、`#RRGGBB` でない色、空のテンプレート）は写しを変えず、フォーカスが外れたら写しの値に戻る。
+//!   （範囲の外の数、`#RRGGBB` でない色、空のテンプレート）は写しを変えず、フォーカスが外れたら欄に入ったときの値に
+//!   戻る（打つ途中に読めた値は写しに入っているので、それには戻さない。`form::FieldEntry`）。
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
 use shunsoku_core::selection::Mode;
 use shunsoku_core::settings::editor::{Editor, choices};
-use shunsoku_core::settings::form::{FillPass, RegionDetail};
+use shunsoku_core::settings::form::{FillPass, RegionDetail, read_number};
 use shunsoku_core::settings::{
     BORDER_WIDTH_RANGE, DpiScaling, OPACITY_RANGE, Region, Rgb, Settings, TRASH_LIMIT_RANGE,
 };
@@ -44,7 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use super::{Class, During, Env, Item, PAGE_X, PAGE_Y, PageBuilder, SS_LEFT, Text, item};
+use super::{Class, During, Env, Item, PAGE_X, PAGE_Y, PageBuilder, STATIC_TEXT, Text, item};
 use crate::wide::to_wide;
 
 /// 欄が結ぶ写しの項目（キーの組み合わせの項目は `SettingsItem` と `ChordRow`）。
@@ -551,10 +552,7 @@ pub fn folder_of(settings: &Settings, field: Field, default_dir: Option<&Path>) 
 /// 数の欄 `field` の入力。範囲（`number_range`）の外か、数でなければ None。
 fn parse_number(field: Field, s: &str) -> Option<u32> {
     let (min, max) = number_range(field);
-    s.trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|n| (min..=max).contains(n))
+    read_number(s, &(min..=max))
 }
 
 /// フォルダの欄の入力。空は既定（`Some(None)`）、絶対パスでなければ None。
@@ -1066,7 +1064,7 @@ impl PageBuilder<'_> {
             y,
             SIDE_BUTTON,
         );
-        let preview = self.control(Class::Static, "", SS_LEFT, x, y + 17, cx, 10);
+        let preview = self.control(Class::Static, "", STATIC_TEXT, x, y + 17, cx, 10);
         if let Some(row) = self.fields.rows.iter_mut().find(|r| r.control == id) {
             row.kind = Kind::Text {
                 preview: Some(preview),

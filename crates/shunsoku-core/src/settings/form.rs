@@ -1,5 +1,8 @@
 //! 設定 GUI の、入力で変わる状態（写しの中身ではないもの）と、出し方の計算。Win32 の層は通知を渡して、決まったことに従う。
 
+use std::ops::RangeInclusive;
+use std::str::FromStr;
+
 use crate::geometry::{Rect, Size};
 
 /// 定型領域の詳細の欄が指す領域。結び直したら、次に欄に出すときはフォーカスのある欄も書き換える。
@@ -42,6 +45,66 @@ impl FillPass {
     /// 前の領域の値が残らないよう書き換える。
     pub fn overwrites(self, focused: bool, region_field: bool) -> bool {
         !focused || (self.rebound && region_field)
+    }
+}
+
+/// 数の欄の入力 `s` を読む。前後の空白は無視し、`range` の中の整数だけを読む（ほかは読めない入力）。
+pub fn read_number<T>(s: &str, range: &RangeInclusive<T>) -> Option<T>
+where
+    T: FromStr + PartialOrd,
+{
+    s.trim().parse().ok().filter(|n| range.contains(n))
+}
+
+/// フォーカスのあるテキストの欄と、入ったときの文字。読めない値で出たら、入ったときの値に戻す（キーを打つ
+/// たびに読める値は写しに入るので、打つ途中の値に戻さないように）。`K` は欄を指す値。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldEntry<K> {
+    entered: Option<(K, String)>,
+}
+
+impl<K> Default for FieldEntry<K> {
+    fn default() -> Self {
+        FieldEntry { entered: None }
+    }
+}
+
+impl<K: PartialEq> FieldEntry<K> {
+    /// 欄 `field` に入った。`text` はそのときの欄の文字（写しの値）。
+    pub fn entered(&mut self, field: K, text: impl Into<String>) {
+        self.entered = Some((field, text.into()));
+    }
+
+    /// 欄 `field` から出た。`readable` は今の文字が読めるか。読めなければ、写しと欄に戻す文字（入ったときの
+    /// 文字）を返す。入ったのと違う欄なら何も返さない。
+    pub fn left(&mut self, field: K, readable: bool) -> Option<String> {
+        let (entered, text) = self.entered.take()?;
+        (entered == field && !readable).then_some(text)
+    }
+
+    /// 適用（OK・適用・Enter）の前に、フォーカスのある欄 `field` を、欄から出たときと同じに確かめる（Enter は
+    /// フォーカスを動かさないので、出る前に適用が来る）。`text` は今の文字、`readable` はそれが読めるか。
+    ///
+    /// - 読めなければ、写しと欄に戻す文字（入ったときの文字）を返す。呼び出し側は適用しない。欄にいるままなので、
+    ///   入ったときの文字を覚えたままにする。
+    /// - 読めれば None。今の文字を入ったときの文字として覚え直す（適用した値が、次に戻す値になる）。
+    /// - 入ったのと違う欄なら何もしない。
+    pub fn applying(
+        &mut self,
+        field: K,
+        text: impl Into<String>,
+        readable: bool,
+    ) -> Option<String> {
+        let (entered, kept) = self.entered.as_mut()?;
+        if *entered != field {
+            return None;
+        }
+        if readable {
+            *kept = text.into();
+            None
+        } else {
+            Some(kept.clone())
+        }
     }
 }
 
@@ -137,6 +200,8 @@ pub fn range_thumbnail(monitor: Option<Size>, range: Rect, size: Size) -> Thumbn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::editor::Editor;
+    use crate::settings::{OPACITY_RANGE, Settings};
 
     #[test]
     fn after_binding_another_region_the_next_fill_overwrites_the_focused_region_field_once() {
@@ -183,6 +248,108 @@ mod tests {
         pause.reregistering();
         assert!(!pause.is_paused());
         assert_eq!(pause.focus_changed(true), Some(PauseChange::Pause));
+    }
+
+    /// Win32 層の不透明度の欄と同じく、読める入力だけを写しに入れる（`fields::set`）。
+    fn type_opacity(editor: &mut Editor, s: &str) {
+        if let Some(n) = read_opacity(s) {
+            editor.draft_mut().scrap.opacity = n;
+        }
+    }
+
+    fn read_opacity(s: &str) -> Option<u8> {
+        read_number(s, &OPACITY_RANGE)
+    }
+
+    #[test]
+    fn a_number_field_reads_whole_numbers_in_its_range() {
+        assert_eq!(read_number(" 50 ", &OPACITY_RANGE), Some(50));
+        assert_eq!(read_number("10", &OPACITY_RANGE), Some(10));
+        assert_eq!(read_number("100", &OPACITY_RANGE), Some(100));
+        // 範囲の外、空、数でないものは読めない
+        assert_eq!(read_number("5", &OPACITY_RANGE), None);
+        assert_eq!(read_number("500", &OPACITY_RANGE), None);
+        assert_eq!(read_number("", &OPACITY_RANGE), None);
+        assert_eq!(read_number("-20", &OPACITY_RANGE), None);
+        assert_eq!(read_number("50%", &OPACITY_RANGE), None);
+        assert_eq!(read_number("70000", &(1..=u32::MAX)), Some(70000));
+    }
+
+    #[test]
+    fn leaving_a_field_with_an_unreadable_value_restores_the_value_it_had_when_entered() {
+        let mut editor = Editor::new(Settings::default());
+        let mut entry = FieldEntry::default();
+        entry.entered("opacity", "100");
+        // 100 → 500 と打つ途中の 50 は読めるので写しに入る
+        for typed in ["10", "1", "", "5", "50", "500"] {
+            type_opacity(&mut editor, typed);
+        }
+        assert_eq!(editor.draft().scrap.opacity, 50);
+
+        // 打つ途中の 50 ではなく、入ったときの 100 に戻す
+        let restore = entry.left("opacity", read_opacity("500").is_some());
+        assert_eq!(restore.as_deref(), Some("100"));
+        type_opacity(&mut editor, restore.as_deref().unwrap_or_default());
+        assert_eq!(editor.draft(), editor.base());
+        assert!(!editor.buttons().apply);
+    }
+
+    #[test]
+    fn leaving_a_field_with_a_readable_value_keeps_it() {
+        let mut entry = FieldEntry::default();
+        entry.entered("opacity", "100");
+        assert_eq!(entry.left("opacity", true), None);
+        // 出たあとは覚えていない
+        assert_eq!(entry.left("opacity", false), None);
+    }
+
+    #[test]
+    fn leaving_a_field_other_than_the_one_entered_restores_nothing() {
+        let mut entry = FieldEntry::default();
+        entry.entered("save_dir", r"C:\shots");
+        assert_eq!(entry.left("opacity", false), None);
+
+        // 別の欄に入り直したら、その欄の値を覚える
+        entry.entered("save_dir", r"C:\shots");
+        entry.entered("opacity", "80");
+        assert_eq!(entry.left("opacity", false).as_deref(), Some("80"));
+    }
+
+    #[test]
+    fn applying_with_an_unreadable_value_in_the_focused_field_restores_it_and_stays() {
+        // Enter（既定の OK）はフォーカスを動かさないので、欄から出る前に適用が来る
+        let mut editor = Editor::new(Settings::default());
+        let mut entry = FieldEntry::default();
+        entry.entered("opacity", "100");
+        for typed in ["10", "1", "", "5", "50", "500"] {
+            type_opacity(&mut editor, typed);
+        }
+
+        // 打つ途中の 50 を書かず、入ったときの 100 に戻して適用しない
+        let restore = entry.applying("opacity", "500", false);
+        assert_eq!(restore.as_deref(), Some("100"));
+        type_opacity(&mut editor, restore.as_deref().unwrap_or_default());
+        assert_eq!(editor.draft(), editor.base());
+
+        // 欄にいるままなので、また読めない値で出たら同じ値に戻す
+        assert_eq!(entry.left("opacity", false).as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn applying_with_a_readable_value_remembers_it_as_the_value_to_return_to() {
+        let mut entry = FieldEntry::default();
+        entry.entered("opacity", "100");
+        assert_eq!(entry.applying("opacity", "80", true), None);
+        // 適用したあとに読めない値で出たら、適用した値に戻す
+        assert_eq!(entry.left("opacity", false).as_deref(), Some("80"));
+    }
+
+    #[test]
+    fn applying_with_focus_outside_the_entered_field_restores_nothing() {
+        let mut entry = FieldEntry::default();
+        assert_eq!(entry.applying("opacity", "500", false), None);
+        entry.entered("save_dir", r"C:\shots");
+        assert_eq!(entry.applying("opacity", "500", false), None);
     }
 
     #[test]

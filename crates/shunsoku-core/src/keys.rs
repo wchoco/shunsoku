@@ -9,6 +9,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+/// Tab の仮想キーコード。
+pub const VK_TAB: u16 = 0x09;
+
 /// 修飾キー。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Modifiers {
@@ -89,9 +92,8 @@ impl Chord {
     /// - Tab はフォーカスの移動に使うので入れない（ダイアログに任せる）。
     /// - Win キーと PrintScreen は入力できない（ADR-0004）。Win キーを押したままでも、Win は付けない。
     pub fn from_key_down(vk: u16, held: Modifiers) -> Option<Chord> {
-        const TAB: u16 = 0x09;
         const PRINT_SCREEN: u16 = 0x2C;
-        if vk == TAB || vk == PRINT_SCREEN {
+        if vk == VK_TAB || vk == PRINT_SCREEN {
             return None;
         }
         let key = Key::from_vk(vk)?;

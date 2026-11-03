@@ -6,7 +6,7 @@
 //!   `SHUNSOKU_AUTOSTART_VALUE` で名前を差し替えられる（`docs/agents/windows-dev.md`）。
 
 use shunsoku_core::APP_NAME;
-use shunsoku_core::autostart::{Action, plan};
+use shunsoku_core::autostart::{Action, VALUE_NAME_VARIABLE, plan, without_verbatim_prefix};
 use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE, WIN32_ERROR,
 };
@@ -19,15 +19,13 @@ use windows::core::PCWSTR;
 use crate::wide::to_wide;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-/// 値の名前を差し替える環境変数（実機の試験用）。
-const VALUE_NAME_ENV: &str = "SHUNSOKU_AUTOSTART_VALUE";
 
 /// Run キーを設定（`enabled`）に合わせる。したことを返す。
 pub fn sync(enabled: bool) -> Result<Action, String> {
     let exe = std::env::current_exe().map_err(|e| format!("could not get the exe path: {e}"))?;
     let name = value_name();
     let current = read(&name).map_err(|e| format!("could not read the Run key: {e:?}"))?;
-    let action = plan(enabled, current.as_deref(), &exe);
+    let action = plan(enabled, current.as_deref(), &exe, normalize);
     match &action {
         Action::Register { command } | Action::Reregister { command } => write(&name, command)
             .map_err(|e| format!("could not register {command} in the Run key: {e:?}"))?,
@@ -39,8 +37,16 @@ pub fn sync(enabled: bool) -> Result<Action, String> {
     Ok(action)
 }
 
+/// Run キーの値の exe といまの exe を比べる前に、パスの書き方をそろえる。ファイルがあれば実際のパスにする
+/// （8.3 の短い名前、`..`、シンボリック リンクやジャンクションを解く）。無ければ書いたままの文字列で比べる。
+fn normalize(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|real| without_verbatim_prefix(&real.display().to_string()))
+        .unwrap_or_else(|_| path.to_owned())
+}
+
 fn value_name() -> String {
-    std::env::var(VALUE_NAME_ENV)
+    std::env::var(VALUE_NAME_VARIABLE)
         .ok()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| APP_NAME.to_owned())

@@ -124,7 +124,7 @@ fn state(hwnd: HWND) -> Option<&'static State> {
 }
 
 /// いま押されている修飾キー。Win キーは入力に使わないので見ない。
-fn held() -> Modifiers {
+pub fn held() -> Modifiers {
     // SAFETY: 引数は定数
     let down = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
     Modifiers {

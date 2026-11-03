@@ -8,13 +8,14 @@
 //!   移動）は欄を使えなくする。
 //! - マウスは候補（`BindingRow::mouse_choices`）のドロップダウン。先頭は「なし」。移動は左ドラッグだけで変えられない。
 //! - 「既定に戻す」で行のショートカットとマウスの上書きを消す（`Editor::reset_binding`）。
-//! - 一覧の列と行は、最初の `fill` で入れる（ダイアログのテンプレートでは入れられないため）。
+//! - 一覧の列と行は、最初の `fill` で入れる（ダイアログのテンプレートでは入れられないため）。列の幅は中身に
+//!   合わせ、`fill` のたびと DPI が変わったときに決め直す（`fit_columns`）。
 //! - コントロールの ID は、ページの帯の最初からの決まった順（`build` が置く順）。
 
 use shunsoku_core::scrap::ops::{BindingRow, MouseGesture, OPERATIONS, binding_rows};
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::{Editor, ShortcutValue};
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_GETITEMCOUNT, LVM_INSERTCOLUMNW,
     LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
@@ -23,12 +24,14 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBS_DROPDOWNLIST,
-    MapDialogRect, SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
+    SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
 use super::list_view::{self, set_cell};
-use super::{Class, PAGE_WIDTH, Page, PageBuilder, Text, chord_field, item, page_first_id};
+use super::{
+    Class, PAGE_WIDTH, Page, PageBuilder, STATIC_TEXT, Text, chord_field, item, page_first_id,
+};
 use crate::wide::to_wide;
 
 /// ページの帯の最初からの位置（`build` が置く順）。
@@ -48,12 +51,12 @@ const FIELD_WIDTH: i16 = 110;
 const RESET_WIDTH: i16 = 60;
 /// ショートカットの欄は「既定に戻す」の手前まで（既定が 3 つある操作も切れずに出るように）。
 const SHORTCUT_WIDTH: i16 = PAGE_WIDTH - RESET_WIDTH - 6 - FIELD_X;
-/// 一覧の列の幅（ダイアログ単位）。最後の列（印）は残り。
-const COLUMNS: [(&str, i16); 4] = [
-    ("settings_gui.scrap_ops.operation", 80),
-    ("settings_gui.scrap_ops.shortcut", 95),
-    ("settings_gui.scrap_ops.mouse", 55),
-    ("settings_gui.scrap_ops.mark", 50),
+/// 一覧の列の見出し。幅は中身に合わせる（`fit_columns`）。
+const COLUMNS: [&str; 4] = [
+    "settings_gui.scrap_ops.operation",
+    "settings_gui.scrap_ops.shortcut",
+    "settings_gui.scrap_ops.mouse",
+    "settings_gui.scrap_ops.mark",
 ];
 
 /// タブのコントロールを置く。
@@ -116,7 +119,7 @@ pub(super) fn build(b: &mut PageBuilder) {
     let mouse_mark = b.control(
         Class::Static,
         "",
-        WINDOW_STYLE(0),
+        STATIC_TEXT,
         mark_x,
         MOUSE_Y + 2,
         PAGE_WIDTH - mark_x,
@@ -182,7 +185,7 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     let rows = binding_rows(OPERATIONS);
     // SAFETY: 自分のダイアログの一覧へのメッセージ
     if unsafe { SendMessageW(list, LVM_GETITEMCOUNT, None, None) }.0 == 0 {
-        init_list(hwnd, list, &rows, text);
+        init_list(list, &rows, text);
     }
     for (i, row) in rows.iter().enumerate() {
         set_cell(list, i, 1, &shortcut_text(editor, row, text));
@@ -193,6 +196,7 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
             .map_or("", |m| text(m.label_key()));
         set_cell(list, i, 3, mark);
     }
+    fit_columns(hwnd);
 
     let Some(row) = selected(hwnd) else {
         return;
@@ -249,7 +253,7 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
 }
 
 /// 一覧の列と行を入れ、最初の行を選ぶ。
-fn init_list(hwnd: HWND, list: HWND, rows: &[BindingRow], text: Text) {
+fn init_list(list: HWND, rows: &[BindingRow], text: Text) {
     // SAFETY: 自分のダイアログの一覧へのメッセージ。文字列と構造体は呼び出しの間生きている（一覧が写す）
     unsafe {
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
@@ -259,11 +263,11 @@ fn init_list(hwnd: HWND, list: HWND, rows: &[BindingRow], text: Text) {
             Some(WPARAM(ex as usize)),
             Some(LPARAM(ex as isize)),
         );
-        for (i, (key, width)) in COLUMNS.iter().enumerate() {
+        for (i, key) in COLUMNS.iter().enumerate() {
             let mut label = to_wide(text(key));
             let column = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH,
-                cx: dialog_units(hwnd, *width),
+                cx: 0,
                 pszText: PWSTR(label.as_mut_ptr()),
                 ..Default::default()
             };
@@ -327,15 +331,12 @@ fn enable(hwnd: HWND, enabled: bool) {
     }
 }
 
-/// ダイアログ単位の幅 `width` をピクセルにする。
-fn dialog_units(hwnd: HWND, width: i16) -> i32 {
-    let mut rect = RECT {
-        right: i32::from(width),
-        ..Default::default()
+/// 一覧の列の幅を中身（見出しと全部の行の文言）に合わせ、余りは最後の列（印）に足す（`columns::column_widths`）。
+/// 一覧に入りきらなければ略さずに横にスクロールさせる。文言を入れ直したとき（`fill`）と、DPI が変わって
+/// ダイアログが大きさと書体を直し終えたときに呼ぶ。
+pub fn fit_columns(hwnd: HWND) {
+    let Some(list) = item(hwnd, list_id()) else {
+        return;
     };
-    // SAFETY: rect は呼び出しの間生きている
-    unsafe {
-        let _ = MapDialogRect(hwnd, &mut rect);
-    }
-    rect.right
+    list_view::fit_columns(list, COLUMNS.len(), &[], 0);
 }

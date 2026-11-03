@@ -2,6 +2,8 @@
 //!
 //! - 本体は、ハーネスが用意した一時フォルダを `APPDATA` にして起動する。そこにハーネスのホットキーだけを書いた
 //!   `settings.toml` を置くので、ユーザーの設定にもログにも触れない。本体のログ（`shunsoku.log`）もそこに残る。
+//! - 本体は起動時に自動起動の登録を同期するので、`SHUNSOKU_AUTOSTART_VALUE` で Run キーの値の名前を
+//!   `shunsoku-perf-harness` に差し替え、ユーザーの登録（`shunsoku`）に触れさせない。
 //! - 区切りの時刻は本体が `SHUNSOKU_PERF_LOG` に書き、ハーネスは書かれている途中のログを読む。
 //!   QPC はプロセスをまたいで同じ時計なので、ハーネスの QPC の時刻とそのまま比べられる。
 //! - Private Working Set は `QueryWorkingSet` で、共有できないページを数える（タスク マネージャーの
@@ -15,6 +17,7 @@ use std::process::{Child, Command};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use shunsoku_core::autostart;
 use shunsoku_core::keys::Chord;
 use shunsoku_core::perf::{self, Mark, PerfLog, Summary};
 use windows::Win32::Foundation::{ERROR_BAD_LENGTH, HANDLE, LPARAM, WPARAM};
@@ -35,6 +38,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 use crate::{Metric, Options};
+
+/// 本体に渡す Run キーの値の名前。本体は起動時に自動起動を同期するので、ユーザーの登録（`shunsoku`）に触れないよう差し替える。
+const AUTOSTART_VALUE: &str = "shunsoku-perf-harness";
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -324,7 +330,8 @@ impl Instance {
         let mut command = Command::new(&options.exe);
         command
             .env("APPDATA", &workspace.dir)
-            .env(perf::LOG_VARIABLE, &log);
+            .env(perf::LOG_VARIABLE, &log)
+            .env(autostart::VALUE_NAME_VARIABLE, AUTOSTART_VALUE);
         let created = qpc();
         let child = command
             .spawn()

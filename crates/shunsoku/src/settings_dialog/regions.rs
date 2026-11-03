@@ -30,23 +30,22 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPOSTPAINT, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
     CDRF_NOTIFYPOSTPAINT, EM_SETCUEBANNER, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT,
-    LVIR_BOUNDS, LVITEMW, LVM_DELETEALLITEMS, LVM_GETCOLUMNW, LVM_GETITEMCOUNT,
-    LVM_GETSTRINGWIDTHW, LVM_GETSUBITEMRECT, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMLVCUSTOMDRAW,
+    LVIR_BOUNDS, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETSUBITEMRECT,
+    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
+    NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_PUSHBUTTON, GetClientRect, SM_CXVSCROLL, SendMessageW, SetDlgItemTextW, WINDOW_STYLE,
-    WS_BORDER, WS_TABSTOP,
+    BS_PUSHBUTTON, SM_CXVSCROLL, SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WS_BORDER, WS_TABSTOP,
 };
 use windows::core::{PCWSTR, PWSTR};
 
 use super::fields::{Action, Field, RegionKey, TemplateOf};
 use super::list_view::{self, set_cell};
 use super::{
-    Class, During, Env, PAGE_WIDTH, Page, PageBuilder, SS_LEFT, Text, item, page_first_id,
+    Class, During, Env, PAGE_WIDTH, Page, PageBuilder, STATIC_TEXT, Text, item, page_first_id,
 };
 use crate::wide::to_wide;
 
@@ -82,13 +81,12 @@ const FIELD_WIDTH: i16 = PAGE_WIDTH - FIELD_X;
 /// 範囲の数の欄（上下のボタンを除く幅）と、横のボタン。
 const NUMBER_WIDTH: i16 = 32;
 const RANGE_BUTTON_X: i16 = DETAIL_X + 126;
-/// 一覧の列と、幅の割合。範囲の列は絵の幅に決め、ほかの列で一覧の中の幅（縦のスクロールバーと範囲の列の分を
-/// 除く）をこの割合で分ける（`fit_columns`）。入りきらない文言は一覧が「…」で略す。
-const COLUMNS: [(&str, i32); 4] = [
-    ("settings_gui.regions.name", 3),
-    ("settings_gui.regions.hotkey", 3),
-    ("settings_gui.regions.range", 0),
-    ("settings_gui.scrap_ops.mark", 2),
+/// 一覧の列の見出し。幅は中身に合わせる（`fit_columns`）。範囲の列は文言でなく絵を描くので、絵の幅より狭くしない。
+const COLUMNS: [&str; 4] = [
+    "settings_gui.regions.name",
+    "settings_gui.regions.hotkey",
+    "settings_gui.regions.range",
+    "settings_gui.scrap_ops.mark",
 ];
 /// 範囲の列。
 const RANGE_COLUMN: usize = 2;
@@ -144,7 +142,7 @@ pub(super) fn build(b: &mut PageBuilder) {
         10,
     );
     let name = b.text(Field::Region(0, RegionKey::Name), FIELD_X, 0, FIELD_WIDTH);
-    let name_mark = b.control(Class::Static, "", SS_LEFT, FIELD_X, 16, FIELD_WIDTH, 10);
+    let name_mark = b.control(Class::Static, "", STATIC_TEXT, FIELD_X, 16, FIELD_WIDTH, 10);
     // ホットキー（印は欄の下）
     b.label(
         "settings_gui.regions.hotkey_label",
@@ -163,7 +161,7 @@ pub(super) fn build(b: &mut PageBuilder) {
         LABEL_WIDTH,
         10,
     );
-    let monitor = b.control(Class::Static, "", SS_LEFT, FIELD_X, 62, FIELD_WIDTH, 10);
+    let monitor = b.control(Class::Static, "", STATIC_TEXT, FIELD_X, 62, FIELD_WIDTH, 10);
     let mut range_buttons = Vec::new();
     let range_rows = [
         (
@@ -200,7 +198,15 @@ pub(super) fn build(b: &mut PageBuilder) {
             14,
         ));
     }
-    let warning = b.control(Class::Static, "", SS_LEFT, DETAIL_X, 106, DETAIL_WIDTH, 10);
+    let warning = b.control(
+        Class::Static,
+        "",
+        STATIC_TEXT,
+        DETAIL_X,
+        106,
+        DETAIL_WIDTH,
+        10,
+    );
     // 保存先と、その下の「参照…」「フォルダを開く」
     b.label(
         "settings_gui.regions.save_dir_label",
@@ -371,7 +377,6 @@ pub fn sync_list(hwnd: HWND, editor: &Editor, bound: usize, text: Text, env: &En
     let count = unsafe { SendMessageW(list, LVM_GETITEMCOUNT, None, None) }.0;
     if count == 0 && column_count(list) == 0 {
         init_columns(list, text);
-        fit_columns(hwnd);
     }
     if usize::try_from(count).ok() != Some(regions.len()) {
         // SAFETY: 自分のダイアログの一覧へのメッセージ。構造体は呼び出しの間生きている（一覧が写す）
@@ -407,6 +412,7 @@ pub fn sync_list(hwnd: HWND, editor: &Editor, bound: usize, text: Text, env: &En
             .map_or("", |m| text(m.label_key()));
         set_cell(list, i, 3, mark);
     }
+    fit_columns(hwnd);
     THUMBNAILS.set(
         regions
             .iter()
@@ -568,7 +574,7 @@ fn init_columns(list: HWND, text: Text) {
             Some(WPARAM(ex as usize)),
             Some(LPARAM(ex as isize)),
         );
-        for (i, (key, _)) in COLUMNS.iter().enumerate() {
+        for (i, key) in COLUMNS.iter().enumerate() {
             let mut label = to_wide(text(key));
             let column = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH,
@@ -586,67 +592,21 @@ fn init_columns(list: HWND, text: Text) {
     }
 }
 
-/// 一覧の列の幅を、一覧の中の幅に収まるように決め直す（列を入れたとき、DPI が変わったとき）。縦のスクロールバーは
-/// 行が増えると出るので、その分を常に空けておく（出たときに横のスクロールバーが出ないように）。
+/// 一覧の列の幅を中身（見出しと全部の行の文言、範囲の列は絵）に合わせ、余りは最後の列（印）に足す
+/// （`list_view::fit_columns`）。縦のスクロールバーは行が増えると出るので、その分を常に空けておく。
+/// 行の文言を出し直したとき（`sync_list`）と、DPI が変わってダイアログが大きさと書体を直し終えたときに呼ぶ。
 pub fn fit_columns(hwnd: HWND) {
     let Some(list) = item(hwnd, list_id()) else {
         return;
     };
-    let mut client = RECT::default();
-    // SAFETY: 自分のダイアログの一覧の大きさを読む
-    let scroll_bar = unsafe {
-        let _ = GetClientRect(list, &mut client);
-        GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(list))
+    // SAFETY: 自分のダイアログの一覧の DPI を読む
+    let (dpi, scroll_bar) = unsafe {
+        let dpi = GetDpiForWindow(list);
+        (dpi as i32, GetSystemMetricsForDpi(SM_CXVSCROLL, dpi))
     };
-    // 範囲の列は、絵と見出しの文言の広いほうに合わせる
-    // SAFETY: 自分のダイアログの一覧へのメッセージ。バッファは呼び出しの間生きている
-    let range = unsafe {
-        let dpi = GetDpiForWindow(list) as i32;
-        let mut label = [0u16; 64];
-        let mut column = LVCOLUMNW {
-            mask: LVCF_TEXT,
-            pszText: PWSTR(label.as_mut_ptr()),
-            cchTextMax: label.len() as i32,
-            ..Default::default()
-        };
-        SendMessageW(
-            list,
-            LVM_GETCOLUMNW,
-            Some(WPARAM(RANGE_COLUMN)),
-            Some(LPARAM(&mut column as *mut LVCOLUMNW as isize)),
-        );
-        let label_width = SendMessageW(
-            list,
-            LVM_GETSTRINGWIDTHW,
-            None,
-            Some(LPARAM(label.as_ptr() as isize)),
-        )
-        .0 as i32;
-        label_width.max(THUMBNAIL.width as i32 * dpi / 96) + 2 * THUMBNAIL_PADDING * dpi / 96
-    };
-    let widths = column_widths(client.right - client.left - scroll_bar, range);
-    for (i, width) in widths.into_iter().enumerate() {
-        // SAFETY: 自分のダイアログの一覧へのメッセージ
-        unsafe {
-            SendMessageW(
-                list,
-                LVM_SETCOLUMNWIDTH,
-                Some(WPARAM(i)),
-                Some(LPARAM(width as isize)),
-            );
-        }
-    }
-}
-
-/// 幅 `available`（ピクセル）から範囲の列の幅 `range` を除き、ほかの列の割合で分ける。端数は最後の列に足す。
-fn column_widths(available: i32, range: i32) -> [i32; 4] {
-    let range = range.min(available.max(0));
-    let available = (available - range).max(0);
-    let total: i32 = COLUMNS.iter().map(|(_, w)| w).sum();
-    let mut widths = COLUMNS.map(|(_, w)| available * w / total);
-    widths[RANGE_COLUMN] = range;
-    widths[3] += available - (widths.iter().sum::<i32>() - range);
-    widths
+    let mut minimum = [0; COLUMNS.len()];
+    minimum[RANGE_COLUMN] = (THUMBNAIL.width as i32 + 2 * THUMBNAIL_PADDING) * dpi / 96;
+    list_view::fit_columns(list, COLUMNS.len(), &minimum, scroll_bar);
 }
 
 /// 一覧の列の数。

@@ -81,14 +81,18 @@ use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, Shortcuts};
 use crate::selection::Mode;
 
+pub mod columns;
 pub mod editor;
 pub mod form;
 mod location;
 pub mod merge;
+pub mod tab_step;
 pub mod unset;
 mod write;
+mod write_failure;
 pub use location::{SettingsLocation, locate};
 pub use write::{OwnWrites, rewrite, write};
+pub use write_failure::WriteFailure;
 
 /// 対応している設定ファイルの形式の版。
 pub const VERSION: i64 = 1;

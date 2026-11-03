@@ -45,7 +45,7 @@
 //!   適用は `write_settings` で書いてから `adopt_settings` で読み込み直しと同じ反映をする。キーの入力欄に
 //!   フォーカスがある間はホットキーの登録を外す（`App::hotkey_pause`）。
 //! - 通知は `notify_user` から出す。設定で通知をオフにしても、止めるのは成功の通知だけ。通知のクリックは
-//!   中身を持たないので、クリックで開くフォルダ（`App::notice_folder`）を覚えておき、新しい通知を出したら忘れる。
+//!   中身を持たないので、クリックで開くフォルダを覚えておき、新しい通知を出したら忘れる（core の `notice::Notices`）。
 //! - コピーと保存の画像は `render::render_image` で表示と同じ描き方で作る。保存先とファイル名は UI スレッドで
 //!   決め（`save::destination`）、PNG の書き出しと書き込みは裏のスレッドで行い、結果は `WM_APP_SAVED` で受ける。
 //!   結果を受けるまでの保存先は `App::pending_saves` に持ち、続けて保存しても同じ名前にしない。
@@ -92,6 +92,7 @@ use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::image::{Fragment, Image};
 use shunsoku_core::keys::{Chord, Key, Modifiers};
 use shunsoku_core::monitors::{self, LocateError};
+use shunsoku_core::notice::Notices;
 use shunsoku_core::perf::Mark;
 use shunsoku_core::protocol::{ErrorKind, Response};
 use shunsoku_core::scrap::ops::{
@@ -286,8 +287,8 @@ struct App {
     renderer: Option<render::Renderer>,
     /// 書き込みの編集モードで最後に選んだ道具・色・太さ。アプリが動いている間、次の編集モードに引き継ぐ。
     carryover: Carryover,
-    /// いま出ている通知をクリックしたときに開くフォルダ（保存の通知のときだけ）。
-    notice_folder: Option<PathBuf>,
+    /// いま出ている通知と、そのクリックで開くフォルダ（保存の通知のときだけ）。
+    notices: Notices,
     gpu: grab::Gpu,
     /// 開いている設定 GUI。
     settings_gui: Option<settings_gui::SettingsGui>,
@@ -907,7 +908,7 @@ fn start(
         save_fallbacks: Vec::new(),
         renderer: None,
         carryover: Carryover::default(),
-        notice_folder: None,
+        notices: Notices::default(),
         gpu: grab::Gpu::default(),
         settings_gui: None,
         hotkey_pause: HotkeyPause::default(),
@@ -1137,12 +1138,12 @@ fn on_tray(owner: HWND, event: tray::Event) {
                     false,
                 ));
             }
-            // 定型領域の一覧（設定ファイルの順）。項目の番号は CMD_REGION_FIRST + 添字
+            // 定型領域の一覧（設定ファイルの順）。項目の番号は CMD_REGION_FIRST + 添字。名前の & はそのまま出す
             let region_names: Vec<String> = with_app(|app| {
                 app.settings
                     .regions
                     .iter()
-                    .map(|region| region.name.clone())
+                    .map(|region| shunsoku_core::menu::literal_label(&region.name))
                     .collect()
             })
             .unwrap_or_default();
@@ -1211,7 +1212,7 @@ fn on_tray(owner: HWND, event: tray::Event) {
         }
         tray::Event::Select => request_capture(Source::TrayClick),
         tray::Event::NotificationClick => {
-            let folder = with_app(|app| app.notice_folder.clone()).flatten();
+            let folder = with_app(|app| app.notices.clicked().map(Path::to_path_buf)).flatten();
             // ShellExecuteW はメッセージを回すことがあるので、App を借りずに呼ぶ
             if let Some(folder) = folder
                 && !save::open_folder(&folder)
@@ -2413,9 +2414,11 @@ fn on_saved() {
             Ok(()) => {
                 log::info!("saved {}", saved.path.display());
                 let body = format!("{}\n{}", text("save.saved"), saved.path.display());
-                if saved.notify && notify_user(notify::Level::Success, &body) {
-                    let folder = saved.path.parent().map(Path::to_path_buf);
-                    with_app(|app| app.notice_folder = folder);
+                if saved.notify
+                    && notify_user(notify::Level::Success, &body)
+                    && let Some(folder) = saved.path.parent().map(Path::to_path_buf)
+                {
+                    with_app(|app| app.notices.opens(folder));
                 }
                 if let Some(to) = saved.reply {
                     // 保存先の設定が相対パスでも、CLI には絶対パスを返す
@@ -3624,10 +3627,10 @@ fn register_region(rect: Rect) {
             });
         }
         Some(Err(e)) => {
-            log::error!("could not register the region: {e}");
+            log::error!("could not register the region: {e:?}");
             notify_user(
                 notify::Level::Error,
-                &format!("{}\n{e}", text("region.register_failed")),
+                &e.notice(i18n::catalog(language()), "region.register_failed"),
             );
         }
         None => {}
@@ -3705,29 +3708,42 @@ fn read_settings(path: Option<&Path>) -> (Settings, Vec<SettingsIssue>) {
 ///   `App::settings` を `new` にする。ホットキーなど、使うときに読むのでは足りないものの反映は呼び出し側で行う。
 /// - 今のファイルが TOML として読めなければ、上書きせずにエラーを返す（手で書いた中身を消さないため）。
 /// - 書きかけの中身を監視に読まれないよう、隣の一時ファイルに書いてから名前を変える。
-fn write_settings(app: &mut App, new: &Settings) -> std::result::Result<(), String> {
-    let path = app
-        .settings_path
-        .clone()
-        .ok_or_else(|| "the settings file location is unknown".to_owned())?;
+fn write_settings(
+    app: &mut App,
+    new: &Settings,
+) -> std::result::Result<(), settings::WriteFailure> {
+    use settings::WriteFailure;
+    // 通知には断られたファイルと OS の文言だけを出す（`WriteFailure::detail`）。どの段階で断られたかはログに残す
+    let refused_by_os = |stage: &str, path: &std::path::Path, e: std::io::Error| {
+        log::warn!(
+            "writing the settings: could not {stage} {}: {e}",
+            path.display()
+        );
+        WriteFailure::Io {
+            path: path.display().to_string(),
+            error: e.to_string(),
+        }
+    };
+    let path = app.settings_path.clone().ok_or(WriteFailure::NoLocation)?;
     let src = match std::fs::read_to_string(&path) {
         Ok(src) => src,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        Err(e) => return Err(refused_by_os("read back", &path, e)),
     };
-    let text = settings::rewrite(&src, new)
-        .ok_or_else(|| format!("{} is not TOML; not overwriting it", path.display()))?;
+    let text = settings::rewrite(&src, new).ok_or_else(|| WriteFailure::NotToml {
+        path: path.display().to_string(),
+    })?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| refused_by_os("create", dir, e))?;
     }
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, &text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, &text).map_err(|e| refused_by_os("write", &tmp, e))?;
     // 名前を変える前に覚える（監視の知らせは UI スレッドのこの関数が返ってから処理されるが、念のため）
     app.own_writes.wrote(&text);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         app.own_writes.forget();
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("{}: {e}", path.display()));
+        return Err(refused_by_os("replace", &path, e));
     }
     log::info!("settings written to {}", path.display());
     app.settings = new.as_written();
@@ -4012,17 +4028,21 @@ fn sync_autostart() {
 }
 
 /// トレイの通知を出す。出したら true。設定で通知をオフにしたときは、成功の通知だけを止める（エラーと警告は出す）。
-/// 新しい通知は前の通知を置き換えるので、クリックで開くフォルダを忘れる（保存の通知なら呼び出し側で覚え直す）。
+/// 新しい通知は前の通知を置き換えるので、出すならクリックで開くフォルダを忘れる（保存の通知なら呼び出し側で覚え
+/// 直す）。出さないなら、前の通知とそのフォルダは残す（`Notices::showing`）。
 fn notify_user(level: notify::Level, body: &str) -> bool {
     let target = with_app(|app| {
-        app.notice_folder = None;
-        (app.windows.tray_owner, app.settings.general.notifications)
+        let success = matches!(level, notify::Level::Success);
+        let show = app
+            .notices
+            .showing(success, app.settings.general.notifications);
+        (app.windows.tray_owner, show)
     });
-    let Some((owner, enabled)) = target else {
+    let Some((owner, show)) = target else {
         log::warn!("notification dropped: {body}");
         return false;
     };
-    if matches!(level, notify::Level::Success) && !enabled {
+    if !show {
         return false;
     }
     // Explorer とやりとりするので、App を借りずに出す
