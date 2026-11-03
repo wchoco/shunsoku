@@ -3624,10 +3624,11 @@ fn register_region(rect: Rect) {
             });
         }
         Some(Err(e)) => {
-            log::error!("could not register the region: {e}");
+            log::error!("could not register the region: {e:?}");
+            let detail = e.detail(i18n::catalog(language()));
             notify_user(
                 notify::Level::Error,
-                &format!("{}\n{e}", text("region.register_failed")),
+                &format!("{}\n{detail}", text("region.register_failed")),
             );
         }
         None => {}
@@ -3705,29 +3706,42 @@ fn read_settings(path: Option<&Path>) -> (Settings, Vec<SettingsIssue>) {
 ///   `App::settings` を `new` にする。ホットキーなど、使うときに読むのでは足りないものの反映は呼び出し側で行う。
 /// - 今のファイルが TOML として読めなければ、上書きせずにエラーを返す（手で書いた中身を消さないため）。
 /// - 書きかけの中身を監視に読まれないよう、隣の一時ファイルに書いてから名前を変える。
-fn write_settings(app: &mut App, new: &Settings) -> std::result::Result<(), String> {
-    let path = app
-        .settings_path
-        .clone()
-        .ok_or_else(|| "the settings file location is unknown".to_owned())?;
+fn write_settings(
+    app: &mut App,
+    new: &Settings,
+) -> std::result::Result<(), settings::WriteFailure> {
+    use settings::WriteFailure;
+    // 通知には断られたファイルと OS の文言だけを出す（`WriteFailure::detail`）。どの段階で断られたかはログに残す
+    let io = |stage: &str, path: &std::path::Path, e: std::io::Error| {
+        log::warn!(
+            "writing the settings: could not {stage} {}: {e}",
+            path.display()
+        );
+        WriteFailure::Io {
+            path: path.display().to_string(),
+            error: e.to_string(),
+        }
+    };
+    let path = app.settings_path.clone().ok_or(WriteFailure::NoLocation)?;
     let src = match std::fs::read_to_string(&path) {
         Ok(src) => src,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        Err(e) => return Err(io("read back", &path, e)),
     };
-    let text = settings::rewrite(&src, new)
-        .ok_or_else(|| format!("{} is not TOML; not overwriting it", path.display()))?;
+    let text = settings::rewrite(&src, new).ok_or_else(|| WriteFailure::NotToml {
+        path: path.display().to_string(),
+    })?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| io("create", dir, e))?;
     }
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, &text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, &text).map_err(|e| io("write", &tmp, e))?;
     // 名前を変える前に覚える（監視の知らせは UI スレッドのこの関数が返ってから処理されるが、念のため）
     app.own_writes.wrote(&text);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         app.own_writes.forget();
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("{}: {e}", path.display()));
+        return Err(io("replace", &path, e));
     }
     log::info!("settings written to {}", path.display());
     app.settings = new.as_written();
