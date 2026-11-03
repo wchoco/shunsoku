@@ -54,8 +54,10 @@
 //!   `ScrapModel` のまま入れる。画素は裏のスレッドで一時ファイルに書き、書き終えたら `WM_APP_TRASH` で受ける。
 //!   トレイメニューの「ごみ箱」から選ぶと、その状態のまま浮かべ直してフォーカスを移す（`restore_scrap`）。
 //!   ごみ箱に入れる画素は元の画像（トリム前）で、トリムの範囲は `ScrapModel` に残るので、戻すとトリムしたまま戻る。
-//! - トリムの範囲を選んでいる間（`Effect::EnterTrimMode` から）は、左ボタン・カーソルの移動・Enter・`Esc`・
-//!   ダブルクリックを core の `ScrapModel::trim_input` に渡し、範囲を描き直す（`on_trim_input`）。
+//! - トリムの範囲を選んでいる間（`Effect::EnterTrimMode` から）は、左ボタン・カーソルの移動・ダブルクリック・
+//!   Enter・Space・`Esc`・矢印（Ctrl で大きさ、Shift で 10 画素）を core の `ScrapModel::trim_input` に渡し、範囲を
+//!   描き直す（`on_trim_input`）。つまみ・十字線・拡大鏡は core の `ScrapModel::trim_view` のとおりに描き、カーソルの
+//!   形は `ScrapModel::trim_cursor_shape` で当てる。十字線の色は入ったときの `[selection] crosshair_color`。
 //! - 書き込みの編集モードの間（`Effect::EnterEditMode` から）は、左ボタン・カーソルの移動・キーを core の
 //!   `ScrapModel::edit_input` に渡し、描き直す（`on_edit_input`）。ショートカットとマウスの割り当て（ホイール・
 //!   中クリック・ダブルクリックも）は効かない。ほかのウィンドウにフォーカスが移ったら（`WM_ACTIVATE`）抜ける。
@@ -357,6 +359,8 @@ struct Scrap {
     zoom_label: bool,
     /// 最後に描いたキャレットの矩形（ウィンドウの中の座標）。打っていなければ None。
     caret: std::cell::Cell<Option<Rect>>,
+    /// トリムの十字線の色。トリムに入ったときの `[selection] crosshair_color`。
+    crosshair: Rgb,
 }
 
 /// 書き込みの編集モードのツールバー。
@@ -521,6 +525,7 @@ impl Scrap {
             &self.model,
             appearance,
             label,
+            self.crosshair,
         )?;
         self.caret.set(caret);
         self.sync_toolbar(appearance, renderer, true);
@@ -535,7 +540,7 @@ impl Scrap {
 /// `renderer` は使い回す描き手（`App::renderer`）。なければ作って入れる。描けなかったときは
 /// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
 /// 文字を打っていれば、IME の変換中の文字（`EditState::composition`）をつなげて描き、キャレットの矩形（ウィンドウの
-/// 中の座標）を返す。
+/// 中の座標）を返す。トリムの最中は、範囲・つまみ・十字線（色は `crosshair`）・拡大鏡を重ねる。
 fn paint_scrap(
     renderer: &mut Option<render::Renderer>,
     window: &scrap_window::ScrapWindow,
@@ -543,6 +548,7 @@ fn paint_scrap(
     model: &ScrapModel,
     appearance: &Appearance,
     label: Option<render::ZoomLabel>,
+    crosshair: Rgb,
 ) -> Result<Option<Rect>> {
     let rect = model.window_rect(appearance);
     let appearance = &model.appearance(appearance);
@@ -560,12 +566,25 @@ fn paint_scrap(
         None => image,
     };
     let display = model.image_rect().size();
-    let trim = model.is_trimming().then(|| render::TrimOverlay {
-        // 画像の左上から、ウィンドウの中の画像の位置へ
-        selection: model.trim_selection().map(|r| {
-            let margin = appearance.margin();
-            r.offset(margin - model.position.x, margin - model.position.y)
-        }),
+    let scale = window.dpi() as f32 / 96.0;
+    let trim = model.trim_view().map(|view| {
+        // スクリーン座標から、ウィンドウの中の座標へ
+        let margin = appearance.margin();
+        let (dx, dy) = (margin - model.position.x, margin - model.position.y);
+        let local = |p: Point| Point::new(p.x + dx, p.y + dy);
+        render::TrimOverlay {
+            selection: view.selection.map(|r| r.offset(dx, dy)),
+            handles: view.handles.iter().map(|r| r.offset(dx, dy)).collect(),
+            crosshair: view.crosshair.map(|at| (local(at), crosshair)),
+            magnifier: view.crosshair.zip(view.magnifier).map(|(at, pixel)| {
+                render::TrimMagnifier {
+                    cursor: local(at),
+                    pixel,
+                    label: view.cursor_label.clone(),
+                }
+            }),
+            scale,
+        }
     });
     let annotations = model.annotations_to_draw();
     let typing = model.typing_annotation();
@@ -580,10 +599,10 @@ fn paint_scrap(
                 composition: composition.map_or("", |c| c.text.as_str()),
                 cursor: composition.map_or(0, |c| c.cursor),
             }),
-            scale: window.dpi() as f32 / 96.0,
+            scale,
         },
         label,
-        trim,
+        trim: trim.as_ref(),
     };
     let caret = painter.paint_scrap(&canvas, image, display, appearance, overlays)?;
     *renderer = Some(painter);
@@ -1399,7 +1418,11 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
                 on_edit_input(hwnd, EditInput::DoubleClick(at));
                 return Some(LRESULT(0));
             }
-            if on_trim_input(hwnd, TrimInput::Confirm) {
+            // トリムの最中は、範囲の中なら確定、ほかはふつうの押下と同じ（core が決める）
+            if is_trimming(hwnd) {
+                // SAFETY: 自分のウィンドウ
+                unsafe { SetCapture(hwnd) };
+                on_trim_input(hwnd, TrimInput::DoubleClick(at));
                 return Some(LRESULT(0));
             }
             let context = OpContext {
@@ -1420,7 +1443,15 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             Some(LRESULT(0))
         }
         // Alt との組み合わせは WM_SYSKEYDOWN で来る。対応表にないキーは DefWindowProcW に任せる
-        WM_KEYDOWN | WM_SYSKEYDOWN => on_scrap_key(hwnd, wparam).then_some(LRESULT(0)),
+        WM_KEYDOWN | WM_SYSKEYDOWN => on_scrap_key(hwnd, wparam, lparam).then_some(LRESULT(0)),
+        // トリムの最中は、範囲のつまみや中の上でカーソルの形を変える
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && is_trimming(hwnd) => {
+            let shape = with_app(|app| app.scrap(hwnd).map(|s| s.model.trim_cursor_shape()))
+                .flatten()
+                .unwrap_or(CursorShape::Cross);
+            overlay::set_cursor(shape);
+            Some(LRESULT(1))
+        }
         // 文字を打っている間の文字（TranslateMessage が作る）
         WM_CHAR => on_scrap_char(hwnd, wparam).then_some(LRESULT(0)),
         // 変換中の文字は IME の窓に出さず、スクラップに描く。App は借りない（IME の呼び出しの中でも届く）
@@ -1948,13 +1979,12 @@ fn run_mouse_operation(hwnd: HWND, gesture: MouseGesture, context: OpContext) {
 }
 
 /// キーをショートカットの対応表で引いて実行する。対応表になければ false。
-fn on_scrap_key(hwnd: HWND, wparam: WPARAM) -> bool {
-    // トリムの最中は Enter で確定、Esc で中止。ほかのキーの操作は効かない（どの操作も実行できない）
+fn on_scrap_key(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
+    // トリムの最中は Enter・Space で確定、Esc で中止、矢印で範囲を直す。ほかのキーの操作は効かない（どの操作も
+    // 実行できない）
     if is_trimming(hwnd) {
-        let input = match VIRTUAL_KEY(wparam.0 as u16) {
-            VK_RETURN => TrimInput::Confirm,
-            VK_ESCAPE => TrimInput::Cancel,
-            _ => return false,
+        let Some(input) = trim_key(wparam, lparam) else {
+            return false;
         };
         return on_trim_input(hwnd, input);
     }
@@ -2120,6 +2150,7 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
     let deferred = with_app(|app| {
         let annotation = Style::from(&app.settings.annotation);
         let font = Font::from(&app.settings.annotation);
+        let crosshair = app.settings.selection.crosshair_color;
         let carryover = app.carryover;
         let module = app.module;
         let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
@@ -2152,6 +2183,7 @@ fn run_scrap_operation(hwnd: HWND, op: &OperationDescriptor, context: OpContext)
                 }
                 Effect::EnterTrimMode => {
                     log::info!("trim started");
+                    scrap.crosshair = crosshair;
                     if let Err(e) = scrap.paint(&appearance, renderer) {
                         log::warn!("could not show the trim mode: {e}");
                     }
@@ -2605,6 +2637,31 @@ fn held_selection_modifiers() -> Input {
 }
 
 /// 範囲選択の画面での `WM_KEYDOWN` を入力にする。対象でないキーは None。
+/// トリムの最中のキーを、トリムの入力にする。範囲選択の画面の精密モード（`selection_key`）と同じ割り当て。
+fn trim_key(wparam: WPARAM, lparam: LPARAM) -> Option<TrimInput> {
+    // SAFETY: GetKeyState は引数のキーの状態を読むだけ
+    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
+    // 押しっぱなしの自動リピート（lParam の bit 30 = 直前も押されていた）
+    let repeat = lparam.0 & (1 << 30) != 0;
+    let shift = down(VK_SHIFT);
+    let arrow = |direction| {
+        Some(if down(VK_CONTROL) {
+            TrimInput::ResizeArrow { direction, shift }
+        } else {
+            TrimInput::Arrow { direction, shift }
+        })
+    };
+    match VIRTUAL_KEY(wparam.0 as u16) {
+        VK_ESCAPE => Some(TrimInput::Cancel),
+        VK_RETURN | VK_SPACE if !repeat => Some(TrimInput::Confirm),
+        VK_LEFT => arrow(Direction::Left),
+        VK_RIGHT => arrow(Direction::Right),
+        VK_UP => arrow(Direction::Up),
+        VK_DOWN => arrow(Direction::Down),
+        _ => None,
+    }
+}
+
 fn selection_key(wparam: WPARAM, lparam: LPARAM) -> Option<Input> {
     // SAFETY: GetKeyState は引数のキーの状態を読むだけ
     let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
@@ -2790,9 +2847,20 @@ fn open_scrap(
             &model,
             appearance,
             None,
+            shunsoku_core::settings::SelectionScreen::default().crosshair_color,
         )
     })
-    .unwrap_or_else(|| paint_scrap(&mut None, &window, visible, &model, appearance, None));
+    .unwrap_or_else(|| {
+        paint_scrap(
+            &mut None,
+            &window,
+            visible,
+            &model,
+            appearance,
+            None,
+            shunsoku_core::settings::SelectionScreen::default().crosshair_color,
+        )
+    });
     painted?;
     window.show(focus);
     Ok(Scrap {
@@ -2805,6 +2873,7 @@ fn open_scrap(
         wheel: Wheel::default(),
         zoom_label: false,
         caret: Default::default(),
+        crosshair: shunsoku_core::settings::SelectionScreen::default().crosshair_color,
     })
 }
 
