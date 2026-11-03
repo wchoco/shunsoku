@@ -21,7 +21,8 @@
 //!   フォーカスの出入りで `WM_APP_SETTINGS_FOCUS` を自分に送り、届いた時点のフォーカスで決める（`check_focus`）。
 //! - 適用（`apply`）: その時点のファイルと写しを 3 者で突き合わせ（`settings::merge`）、両方で変えた項目があれば
 //!   借りずに確かめてから、結果を書き（`write_settings`）、読み込み直しと同じ反映をし（`adopt_settings`）、ホットキーは
-//!   必ず登録し直して、登録できなかった項目を写しの印にする（`Editor::applied`）。OK は適用して、全部登録できたら閉じる。
+//!   必ず登録し直して、登録できなかった項目を写しの印にする（`Editor::applied`）。OK は適用して、書けたら閉じる
+//!   （登録できなかったホットキーは通知で知らせる）。
 //! - 適用で UI の言語が変わったら（`SettingsGui::language` と違ったら）、同じタブ・同じ位置で組み直す（`rebuild`）。
 //!   今のダイアログは `REBUILDING` を立てて壊し（`WM_DESTROY` で `App::settings_gui` を消さない）、写しはそのまま
 //!   新しいダイアログに出す。外の変更で言語が変わったときは、次に適用したときに組み直す。
@@ -65,7 +66,7 @@ use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
 use crate::settings_dialog::regions::{self, ListButton};
 use crate::settings_dialog::{self, ChordRow, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops};
 use crate::wide::to_wide;
-use crate::{menu, monitor_list, notify, panic_hook, save};
+use crate::{hotkey, menu, monitor_list, notify, panic_hook, save};
 
 /// 開いている設定 GUI。
 pub(super) struct SettingsGui {
@@ -387,10 +388,18 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
 fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
     if id == IDOK.0 {
         if code == BN_CLICKED {
-            if apply(hwnd) {
-                destroy(hwnd);
-            } else {
-                rebuild_if_language_changed(hwnd);
+            // 書けたら閉じる。登録できなかったホットキーは、欄の印が見えなくなるので通知で知らせる
+            match apply(hwnd) {
+                Some(failed) => {
+                    destroy(hwnd);
+                    if !failed.is_empty() {
+                        let chords: Vec<String> =
+                            failed.iter().map(|f| f.chord.to_string()).collect();
+                        let body = format!("{}{}", text("hotkey.failed"), chords.join(", "));
+                        notify_user(notify::Level::Warning, &body);
+                    }
+                }
+                None => rebuild_if_language_changed(hwnd),
             }
         }
         return;
@@ -851,12 +860,12 @@ fn on_scrap_op_selected(hwnd: HWND) {
     refresh(hwnd);
 }
 
-/// 写しを適用する。適用でき、ホットキーを全部登録できたら true（OK で閉じてよい）。
+/// 写しを適用する。書けたら（書くものがなかったときも）、登録できなかったホットキーを返す（OK で閉じてよい）。
 ///
 /// その時点のファイルを読み、GUI で変えた項目だけを当てる（3 者の突き合わせ、`settings::merge`）。外と GUI の両方で
 /// 変えた項目があれば、`App` を借りずに確かめ、上書きを選ばれたら読み直してもう一度突き合わせる（確かめている間に
 /// 新しい衝突が増えていれば、また確かめる）。
-fn apply(hwnd: HWND) -> bool {
+fn apply(hwnd: HWND) -> Option<Vec<hotkey::Failed>> {
     let mut confirmed: Vec<Field> = Vec::new();
     let result = loop {
         match with_app(|app| apply_merged(app, &confirmed)).flatten() {
@@ -882,16 +891,16 @@ fn apply(hwnd: HWND) -> bool {
         sync_autostart();
     }
     match result {
-        Some(Ok(all_registered)) => all_registered,
+        Some(Ok(failed)) => Some(failed),
         Some(Err(e)) => {
             log::error!("could not write the settings: {e}");
             notify_user(
                 notify::Level::Error,
                 &format!("{}\n{e}", text("settings_gui.write_failed")),
             );
-            false
+            None
         }
-        None => false,
+        None => None,
     }
 }
 
@@ -899,8 +908,8 @@ fn apply(hwnd: HWND) -> bool {
 enum Step {
     /// 確かめていない衝突がある。
     Confirm(Vec<Field>),
-    /// 書いた（か、書くものがなかった）。ホットキーを全部登録できたら Ok(true)。
-    Done(Result<bool, String>),
+    /// 書いた（か、書くものがなかった）。Ok は登録できなかったホットキー。
+    Done(Result<Vec<hotkey::Failed>, String>),
 }
 
 /// ファイルを読んで写しと突き合わせ、衝突が `confirmed` に収まっていれば書いて反映する。
@@ -923,7 +932,7 @@ fn apply_merged(app: &mut App, confirmed: &[Field]) -> Option<Step> {
         if let Some(gui) = app.settings_gui.as_mut() {
             gui.editor.applied(new, []);
         }
-        return Some(Step::Done(Ok(true)));
+        return Some(Step::Done(Ok(Vec::new())));
     }
     let old = app.settings.clone();
     if let Err(e) = write_settings(app, &new) {
@@ -938,7 +947,7 @@ fn apply_merged(app: &mut App, confirmed: &[Field]) -> Option<Step> {
         gui.editor.applied(applied, unregistered);
     }
     log::info!("settings applied from the GUI");
-    Some(Step::Done(Ok(failed.is_empty())))
+    Some(Step::Done(Ok(failed)))
 }
 
 /// 突き合わせに使う、今のファイルの設定。ファイルがなければ既定値。読めないか TOML でなければ、常駐側の設定
