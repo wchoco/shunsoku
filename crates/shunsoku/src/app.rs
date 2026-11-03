@@ -79,6 +79,7 @@
 //!   そのとき（`EditOutput::CompositionTaken`）は IME の側の変換中の文字を捨てる。編集モードのダブルクリックは
 //!   `EditInput::DoubleClick`。
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1927,8 +1928,7 @@ fn on_scrap_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
         i32::from((lparam.0 & 0xFFFF) as u16 as i16),
         i32::from(((lparam.0 >> 16) & 0xFFFF) as u16 as i16),
     );
-    let Some(notches) = with_app(|app| Some(app.scrap_mut(hwnd)?.wheel.turn(delta))).flatten()
-    else {
+    let Some(notches) = wheel_notches(hwnd, delta) else {
         return true;
     };
     // 向きが変わるとためた分は捨てるので、ノッチの向きは回転の向きと同じ
@@ -1949,22 +1949,19 @@ fn on_edit_wheel(hwnd: HWND, modifiers: Modifiers, delta: i32) -> bool {
         with_app(|app| {
             let scrap = app.scrap(hwnd)?;
             let state = scrap.model.edit_state()?;
-            match &scrap.toolbar {
-                Some(toolbar) => toolbar::wheel_pick(state, &toolbar.colours, modifiers, rotation),
+            let colours = match &scrap.toolbar {
+                Some(toolbar) => Cow::Borrowed(toolbar.colours.as_slice()),
                 // ツールバーを作れなかったときも、ツールバーに並べるはずだった色で選ぶ
-                None => {
-                    let colours = toolbar::palette(app.settings.annotation.color);
-                    toolbar::wheel_pick(state, &colours, modifiers, rotation)
-                }
-            }
+                None => Cow::Owned(toolbar::palette(app.settings.annotation.color)),
+            };
+            toolbar::wheel_pick(state, &colours, modifiers, rotation)
         })
         .flatten()
     };
     if pick(delta).is_none() {
         return false;
     }
-    let Some(notches) = with_app(|app| Some(app.scrap_mut(hwnd)?.wheel.turn(delta))).flatten()
-    else {
+    let Some(notches) = wheel_notches(hwnd, delta) else {
         return true;
     };
     // 1 ノッチで 1 段。選ぶたびに状態が変わるので、ノッチごとに選び直す
@@ -1977,6 +1974,12 @@ fn on_edit_wheel(hwnd: HWND, modifiers: Modifiers, delta: i32) -> bool {
         }
     }
     true
+}
+
+/// ホイールの回転量 `delta` をスクラップ `hwnd` にためて、回り切ったノッチの数（上が正）を返す。スクラップが
+/// なければ None。
+fn wheel_notches(hwnd: HWND, delta: i32) -> Option<i32> {
+    with_app(|app| Some(app.scrap_mut(hwnd)?.wheel.turn(delta))).flatten()
 }
 
 /// `WM_APP_SCRAP_DPI`: 新しい DPI を core に渡し、表示の大きさが変わったら描き直す。基準点はドラッグ中なら
