@@ -5,7 +5,8 @@
 //! - 書き換える項目は、値の前後の飾り（行末のコメントなど）を引き継ぐ。ない項目は表の末尾に足し、ない表は
 //!   文書の末尾に足す。
 //! - 項目の種類ごとの書き方は `put`（値 1 つ）と `section`（表 1 つ）に寄せる。
-//! - 定型領域（`[[regions]]`）は、ファイルにない名前のものを末尾に足すだけ（書き換え・削除・並べ替えはしない）。
+//! - 定型領域（`[[regions]]`）は、ファイルで付いていた名前（`Region::loaded_name`）で要素に結び付けて書き、
+//!   設定の並びに要素を並べ直す（名前の変更・削除・並べ替え・複製・追加をしても、残る要素のコメントは残る）。
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -17,7 +18,7 @@ use super::{
     DEFAULT_REGION_FILE_NAME_TEMPLATE, DpiScaling, General, HotkeyAction, Hotkeys, LogLevel,
     OPACITY_RANGE, Reader, Region, ScrapAppearance, SelectionScreen, Settings, TRASH_LIMIT_RANGE,
     VERSION, dpi_scaling, in_range, log_level, non_empty_str, optional_chord, optional_gesture,
-    read_regions, region_number, rgb, save_dir, selection_mode,
+    read_regions_at, region_number, rgb, save_dir, selection_mode,
 };
 use crate::selection::Mode;
 
@@ -273,8 +274,13 @@ fn write_selection(t: &mut dyn TableLike, s: &SelectionScreen) {
     );
 }
 
-/// 定型領域（`[[regions]]`）。ファイルにない名前の定型領域を、最後の要素の後ろに足す（アプリから書くのは
-/// 定型領域の登録だけ。#71）。ファイルにある要素（読み込みで捨てられるものも）は、手で書いたまま残す。
+/// 定型領域（`[[regions]]`）。`regions` の並びに要素を作り直す。
+///
+/// - 定型領域は `loaded_name` でファイルの要素に結び付け、その要素に書く（名前を変えても、手で書いた
+///   コメント・並び順の中の位置の飾りは要素ごと残る）。`loaded_name` が None（足した・複製した）なら、
+///   どれにも結び付いていない同じ名前の要素に結び付ける。どれにも結び付かなければ新しい要素を作る。
+/// - 結び付かなかった要素（消した定型領域）は消す。読み込みで捨てられる要素（書きかけなど）は消さず、
+///   ファイルで前にあった要素の後ろ（前になければ先頭）に、手で書いたまま残す。
 fn write_regions(root: &mut Table, regions: &[Region]) {
     let tables = match root
         .get_mut("regions")
@@ -289,15 +295,69 @@ fn write_regions(root: &mut Table, regions: &[Region]) {
                 .expect("just inserted")
         }
     };
-    let kept: Vec<String> = read_regions(tables, &mut Reader { issues: Vec::new() })
+    let read: Vec<(usize, String)> = read_regions_at(tables, &mut Reader { issues: Vec::new() })
         .into_iter()
-        .map(|region| region.name)
+        .map(|(i, region)| (i, region.name))
         .collect();
-    for region in regions.iter().filter(|r| !kept.contains(&r.name)) {
-        let mut table = Table::new();
-        write_region(&mut table, region);
-        tables.push(table);
+    // 定型領域ごとに結び付けた要素の添字
+    let mut linked: Vec<Option<usize>> = vec![None; regions.len()];
+    let claim = |linked: &mut Vec<Option<usize>>, key: fn(&Region) -> Option<&str>| {
+        for (k, region) in regions.iter().enumerate() {
+            if linked[k].is_some() {
+                continue;
+            }
+            let Some(name) = key(region) else { continue };
+            linked[k] = read
+                .iter()
+                .find(|(i, n)| n == name && !linked.contains(&Some(*i)))
+                .map(|&(i, _)| i);
+        }
+    };
+    claim(&mut linked, |r| r.loaded_name.as_deref());
+    claim(&mut linked, |r| {
+        r.loaded_name.is_none().then_some(r.name.as_str())
+    });
+    let valid = |i: usize| read.iter().any(|&(j, _)| j == i);
+    let mut old: Vec<Option<Table>> = std::mem::take(tables).into_iter().map(Some).collect();
+    // 前の読める要素ごとに、その後ろに残す読めない要素（添字の順）
+    let mut stray: BTreeMap<Option<usize>, Vec<usize>> = BTreeMap::new();
+    let mut before = None;
+    for i in 0..old.len() {
+        if valid(i) {
+            before = Some(i);
+        } else {
+            stray
+                .entry(before.filter(|&b| linked.contains(&Some(b))))
+                .or_default()
+                .push(i);
+        }
     }
+    let mut out: Vec<Table> = Vec::new();
+    let mut take_strays =
+        |anchor: Option<usize>, out: &mut Vec<Table>, old: &mut Vec<Option<Table>>| {
+            for i in stray.remove(&anchor).unwrap_or_default() {
+                out.extend(old[i].take());
+            }
+        };
+    take_strays(None, &mut out, &mut old);
+    for (region, link) in regions.iter().zip(&linked) {
+        let mut table = link.and_then(|i| old[i].take()).unwrap_or_default();
+        write_region(&mut table, region);
+        out.push(table);
+        if let Some(i) = *link {
+            take_strays(Some(i), &mut out, &mut old);
+        }
+    }
+    // 残った要素の位置を、並べ替えた順に振り直す（位置の順に書き出されるため）
+    let mut positions: Vec<isize> = out.iter().filter_map(Table::position).collect();
+    positions.sort_unstable();
+    let mut positions = positions.into_iter();
+    for table in &mut out {
+        if table.position().is_some() {
+            table.set_position(positions.next());
+        }
+    }
+    tables.extend(out);
 }
 
 /// 定型領域 1 つ。名前・モニタ・範囲は既定値がないので、読めなければ常に書く。
@@ -656,6 +716,7 @@ paste = "Ctrl+V"
             file_name_template: DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned(),
             save: true,
             scrap: false,
+            loaded_name: None,
         }
     }
 
@@ -668,6 +729,7 @@ paste = "Ctrl+V"
             file_name_template: "{name}_{seq:3}".to_owned(),
             save: false,
             scrap: true,
+            loaded_name: None,
             ..region("領域 1")
         };
         let out = written(src, |s| s.regions.push(added.clone()));
@@ -721,6 +783,98 @@ shadow = false
     }
 
     #[test]
+    fn a_renamed_region_keeps_its_table_and_comments() {
+        let out = written(TWO_REGIONS, |s| s.regions[0].name = "x".to_owned());
+        assert_eq!(
+            out,
+            TWO_REGIONS.replace(
+                "name = \"a\"            # 左上",
+                "name = \"x\"            # 左上"
+            )
+        );
+    }
+
+    /// TWO_REGIONS の 2 つの要素（前の飾りから最後の行まで）。
+    const REGION_A: &str = "\n# 定型領域\n[[regions]]\nname = \"a\"            # 左上\nmonitor = 'M1'\nx = 0\ny = 0\nwidth = 10\nheight = 10\n";
+    const REGION_B: &str = "\n[[regions]]\n# 右下\nname = \"b\"\nmonitor = 'M1'\nx = 100\ny = 100\nwidth = 20 # 幅\nheight = 20\n";
+
+    #[test]
+    fn a_deleted_region_takes_only_its_own_table_away() {
+        let out = written(TWO_REGIONS, |s| {
+            s.regions.remove(0);
+        });
+        assert_eq!(out, TWO_REGIONS.replace(REGION_A, ""));
+        let out = written(TWO_REGIONS, |s| s.regions.clear());
+        assert_eq!(out, TWO_REGIONS.replace(REGION_A, "").replace(REGION_B, ""));
+        assert_eq!(load(&out).0.regions, vec![]);
+    }
+
+    #[test]
+    fn reordered_regions_move_with_their_comments() {
+        let out = written(TWO_REGIONS, |s| s.regions.swap(0, 1));
+        assert_eq!(
+            out,
+            TWO_REGIONS.replace(
+                &format!("{REGION_A}{REGION_B}"),
+                &format!("{REGION_B}{REGION_A}")
+            )
+        );
+    }
+
+    #[test]
+    fn a_duplicated_region_goes_after_its_original_and_the_original_keeps_its_comments() {
+        let out = written(TWO_REGIONS, |s| {
+            let copy = Region {
+                name: "a のコピー".to_owned(),
+                loaded_name: None,
+                ..s.regions[0].clone()
+            };
+            s.regions.insert(1, copy);
+        });
+        assert_eq!(
+            out,
+            TWO_REGIONS.replace(
+                REGION_B,
+                &format!("\n[[regions]]\nname = \"a のコピー\"\nmonitor = \"M1\"\nx = 0\ny = 0\nwidth = 10\nheight = 10\n{REGION_B}")
+            )
+        );
+        let names: Vec<String> = load(&out).0.regions.into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["a", "a のコピー", "b"]);
+    }
+
+    #[test]
+    fn regions_swapping_names_keep_their_own_tables() {
+        let out = written(TWO_REGIONS, |s| {
+            s.regions[0].name = "b".to_owned();
+            s.regions[1].name = "a".to_owned();
+        });
+        assert_eq!(
+            out,
+            TWO_REGIONS
+                .replace("name = \"a\"   ", "name = \"B\"   ")
+                .replace("name = \"b\"\n", "name = \"a\"\n")
+                .replace("name = \"B\"   ", "name = \"b\"   ")
+        );
+    }
+
+    #[test]
+    fn written_settings_link_their_regions_to_the_names_now_in_the_file() {
+        let (mut s, _) = load(TWO_REGIONS);
+        s.regions[0].name = "x".to_owned();
+        s.regions.push(region("c"));
+        let text = rewrite(TWO_REGIONS, &s).unwrap();
+        let mut s = s.as_written();
+        assert_eq!(s, load(&text).0);
+        // 書いたあとにもう一度名前を変えても、同じ要素に書く
+        s.regions[0].name = "y".to_owned();
+        s.regions[2].name = "d".to_owned();
+        let again = rewrite(&text, &s).unwrap();
+        assert!(again.contains("name = \"y\"            # 左上"), "{again}");
+        let names: Vec<String> = load(&again).0.regions.into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["y", "b", "d"]);
+    }
+
+    #[test]
     fn regions_dropped_when_read_are_left_in_place() {
         let src = r#"version = 1
 [[regions]]
@@ -746,6 +900,22 @@ height = 10
         assert!(out.starts_with(src), "{out}");
         let names: Vec<String> = load(&out).0.regions.into_iter().map(|r| r.name).collect();
         assert_eq!(names, ["a", "b", "c"]);
+        // 前の要素を消すと先頭に、並べ替えると前の要素に付いて動く
+        let a =
+            "[[regions]]\nname = \"a\"\nmonitor = 'M1'\nx = 0\ny = 0\nwidth = 10\nheight = 10\n";
+        let draft = "[[regions]]\nname = \"書きかけ\"\nmonitor = 'M1'\n";
+        let b =
+            "[[regions]]\nname = \"b\"\nmonitor = 'M1'\nx = 0\ny = 0\nwidth = 10\nheight = 10\n";
+        assert_eq!(
+            written(src, |s| {
+                s.regions.remove(0);
+            }),
+            format!("version = 1\n{draft}{b}")
+        );
+        assert_eq!(
+            written(src, |s| s.regions.swap(0, 1)),
+            format!("version = 1\n{b}{a}{draft}")
+        );
     }
 
     #[test]

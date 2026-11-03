@@ -8,10 +8,13 @@
 //! - 「スクラップ操作」タブの行（`scrap::ops::BindingRow`）は、上書きがなければ表の既定を出す（`shortcut` /
 //!   `mouse`）。ショートカットの欄にキーを入れたら、その 1 つで上書きする（`set_chord`）。マウスは候補から選ぶ
 //!   （`set_mouse`。既定と同じなら上書きを消す）。行の「既定に戻す」は両方の上書きを消す（`reset_binding`）。
+//! - 「定型領域」タブの一覧の追加・複製・削除・並べ替えは `add_region` / `duplicate_region` / `remove_region` /
+//!   `move_region`。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
 
 use std::collections::BTreeSet;
 
-use super::{Problem, Settings, SettingsItem};
+use super::{Problem, Region, Settings, SettingsItem, new_region};
+use crate::geometry::Rect;
 use crate::keys::Chord;
 use crate::scrap::ops::{BindingRow, MouseGesture};
 
@@ -175,6 +178,61 @@ impl Editor {
         self.draft.shortcuts.contains_key(row.op.id) || self.draft.mouse.contains_key(row.op.id)
     }
 
+    /// 定型領域を末尾に足す（「追加」）。名前は `"{base} N"`（`new_region`）。足した位置を返す。
+    pub fn add_region(&mut self, base: &str, monitor: &str, rect: Rect) -> usize {
+        let region = new_region(&self.draft, base, monitor, rect);
+        self.draft.regions.push(region);
+        self.forget_region_marks();
+        self.draft.regions.len() - 1
+    }
+
+    /// 定型領域 `index` を写して、その後ろに入れる（「複製」）。名前は `name`（ほかと重なれば `"{name} N"`、
+    /// N は 2 から）。ホットキーは写さない（重なって適用できなくなるため）。入れた位置を返す。
+    pub fn duplicate_region(&mut self, index: usize, name: &str) -> usize {
+        let used = |n: &str| self.draft.regions.iter().any(|r| r.name == n);
+        let name = std::iter::once(name.to_owned())
+            .chain((2..).map(|n: u64| format!("{name} {n}")))
+            .find(|n| !used(n))
+            .expect("some number is unused");
+        let copy = Region {
+            name,
+            hotkey: None,
+            loaded_name: None,
+            ..self.draft.regions[index].clone()
+        };
+        self.draft.regions.insert(index + 1, copy);
+        self.forget_region_marks();
+        index + 1
+    }
+
+    /// 定型領域 `index` を消す（「削除」）。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を返す。
+    pub fn remove_region(&mut self, index: usize) -> Option<usize> {
+        self.draft.regions.remove(index);
+        self.forget_region_marks();
+        let len = self.draft.regions.len();
+        (len > 0).then(|| index.min(len - 1))
+    }
+
+    /// 定型領域 `index` を隣と入れ替える（「上へ」「下へ」）。端なら動かさない。移った位置を返す。
+    pub fn move_region(&mut self, index: usize, to: Move) -> usize {
+        let other = match to {
+            Move::Up => index.checked_sub(1),
+            Move::Down => Some(index + 1).filter(|&i| i < self.draft.regions.len()),
+        };
+        let Some(other) = other else {
+            return index;
+        };
+        self.draft.regions.swap(index, other);
+        self.forget_region_marks();
+        other
+    }
+
+    /// 定型領域の位置が変わったので、位置で覚えた「登録できなかった」印を忘れる。
+    fn forget_region_marks(&mut self) {
+        self.not_registered
+            .retain(|item| !matches!(item, SettingsItem::RegionHotkey(_)));
+    }
+
     /// OK と適用を押せるか。OK は適用を止める問題がないとき、適用はそれに加えて写しが base と違うとき。
     pub fn buttons(&self) -> Buttons {
         let ok = !super::validate(&self.draft)
@@ -185,6 +243,13 @@ impl Editor {
             apply: ok && self.draft != self.base,
         }
     }
+}
+
+/// 定型領域を動かす向き（`Editor::move_region`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    Up,
+    Down,
 }
 
 /// ドロップダウンの項目と、選んでおく位置。
@@ -591,5 +656,112 @@ mod tests {
 
         editor.reset_binding(&row("close"));
         assert_eq!(editor.mark(&SettingsItem::Mouse("close".into())), None);
+    }
+
+    /// 範囲選択キャプチャのホットキーが入った（適用を止める問題のない）設定に、定型領域 `names` を足したもの。
+    fn with_regions(names: &[&str]) -> Settings {
+        let mut s = Settings::default();
+        s.hotkeys.select_capture = Some(chord("Ctrl+Shift+A"));
+        for name in names {
+            let region = crate::settings::new_region(&s, "x", "M1", Rect::new(0, 0, 10, 10));
+            s.regions.push(crate::settings::Region {
+                name: (*name).to_owned(),
+                loaded_name: Some((*name).to_owned()),
+                ..region
+            });
+        }
+        s
+    }
+
+    fn region_names(editor: &Editor) -> Vec<&str> {
+        editor
+            .draft()
+            .regions
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_added_region_gets_the_next_free_number_and_goes_last() {
+        let mut editor = Editor::new(with_regions(&["a", "領域 1"]));
+
+        let i = editor.add_region("領域", "M2", Rect::new(0, 0, 640, 480));
+
+        assert_eq!(i, 2);
+        assert_eq!(region_names(&editor), ["a", "領域 1", "領域 2"]);
+        let added = &editor.draft().regions[2];
+        assert_eq!(
+            (added.monitor.as_str(), added.rect),
+            ("M2", Rect::new(0, 0, 640, 480))
+        );
+        assert_eq!(added.loaded_name, None);
+        assert!(editor.buttons().apply);
+        assert_eq!(editor.base().regions.len(), 2);
+    }
+
+    #[test]
+    fn a_duplicate_goes_after_its_original_without_the_hotkey() {
+        let mut settings = with_regions(&["a", "b"]);
+        settings.regions[0].hotkey = Some(chord("Ctrl+Alt+1"));
+        settings.regions[0].scrap = true;
+        let mut editor = Editor::new(settings);
+
+        let i = editor.duplicate_region(0, "a のコピー");
+        let j = editor.duplicate_region(0, "a のコピー");
+
+        assert_eq!((i, j), (1, 1));
+        assert_eq!(
+            region_names(&editor),
+            ["a", "a のコピー 2", "a のコピー", "b"]
+        );
+        let copy = &editor.draft().regions[2];
+        // 同じホットキーは重なって適用できなくなるので、写さない
+        assert_eq!(copy.hotkey, None);
+        assert!(copy.scrap);
+        assert_eq!(copy.loaded_name, None);
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn a_removed_region_leaves_the_next_one_selected() {
+        let mut editor = Editor::new(with_regions(&["a", "b", "c"]));
+
+        assert_eq!(editor.remove_region(1), Some(1));
+        assert_eq!(region_names(&editor), ["a", "c"]);
+        assert_eq!(editor.remove_region(1), Some(0));
+        assert_eq!(editor.remove_region(0), None);
+        assert_eq!(region_names(&editor), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_moved_region_swaps_with_its_neighbour_and_stops_at_the_ends() {
+        let mut editor = Editor::new(with_regions(&["a", "b", "c"]));
+
+        assert_eq!(editor.move_region(0, Move::Down), 1);
+        assert_eq!(region_names(&editor), ["b", "a", "c"]);
+        assert_eq!(editor.move_region(1, Move::Up), 0);
+        assert_eq!(editor.move_region(0, Move::Up), 0);
+        assert_eq!(editor.move_region(2, Move::Down), 2);
+        assert_eq!(region_names(&editor), ["a", "b", "c"]);
+        assert!(!editor.buttons().apply);
+    }
+
+    #[test]
+    fn region_names_must_be_filled_and_unique_before_applying() {
+        let mut editor = Editor::new(with_regions(&["a", "b"]));
+
+        editor.draft_mut().regions[1].name = "a".into();
+        assert_eq!(
+            editor.mark(&SettingsItem::RegionName(1)),
+            Some(Mark::Problem(Problem::DuplicateName))
+        );
+        assert!(!editor.buttons().ok);
+        editor.draft_mut().regions[1].name = String::new();
+        assert_eq!(
+            editor.mark(&SettingsItem::RegionName(1)),
+            Some(Mark::Problem(Problem::EmptyName))
+        );
+        assert!(!editor.buttons().ok);
     }
 }
