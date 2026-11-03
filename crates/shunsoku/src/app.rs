@@ -180,6 +180,8 @@ const WM_APP_PIPE: u32 = WM_APP + 6;
 const WM_APP_REGION: u32 = WM_APP + 7;
 /// 設定 GUI のキーの組み合わせの欄のフォーカスが変わった（設定 GUI が自分に送る。`settings_gui::check_focus`）。
 const WM_APP_SETTINGS_FOCUS: u32 = WM_APP + 8;
+/// 設定 GUI の DPI が変わり、ダイアログが大きさを直し終えた（設定 GUI が自分に送る。定型領域の一覧の列の幅を直す）。
+const WM_APP_SETTINGS_DPI: u32 = WM_APP + 9;
 
 /// 2 つのウィンドウのクラス名。2 つ目のプロセスはこの名前でメッセージ専用ウィンドウを探す。
 const CLASS_NAME: PCWSTR = w!("shunsoku.app");
@@ -2686,8 +2688,12 @@ fn finish_selection() {
         drop(overlay);
         end_capture();
         log::info!("overlay closed");
-        if let Some(rect) = selection.rect() {
-            register_region(rect);
+        match (request.method, selection.rect()) {
+            (CaptureMethod::ReselectRegion(index), Some(rect)) => {
+                settings_gui::region_reselected(index, rect)
+            }
+            (_, Some(rect)) => register_region(rect),
+            _ => {}
         }
         return;
     }
@@ -2868,15 +2874,17 @@ fn take_capture() {
         }
     };
     match method {
-        Some(request::CaptureMethod::Select | request::CaptureMethod::RegisterRegion) => {
-            open_overlay()
-        }
+        Some(
+            request::CaptureMethod::Select
+            | request::CaptureMethod::RegisterRegion
+            | request::CaptureMethod::ReselectRegion(_),
+        ) => open_overlay(),
         Some(request::CaptureMethod::ActiveWindow) => capture_active_window(),
         Some(request::CaptureMethod::Window(target)) => {
             capture_window(window_list::hwnd(target.window), target.crop);
         }
         Some(request::CaptureMethod::Rect { monitor, rect }) => capture_rect(monitor, rect),
-        Some(request::CaptureMethod::Region(_)) => {
+        Some(request::CaptureMethod::Region(_) | request::CaptureMethod::TrialRegion(_)) => {
             // 定型領域はふだん `request_region` の待ち行列から撮る。ここに来たら同じ流れで撮る
             let request = with_app(|app| match std::mem::take(&mut app.capture) {
                 Capture::Waiting(request) => Some(request),
@@ -3162,7 +3170,7 @@ fn open_overlay() {
                 .with_mode(app.settings.selection.mode)
                 .with_crosshair(app.settings.selection.crosshair);
             let mut overlay = overlay;
-            if request.method == request::CaptureMethod::RegisterRegion {
+            if request.method.registers_region() {
                 // 定型領域の登録は常に精密モードで、画面の上端に登録だと出す
                 selection = selection.registering();
                 overlay.set_banner(Some(text("selection.register_banner")));
@@ -3236,6 +3244,8 @@ fn end_capture() {
             post_region_message(window);
         }
     }
+    // 「範囲を選び直す」で隠した設定 GUI を出し直す
+    settings_gui::capture_done();
 }
 
 /// `WM_HOTKEY`。範囲選択の画面を開いている間に押されたものは `request_capture`・`request_region` が無視する。
@@ -3297,6 +3307,40 @@ fn request_region(index: usize, from: &str) {
     }
 }
 
+/// 設定 GUI の「範囲を選び直す」: 範囲選択の画面を登録のモードで開き、決めた範囲を写しの定型領域 `index` に
+/// 入れる（`settings_gui::region_reselected`）。ほかの依頼を進めていれば受けずに false。
+fn request_reselect(index: usize) -> bool {
+    let idle = with_app(|app| matches!(app.capture, Capture::Idle)).unwrap_or(false);
+    if idle {
+        log::info!(
+            "reselecting region {} requested from the settings GUI",
+            index + 1
+        );
+        submit(CaptureRequest::reselect_region(index));
+    }
+    idle
+}
+
+/// 設定 GUI の「試しに撮る」: 写しの定型領域 `region` の値で撮る（定型領域キャプチャと同じ待ち行列で、この処理を
+/// 抜けてから撮る）。ほかの依頼を進めていれば受けずに false。
+fn request_trial(region: &settings::Region) -> bool {
+    let queued = with_app(|app| {
+        if !matches!(app.capture, Capture::Idle) {
+            return None;
+        }
+        app.regions_waiting
+            .push_back(CaptureRequest::trial_region(region));
+        Some(app.windows.message)
+    })
+    .flatten();
+    let Some(message_window) = queued else {
+        return false;
+    };
+    log::info!("trial capture of region {} requested", region.name);
+    post_region_message(message_window);
+    true
+}
+
 /// 待っている定型領域キャプチャを、いまの処理を抜けてから進めるよう `WM_APP_REGION` を送る。
 fn post_region_message(message_window: HWND) {
     // SAFETY: 自分のメッセージ専用ウィンドウに送るだけ
@@ -3329,6 +3373,8 @@ fn run_waiting_regions() {
                     flush_composition();
                 }
                 capture_region(request);
+                // 「試しに撮る」で隠した設定 GUI を出し直す
+                settings_gui::capture_done();
             }
             Some(Err(message_window)) => {
                 // SAFETY: 自分のウィンドウのタイマー
@@ -3442,18 +3488,14 @@ fn menus_visible() -> bool {
 
 /// 定型領域キャプチャを 1 件撮り、依頼の出力（保存・スクラップ）を出す。撮れなければ失敗を通知する。
 fn capture_region(request: CaptureRequest) {
-    let CaptureMethod::Region(id) = &request.method else {
-        return;
+    let name = match &request.method {
+        CaptureMethod::Region(id) => id.0.clone(),
+        CaptureMethod::TrialRegion(region) => region.name.clone(),
+        _ => return,
     };
-    let name = id.0.as_str();
-    let region = with_app(|app| {
-        app.settings
-            .regions
-            .iter()
-            .find(|region| region.name == name)
-            .cloned()
-    })
-    .flatten();
+    let name = name.as_str();
+    // 試しに撮る依頼（設定 GUI）は写しの値で、ほかは適用済みの設定から名前で引く
+    let region = with_app(|app| request.region_to_capture(&app.settings.regions)).flatten();
     let Some(region) = region else {
         log::warn!("region {name} is not in the settings");
         let message = format!("{}{name}", text("region.gone"));
@@ -3544,23 +3586,23 @@ fn capture_region(request: CaptureRequest) {
 }
 
 /// 範囲選択の画面で決めた範囲（スクリーン座標）を、定型領域として設定ファイルの `[[regions]]` に足す。
-/// 名前は重ならない「領域 N」、モニタは範囲の左上を含むモニタ。足せたら、トレイの「定型領域」サブメニュー
-/// （開くたびに `App::settings` から作る）に出て、すぐに撮れる。結果は通知で知らせる。
+/// 名前は重ならない「領域 N」（設定 GUI を開いていれば、その写しの定型領域とも重ならない）、モニタは範囲の左上を
+/// 含むモニタ。足せたら、トレイの「定型領域」サブメニュー（開くたびに `App::settings` から作る）に出て、すぐに
+/// 撮れる。結果は通知で知らせ、設定 GUI の「定型領域」タブで足した領域の名前の欄にフォーカスを置く。
 fn register_region(rect: Rect) {
     let monitors = monitor_list::list();
-    let Some(monitor) = monitors.iter().find(|m| m.rect.contains(rect.origin())) else {
+    let Some((index, relative)) = monitors::relative_to(&monitors, rect) else {
         log::warn!("no monitor contains the region to register at {rect:?}");
         notify_user(notify::Level::Error, text("region.register_failed"));
         return;
     };
-    let relative = rect.offset(-monitor.rect.left, -monitor.rect.top);
+    let monitor = &monitors[index];
     let result = with_app(|app| {
-        let region = settings::new_region(
-            &app.settings,
-            text("region.default_name"),
-            &monitor.id,
-            relative,
-        );
+        let base = text("region.default_name");
+        let region = match &app.settings_gui {
+            Some(gui) => gui.new_registered_region(&app.settings, base, &monitor.id, relative),
+            None => settings::new_region(&app.settings, base, &monitor.id, relative),
+        };
         let mut new = app.settings.clone();
         new.regions.push(region.clone());
         write_settings(app, &new).map(|()| region)
@@ -3577,6 +3619,12 @@ fn register_region(rect: Rect) {
                 notify::Level::Success,
                 &format!("{}{}", text("region.registered"), region.name),
             );
+            // 書いた定型領域はファイルの要素に結び付いている（`Settings::as_written`）
+            let name = region.name.clone();
+            settings_gui::region_registered(settings::Region {
+                loaded_name: Some(name),
+                ..region
+            });
         }
         Some(Err(e)) => {
             log::error!("could not register the region: {e}");

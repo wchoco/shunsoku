@@ -6,6 +6,7 @@
 //!   番号は位置の順（左から右、同じ左端なら上から下）に 1 から振る。抜き差しや配置の変更がなければ、
 //!   起動し直しても同じ番号になる。
 //! - 定型領域キャプチャの撮影の判定（`locate_by_id`）。定型領域はモニタを識別子で覚える。
+//! - 範囲選択の画面で決めた範囲を、定型領域のモニタ相対の範囲にする（`relative_to`）。
 
 use crate::geometry::Rect;
 
@@ -130,6 +131,16 @@ pub fn locate_by_id(
     Ok(Located { index, screen })
 }
 
+/// 範囲選択の画面で決めた範囲 `screen`（スクリーン座標）を、左上を含むモニタの相対の範囲にする（定型領域の
+/// 登録と「範囲を選び直す」）。そのモニタの `monitors` の中の位置も返す。左上がどのモニタにもなければ None。
+pub fn relative_to(monitors: &[Monitor], screen: Rect) -> Option<(usize, Rect)> {
+    let index = monitors
+        .iter()
+        .position(|m| m.rect.contains(screen.origin()))?;
+    let monitor = &monitors[index].rect;
+    Some((index, screen.offset(-monitor.left, -monitor.top)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +162,28 @@ mod tests {
             monitor("below", Rect::new(0, 1440, 1920, 2520), false),
             monitor("left", Rect::new(-1920, 0, 0, 1080), false),
         ]
+    }
+
+    #[test]
+    fn a_chosen_range_belongs_to_the_monitor_holding_its_top_left_corner() {
+        let monitors = three();
+        // 左のモニタの中で選んだ範囲（スクリーン座標）は、そのモニタの左上からの位置になる
+        let (index, relative) = relative_to(&monitors, Rect::new(-1800, 100, -1000, 700)).unwrap();
+        assert_eq!(monitors[index].name, "left");
+        assert_eq!(relative, Rect::new(120, 100, 920, 700));
+        // 下のモニタ
+        let (index, relative) = relative_to(&monitors, Rect::new(10, 1450, 110, 1550)).unwrap();
+        assert_eq!(monitors[index].name, "below");
+        assert_eq!(relative, Rect::new(10, 10, 110, 110));
+    }
+
+    #[test]
+    fn a_range_starting_outside_every_monitor_has_no_monitor() {
+        // メインの右下の外（下のモニタは 1920 までの幅）
+        assert_eq!(
+            relative_to(&three(), Rect::new(2000, 1500, 2100, 1600)),
+            None
+        );
     }
 
     #[test]

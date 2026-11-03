@@ -11,7 +11,8 @@
 //! - 一覧の行の数は `sync_list` で写しに揃える。揃えて選んでいる行がなくなったら、詳細が指していた位置の行を選ぶ。
 //!   呼び出し側は、欄を出す（`fill`）前に `sync_list` を呼ぶ。`sync_list` の中で行を選んで届く通知では欄を結び
 //!   直すだけにする（`is_syncing`）。
-//! - 「範囲を選び直す」（`reselect_id`）と「試しに撮る」（`test_capture_id`）は置き場所だけ（#99 で使えるようにする）。
+//! - 「範囲を選び直す」（`reselect_id`）と「試しに撮る」（`test_capture_id`）は、呼び出し側が範囲選択の画面を
+//!   開く・写しの値で撮る。
 //! - コントロールの ID は、ページの帯の最初からの決まった順（`build` が置く順）。
 
 use std::cell::{Cell, RefCell};
@@ -24,15 +25,16 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Controls::{
     EM_SETCUEBANNER, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_STATE,
     LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE,
-    LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVNI_SELECTED,
     LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
     LVS_SINGLESEL,
 };
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_PUSHBUTTON, MapDialogRect, SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WS_BORDER,
-    WS_TABSTOP,
+    BS_PUSHBUTTON, GetClientRect, SM_CXVSCROLL, SendMessageW, SetDlgItemTextW, WINDOW_STYLE,
+    WS_BORDER, WS_TABSTOP,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -73,12 +75,13 @@ const FIELD_WIDTH: i16 = PAGE_WIDTH - FIELD_X;
 /// 範囲の数の欄（上下のボタンを除く幅）と、横のボタン。
 const NUMBER_WIDTH: i16 = 32;
 const RANGE_BUTTON_X: i16 = DETAIL_X + 126;
-/// 一覧の列の幅（ダイアログ単位）。
-const COLUMNS: [(&str, i16); 4] = [
-    ("settings_gui.regions.name", 50),
-    ("settings_gui.regions.hotkey", 48),
-    ("settings_gui.regions.range", 56),
-    ("settings_gui.scrap_ops.mark", 60),
+/// 一覧の列と、幅の割合。列の幅は一覧の中の幅（縦のスクロールバーの分を除く）をこの割合で分ける
+/// （`fit_columns`）。入りきらない文言は一覧が「…」で略す。
+const COLUMNS: [(&str, i32); 4] = [
+    ("settings_gui.regions.name", 3),
+    ("settings_gui.regions.hotkey", 3),
+    ("settings_gui.regions.range", 4),
+    ("settings_gui.scrap_ops.mark", 2),
 ];
 
 /// 「追加」で足す定型領域の大きさ（物理ピクセル。モニタより大きければモニタに収める）。
@@ -291,12 +294,12 @@ pub fn hotkey_id() -> i32 {
     id(HOTKEY)
 }
 
-/// 「範囲を選び直す」の ID（#99）。
+/// 「範囲を選び直す」の ID。
 pub fn reselect_id() -> i32 {
     id(RESELECT)
 }
 
-/// 「試しに撮る」の ID（#99）。
+/// 「試しに撮る」の ID。
 pub fn test_capture_id() -> i32 {
     id(TEST_CAPTURE)
 }
@@ -398,7 +401,8 @@ pub fn sync_list(hwnd: HWND, editor: &Editor, bound: usize, text: Text) {
     // SAFETY: 自分のダイアログの一覧へのメッセージ
     let count = unsafe { SendMessageW(list, LVM_GETITEMCOUNT, None, None) }.0;
     if count == 0 && column_count(list) == 0 {
-        init_columns(hwnd, list, text);
+        init_columns(list, text);
+        fit_columns(hwnd);
     }
     if usize::try_from(count).ok() != Some(regions.len()) {
         // SAFETY: 自分のダイアログの一覧へのメッセージ。構造体は呼び出しの間生きている（一覧が写す）
@@ -454,9 +458,6 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     enable(hwnd, id(REMOVE), selected.is_some());
     enable(hwnd, id(UP), selected.is_some_and(|i| i > 0));
     enable(hwnd, id(DOWN), selected.is_some_and(|i| i + 1 < len));
-    // #99 で使えるようにする
-    enable(hwnd, reselect_id(), false);
-    enable(hwnd, test_capture_id(), false);
 
     let region = selected.map(|i| (i, &draft.regions[i]));
     let name_mark = region
@@ -523,7 +524,7 @@ fn range_text(rect: &Rect) -> String {
 }
 
 /// 一覧の列を入れる。
-fn init_columns(hwnd: HWND, list: HWND, text: Text) {
+fn init_columns(list: HWND, text: Text) {
     // SAFETY: 自分のダイアログの一覧へのメッセージ。文字列と構造体は呼び出しの間生きている（一覧が写す）
     unsafe {
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
@@ -533,11 +534,11 @@ fn init_columns(hwnd: HWND, list: HWND, text: Text) {
             Some(WPARAM(ex as usize)),
             Some(LPARAM(ex as isize)),
         );
-        for (i, (key, width)) in COLUMNS.iter().enumerate() {
+        for (i, (key, _)) in COLUMNS.iter().enumerate() {
             let mut label = to_wide(text(key));
             let column = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH,
-                cx: dialog_units(hwnd, *width),
+                cx: 0,
                 pszText: PWSTR(label.as_mut_ptr()),
                 ..Default::default()
             };
@@ -549,6 +550,41 @@ fn init_columns(hwnd: HWND, list: HWND, text: Text) {
             );
         }
     }
+}
+
+/// 一覧の列の幅を、一覧の中の幅に収まるように決め直す（列を入れたとき、DPI が変わったとき）。縦のスクロールバーは
+/// 行が増えると出るので、その分を常に空けておく（出たときに横のスクロールバーが出ないように）。
+pub fn fit_columns(hwnd: HWND) {
+    let Some(list) = item(hwnd, list_id()) else {
+        return;
+    };
+    let mut client = RECT::default();
+    // SAFETY: 自分のダイアログの一覧の大きさを読む
+    let scroll_bar = unsafe {
+        let _ = GetClientRect(list, &mut client);
+        GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(list))
+    };
+    let widths = column_widths(client.right - client.left - scroll_bar);
+    for (i, width) in widths.into_iter().enumerate() {
+        // SAFETY: 自分のダイアログの一覧へのメッセージ
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_SETCOLUMNWIDTH,
+                Some(WPARAM(i)),
+                Some(LPARAM(width as isize)),
+            );
+        }
+    }
+}
+
+/// 幅 `available`（ピクセル）を列の割合で分ける。端数は最後の列に足す。
+fn column_widths(available: i32) -> [i32; 4] {
+    let available = available.max(0);
+    let total: i32 = COLUMNS.iter().map(|(_, w)| w).sum();
+    let mut widths = COLUMNS.map(|(_, w)| available * w / total);
+    widths[3] += available - widths.iter().sum::<i32>();
+    widths
 }
 
 /// 一覧の列の数。
@@ -598,17 +634,4 @@ fn enable(hwnd: HWND, id: i32, enabled: bool) {
             let _ = EnableWindow(control, enabled);
         }
     }
-}
-
-/// ダイアログ単位の幅 `width` をピクセルにする。
-fn dialog_units(hwnd: HWND, width: i16) -> i32 {
-    let mut rect = RECT {
-        right: i32::from(width),
-        ..Default::default()
-    };
-    // SAFETY: rect は呼び出しの間生きている
-    unsafe {
-        let _ = MapDialogRect(hwnd, &mut rect);
-    }
-    rect.right
 }
