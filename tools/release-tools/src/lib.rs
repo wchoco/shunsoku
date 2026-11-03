@@ -2,14 +2,24 @@
 
 /// タグ（`v0.1.0`、`v0.1.0-rc.1` など）が workspace の version と一致するか。
 /// プレリリースの部分（`-` から後ろ）は除いて比べる。
+///
+/// プレリリースの部分は semver の識別子の文字（英数字・`.`・`-`）だけを通す。
+/// workflow はタグを zip のファイル名とリリースの名前に使うため。
 pub fn tag_matches_version(tag: &str, version: &str) -> bool {
     let Some(rest) = tag.strip_prefix('v') else {
         return false;
     };
     match rest.split_once('-') {
-        Some((core, pre)) => !pre.is_empty() && core == version,
+        Some((core, pre)) => core == version && is_prerelease(pre),
         None => rest == version,
     }
+}
+
+fn is_prerelease(pre: &str) -> bool {
+    !pre.is_empty()
+        && pre
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
 /// `docs/perf.md` の「累積表」の見出し行・区切り行・最新（最後）の行を、Markdown の表として返す。
@@ -85,6 +95,16 @@ mod tests {
             latest_perf_table("## 累積表\n\n| マイルストーン |\n|---|\n\n本文\n"),
             None
         );
+    }
+
+    #[test]
+    fn プレリリースの部分に英数字と点とハイフン以外があれば一致しない() {
+        // タグはファイル名とリリースの名前に使うので、パスの区切りなどを通さない
+        assert!(tag_matches_version("v0.1.0-rc.1-2", "0.1.0"));
+        assert!(!tag_matches_version("v0.1.0-rc/1", "0.1.0"));
+        assert!(!tag_matches_version("v0.1.0-rc..\\1", "0.1.0"));
+        assert!(!tag_matches_version("v0.1.0-rc$1", "0.1.0"));
+        assert!(!tag_matches_version("v0.1.0-rc 1", "0.1.0"));
     }
 
     #[test]
