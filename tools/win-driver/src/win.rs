@@ -9,17 +9,23 @@ use std::path::Path;
 use std::process::{Child, Command as Process, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use shunsoku_core::keys::Chord;
+use shunsoku_core::app_window;
+use shunsoku_core::keys::{Chord, KeyStroke, Modifiers};
 use windows::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HWND, LPARAM, POINT, RECT,
-    SetHandleInformation, WPARAM,
+    CloseHandle, FILETIME, GlobalFree, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HGLOBAL, HWND,
+    LPARAM, POINT, RECT, SetHandleInformation, WPARAM,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+    GetClipboardFormatNameW, OpenClipboard, SetClipboardData,
+};
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, MEM_COMMIT, MEM_RELEASE,
+    MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
 };
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, GetExitCodeProcess, GetProcessTimes, OpenProcess,
@@ -37,24 +43,27 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, IsWindowEnabled, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_SHIFT,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    SendInput, VIRTUAL_KEY,
 };
-use windows::Win32::UI::Shell::{NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect};
+use windows::Win32::UI::Shell::{NIN_SELECT, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BringWindowToTop, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, EnumChildWindows,
-    EnumWindows, FindWindowExW, GA_ROOT, GUITHREADINFO, GetAncestor, GetClassNameW, GetDlgCtrlID,
-    GetForegroundWindow, GetGUIThreadInfo, GetMenuItemCount, GetMenuState, GetMenuStringW,
-    GetSubMenu, GetWindowRect, GetWindowThreadProcessId, HMENU, HWND_MESSAGE, IsWindow,
-    IsWindowVisible, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MN_GETHMENU,
-    PostMessageW, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW,
-    SetCursorPos, SetForegroundWindow, SetWindowPos, WM_APP, WM_CONTEXTMENU, WM_GETTEXT,
-    WM_GETTEXTLENGTH, WindowFromPoint,
+    BM_GETCHECK, BringWindowToTop, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CreateWindowExW,
+    DestroyWindow, EnumChildWindows, EnumWindows, FindWindowExW, FindWindowW, GA_ROOT,
+    GUITHREADINFO, GetAncestor, GetClassNameW, GetCursorPos, GetDlgCtrlID, GetForegroundWindow,
+    GetGUIThreadInfo, GetMenuItemCount, GetMenuState, GetMenuStringW, GetSubMenu, GetWindowRect,
+    GetWindowThreadProcessId, HMENU, HWND_MESSAGE, IsWindow, IsWindowVisible, MF_BYPOSITION,
+    MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MN_GETHMENU, PostMessageW, SMTO_ABORTIFHUNG,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetCursorPos,
+    SetForegroundWindow, SetWindowPos, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU,
+    WM_GETTEXT, WM_GETTEXTLENGTH, WindowFromPoint,
 };
-use windows::core::{BOOL, PCWSTR};
+use windows::core::{BOOL, PCWSTR, w};
 
 use crate::cli::{Button, Command, FocusFilter, Invocation, WindowFilter};
-use crate::guard::{self, Launched, Seen};
+use crate::guard::{self, IconRect, Kind, Launched, Seen};
+use crate::input;
 use crate::list_view::{self, Cell};
 use crate::test_env::test_env;
 use crate::wait::{self, RealClock, TimedOut};
@@ -77,11 +86,8 @@ fn timed_out(what: &str) -> impl FnOnce(TimedOut) -> Failure + '_ {
     move |TimedOut| Failure::Failed(format!("時間切れ: {what}"))
 }
 
-/// 本体のメッセージ専用ウィンドウのクラス名（`crates/shunsoku/src/app.rs` の `CLASS_NAME`）。
-const APP_CLASS: &str = "shunsoku.app";
-/// 本体のトレイの通知のメッセージ（`app.rs` の `WM_APP_TRAY`）と、アイコンの ID（`tray.rs` の `ICON_ID`）。
-const WM_APP_TRAY: u32 = WM_APP + 1;
-const TRAY_ICON_ID: u32 = 1;
+/// 本体のトレイの通知のメッセージ（`shunsoku_core::app_window`）。
+const WM_APP_TRAY: u32 = WM_APP + app_window::TRAY_MESSAGE_FROM_WM_APP;
 /// 他のプロセスのウィンドウに送るメッセージの待ちの上限。
 const SEND_TIMEOUT_MS: u32 = 2000;
 /// `GetExitCodeProcess` の動いている印。
@@ -111,8 +117,8 @@ pub fn run(inv: Invocation) -> Result<()> {
         } => run_to_end(root, portable, &exe, &args, timeout),
         Command::Kill { pid } => kill(root, pid),
         Command::Pids => {
-            for pid in targets(root) {
-                println!("{pid}");
+            for l in alive(root) {
+                println!("{}", l.pid);
             }
             Ok(())
         }
@@ -266,25 +272,83 @@ pub fn run(inv: Invocation) -> Result<()> {
         }
         Command::Keys { chords } => {
             for chord in chords {
-                guard_input(root, None)?;
-                send_chord(chord);
+                guard_input(root, &[])?;
+                send_strokes(&chord.strokes());
             }
             Ok(())
         }
         Command::Type { text } => {
             for unit in text.encode_utf16() {
-                guard_input(root, None)?;
+                guard_input(root, &[])?;
                 send_unicode(unit);
             }
             Ok(())
         }
-        Command::Click { x, y, button } => {
-            // SAFETY: カーソルを動かすだけ。入力はこの後の確かめが通ってから送る
-            unsafe { SetCursorPos(x, y) }.map_err(failed)?;
-            guard_input(root, Some(POINT { x, y }))?;
-            send_click(button);
+        Command::HoldKey { chord, duration } => {
+            guard_input(root, &[])?;
+            let strokes = chord.strokes();
+            let (down, up) = strokes.split_at(strokes.len() / 2);
+            send_strokes(down);
+            std::thread::sleep(duration);
+            // 前面が変わっていても離す（押したままにしない）
+            send_strokes(up);
             Ok(())
         }
+        Command::Click {
+            x,
+            y,
+            button,
+            count,
+        } => {
+            move_cursor(root, POINT { x, y })?;
+            let (down, up) = button_flags(button);
+            for _ in 0..count {
+                send_mouse(&[down, up]);
+            }
+            Ok(())
+        }
+        Command::Drag {
+            from,
+            to,
+            button,
+            with,
+        } => drag(root, from, to, button, with),
+        Command::Wheel { x, y, notches } => {
+            move_cursor(root, POINT { x, y })?;
+            for delta in input::wheel_steps(notches) {
+                send_inputs(&[mouse_input(MOUSEEVENTF_WHEEL, delta)]);
+            }
+            Ok(())
+        }
+        Command::HoldButton {
+            x,
+            y,
+            duration,
+            button,
+        } => {
+            move_cursor(root, POINT { x, y })?;
+            let (down, up) = button_flags(button);
+            send_mouse(&[down]);
+            std::thread::sleep(duration);
+            send_mouse(&[up]);
+            Ok(())
+        }
+        Command::ClipGet => {
+            guard_input(root, &[])?;
+            clip_get()
+        }
+        Command::ClipSet { text } => {
+            guard_input(root, &[])?;
+            clip_set(&text)
+        }
+        Command::Hotkey { chords } => {
+            for chord in chords {
+                guard_hotkey(root)?;
+                send_strokes(&chord.strokes());
+            }
+            Ok(())
+        }
+        Command::TrayClick { pid } => tray_click(root, pid),
         Command::TrayMenu { pid } => tray_menu(root, pid),
     }
 }
@@ -293,6 +357,7 @@ pub fn run(inv: Invocation) -> Result<()> {
 
 /// テスト用の環境を付けて起動し、PID を控える。起動はここを通す（付けずに起動する道を作らない）。
 fn spawn(root: &str, portable: bool, exe: &str, args: &[String], piped: bool) -> Result<Child> {
+    let kind = guard::exe_kind(exe).map_err(Failure::Refused)?;
     let env = test_env(root, portable);
     for (key, value) in &env {
         if matches!(*key, "APPDATA" | "TEMP") {
@@ -326,6 +391,7 @@ fn spawn(root: &str, portable: bool, exe: &str, args: &[String], piped: bool) ->
     let launched = Launched {
         pid: child.id(),
         created: created_of(handle).ok_or_else(|| failed("起動した時刻を読めない"))?,
+        kind,
     };
     fs::OpenOptions::new()
         .create(true)
@@ -387,8 +453,8 @@ fn launched_path(root: &str) -> String {
     format!(r"{}\launched.txt", root.trim_end_matches(['\\', '/']))
 }
 
-/// 自分が起動して、まだ動いているプロセス（PID と起動した時刻が控えと合うもの）。
-fn targets(root: &str) -> Vec<u32> {
+/// 自分が起動して、まだ動いているプロセス（PID と起動した時刻が控えと合うもの）。止めてよいもの。
+fn alive(root: &str) -> Vec<Launched> {
     let content = fs::read_to_string(launched_path(root)).unwrap_or_default();
     guard::parse_launched(&content)
         .into_iter()
@@ -398,16 +464,26 @@ fn targets(root: &str) -> Vec<u32> {
                 created_of(h.0) == Some(l.created) && exit_code_of(h.0) == Some(STILL_ACTIVE)
             })
         })
+        .collect()
+}
+
+/// 入力の宛先にしてよいプロセス（自分が起動して動いている本体）。
+fn targets(root: &str) -> Vec<u32> {
+    alive(root)
+        .into_iter()
+        .filter(|l| l.kind == Kind::App)
         .map(|l| l.pid)
         .collect()
 }
 
+/// `pid` が `allowed` になければ、安全の決まりで止める。`action` は「止め」「メニューを開か」など。
+fn own(allowed: &[u32], pid: u32, action: &str) -> Result<()> {
+    guard::check_own(allowed, pid, action).map_err(Failure::Refused)
+}
+
 fn kill(root: &str, pid: u32) -> Result<()> {
-    if !targets(root).contains(&pid) {
-        return Err(Failure::Refused(format!(
-            "PID {pid} は自分が起動して動いているプロセスでないので止めない"
-        )));
-    }
+    let alive: Vec<u32> = alive(root).into_iter().map(|l| l.pid).collect();
+    own(&alive, pid, "止め")?;
     let h = open(pid, PROCESS_TERMINATE).ok_or_else(|| failed("プロセスを開けない"))?;
     // SAFETY: 開いたハンドルを渡す
     unsafe { TerminateProcess(h.0, 1) }.map_err(failed)?;
@@ -502,13 +578,11 @@ fn top_windows() -> Vec<HWND> {
 }
 
 fn message_windows() -> Vec<HWND> {
-    let class: Vec<u16> = APP_CLASS.encode_utf16().chain([0]).collect();
+    let class = PCWSTR(app_window::APP_CLASS_WIDE.as_ptr());
     let mut v = Vec::new();
     let mut after = None;
-    // SAFETY: クラス名は呼び出しの間生きている
-    while let Ok(h) =
-        unsafe { FindWindowExW(Some(HWND_MESSAGE), after, PCWSTR(class.as_ptr()), None) }
-    {
+    // SAFETY: クラス名は 'static
+    while let Ok(h) = unsafe { FindWindowExW(Some(HWND_MESSAGE), after, class, None) } {
         v.push(h);
         after = Some(h);
     }
@@ -927,32 +1001,125 @@ fn tabs_report(tab: HWND) -> Result<()> {
 
 // --- 入力 ---
 
-/// テスト対象（自分が起動したプロセス）のウィンドウ。そうでなければ止める。
+/// テスト対象（自分が起動した本体）のウィンドウ。そうでなければ止める。
 fn target_window(root: &str, raw: isize) -> Result<HWND> {
     let h = window(raw)?;
-    if !targets(root).contains(&pid_of(h)) {
-        return Err(Failure::Refused(format!(
-            "テスト対象のウィンドウでないので触らない: {}",
-            describe(h)
-        )));
-    }
+    own(&targets(root), pid_of(h), "触ら").map_err(|e| match e {
+        Failure::Refused(m) => Failure::Refused(format!("{m}: {}", describe(h))),
+        other => other,
+    })?;
     Ok(h)
 }
 
-/// 入力を送る前の確かめ。前面のウィンドウ（と、クリックならカーソルの下のウィンドウ）がテスト対象でなければ止める。
-fn guard_input(root: &str, point: Option<POINT>) -> Result<()> {
-    let seen = |h: HWND| Seen {
+fn seen(h: HWND) -> Seen {
+    Seen {
         pid: pid_of(h),
+        class: class_of(h),
         describe: describe(h),
-    };
+    }
+}
+
+fn foreground() -> HWND {
     // SAFETY: 問い合わせのみ
-    let fg = unsafe { GetForegroundWindow() };
-    let under = point.map(|p| {
+    unsafe { GetForegroundWindow() }
+}
+
+/// 入力を送る前の確かめ。前面のウィンドウと、マウスなら `points` それぞれの下のウィンドウがテスト対象でなければ止める。
+/// 下のウィンドウは `WindowFromPoint` で座標から見るので、カーソルを動かす前に確かめられる。
+fn guard_input(root: &str, points: &[POINT]) -> Result<()> {
+    let under: Vec<Seen> = points
+        .iter()
         // SAFETY: 問い合わせのみ
-        let h = unsafe { WindowFromPoint(p) };
-        seen(h)
-    });
-    guard::check_input(&targets(root), &seen(fg), under.as_ref()).map_err(Failure::Refused)
+        .map(|&p| seen(unsafe { WindowFromPoint(p) }))
+        .collect();
+    guard::check_input(&targets(root), &seen(foreground()), &under).map_err(Failure::Refused)
+}
+
+fn cursor_pos() -> Result<POINT> {
+    let mut p = POINT::default();
+    // SAFETY: 構造体は呼び出しの間生きている
+    unsafe { GetCursorPos(&mut p) }.map_err(failed)?;
+    Ok(p)
+}
+
+fn set_cursor(p: POINT) -> Result<()> {
+    // SAFETY: 座標を渡すだけ
+    unsafe { SetCursorPos(p.x, p.y) }.map_err(failed)
+}
+
+/// カーソルを `p` へ動かす。動かす前に確かめる。動かした後にもう一度確かめ（ホバーで出るものが覆うことがある）、
+/// 断るときはカーソルを元の場所へ戻す。
+fn move_cursor(root: &str, p: POINT) -> Result<()> {
+    guard_input(root, &[p])?;
+    let back = cursor_pos()?;
+    set_cursor(p)?;
+    std::thread::sleep(Duration::from_millis(50));
+    guard_input(root, &[p]).inspect_err(|_| {
+        let _ = set_cursor(back);
+    })
+}
+
+fn drag(
+    root: &str,
+    from: (i32, i32),
+    to: (i32, i32),
+    button: Button,
+    with: Modifiers,
+) -> Result<()> {
+    let path: Vec<POINT> = input::drag_path(from, to, input::DRAG_STEPS)
+        .into_iter()
+        .map(|(x, y)| POINT { x, y })
+        .collect();
+    // 通る点すべての下を、カーソルを動かす前に確かめる
+    guard_input(root, &path)?;
+    move_cursor(root, path[0])?;
+    let held = modifier_strokes(with);
+    let (press, release) = held.split_at(held.len() / 2);
+    send_strokes(press);
+    let (down, up) = button_flags(button);
+    send_mouse(&[down]);
+    std::thread::sleep(Duration::from_millis(100));
+    for &p in &path[1..] {
+        let _ = set_cursor(p);
+        // 動いたことを伝える（SetCursorPos だけでは WM_MOUSEMOVE が遅れることがある）
+        send_inputs(&[mouse_input(MOUSEEVENTF_MOVE, 0)]);
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    send_mouse(&[up]);
+    send_strokes(release);
+    Ok(())
+}
+
+/// 修飾キーだけを押して離す順（`Chord::strokes` から、修飾キーでないキーを除いたもの）。
+fn modifier_strokes(m: Modifiers) -> Vec<KeyStroke> {
+    // 組み合わせにはキーが 1 つ要るので F24（0x87）を置き、押す前に取り除く
+    const F24: u16 = 0x87;
+    let chord = Chord {
+        modifiers: m,
+        key: shunsoku_core::keys::Key::from_vk(F24).expect("F24 は名前の表にある"),
+    };
+    chord
+        .strokes()
+        .into_iter()
+        .filter(|k| k.vk != F24)
+        .collect()
+}
+
+/// ホットキーを送る前の確かめ（`guard::check_hotkey`）。前面がテスト対象でもデスクトップ・タスクバーでもなければ、
+/// タスクバーを前面にしてからもう一度確かめる。
+fn guard_hotkey(root: &str) -> Result<()> {
+    let targets = targets(root);
+    if guard::check_hotkey(&targets, &seen(foreground())).is_ok() {
+        return Ok(());
+    }
+    if targets.is_empty() {
+        return guard::check_hotkey(&targets, &seen(foreground())).map_err(Failure::Refused);
+    }
+    // SAFETY: クラス名は 'static
+    if let Ok(taskbar) = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) } {
+        let _ = activate(taskbar);
+    }
+    guard::check_hotkey(&targets, &seen(foreground())).map_err(Failure::Refused)
 }
 
 fn send_inputs(inputs: &[INPUT]) {
@@ -975,35 +1142,23 @@ fn key_input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     }
 }
 
-fn send_chord(chord: Chord) {
-    let m = chord.modifiers;
-    let mut keys: Vec<u16> = [
-        (m.win, VK_LWIN),
-        (m.ctrl, VK_CONTROL),
-        (m.alt, VK_MENU),
-        (m.shift, VK_SHIFT),
-    ]
-    .into_iter()
-    .filter(|(on, _)| *on)
-    .map(|(_, vk)| vk.0)
-    .collect();
-    keys.push(chord.key.vk());
-    // 矢印・Home・End・PageUp/Down・Insert・Delete は拡張キー
-    let ext = |vk: u16| {
-        if (0x21..=0x2E).contains(&vk) {
-            KEYEVENTF_EXTENDEDKEY
-        } else {
-            KEYBD_EVENT_FLAGS(0)
-        }
-    };
-    let inputs: Vec<INPUT> = keys
+/// キーを押す・離す（順は `Chord::strokes`）。
+fn send_strokes(strokes: &[KeyStroke]) {
+    if strokes.is_empty() {
+        return;
+    }
+    let inputs: Vec<INPUT> = strokes
         .iter()
-        .map(|&vk| key_input(vk, 0, ext(vk)))
-        .chain(
-            keys.iter()
-                .rev()
-                .map(|&vk| key_input(vk, 0, ext(vk) | KEYEVENTF_KEYUP)),
-        )
+        .map(|k| {
+            let mut flags = KEYBD_EVENT_FLAGS(0);
+            if k.up {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            if k.extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            key_input(k.vk, 0, flags)
+        })
         .collect();
     send_inputs(&inputs);
 }
@@ -1015,21 +1170,30 @@ fn send_unicode(unit: u16) {
     ]);
 }
 
-fn send_click(button: Button) {
-    let (down, up) = match button {
-        Button::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-        Button::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-    };
-    let mouse = |flags: MOUSE_EVENT_FLAGS| INPUT {
+fn mouse_input(flags: MOUSE_EVENT_FLAGS, data: i32) -> INPUT {
+    INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
             mi: MOUSEINPUT {
                 dwFlags: flags,
+                mouseData: data as u32,
                 ..Default::default()
             },
         },
-    };
-    send_inputs(&[mouse(down), mouse(up)]);
+    }
+}
+
+fn button_flags(button: Button) -> (MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS) {
+    match button {
+        Button::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        Button::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        Button::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+    }
+}
+
+fn send_mouse(flags: &[MOUSE_EVENT_FLAGS]) {
+    let inputs: Vec<INPUT> = flags.iter().map(|&f| mouse_input(f, 0)).collect();
+    send_inputs(&inputs);
 }
 
 /// テスト対象のウィンドウを前面にする。前面のスレッドに入力をつないでから `SetForegroundWindow` する。
@@ -1064,28 +1228,45 @@ fn activate(h: HWND) -> Result<()> {
 /// テスト対象の通知領域のアイコンのメニューを開く。本体のメッセージ専用ウィンドウを前面にしてから、
 /// アイコンの右クリック（NOTIFYICON_VERSION_4 の `WM_CONTEXTMENU`）を本体に送る。
 fn tray_menu(root: &str, pid: u32) -> Result<()> {
-    if !targets(root).contains(&pid) {
-        return Err(Failure::Refused(format!(
-            "PID {pid} は自分が起動したプロセスでないのでメニューを開かない"
-        )));
-    }
-    let owner = message_windows()
-        .into_iter()
-        .find(|&h| pid_of(h) == pid)
-        .ok_or_else(|| failed("本体のウィンドウがない（まだトレイに出ていない？）"))?;
+    own(&targets(root), pid, "メニューを開か")?;
+    let owner = tray_owner(pid)?;
+    // メニューはアイコンの上に出す。アイコンがあふれた側に隠れていれば、カーソルの位置に出す
+    let (x, y) = match icon_rect(owner) {
+        Ok(r) => ((r.left + r.right) / 2, (r.top + r.bottom) / 2),
+        Err(_) => {
+            let p = cursor_pos()?;
+            (p.x, p.y)
+        }
+    };
+    let _ = activate(owner);
+    post_tray(owner, WM_CONTEXTMENU, x, y)?;
+    let menu = wait::wait_for(&mut RealClock::new(), Duration::from_secs(3), || {
+        top_windows()
+            .into_iter()
+            .find(|&h| class_of(h) == "#32768" && pid_of(h) == pid)
+    })
+    .map_err(timed_out("メニューが開かない"))?;
+    println!("menu {}", describe(menu));
+    dump_menu(HMENU(send(menu, MN_GETHMENU, 0, 0) as *mut c_void), 1);
+    Ok(())
+}
+
+/// テスト対象のアイコンの矩形。アイコンがあふれた側（`^` の中）に隠れていると、シェルは E_FAIL を返す。
+fn icon_rect(owner: HWND) -> windows::core::Result<RECT> {
     let id = NOTIFYICONIDENTIFIER {
         cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
         hWnd: owner,
-        uID: TRAY_ICON_ID,
+        uID: app_window::TRAY_ICON_ID,
         ..Default::default()
     };
     // SAFETY: 構造体は呼び出しの間生きている
-    let r = unsafe { Shell_NotifyIconGetRect(&id) }
-        .map_err(|e| failed(format!("通知領域のアイコンがない: {e}")))?;
-    let (x, y) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
-    let _ = activate(owner);
+    unsafe { Shell_NotifyIconGetRect(&id) }
+}
+
+/// シェルの代わりに、テスト対象の本体にトレイの通知（NOTIFYICON_VERSION_4 の形）を送る。
+fn post_tray(owner: HWND, code: u32, x: i32, y: i32) -> Result<()> {
     let wp = ((y as u32 & 0xFFFF) << 16) | (x as u32 & 0xFFFF);
-    let lp = WM_CONTEXTMENU | (TRAY_ICON_ID << 16);
+    let lp = code | (app_window::TRAY_ICON_ID << 16);
     // SAFETY: テスト対象のウィンドウに送る
     unsafe {
         PostMessageW(
@@ -1095,14 +1276,224 @@ fn tray_menu(root: &str, pid: u32) -> Result<()> {
             LPARAM(lp as isize),
         )
     }
+    .map_err(failed)
+}
+
+/// テスト対象の本体のメッセージ専用ウィンドウ（トレイのアイコンの持ち主）。
+fn tray_owner(pid: u32) -> Result<HWND> {
+    message_windows()
+        .into_iter()
+        .find(|&h| pid_of(h) == pid)
+        .ok_or_else(|| failed("本体のウィンドウがない（まだトレイに出ていない？）"))
+}
+
+/// テスト対象の通知領域のアイコンを、本当のクリックで左クリックする（シェルが本体に `NIN_SELECT` を送る）。
+/// クリックするのは、テスト対象のアイコンの矩形（`Shell_NotifyIconGetRect`）の中心で、その下が通知領域のときだけ。
+/// アイコンがあふれた側に隠れていれば、クリックせずに `NIN_SELECT` を本体に送る（出力の `posted` で分かる）。
+fn tray_click(root: &str, pid: u32) -> Result<()> {
+    own(&targets(root), pid, "クリックし")?;
+    let owner = tray_owner(pid)?;
+    let r = match icon_rect(owner) {
+        Ok(r) => r,
+        Err(e) => {
+            // あふれた側に隠れていてクリックできない。クリックせず、シェルが送るのと同じ通知を本体に送る
+            let p = cursor_pos()?;
+            post_tray(owner, NIN_SELECT, p.x, p.y)?;
+            println!(
+                "posted NIN_SELECT（アイコンが通知領域に出ていないのでクリックしていない: {e}）"
+            );
+            return Ok(());
+        }
+    };
+    let icon = IconRect {
+        left: r.left,
+        top: r.top,
+        right: r.right,
+        bottom: r.bottom,
+    };
+    let under_root = |x: i32, y: i32| {
+        // SAFETY: 問い合わせのみ
+        seen(unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) })
+    };
+    let center = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    let (x, y) = guard::tray_click_point(&icon, &under_root(center.0, center.1))
+        .map_err(Failure::Refused)?;
+    let back = cursor_pos()?;
+    set_cursor(POINT { x, y })?;
+    std::thread::sleep(Duration::from_millis(50));
+    // 動かした後に、アイコンの上がまだ通知領域か確かめる。違えば戻す
+    if let Err(m) = guard::tray_click_point(&icon, &under_root(x, y)) {
+        let _ = set_cursor(back);
+        return Err(Failure::Refused(m));
+    }
+    send_mouse(&[MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]);
+    println!(
+        "clicked {x},{y} icon={},{},{},{}",
+        r.left, r.top, r.right, r.bottom
+    );
+    Ok(())
+}
+
+// --- クリップボード ---
+
+const CF_UNICODETEXT: u32 = 13;
+const CF_DIB: u32 = 8;
+
+/// クリップボードの形式の名前。標準の形式は表から、登録された形式は `GetClipboardFormatNameW` で読む。
+fn format_name(format: u32) -> String {
+    let known = match format {
+        1 => Some("CF_TEXT"),
+        2 => Some("CF_BITMAP"),
+        7 => Some("CF_OEMTEXT"),
+        CF_DIB => Some("CF_DIB"),
+        CF_UNICODETEXT => Some("CF_UNICODETEXT"),
+        15 => Some("CF_HDROP"),
+        16 => Some("CF_LOCALE"),
+        17 => Some("CF_DIBV5"),
+        _ => None,
+    };
+    if let Some(name) = known {
+        return name.into();
+    }
+    let mut buf = [0u16; 256];
+    // SAFETY: バッファは呼び出しの間生きている
+    let n = unsafe { GetClipboardFormatNameW(format, &mut buf) };
+    if n > 0 {
+        String::from_utf16_lossy(&buf[..n as usize])
+    } else {
+        format!("#{format}")
+    }
+}
+
+/// クリップボードを開いている間。ほかのプロセスが開いていれば、少し待つ。
+struct Clipboard;
+
+impl Clipboard {
+    fn open(owner: Option<HWND>) -> Result<Clipboard> {
+        wait::wait_for(&mut RealClock::new(), Duration::from_secs(1), || {
+            // SAFETY: 開いたら Drop で閉じる
+            unsafe { OpenClipboard(owner) }.ok()
+        })
+        .map_err(timed_out("クリップボードを開けない"))?;
+        Ok(Clipboard)
+    }
+}
+
+impl Drop for Clipboard {
+    fn drop(&mut self) {
+        // SAFETY: open で開いた
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+/// 形式の一覧と、文字・画像の大きさを出す。
+fn clip_get() -> Result<()> {
+    let _open = Clipboard::open(None)?;
+    let mut formats = Vec::new();
+    let mut f = 0;
+    loop {
+        // SAFETY: 開いている間の問い合わせ
+        f = unsafe { EnumClipboardFormats(f) };
+        if f == 0 {
+            break;
+        }
+        formats.push(f);
+    }
+    let names: Vec<String> = formats.iter().map(|&f| format_name(f)).collect();
+    println!("formats {}", names.join(","));
+    if formats.contains(&CF_UNICODETEXT) {
+        let text = with_global(CF_UNICODETEXT, |bytes| {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .take_while(|&u| u != 0)
+                .collect();
+            String::from_utf16_lossy(&units)
+        })?;
+        println!("text \"{}\"", text.replace("\r\n", "\\n"));
+    }
+    if formats.contains(&CF_DIB) {
+        // BITMAPINFOHEADER の biWidth（4 バイト目から）と biHeight（8 バイト目から。負なら上から下）
+        let (w, h) = with_global(CF_DIB, |b| {
+            let at = |i: usize| {
+                b.get(i..i + 4)
+                    .map_or(0, |s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+            };
+            (at(4), at(8).abs())
+        })?;
+        println!("image {w}x{h}");
+    }
+    Ok(())
+}
+
+/// 開いているクリップボードの `format` のデータを読む。
+fn with_global<T>(format: u32, read: impl FnOnce(&[u8]) -> T) -> Result<T> {
+    // SAFETY: 開いている間に取り出し、ロックしている間だけ、ロックした大きさの分だけ読む
+    unsafe {
+        let h = GetClipboardData(format).map_err(failed)?;
+        let g = HGLOBAL(h.0);
+        let ptr = GlobalLock(g);
+        if ptr.is_null() {
+            return Err(failed("クリップボードのデータを読めない"));
+        }
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, GlobalSize(g));
+        let value = read(bytes);
+        let _ = GlobalUnlock(g);
+        Ok(value)
+    }
+}
+
+/// クリップボードに文字を入れる。持ち主のウィンドウがないと `SetClipboardData` が失敗するので、
+/// メッセージ専用のウィンドウを作って持ち主にする（データは道具が終わっても残る）。
+fn clip_set(text: &str) -> Result<()> {
+    let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    // SAFETY: 自分のメッセージ専用のウィンドウを作る。終わったら壊す
+    let owner = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            None,
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            None,
+            None,
+        )
+    }
     .map_err(failed)?;
-    let menu = wait::wait_for(&mut RealClock::new(), Duration::from_secs(3), || {
-        top_windows()
-            .into_iter()
-            .find(|&h| class_of(h) == "#32768" && pid_of(h) == pid)
-    })
-    .map_err(timed_out("メニューが開かない"))?;
-    println!("menu {}", describe(menu));
-    dump_menu(HMENU(send(menu, MN_GETHMENU, 0, 0) as *mut c_void), 1);
+    let result = put_text(owner, &wide);
+    // SAFETY: 作ったウィンドウ
+    unsafe {
+        let _ = DestroyWindow(owner);
+    }
+    result?;
+    println!("set {} 文字", text.chars().count());
+    Ok(())
+}
+
+fn put_text(owner: HWND, wide: &[u16]) -> Result<()> {
+    let _open = Clipboard::open(Some(owner))?;
+    // SAFETY: 開いている間に空にし、取ったメモリに文字を写して渡す。渡したメモリはシステムのものになる
+    unsafe {
+        EmptyClipboard().map_err(failed)?;
+        let g = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).map_err(failed)?;
+        let ptr = GlobalLock(g);
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(g));
+            return Err(failed("メモリをロックできない"));
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr as *mut u16, wide.len());
+        let _ = GlobalUnlock(g);
+        if let Err(e) = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(g.0))) {
+            let _ = GlobalFree(Some(g));
+            return Err(failed(e));
+        }
+    }
     Ok(())
 }
