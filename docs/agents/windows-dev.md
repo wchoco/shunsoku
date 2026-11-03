@@ -43,6 +43,22 @@ scripts/win-screenshot.sh <out.png> [x y width height]   # 範囲は仮想スク
 - 出力は scratchpad に置く。リポジトリには入れない。
 - スクラップを出す・ドラッグするなどの操作は `SendInput` で送る。手本は `tools/perf-harness/src/measure.rs` の `drag` と `send_hotkey`。
 
+## 5. 実機を道具で操作する（手動確認）
+
+`docs/manual-checks.md` の項目を実機で確かめるときは、`tools/win-driver` を通して起動・入力・読み取りをする。安全の決まりと結果の書き方は [manual-check.md](manual-check.md)。
+
+```sh
+scripts/win-driver.sh build                                   # -> %USERPROFILE%\shunsoku-build\<worktree 名>\win-driver.exe
+export DRV_ROOT='C:\Users\<you>\shunsoku-build\check-m5'      # テスト用のフォルダ（Windows のパス）
+scripts/win-driver.sh launch '<shunsoku.exe のパス>'          # テスト用の環境を付けて起動し、PID を出す
+scripts/win-driver.sh wait-window --pid <PID> --class '#32770'
+scripts/win-driver.sh kids <hwnd>                             # コントロールの ID・文字・状態
+scripts/win-driver.sh --help                                  # コマンドの一覧
+```
+
+- 終了コードは 0 成功、1 失敗・時間切れ、2 使い方の誤り、3 安全の決まりで止めた（前面がテスト対象でない、自分の PID でない）。
+- `DRV_ROOT` は確認ごとに分ける。フォルダ名が多重起動の判定の名前と Run キーの値の名前（`shunsoku-test-<フォルダ名>`）になる。
+
 ## Win32 の落とし穴
 
 実装で踏んだもの。該当する API を触るときに読む。

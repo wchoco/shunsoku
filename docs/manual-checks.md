@@ -11,6 +11,7 @@
   - 値: ファイル、ログ、レジストリ、終了コード、コントロールの文字や大きさで判定できる。
   - 目視: 画像を見ないと判定できない。ぼやけ、ちらつき、枠の見た目、スクラップに描かれたものなど。
   - 人: エージェントには操作できない。サインインのし直し、通知のクリック、IME、UAC、モニタの抜き差しや並び替え、HDR、別の PC など。人が確かめる。
+- エージェントが確かめるときは、`tools/win-driver` を通して操作し、[docs/agents/manual-check.md](agents/manual-check.md) の決まり（安全、結果の書き方、判定の仕方）に従う。
 - 確かめる exe: リリースの workflow が作った zip を展開したもの（M5-18、M5-19）。
 - 番号は `<マイルストーン>-<spec の番号>`。手順と期待する結果は、各 spec の表のまま写した。後のマイルストーンで振る舞いが変わった項目は、表の後の「置き換わった項目」に書いた。そちらを優先する。
 - 出典: M1 [#32](https://github.com/wchoco/shunsoku/issues/32)、M2 [#33](https://github.com/wchoco/shunsoku/issues/33)、M3 [#34](https://github.com/wchoco/shunsoku/issues/34)、M4 [#35](https://github.com/wchoco/shunsoku/issues/35)、M5 [#36](https://github.com/wchoco/shunsoku/issues/36)。
