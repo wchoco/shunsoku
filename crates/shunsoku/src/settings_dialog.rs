@@ -28,10 +28,11 @@ use std::thread::LocalKey;
 use shunsoku_core::monitors::Monitor;
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::Editor;
-use shunsoku_core::settings::gui::TabStep;
+use shunsoku_core::settings::tab_step::TabStep;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
 use windows::Win32::UI::Controls::{
     EnableThemeDialogTexture, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
     ICC_TAB_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, TCIF_TEXT,
@@ -40,11 +41,12 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateDialogIndirectParamW, DLGPROC, DLGTEMPLATE, DS_CENTER,
-    DS_MODALFRAME, DS_SETFONT, EnumChildWindows, GWLP_ID, GetDlgItem, GetWindowLongPtrW, IDCANCEL,
-    IDOK, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SendMessageW, SetDlgItemTextW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
-    WS_GROUP, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    DS_MODALFRAME, DS_SETFONT, EnumChildWindows, GWLP_ID, GetDlgItem, GetNextDlgTabItem, GetParent,
+    GetWindowLongPtrW, IDCANCEL, IDOK, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetDlgItemTextW, SetWindowPos, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_APPWINDOW,
+    WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_GROUP, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -55,9 +57,9 @@ pub use fields::Fields;
 pub const ID_APPLY: i32 = 10;
 /// タブ。
 pub const ID_TAB: i32 = 100;
-/// ページの Static の書式: 左寄せ（`SS_LEFT` = 0）で、`&` を下線の印にしない（`SS_NOPREFIX` = 0x80）。
+/// ページの Static の書式: 左寄せ（`SS_LEFT`）で、`&` を下線の印にしない（`SS_NOPREFIX`）。
 /// 定型領域の名前やモニタの ID、ファイル名の例のように、ユーザーや OS から来た文字列もそのまま出すため。
-const STATIC_TEXT: WINDOW_STYLE = WINDOW_STYLE(0x80);
+const STATIC_TEXT: WINDOW_STYLE = WINDOW_STYLE(SS_LEFT.0 | SS_NOPREFIX.0);
 /// ダイアログの背景をタブの中の色で塗る（`ETDT_ENABLE | ETDT_USETABTEXTURE`）。ページの Static の背景がタブと揃う。
 const ETDT_ENABLETAB: u32 = 6;
 /// ページのコントロールの ID の帯。
@@ -370,9 +372,36 @@ pub fn step_page(hwnd: HWND, step: TabStep) {
         .iter()
         .position(|def| def.page == current)
         .unwrap_or(0);
-    if let Some(def) = PAGES.get(step.from(index, PAGES.len())) {
+    if let Some(def) = PAGES.get(step.next_index(index, PAGES.len())) {
         show_page(hwnd, def.page);
     }
+}
+
+/// `control`（ダイアログ `hwnd` の子孫）が、どれかのページのコントロールか（タブの見出しや OK などではない）。
+pub fn in_page(hwnd: HWND, control: HWND) -> bool {
+    let mut child = control;
+    // ダイアログの直の子までさかのぼる（ドロップダウンの中のエディットなど）
+    loop {
+        // SAFETY: ウィンドウの親を読むだけ
+        let parent = unsafe { GetParent(child) };
+        match parent {
+            Ok(parent) if parent == hwnd => break,
+            Ok(parent) if !parent.is_invalid() => child = parent,
+            _ => return false,
+        }
+    }
+    // SAFETY: 子ウィンドウの ID を読む
+    let id = unsafe { GetWindowLongPtrW(child, GWLP_ID) } as i32;
+    (PAGE_ID_FIRST..PAGE_ID_FIRST + PAGES.len() as i32 * PAGE_ID_SPAN).contains(&id)
+}
+
+/// 出しているページの最初の欄（Tab で最初に止まるコントロール）。ページに止まる欄がなければ None。
+pub fn first_field(hwnd: HWND) -> Option<HWND> {
+    let tab = item(hwnd, ID_TAB)?;
+    // タブは Z 順の最後なので、その次はページの最初のコントロールに回る。隠れたページと使えない欄は飛ばされる
+    // SAFETY: 自分のダイアログとその子
+    let next = unsafe { GetNextDlgTabItem(hwnd, Some(tab), false) }.ok()?;
+    in_page(hwnd, next).then_some(next)
 }
 
 /// `page` のタブを選び、そのページのコントロールだけを出す。

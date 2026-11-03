@@ -81,11 +81,12 @@ use crate::keys::Chord;
 use crate::scrap::ops::{MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, Shortcuts};
 use crate::selection::Mode;
 
+pub mod columns;
 pub mod editor;
 pub mod form;
-pub mod gui;
 mod location;
 pub mod merge;
+pub mod tab_step;
 pub mod unset;
 mod write;
 mod write_failure;
