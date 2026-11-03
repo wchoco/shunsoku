@@ -797,6 +797,9 @@ fn draw_trim_overlay(
     image_rect: Rect,
     trim: &TrimOverlay,
 ) -> Result<()> {
+    // 範囲の縁の線、十字線、つまみの縁取りは、DPI によらず物理ピクセルで 1px にする（範囲選択の画面の精密
+    // モードと同じ）。画素の境目を指す細い線なので、太らせると選んでいる画素が隠れる。つまみの大きさは core が
+    // DPI で換算して渡す
     let selection = trim.selection.and_then(|r| r.intersect(&image_rect));
     // SAFETY: BeginDraw と EndDraw の間で呼ぶ
     unsafe {
