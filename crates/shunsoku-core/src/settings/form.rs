@@ -156,6 +156,21 @@ impl HotkeyPause {
     }
 }
 
+/// 設定 GUI で、コントロールが自分では受けないクリックの場所（ダイアログかタブに届く）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickPlace {
+    /// ダイアログの地・ラベル・タブのページの地。
+    Background,
+    /// タブの見出し（タブが自分でフォーカスを取る）。
+    TabHeader,
+}
+
+/// `place` をクリックしたら、キーの組み合わせの欄からフォーカスを外して、どの部品も選ばれていない状態にするか
+/// （#118）。`in_chord_field` はいまフォーカスが欄にあるか。外れれば、`HotkeyPause` がホットキーを登録し直す。
+pub fn click_blurs(in_chord_field: bool, place: ClickPlace) -> bool {
+    in_chord_field && place == ClickPlace::Background
+}
+
 /// 定型領域の一覧の、範囲の絵（モニタの中のどこか）。座標は絵の左上からのピクセル。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thumbnail {
@@ -239,6 +254,23 @@ mod tests {
         pause.focus_changed(true);
         assert_eq!(pause.closed(), Some(PauseChange::Resume));
         assert!(!pause.is_paused());
+    }
+
+    #[test]
+    fn clicking_the_background_takes_focus_off_a_chord_field_and_hotkeys_resume() {
+        // 背景・ラベル・タブのページの地をクリックしたら外す
+        assert!(click_blurs(true, ClickPlace::Background));
+        let mut pause = HotkeyPause::default();
+        pause.focus_changed(true);
+        assert_eq!(pause.focus_changed(false), Some(PauseChange::Resume));
+    }
+
+    #[test]
+    fn clicking_a_tab_or_with_focus_elsewhere_leaves_focus_as_it_is() {
+        // タブの見出しはタブが自分でフォーカスを取る。ほかの欄にフォーカスがあれば今のまま
+        assert!(!click_blurs(true, ClickPlace::TabHeader));
+        assert!(!click_blurs(false, ClickPlace::Background));
+        assert!(!click_blurs(false, ClickPlace::TabHeader));
     }
 
     #[test]
