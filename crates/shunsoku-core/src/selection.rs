@@ -15,6 +15,8 @@
 //! - 矢印で動かすカーソルは、どれかのモニタの画素に留める（隙間や画面の外には出ない）。
 //! - ウィンドウの一覧（`WindowInfo`）も Win32 層が集めて渡す。`Shift` を押している間はカーソルの下の
 //!   ウィンドウ（`Ctrl` も押していれば部品）をハイライトし、クリックか `Enter` でそれを選ぶ（`chosen_window`）。
+//! - ハイライトのないまま動かさずにクリックしたら（モードによらず）、`Esc` と同じく中止する。
+//!   定型領域の登録では中止せず、何も選んでいない状態に戻す。
 //! - 定型領域の登録（`registering`）は常に精密モードで、`Tab` は効かない。範囲は 1 枚のモニタの中に限り、
 //!   ウィンドウを選んだら、その矩形をモニタの中に切り詰めて調整に入る。
 
@@ -393,10 +395,14 @@ impl Selection {
                 if self.state == State::Selecting {
                     if self.anchor == Some(at) {
                         // 動かさずに離した（クリック）。ハイライトしていればそのウィンドウを撮り、
-                        // していなければ何も選ばなかったことにする
+                        // していなければ取りやめる（定型領域の登録では選び直す）
                         let highlight = self.highlight();
                         self.reset();
-                        self.choose_window(highlight);
+                        if highlight.is_some() {
+                            self.choose_window(highlight);
+                        } else if !self.registering {
+                            self.state = State::Cancelled;
+                        }
                     } else {
                         self.decide();
                     }
@@ -914,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn a_click_without_dragging_does_nothing() {
+    fn a_click_without_dragging_cancels() {
         let mut s = one_monitor();
         s.handle(Input::Press {
             button: Button::Left,
@@ -924,8 +930,17 @@ mod tests {
             button: Button::Left,
             at: p(10, 20),
         });
-        assert_eq!(state, State::Idle);
-        assert_eq!(s.rect(), None);
+        assert_eq!(state, State::Cancelled);
+        assert_eq!(s.chosen_window(), None);
+    }
+
+    #[test]
+    fn space_twice_on_the_same_pixel_confirms_a_one_pixel_range() {
+        let mut s = one_monitor();
+        s.handle(Input::Move { at: p(10, 20) });
+        s.handle(Input::Space);
+        assert_eq!(s.handle(Input::Space), State::Confirmed);
+        assert_eq!(s.rect(), Some(Rect::new(10, 20, 11, 21)));
     }
 
     fn start_drag(s: &mut Selection) {
@@ -1420,10 +1435,25 @@ mod tests {
     }
 
     #[test]
-    fn a_click_outside_the_range_leaves_nothing_selected() {
+    fn a_click_without_dragging_in_precise_mode_cancels() {
+        let mut s = precise();
+        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Cancelled);
+    }
+
+    #[test]
+    fn a_click_outside_the_adjusted_range_cancels() {
         let mut s = adjusting();
-        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Idle);
-        assert_eq!(s.rect(), None);
+        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Cancelled);
+    }
+
+    #[test]
+    fn a_one_pixel_range_in_precise_mode_is_confirmed_with_enter() {
+        let mut s = precise();
+        s.handle(Input::Move { at: p(10, 20) });
+        s.handle(Input::Space);
+        assert_eq!(s.handle(Input::Space), State::Adjusting);
+        assert_eq!(s.handle(Input::Enter), State::Confirmed);
+        assert_eq!(s.rect(), Some(Rect::new(10, 20, 11, 21)));
     }
 
     #[test]
@@ -1595,6 +1625,13 @@ mod tests {
             p(0, 0),
         )
         .registering()
+    }
+
+    #[test]
+    fn a_click_without_dragging_while_registering_starts_over_instead_of_cancelling() {
+        let mut s = registering();
+        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Idle);
+        assert_eq!(s.rect(), None);
     }
 
     #[test]

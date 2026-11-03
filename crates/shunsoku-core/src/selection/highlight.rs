@@ -311,7 +311,8 @@ mod tests {
         let mut s = window_with_parts(p(500, 400));
         assert_eq!(s.handle(Input::Enter), State::Idle);
         s.handle(press(p(500, 400)));
-        assert_eq!(s.handle(release(p(500, 400))), State::Idle);
+        // ハイライトのないクリックは取りやめになる
+        assert_eq!(s.handle(release(p(500, 400))), State::Cancelled);
         assert_eq!(s.chosen_window(), None);
     }
 
@@ -329,15 +330,15 @@ mod tests {
     }
 
     #[test]
-    fn a_click_with_shift_where_no_window_is_highlighted_does_nothing() {
+    fn a_click_with_shift_where_no_window_is_highlighted_cancels() {
         let mut s = screen(
             vec![window(1, Rect::new(100, 100, 500, 500), "ビューア")],
             p(800, 800),
         );
         s.handle(shift());
         s.handle(press(p(800, 800)));
-        assert_eq!(s.handle(release(p(800, 800))), State::Idle);
-        assert_eq!(s.handle(Input::Enter), State::Idle);
+        assert_eq!(s.handle(release(p(800, 800))), State::Cancelled);
+        assert_eq!(s.chosen_window(), None);
     }
 
     #[test]
