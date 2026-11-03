@@ -36,7 +36,7 @@ use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::monitors;
 use shunsoku_core::settings::editor::{Editor, Move};
-use shunsoku_core::settings::form::{FieldEntry, PauseChange};
+use shunsoku_core::settings::form::{ClickPlace, FieldEntry, PauseChange};
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::tab_step::{StepFocus, TabStep};
 use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
@@ -56,7 +56,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_OKCANCEL, MSG, MessageBoxW, PostMessageW, PostQuitMessage, SW_HIDE, SW_RESTORE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
+    WM_DPICHANGED, WM_INITDIALOG, WM_LBUTTONDOWN, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETFOCUS,
+    WM_SETTINGCHANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetDlgCtrlID, IsChild, WM_KEYDOWN};
 use windows::core::{BOOL, PCWSTR};
@@ -452,6 +453,13 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
             check_focus();
             true
         }
+        // 欄の外のクリックで、欄からフォーカスを外す（#118）。ページの中のクリックはタブが拾う
+        WM_LBUTTONDOWN => {
+            settings_dialog::blur_on_click(hwnd, ClickPlace::Background);
+            false
+        }
+        // 外したフォーカスを、ダイアログの既定の処理で欄へ戻させない
+        WM_SETFOCUS => settings_dialog::blurring(),
         WM_DPICHANGED => {
             // ダイアログが大きさと書体を直し終えてから、一覧の列の幅を合わせ直す
             // SAFETY: 自分のダイアログに送る

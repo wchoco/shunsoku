@@ -21,19 +21,15 @@ pub struct Tray {
     tooltip: String,
 }
 
-/// トレイのアイコンへの操作（`callback_message` の wParam/lParam を読んだもの）。
-pub enum Event {
-    /// 左クリック、または選んで Enter / Space。
-    Select,
-    /// 右クリック、またはキーボードでのメニュー。座標はスクリーン座標（物理ピクセル）。
-    ContextMenu {
-        x: i32,
-        y: i32,
-    },
-    /// 通知（`notify`）がクリックされた。何の通知だったかは持たない。
-    NotificationClick,
-    Other,
-}
+pub use shunsoku_core::tray::Event;
+
+// core は Win32 の定数を自分で持つ。windows クレートの値とずれていないことを組むときに確かめる
+const _: () = {
+    assert!(shunsoku_core::tray::NIN_SELECT == NIN_SELECT);
+    assert!(shunsoku_core::tray::NINF_KEY == NINF_KEY);
+    assert!(shunsoku_core::tray::NIN_BALLOONUSERCLICK == NIN_BALLOONUSERCLICK);
+    assert!(shunsoku_core::tray::WM_CONTEXTMENU == WM_CONTEXTMENU);
+};
 
 impl Tray {
     /// まだ登録はしない。`register` で登録する。
@@ -87,17 +83,5 @@ fn base(hwnd: HWND) -> NOTIFYICONDATAW {
 /// `callback_message` の引数を読む。
 pub fn event(wparam: WPARAM, lparam: LPARAM) -> Event {
     // v4: lParam の下位がイベント、上位がアイコンの番号。wParam が座標
-    let code = (lparam.0 & 0xFFFF) as u32;
-    if code == NIN_SELECT || code == NIN_SELECT | NINF_KEY {
-        Event::Select
-    } else if code == WM_CONTEXTMENU {
-        Event::ContextMenu {
-            x: (wparam.0 & 0xFFFF) as u16 as i16 as i32,
-            y: ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32,
-        }
-    } else if code == NIN_BALLOONUSERCLICK {
-        Event::NotificationClick
-    } else {
-        Event::Other
-    }
+    shunsoku_core::tray::event((lparam.0 & 0xFFFF) as u32, wparam.0)
 }

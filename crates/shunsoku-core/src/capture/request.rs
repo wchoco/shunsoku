@@ -20,8 +20,6 @@ use crate::settings::Region;
 pub enum Source {
     /// 範囲選択キャプチャのホットキー。
     Hotkey,
-    /// トレイのアイコンの左クリック（またはキーボードで選んで Enter / Space）。
-    TrayClick,
     /// トレイのメニューの「範囲選択キャプチャ」。
     TrayMenu,
     /// アクティブウィンドウのキャプチャのホットキー。
@@ -141,9 +139,7 @@ impl CaptureRequest {
     /// 発生源から依頼を作る。
     pub fn from_source(source: Source) -> CaptureRequest {
         match source {
-            Source::Hotkey | Source::TrayClick | Source::TrayMenu => {
-                CaptureRequest::scrap(CaptureMethod::Select)
-            }
+            Source::Hotkey | Source::TrayMenu => CaptureRequest::scrap(CaptureMethod::Select),
             Source::ActiveWindowHotkey => CaptureRequest::scrap(CaptureMethod::ActiveWindow),
             Source::AddRegion => CaptureRequest {
                 outputs: Outputs {
@@ -330,12 +326,6 @@ mod tests {
             notify: true,
             reply: None,
         }
-    }
-
-    #[test]
-    fn tray_click_requests_a_select_capture_shown_as_a_focused_scrap() {
-        let request = CaptureRequest::from_source(Source::TrayClick);
-        assert_eq!(request, select_capture());
     }
 
     #[test]
@@ -558,7 +548,7 @@ mod tests {
 
     #[test]
     fn hotkey_and_tray_requests_expect_no_reply() {
-        for source in [Source::Hotkey, Source::TrayClick, Source::TrayMenu] {
+        for source in [Source::Hotkey, Source::TrayMenu] {
             assert_eq!(CaptureRequest::from_source(source).reply, None);
         }
     }
@@ -635,7 +625,7 @@ mod tests {
                 .registers_region()
         );
         assert!(
-            !CaptureRequest::from_source(Source::TrayClick)
+            !CaptureRequest::from_source(Source::TrayMenu)
                 .method
                 .registers_region()
         );
@@ -690,7 +680,7 @@ mod tests {
             Some("dash")
         );
         assert_eq!(
-            CaptureRequest::from_source(Source::TrayClick).region_name(),
+            CaptureRequest::from_source(Source::TrayMenu).region_name(),
             None
         );
         assert_eq!(CaptureRequest::reselect_region(0).region_name(), None);
@@ -710,7 +700,7 @@ mod tests {
         );
         assert_eq!(request.region_to_capture(&[other]), None);
         assert_eq!(
-            CaptureRequest::from_source(Source::TrayClick).region_to_capture(&[region(true, true)]),
+            CaptureRequest::from_source(Source::TrayMenu).region_to_capture(&[region(true, true)]),
             None
         );
     }
