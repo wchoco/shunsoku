@@ -38,7 +38,7 @@ use shunsoku_core::monitors;
 use shunsoku_core::settings::editor::{Editor, Move};
 use shunsoku_core::settings::form::{FieldEntry, PauseChange};
 use shunsoku_core::settings::merge::{Field, merge};
-use shunsoku_core::settings::tab_step::TabStep;
+use shunsoku_core::settings::tab_step::{StepFocus, TabStep};
 use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -140,9 +140,17 @@ pub(super) fn is_dialog_message(msg: &MSG) -> bool {
         && msg.message == WM_KEYDOWN
         && let Some(step) = TabStep::from_key_down(msg.wParam.0 as u16, chord_field::held())
     {
+        // SAFETY: フォーカスのあるウィンドウを読むだけ
+        let focus = unsafe { GetFocus() };
+        let in_page = settings_dialog::in_page(dialog, focus);
         settings_dialog::step_page(dialog, step);
-        // 隠したページの欄にフォーカスを残さない（タブを押したときと同じくタブに置く）
-        set_focus(dialog, ID_TAB);
+        // 標準のプロパティシートと同じく、欄にいたら新しいページの最初の欄へ移す（隠したページに残さない）
+        if StepFocus::after(in_page) == StepFocus::FirstField {
+            match settings_dialog::first_field(dialog) {
+                Some(field) => focus_control(dialog, field),
+                None => set_focus(dialog, ID_TAB),
+            }
+        }
         return true;
     }
     // SAFETY: msg はこの呼び出しの間生きている
@@ -286,15 +294,20 @@ fn field_of(gui: &SettingsGui, item: &SettingsItem) -> Option<i32> {
 /// ダイアログの中の ID `id` のコントロールにフォーカスを置く。
 fn set_focus(hwnd: HWND, id: i32) {
     if let Some(control) = settings_dialog::item(hwnd, id) {
-        // SAFETY: 自分のダイアログと、その子のコントロール
-        unsafe {
-            SendMessageW(
-                hwnd,
-                WM_NEXTDLGCTL,
-                Some(WPARAM(control.0 as usize)),
-                Some(LPARAM(1)),
-            );
-        }
+        focus_control(hwnd, control);
+    }
+}
+
+/// ダイアログ `hwnd` のコントロール `control` にフォーカスを移す（既定のボタンの印もダイアログに直させる）。
+fn focus_control(hwnd: HWND, control: HWND) {
+    // SAFETY: 自分のダイアログと、その子のコントロール
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_NEXTDLGCTL,
+            Some(WPARAM(control.0 as usize)),
+            Some(LPARAM(1)),
+        );
     }
 }
 

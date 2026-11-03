@@ -41,11 +41,12 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateDialogIndirectParamW, DLGPROC, DLGTEMPLATE, DS_CENTER,
-    DS_MODALFRAME, DS_SETFONT, EnumChildWindows, GWLP_ID, GetDlgItem, GetWindowLongPtrW, IDCANCEL,
-    IDOK, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SendMessageW, SetDlgItemTextW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
-    WS_GROUP, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    DS_MODALFRAME, DS_SETFONT, EnumChildWindows, GWLP_ID, GetDlgItem, GetNextDlgTabItem, GetParent,
+    GetWindowLongPtrW, IDCANCEL, IDOK, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetDlgItemTextW, SetWindowPos, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_APPWINDOW,
+    WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_GROUP, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -374,6 +375,33 @@ pub fn step_page(hwnd: HWND, step: TabStep) {
     if let Some(def) = PAGES.get(step.next_index(index, PAGES.len())) {
         show_page(hwnd, def.page);
     }
+}
+
+/// `control`（ダイアログ `hwnd` の子孫）が、どれかのページのコントロールか（タブの見出しや OK などではない）。
+pub fn in_page(hwnd: HWND, control: HWND) -> bool {
+    let mut child = control;
+    // ダイアログの直の子までさかのぼる（ドロップダウンの中のエディットなど）
+    loop {
+        // SAFETY: ウィンドウの親を読むだけ
+        let parent = unsafe { GetParent(child) };
+        match parent {
+            Ok(parent) if parent == hwnd => break,
+            Ok(parent) if !parent.is_invalid() => child = parent,
+            _ => return false,
+        }
+    }
+    // SAFETY: 子ウィンドウの ID を読む
+    let id = unsafe { GetWindowLongPtrW(child, GWLP_ID) } as i32;
+    (PAGE_ID_FIRST..PAGE_ID_FIRST + PAGES.len() as i32 * PAGE_ID_SPAN).contains(&id)
+}
+
+/// 出しているページの最初の欄（Tab で最初に止まるコントロール）。ページに止まる欄がなければ None。
+pub fn first_field(hwnd: HWND) -> Option<HWND> {
+    let tab = item(hwnd, ID_TAB)?;
+    // タブは Z 順の最後なので、その次はページの最初のコントロールに回る。隠れたページと使えない欄は飛ばされる
+    // SAFETY: 自分のダイアログとその子
+    let next = unsafe { GetNextDlgTabItem(hwnd, Some(tab), false) }.ok()?;
+    in_page(hwnd, next).then_some(next)
 }
 
 /// `page` のタブを選び、そのページのコントロールだけを出す。

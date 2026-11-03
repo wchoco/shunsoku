@@ -34,6 +34,28 @@ impl TabStep {
     }
 }
 
+/// Ctrl+Tab / Ctrl+Shift+Tab でタブを移したあと、フォーカスを置く先。標準のプロパティシートに合わせる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepFocus {
+    /// 新しいページの最初の欄へ移す。
+    FirstField,
+    /// 今の場所（タブの見出しか、OK などページの外のボタン）のまま。
+    Stay,
+}
+
+impl StepFocus {
+    /// 移す前にフォーカスがページの中（欄やページのボタン）にあったか（`in_page`）から決める。ページの中に
+    /// いたら、隠れるページにフォーカスを残さず、新しいページの最初の欄へ移す。タブの見出しや、どのページでも
+    /// 見えている OK・キャンセル・適用にいたら、そのままにする。
+    pub fn after(in_page: bool) -> StepFocus {
+        if in_page {
+            StepFocus::FirstField
+        } else {
+            StepFocus::Stay
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +106,16 @@ mod tests {
             shift: false,
         };
         assert_eq!(TabStep::from_key_down(VK_TAB, win), None);
+    }
+
+    #[test]
+    fn after_stepping_from_a_field_the_focus_goes_to_the_first_field_of_the_new_page() {
+        assert_eq!(StepFocus::after(true), StepFocus::FirstField);
+    }
+
+    #[test]
+    fn after_stepping_from_the_tabs_or_the_dialog_buttons_the_focus_stays() {
+        assert_eq!(StepFocus::after(false), StepFocus::Stay);
     }
 
     #[test]
