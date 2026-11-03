@@ -93,6 +93,7 @@ mode = "Default selection mode:"
 mode_normal = "Normal (release to capture)"
 mode_precise = "Precise (adjust, then capture)"
 crosshair = "Show a crosshair when selecting"
+crosshair_color = "Crosshair color:"
 hint = "Select a field and press keys to assign them. Tab moves to the next field."
 
 [settings_gui.regions]

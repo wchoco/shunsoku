@@ -3186,6 +3186,7 @@ fn open_overlay() {
                 .with_mode(app.settings.selection.mode)
                 .with_crosshair(app.settings.selection.crosshair);
             let mut overlay = overlay;
+            overlay.set_crosshair_color(app.settings.selection.crosshair_color);
             if request.method.registers_region() {
                 // 定型領域の登録は常に精密モードで、画面の上端に登録だと出す
                 selection = selection.registering();
