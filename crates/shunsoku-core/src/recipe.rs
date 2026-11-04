@@ -69,7 +69,8 @@ pub struct AppearanceValues {
     pub border: Option<bool>,
     /// 枠の色。書けば枠も出す。
     pub border_color: Option<Rgb>,
-    /// 枠の太さ（物理ピクセル、`settings::BORDER_WIDTH_RANGE`）。書けば枠も出す。
+    /// 枠の太さ（物理ピクセル、`settings::BORDER_WIDTH_RANGE`）。書けば枠も出す。キーと値は `[scrap] border_width`
+    /// と同じで、物理ピクセルのまま持つわけも同じ（`AppearanceOverrides::border_width`）。
     pub border_width: Option<u32>,
     /// 影の有無。
     pub shadow: Option<bool>,
