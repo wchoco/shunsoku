@@ -22,7 +22,8 @@ use std::collections::BTreeSet;
 use super::{Problem, Region, Settings, SettingsItem, new_region};
 use crate::geometry::Rect;
 use crate::keys::Chord;
-use crate::recipe::{self, AppearanceStep, Recipe, Step};
+pub use crate::recipe::AppearanceItem;
+use crate::recipe::{self, AppearanceStep, ItemValue, Recipe, Step, StepKey, Written};
 use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationId};
 
 /// 設定 GUI の写し。
@@ -399,23 +400,23 @@ impl Editor {
         let Some(Step::Appearance(step)) = self.draft.recipes.get(index)?.steps.get(step) else {
             return None;
         };
-        let v = &step.values;
-        let text = |value: Option<String>| {
-            let rejected = step
-                .rejected
-                .iter()
-                .find(|r| r.key == item.key())
-                .and_then(|r| r.value.as_deref())
-                .map(unquoted);
-            AppearanceInput::Text(value.or(rejected).unwrap_or_default())
+        let text = match step.values.get(item) {
+            Some(ItemValue::Switch(on)) => return Some(AppearanceInput::Switch(Some(on))),
+            None if item.is_switch() => return Some(AppearanceInput::Switch(None)),
+            Some(ItemValue::Color(color)) => Some(color.to_string()),
+            Some(ItemValue::Number(n)) => Some(n.to_string()),
+            None => None,
         };
-        Some(match item {
-            AppearanceItem::Border => AppearanceInput::Switch(v.border),
-            AppearanceItem::Shadow => AppearanceInput::Switch(v.shadow),
-            AppearanceItem::BorderColor => text(v.border_color.map(|c| c.to_string())),
-            AppearanceItem::BorderWidth => text(v.border_width.map(|w| w.to_string())),
-            AppearanceItem::Opacity => text(v.opacity.map(|o| o.to_string())),
-        })
+        let rejected = || {
+            step.rejected
+                .iter()
+                .find(|r| r.key == StepKey::Item(item))
+                .and_then(|r| r.value.as_deref())
+                .map(unquoted)
+        };
+        Some(AppearanceInput::Text(
+            text.or_else(rejected).unwrap_or_default(),
+        ))
     }
 
     /// レシピ `index` の手 `step`（見た目を指定する手）の項目 `item` を、欄の入力 `input` にする。「変えない」
@@ -440,37 +441,28 @@ impl Editor {
         if item.is_switch() != matches!(input, AppearanceInput::Switch(_)) {
             return;
         }
-        step.rejected.retain(|r| r.key != item.key());
-        let v = &mut step.values;
-        let s = match input {
-            AppearanceInput::Switch(on) => {
-                match item {
-                    AppearanceItem::Border => v.border = on,
-                    _ => v.shadow = on,
+        step.rejected.retain(|r| r.key != StepKey::Item(item));
+        let written = match &input {
+            AppearanceInput::Switch(on) => on.map(Written::Bool),
+            AppearanceInput::Text(s) => {
+                let s = s.trim();
+                // 数の欄の文字は、設定ファイルの整数と同じに読む（整数でなければ型の誤り）
+                match s.parse() {
+                    _ if s.is_empty() => None,
+                    Ok(n) if item.number_range().is_some() => Some(Written::Integer(n)),
+                    _ => Some(Written::Text(s)),
                 }
-                return;
             }
-            AppearanceInput::Text(s) => s,
         };
-        let s = s.trim();
-        let rejection = match item {
-            AppearanceItem::BorderColor => read_text(&mut v.border_color, s, |s| {
-                s.parse().map_err(|_| recipe::Rejection::BadValue)
-            }),
-            AppearanceItem::BorderWidth => read_text(&mut v.border_width, s, |s| {
-                ranged(s, &super::BORDER_WIDTH_RANGE)
-            }),
-            _ => read_text(&mut v.opacity, s, |s| ranged(s, &super::OPACITY_RANGE)),
+        let Some(written) = written else {
+            step.values.clear(item);
+            return;
         };
-        if let Some(reason) = rejection {
-            // 書いたまま残す（範囲外の数はそのまま、ほかは TOML の文字列として）
-            let value = match reason {
-                recipe::Rejection::OutOfRange => s.to_owned(),
-                _ => toml_edit::Value::from(s).to_string(),
-            };
+        if let Err(reason) = step.values.set(item, written) {
+            // 書いたまま残す
             step.rejected.push(recipe::Rejected {
-                key: item.key().to_owned(),
-                value: Some(value),
+                key: StepKey::Item(item),
+                value: written.toml(),
                 reason,
             });
         }
@@ -535,42 +527,7 @@ pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> S
     text("settings_gui.recipes.step.appearance").replace("{items}", &items.join(" "))
 }
 
-/// 見た目を指定する手の項目（設定 GUI の欄の順）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppearanceItem {
-    /// 枠を出すか。
-    Border,
-    /// 枠の色。
-    BorderColor,
-    /// 枠の太さ。
-    BorderWidth,
-    /// 透明度。
-    Opacity,
-    /// 影の有無。
-    Shadow,
-}
-
 impl AppearanceItem {
-    /// 欄の順。
-    pub const ALL: [AppearanceItem; 5] = [
-        AppearanceItem::Border,
-        AppearanceItem::BorderColor,
-        AppearanceItem::BorderWidth,
-        AppearanceItem::Opacity,
-        AppearanceItem::Shadow,
-    ];
-
-    /// 設定ファイルの手のキー。
-    pub fn key(self) -> &'static str {
-        match self {
-            AppearanceItem::Border => "border",
-            AppearanceItem::BorderColor => "border_color",
-            AppearanceItem::BorderWidth => "border_width",
-            AppearanceItem::Opacity => "opacity",
-            AppearanceItem::Shadow => "shadow",
-        }
-    }
-
     /// 欄の見出しの文言のキー。
     pub fn label_key(self) -> &'static str {
         match self {
@@ -580,11 +537,6 @@ impl AppearanceItem {
             AppearanceItem::Opacity => "settings_gui.recipes.appearance.opacity",
             AppearanceItem::Shadow => "settings_gui.recipes.appearance.shadow",
         }
-    }
-
-    /// オン・オフの欄か（ほかは文字の欄）。
-    pub fn is_switch(self) -> bool {
-        matches!(self, AppearanceItem::Border | AppearanceItem::Shadow)
     }
 
     /// 数の欄なら、その範囲（上下のボタンに付ける）。
@@ -598,7 +550,7 @@ impl AppearanceItem {
                 u32::from(*super::OPACITY_RANGE.start()),
                 u32::from(*super::OPACITY_RANGE.end()),
             )),
-            _ => None,
+            AppearanceItem::Border | AppearanceItem::BorderColor | AppearanceItem::Shadow => None,
         }
     }
 }
@@ -621,37 +573,6 @@ pub const SWITCH_CHOICES: [(Option<bool>, &str); 3] = [
 
 /// 「変えない」の文言のキー。文字の欄では、空のときに薄く出す。
 pub const UNCHANGED_KEY: &str = "settings_gui.recipes.appearance.unchanged";
-
-/// 文字の欄の `s`（前後の空白を除いたもの）を `field` に入れる。空なら「変えない」。`read` で読めなければ
-/// `field` を空にして、そのわけを返す。
-fn read_text<T>(
-    field: &mut Option<T>,
-    s: &str,
-    read: impl FnOnce(&str) -> Result<T, recipe::Rejection>,
-) -> Option<recipe::Rejection> {
-    let (value, rejection) = if s.is_empty() {
-        (None, None)
-    } else {
-        match read(s) {
-            Ok(value) => (Some(value), None),
-            Err(reason) => (None, Some(reason)),
-        }
-    };
-    *field = value;
-    rejection
-}
-
-/// 数の欄の `s`。整数でなければ `BadValue`、`range` の外なら `OutOfRange`。
-fn ranged<T: TryFrom<i64> + PartialOrd>(
-    s: &str,
-    range: &std::ops::RangeInclusive<T>,
-) -> Result<T, recipe::Rejection> {
-    let n: i64 = s.parse().map_err(|_| recipe::Rejection::BadValue)?;
-    T::try_from(n)
-        .ok()
-        .filter(|n| range.contains(n))
-        .ok_or(recipe::Rejection::OutOfRange)
-}
 
 /// 読めなかった値（TOML の書き方）を欄に出す文字にする。文字列なら中身、ほかはそのまま。
 fn unquoted(written: &str) -> String {
@@ -1708,7 +1629,7 @@ mod tests {
 
         assert!(
             written.contains(
-                r##"steps = ["copy", { op = "appearance", opacity = 40, border_color = "#FF0000", shadow = false }]"##
+                r##"steps = ["copy", { op = "appearance", border_color = "#FF0000", opacity = 40, shadow = false }]"##
             ),
             "{written}"
         );

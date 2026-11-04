@@ -3,7 +3,7 @@
 use crate::keys::Chord;
 use crate::scrap::ScrapModel;
 use crate::scrap::ops::{Effect, InRecipe, OpContext, OperationDescriptor, OperationId};
-use crate::settings::Rgb;
+use crate::settings::{BORDER_WIDTH_RANGE, OPACITY_RANGE, Rgb};
 
 /// 設定ファイルの `[[recipes]]` の 1 つ。中身の検査はまだしていない（書いたまま）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -69,7 +69,8 @@ pub struct AppearanceValues {
     pub border: Option<bool>,
     /// 枠の色。書けば枠も出す。
     pub border_color: Option<Rgb>,
-    /// 枠の太さ（物理ピクセル、`settings::BORDER_WIDTH_RANGE`）。書けば枠も出す。
+    /// 枠の太さ（物理ピクセル、`settings::BORDER_WIDTH_RANGE`）。書けば枠も出す。キーと値は `[scrap] border_width`
+    /// と同じで、物理ピクセルのまま持つわけも同じ（`AppearanceOverrides::border_width`）。
     pub border_width: Option<u32>,
     /// 影の有無。
     pub shadow: Option<bool>,
@@ -80,12 +81,182 @@ impl AppearanceValues {
     pub fn is_empty(&self) -> bool {
         *self == AppearanceValues::default()
     }
+
+    /// 項目 `item` に書いた値。「変えない」は None。
+    pub fn get(&self, item: AppearanceItem) -> Option<ItemValue> {
+        match item {
+            AppearanceItem::Border => self.border.map(ItemValue::Switch),
+            AppearanceItem::BorderColor => self.border_color.map(ItemValue::Color),
+            AppearanceItem::BorderWidth => self.border_width.map(ItemValue::Number),
+            AppearanceItem::Opacity => self.opacity.map(|o| ItemValue::Number(u32::from(o))),
+            AppearanceItem::Shadow => self.shadow.map(ItemValue::Switch),
+        }
+    }
+
+    /// 項目 `item` を、書いた値 `written` にする。値の型と範囲は設定ファイルの `[scrap]` と同じ。読めなければ
+    /// 項目を「変えない」にして、そのわけを返す。設定ファイルの読み込みと設定 GUI の欄の両方がこれで読む。
+    pub fn set(&mut self, item: AppearanceItem, written: Written) -> Result<(), Rejection> {
+        self.clear(item);
+        match (item, written) {
+            (AppearanceItem::Border, Written::Bool(on)) => self.border = Some(on),
+            (AppearanceItem::Shadow, Written::Bool(on)) => self.shadow = Some(on),
+            (AppearanceItem::BorderColor, Written::Text(s)) => {
+                self.border_color = Some(s.parse().map_err(|_| Rejection::BadValue)?);
+            }
+            (AppearanceItem::BorderWidth, Written::Integer(n)) => {
+                self.border_width = Some(ranged(n, BORDER_WIDTH_RANGE)?);
+            }
+            (AppearanceItem::Opacity, Written::Integer(n)) => {
+                self.opacity = Some(ranged(n, OPACITY_RANGE)?);
+            }
+            (
+                AppearanceItem::Border
+                | AppearanceItem::Shadow
+                | AppearanceItem::BorderColor
+                | AppearanceItem::BorderWidth
+                | AppearanceItem::Opacity,
+                _,
+            ) => return Err(Rejection::BadValue),
+        }
+        Ok(())
+    }
+
+    /// 項目 `item` を「変えない」にする。
+    pub fn clear(&mut self, item: AppearanceItem) {
+        match item {
+            AppearanceItem::Border => self.border = None,
+            AppearanceItem::BorderColor => self.border_color = None,
+            AppearanceItem::BorderWidth => self.border_width = None,
+            AppearanceItem::Opacity => self.opacity = None,
+            AppearanceItem::Shadow => self.shadow = None,
+        }
+    }
+}
+
+/// 整数 `n` が `range` に入っていればその値。入っていなければ `OutOfRange`。
+fn ranged<T: TryFrom<i64> + PartialOrd>(
+    n: i64,
+    range: std::ops::RangeInclusive<T>,
+) -> Result<T, Rejection> {
+    T::try_from(n)
+        .ok()
+        .filter(|n| range.contains(n))
+        .ok_or(Rejection::OutOfRange)
+}
+
+/// 見た目を指定する手の項目。並びは設定ファイルに書くキーの順で、設定 GUI の欄の順。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppearanceItem {
+    /// 枠を出すか（`border`）。
+    Border,
+    /// 枠の色（`border_color`）。
+    BorderColor,
+    /// 枠の太さ（`border_width`）。
+    BorderWidth,
+    /// 透明度（`opacity`）。
+    Opacity,
+    /// 影の有無（`shadow`）。
+    Shadow,
+}
+
+impl AppearanceItem {
+    /// 項目の並び（設定ファイルのキーの順、設定 GUI の欄の順）。
+    pub const ALL: [AppearanceItem; 5] = [
+        AppearanceItem::Border,
+        AppearanceItem::BorderColor,
+        AppearanceItem::BorderWidth,
+        AppearanceItem::Opacity,
+        AppearanceItem::Shadow,
+    ];
+
+    /// 設定ファイルの手のキー。
+    pub fn key(self) -> &'static str {
+        match self {
+            AppearanceItem::Border => "border",
+            AppearanceItem::BorderColor => "border_color",
+            AppearanceItem::BorderWidth => "border_width",
+            AppearanceItem::Opacity => "opacity",
+            AppearanceItem::Shadow => "shadow",
+        }
+    }
+
+    /// 設定ファイルの手のキー `key` の項目。
+    pub fn from_key(key: &str) -> Option<AppearanceItem> {
+        AppearanceItem::ALL
+            .into_iter()
+            .find(|item| item.key() == key)
+    }
+
+    /// オン・オフの項目か（ほかは色か数）。
+    pub fn is_switch(self) -> bool {
+        match self {
+            AppearanceItem::Border | AppearanceItem::Shadow => true,
+            AppearanceItem::BorderColor | AppearanceItem::BorderWidth | AppearanceItem::Opacity => {
+                false
+            }
+        }
+    }
+}
+
+/// 項目に書いた値（`AppearanceValues::get`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemValue {
+    /// オン・オフ（枠・影）。
+    Switch(bool),
+    /// 色（枠の色）。
+    Color(Rgb),
+    /// 数（枠の太さ・透明度）。
+    Number(u32),
+}
+
+/// 項目に書いたまま値（`AppearanceValues::set`）。設定ファイルの値の型か、設定 GUI の欄の入力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written<'a> {
+    Integer(i64),
+    Bool(bool),
+    Text(&'a str),
+    /// ほかの型（小数、配列など）。
+    Other,
+}
+
+impl Written<'_> {
+    /// 設定ファイルに書く形。ほかの型は書けないので None。
+    pub fn toml(self) -> Option<String> {
+        match self {
+            Written::Integer(n) => Some(n.to_string()),
+            Written::Bool(on) => Some(on.to_string()),
+            Written::Text(s) => Some(toml_edit::Value::from(s).to_string()),
+            Written::Other => None,
+        }
+    }
+}
+
+/// 見た目を指定する手に書いたキー。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepKey {
+    /// `op`。
+    Op,
+    /// 見た目の項目のキー。
+    Item(AppearanceItem),
+    /// 知らないキー。
+    Unknown(String),
+}
+
+impl StepKey {
+    /// 設定ファイルに書くキー。
+    pub fn as_str(&self) -> &str {
+        match self {
+            StepKey::Op => "op",
+            StepKey::Item(item) => item.key(),
+            StepKey::Unknown(key) => key,
+        }
+    }
 }
 
 /// 見た目を指定する手の、読めなかった項目 1 つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejected {
-    pub key: String,
+    pub key: StepKey,
     /// 書いた値（TOML の書き方のまま）。書き戻すときにそのまま書く。`op` を書いていないときは None。
     pub value: Option<String>,
     pub reason: Rejection,
@@ -196,21 +367,17 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
         }
         let mut steps = Vec::with_capacity(recipe.steps.len());
         for step in &recipe.steps {
-            match step {
-                Step::Op(id) => match ops.iter().find(|op| op.id == id && can_be_step(op)) {
-                    Some(op) => steps.push(PlannedStep { op, values: None }),
-                    None => problems.push(Problem::NotAStep(id.clone())),
-                },
-                Step::Appearance(step) => {
-                    let found = check_appearance(step, &mut problems);
-                    match ops.iter().find(|op| op.id == APPEARANCE) {
-                        Some(op) => steps.push(PlannedStep {
-                            op,
-                            values: Some(found),
-                        }),
-                        None => problems.push(Problem::NotAStep(APPEARANCE.to_owned())),
-                    }
-                }
+            let values = step
+                .values()
+                .map(|step| check_appearance(step, &mut problems));
+            // 値のある手は値を取る操作（`takes_values`）を、値のない手はレシピに入れられる操作を呼ぶ
+            let fits = |op: &OperationDescriptor| match values {
+                Some(_) => op.takes_values,
+                None => can_be_step(op),
+            };
+            match ops.iter().find(|op| op.id == step.op_id() && fits(op)) {
+                Some(op) => steps.push(PlannedStep { op, values }),
+                None => problems.push(Problem::NotAStep(step.op_id().to_owned())),
             }
         }
         if let Some((_, before_last)) = recipe.steps.split_last()
@@ -238,14 +405,14 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
 fn check_appearance(step: &AppearanceStep, problems: &mut Vec<Problem>) -> AppearanceValues {
     for r in &step.rejected {
         problems.push(match r.reason {
-            Rejection::OutOfRange => Problem::OutOfRange(r.key.clone()),
-            Rejection::BadValue => Problem::BadValue(r.key.clone()),
-            Rejection::UnknownKey => Problem::UnknownKey(r.key.clone()),
+            Rejection::OutOfRange => Problem::OutOfRange(r.key.as_str().to_owned()),
+            Rejection::BadValue => Problem::BadValue(r.key.as_str().to_owned()),
+            Rejection::UnknownKey => Problem::UnknownKey(r.key.as_str().to_owned()),
             Rejection::NotAppearance => Problem::NotAppearance,
         });
     }
     let values = step.values;
-    let wrote_an_item = !values.is_empty() || step.rejected.iter().any(|r| r.key != "op");
+    let wrote_an_item = !values.is_empty() || step.rejected.iter().any(|r| r.key != StepKey::Op);
     if !wrote_an_item {
         problems.push(Problem::NoValues);
     }

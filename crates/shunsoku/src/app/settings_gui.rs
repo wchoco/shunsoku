@@ -579,19 +579,14 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
             EN_KILLFOCUS => refresh(hwnd),
             _ => {}
         },
-        _ if recipes::appearance_item(id).is_some() => {
-            let Some(item) = recipes::appearance_item(id) else {
-                return;
-            };
-            match code {
-                CBN_SELCHANGE | EN_CHANGE if !recipes::is_syncing() => {
-                    set_appearance(hwnd, item, recipes::appearance_input(hwnd, item));
-                }
-                // 打っている間は書き換えない欄を、出たら写しの値に揃える
-                EN_KILLFOCUS => refresh(hwnd),
-                _ => {}
+        _ if let Some(item) = recipes::appearance_item(id) => match code {
+            CBN_SELCHANGE | EN_CHANGE if !recipes::is_syncing() => {
+                set_appearance(hwnd, item, recipes::appearance_input(hwnd, item));
             }
-        }
+            // 打っている間は書き換えない欄を、出たら写しの値に揃える
+            EN_KILLFOCUS => refresh(hwnd),
+            _ => {}
+        },
         _ if chord_field::is_field(control) => match code {
             EN_CHANGE => on_chord_changed(hwnd, id, chord_field::value(control)),
             EN_SETFOCUS | EN_KILLFOCUS => {

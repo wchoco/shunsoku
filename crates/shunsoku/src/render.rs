@@ -607,11 +607,7 @@ fn draw_selection_mark(
 
 /// 書き込みの色（不透明）。
 fn color_of(annotation: &Annotation) -> D2D1_COLOR_F {
-    let shunsoku_core::settings::Rgb(r, g, b) = annotation.style.color;
-    rgb(
-        (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
-        1.0,
-    )
+    rgb_color(annotation.style.color)
 }
 
 /// 打っている文字のキャレットの太さ（96 DPI での画素。`AnnotationLayer::scale` で換算する）。
@@ -1163,10 +1159,9 @@ fn draw_toolbar_button(
                 plain,
                 stroke,
             )?,
-            Button::Color(shunsoku_core::settings::Rgb(r, g, b)) => {
+            Button::Color(color) => {
                 let swatch = to_rect_f(rect.inflate(-(6.0 * scale).round() as i32));
-                let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
-                let fill = target.CreateSolidColorBrush(&rgb(color, 1.0), None)?;
+                let fill = target.CreateSolidColorBrush(&rgb_color(color), None)?;
                 target.FillRectangle(&swatch, &fill);
                 // 白でも見えるように縁を引く
                 fill.SetColor(&rgb(TOOLBAR_SWATCH_EDGE, 1.0));
@@ -1329,8 +1324,8 @@ fn rgb(color: u32, alpha: f32) -> D2D1_COLOR_F {
 }
 
 /// 設定の色を、不透明の色にする。
-fn rgb_color(Rgb(r, g, b): Rgb) -> D2D1_COLOR_F {
-    rgb(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b), 1.0)
+fn rgb_color(color: Rgb) -> D2D1_COLOR_F {
+    rgb(color.to_rrggbb(), 1.0)
 }
 
 fn to_rect_f(r: Rect) -> D2D_RECT_F {

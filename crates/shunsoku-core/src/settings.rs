@@ -79,7 +79,9 @@ use toml_edit::{DocumentMut, Item, TableLike};
 use crate::geometry::Rect;
 use crate::i18n::Language;
 use crate::keys::Chord;
-use crate::recipe::{self, AppearanceStep, Recipe, Rejected, Rejection, Step};
+use crate::recipe::{
+    self, AppearanceItem, AppearanceStep, Recipe, Rejected, Rejection, Step, StepKey, Written,
+};
 use crate::scrap::ops::{
     MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, ShortcutOwner, Shortcuts,
 };
@@ -417,6 +419,14 @@ impl std::fmt::Display for Rgb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Rgb(r, g, b) = *self;
         write!(f, "#{r:02X}{g:02X}{b:02X}")
+    }
+}
+
+impl Rgb {
+    /// `0xRRGGBB` の数（描画と、スクラップの見た目の色の持ち方）。
+    pub fn to_rrggbb(self) -> u32 {
+        let Rgb(r, g, b) = self;
+        u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
     }
 }
 
@@ -1179,32 +1189,32 @@ fn recipe_steps(item: &Item) -> Option<Vec<Step>> {
         .collect()
 }
 
-/// 値のある手（`{ op = "appearance", ... }`）。キーと値の範囲は `[scrap]` と同じ。
+/// 値のある手（`{ op = "appearance", ... }`）。項目のキーと値の範囲は `[scrap]` と同じ（`AppearanceValues::set`）。
 fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
     let mut step = AppearanceStep::default();
     let mut wrote_op = false;
     for (key, value) in table.iter() {
-        let v = &mut step.values;
-        let reason = match key {
-            "op" => {
-                wrote_op = true;
-                (value.as_str() != Some(recipe::APPEARANCE)).then_some(Rejection::NotAppearance)
+        let (key, reason) = if key == "op" {
+            wrote_op = true;
+            let other = value.as_str() != Some(recipe::APPEARANCE);
+            (StepKey::Op, other.then_some(Rejection::NotAppearance))
+        } else {
+            match AppearanceItem::from_key(key) {
+                Some(item) => (
+                    StepKey::Item(item),
+                    step.values.set(item, written(value)).err(),
+                ),
+                None => (
+                    StepKey::Unknown(key.to_owned()),
+                    Some(Rejection::UnknownKey),
+                ),
             }
-            "opacity" => read_ranged(&mut v.opacity, value, OPACITY_RANGE),
-            "border_width" => read_ranged(&mut v.border_width, value, BORDER_WIDTH_RANGE),
-            "border" => read_into(&mut v.border, value.as_bool()),
-            "shadow" => read_into(&mut v.shadow, value.as_bool()),
-            "border_color" => read_into(
-                &mut v.border_color,
-                value.as_str().and_then(|s| s.parse().ok()),
-            ),
-            _ => Some(Rejection::UnknownKey),
         };
         if let Some(reason) = reason {
             let mut written = value.clone();
             written.decor_mut().clear();
             step.rejected.push(Rejected {
-                key: key.to_owned(),
+                key,
                 value: Some(written.to_string()),
                 reason,
             });
@@ -1212,7 +1222,7 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
     }
     if !wrote_op {
         step.rejected.push(Rejected {
-            key: "op".to_owned(),
+            key: StepKey::Op,
             value: None,
             reason: Rejection::NotAppearance,
         });
@@ -1220,32 +1230,13 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
     step
 }
 
-/// 整数 `value` が `range` に入っていれば `field` に入れる。整数でなければ `BadValue`、範囲外なら `OutOfRange`。
-fn read_ranged<T: TryFrom<i64> + PartialOrd>(
-    field: &mut Option<T>,
-    value: &toml_edit::Value,
-    range: std::ops::RangeInclusive<T>,
-) -> Option<Rejection> {
-    let Some(n) = value.as_integer() else {
-        return Some(Rejection::BadValue);
-    };
-    match T::try_from(n).ok().filter(|n| range.contains(n)) {
-        Some(n) => {
-            *field = Some(n);
-            None
-        }
-        None => Some(Rejection::OutOfRange),
-    }
-}
-
-/// 読めた値 `read` を `field` に入れる。読めなければ `BadValue`。
-fn read_into<T>(field: &mut Option<T>, read: Option<T>) -> Option<Rejection> {
-    match read {
-        Some(value) => {
-            *field = Some(value);
-            None
-        }
-        None => Some(Rejection::BadValue),
+/// 設定ファイルの値を、見た目の項目に書いた値として読む。
+fn written(value: &toml_edit::Value) -> Written<'_> {
+    match value {
+        toml_edit::Value::Integer(n) => Written::Integer(*n.value()),
+        toml_edit::Value::Boolean(b) => Written::Bool(*b.value()),
+        toml_edit::Value::String(s) => Written::Text(s.value()),
+        _ => Written::Other,
     }
 }
 

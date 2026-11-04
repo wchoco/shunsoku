@@ -555,21 +555,21 @@ fn set_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     if let Some(shadow) = values.shadow {
         overrides.shadow = Some(shadow);
     }
-    let color = values
-        .border_color
-        .map(|settings::Rgb(r, g, b)| u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b));
     if let Some(width) = values.border_width {
         overrides.border_width = Some(width);
     }
-    let shows = values.border == Some(true) || values.border_width.is_some();
-    match (values.border, color) {
-        (Some(false), _) => overrides.border = Some(BorderOverride::Hidden),
-        (_, Some(color)) => overrides.border = Some(BorderOverride::Color(color)),
-        // 枠を出すだけ（太さだけを書いたときも）なら、色は今の色のまま
-        (_, None) if shows && !before.show_border => {
-            overrides.border = Some(BorderOverride::Color(before.border.color));
-        }
-        _ => {}
+    // 枠を出す（色か太さを書いたときも）なら、全体の既定値で枠を出していても、枠を出す上書きを入れる（あとで
+    // 既定値が枠を出さなくなっても、この手で決めた枠は残す）。色を書かなければ今の色のまま
+    let shows = values.border == Some(true)
+        || values.border_color.is_some()
+        || values.border_width.is_some();
+    if values.border == Some(false) {
+        overrides.border = Some(BorderOverride::Hidden);
+    } else if shows {
+        let color = values
+            .border_color
+            .map_or(before.border.color, settings::Rgb::to_rrggbb);
+        overrides.border = Some(BorderOverride::Color(color));
     }
     redrawn(model.appearance(&context.appearance) != before)
 }
@@ -2175,6 +2175,46 @@ mod tests {
                 color: 0x00_00_FF
             })
         );
+    }
+
+    #[test]
+    fn a_step_that_writes_the_border_keeps_it_shown_when_the_default_stops_showing_it() {
+        let shown = Appearance::default();
+        let hidden = Appearance {
+            show_border: false,
+            ..shown
+        };
+        for values in [
+            AppearanceValues {
+                border_width: Some(3),
+                ..AppearanceValues::default()
+            },
+            AppearanceValues {
+                border: Some(true),
+                ..AppearanceValues::default()
+            },
+            AppearanceValues {
+                border_color: Some(settings::Rgb(0x80, 0x80, 0x80)),
+                ..AppearanceValues::default()
+            },
+        ] {
+            let mut model = scrap();
+            let context = OpContext {
+                values: Some(values),
+                ..with_defaults(shown)
+            };
+            execute(op("appearance"), &mut model, &context);
+
+            // 全体の既定値で枠を出さなくなっても、手で書いた枠は出たまま
+            assert_eq!(
+                model.appearance(&hidden).shown_border(),
+                Some(Border {
+                    width: values.border_width.unwrap_or(1),
+                    color: 0x80_80_80
+                }),
+                "{values:?}"
+            );
+        }
     }
 
     #[test]

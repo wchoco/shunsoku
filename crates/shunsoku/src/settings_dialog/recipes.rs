@@ -6,9 +6,10 @@
 //!   `Editor::set_recipe_name` で写しに入れる。
 //! - 操作の並びは、見出しのない 1 列の一覧と、横の「上へ」「下へ」「削除」。下のドロップダウンには、その時点で
 //!   レシピに足せる操作（`Editor::step_choices`）だけを出し、「足す」で足す（`chosen_step`）。
-//! - 操作の並びの下に、見た目の手の 5 項目（枠・太さ・枠の色・透明度・影、#141）。並びで見た目の手を選んでいる
+//! - 操作の並びの下に、見た目の手の 5 項目（枠を出すか・枠の色・枠の太さ・透明度・影、#141）。並びで見た目の手を選んでいる
 //!   間だけ使え、ほかの手では無効にする（ページを出し直すと全部見えるので、隠さずに無効にする）。どの欄も先頭が
-//!   「変えない」で、枠と影はドロップダウン、太さと透明度は数の欄、枠の色は文字の欄と「選ぶ…」。値の出し入れは
+//!   「変えない」で、枠と影はドロップダウン、太さと透明度は数の欄、枠の色は文字の欄と「選ぶ…」（部品は
+//!   「スクラップ」タブと同じ `PageBuilder` の `choice_control` / `number_controls` / `color_controls`）。値の出し入れは
 //!   `Editor::appearance` / `set_appearance` で、呼び出し側が `appearance_item` / `appearance_input` で受ける。
 //! - ショートカットは全体のホットキーと同じ入力欄（`chord_field`）で、`ChordRow` の 1 つ。行を選び直したら、
 //!   呼び出し側が `ChordRow::item` をその行の `SettingsItem::RecipeShortcut` に差し替える（`shortcut_id`）。
@@ -28,15 +29,13 @@ use windows::Win32::UI::Controls::{
     EM_SETCUEBANNER, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
     LVM_GETITEMCOUNT, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE,
     LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_NOSORTHEADER, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL, UDM_SETRANGE32, UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_AUTOBUDDY,
-    UDS_NOTHOUSANDS, UDS_SETBUDDYINT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, UDM_SETRANGE32,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCOUNT, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
-    CBS_DROPDOWNLIST, ES_NUMBER, SM_CXVSCROLL, SendMessageW, SetDlgItemTextW, WINDOW_STYLE,
-    WS_BORDER, WS_TABSTOP, WS_VSCROLL,
+    SM_CXVSCROLL, SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WS_BORDER, WS_TABSTOP,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -62,10 +61,10 @@ const STEPS_MARK: i32 = 11;
 /// 指定する手を選んでいなければ使えなくする。
 const APPEARANCE_FIRST: i32 = 12;
 const BORDER: i32 = 13;
-const BORDER_WIDTH: i32 = 15;
-const BORDER_WIDTH_UPDOWN: i32 = 16;
-const BORDER_COLOR: i32 = 18;
-const PICK_COLOR: i32 = 19;
+const BORDER_COLOR: i32 = 15;
+const PICK_COLOR: i32 = 16;
+const BORDER_WIDTH: i32 = 18;
+const BORDER_WIDTH_UPDOWN: i32 = 19;
 const OPACITY: i32 = 21;
 const OPACITY_UPDOWN: i32 = 22;
 const SHADOW: i32 = 24;
@@ -99,13 +98,13 @@ const FIELD_X: i16 = DETAIL_X + LABEL_WIDTH + 2;
 const FIELD_WIDTH: i16 = PAGE_WIDTH - FIELD_X;
 /// 操作の並びの一覧と、その横のボタン。
 const STEPS_Y: i16 = 30;
-const STEPS_HEIGHT: i16 = 62;
+const STEPS_HEIGHT: i16 = 46;
 /// 並びの下の印。範囲外の文言は 2 行になる。
 const STEPS_MARK_HEIGHT: i16 = 20;
 const STEP_BUTTON_WIDTH: i16 = 40;
 const STEPS_WIDTH: i16 = FIELD_WIDTH - STEP_BUTTON_WIDTH - 4;
 const STEP_BUTTON_X: i16 = FIELD_X + STEPS_WIDTH + 4;
-/// 見た目を指定する手の欄（3 行）。1 行目は枠と太さ、2 行目は枠の色、3 行目は透明度と影。2 列目の見出しと欄の左端。
+/// 見た目を指定する手の欄（4 行）。上から枠を出すか、枠の色、枠の太さ、透明度と影。2 列目の見出しと欄の左端。
 const APPEARANCE_Y: i16 = STEPS_Y + STEPS_HEIGHT + 2 + STEPS_MARK_HEIGHT + 2;
 const APPEARANCE_ROW: i16 = 16;
 const SWITCH_WIDTH: i16 = 56;
@@ -113,9 +112,7 @@ const NUMBER_WIDTH: i16 = 48;
 const SECOND_LABEL_X: i16 = FIELD_X + SWITCH_WIDTH + 6;
 const SECOND_LABEL_WIDTH: i16 = 32;
 const SECOND_FIELD_X: i16 = FIELD_X + 96;
-const COLOR_WIDTH: i16 = 50;
-const PICK_COLOR_WIDTH: i16 = 50;
-const STEP_CHOICE_Y: i16 = APPEARANCE_Y + 3 * APPEARANCE_ROW + 2;
+const STEP_CHOICE_Y: i16 = APPEARANCE_Y + 4 * APPEARANCE_ROW + 2;
 const SHORTCUT_Y: i16 = STEP_CHOICE_Y + 22;
 /// 一覧の列の見出し。幅は中身に合わせる（`fit_columns`）。
 const COLUMNS: [&str; 3] = [
@@ -207,42 +204,21 @@ pub(super) fn build(b: &mut PageBuilder) {
     // 見た目を指定する手の欄。部品は「スクラップ」タブと同じ（数は上下のボタン付き、色は「選ぶ…」付き）。
     // オン・オフは「変えない」を先頭に置くドロップダウン
     let appearance_first = b.next_id;
-    let combo = WS_TABSTOP | WS_VSCROLL | style(CBS_DROPDOWNLIST as u32);
-    let number = |b: &mut PageBuilder, x: i16, y: i16| {
-        let id = b.edit(style(ES_NUMBER as u32), x, y, NUMBER_WIDTH);
-        // 上下のボタンは直前の欄（Z 順の前）に付く
-        let updown = style(
-            UDS_AUTOBUDDY | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_SETBUDDYINT | UDS_NOTHOUSANDS,
-        );
-        let updown = b.control(Class::UpDown, "", updown, x + NUMBER_WIDTH, y, 10, 14);
-        (id, updown)
-    };
     let label = |b: &mut PageBuilder, item: AppearanceItem, x: i16, y: i16, cx: i16| {
         b.label(item.label_key(), x, y + 2, cx, 10);
     };
     let mut y = APPEARANCE_Y;
     label(b, AppearanceItem::Border, DETAIL_X, y, LABEL_WIDTH);
-    let border = b.control(Class::ComboBox, "", combo, FIELD_X, y, SWITCH_WIDTH, 60);
-    let width_label = AppearanceItem::BorderWidth;
-    label(b, width_label, SECOND_LABEL_X, y, SECOND_LABEL_WIDTH);
-    let (border_width, border_width_updown) = number(b, SECOND_FIELD_X, y);
+    let border = b.choice_control(FIELD_X, y, SWITCH_WIDTH, 60);
     y += APPEARANCE_ROW;
     label(b, AppearanceItem::BorderColor, DETAIL_X, y, LABEL_WIDTH);
-    let border_color = b.edit(WINDOW_STYLE(0), FIELD_X, y, COLOR_WIDTH);
-    let pick_text = (b.text)("settings_gui.pick_color");
-    let pick_x = FIELD_X + COLOR_WIDTH + 4;
-    let pick_color = b.control(
-        Class::Button,
-        pick_text,
-        push,
-        pick_x,
-        y,
-        PICK_COLOR_WIDTH,
-        14,
-    );
+    let (border_color, pick_color) = b.color_controls(FIELD_X, y);
+    y += APPEARANCE_ROW;
+    label(b, AppearanceItem::BorderWidth, DETAIL_X, y, LABEL_WIDTH);
+    let (border_width, border_width_updown) = b.number_controls(FIELD_X, y, NUMBER_WIDTH);
     y += APPEARANCE_ROW;
     label(b, AppearanceItem::Opacity, DETAIL_X, y, LABEL_WIDTH);
-    let (opacity, opacity_updown) = number(b, FIELD_X, y);
+    let (opacity, opacity_updown) = b.number_controls(FIELD_X, y, NUMBER_WIDTH);
     label(
         b,
         AppearanceItem::Shadow,
@@ -251,26 +227,10 @@ pub(super) fn build(b: &mut PageBuilder) {
         SECOND_LABEL_WIDTH,
     );
     let shadow_width = PAGE_WIDTH - SECOND_FIELD_X;
-    let shadow = b.control(
-        Class::ComboBox,
-        "",
-        combo,
-        SECOND_FIELD_X,
-        y,
-        shadow_width,
-        60,
-    );
+    let shadow = b.choice_control(SECOND_FIELD_X, y, shadow_width, 60);
     let appearance_end = b.next_id;
     // 足す操作を選ぶドロップダウン（高さは開いたときの一覧の高さ）と「足す」
-    let choice = b.control(
-        Class::ComboBox,
-        "",
-        WS_TABSTOP | WS_VSCROLL | style(CBS_DROPDOWNLIST as u32),
-        FIELD_X,
-        STEP_CHOICE_Y,
-        STEPS_WIDTH,
-        120,
-    );
+    let choice = b.choice_control(FIELD_X, STEP_CHOICE_Y, STEPS_WIDTH, 120);
     let add_text = (b.text)("settings_gui.recipes.add_step");
     let step_add = b.control(
         Class::Button,
@@ -314,10 +274,10 @@ pub(super) fn build(b: &mut PageBuilder) {
         offsets(&[
             appearance_first,
             border,
-            border_width,
-            border_width_updown,
             border_color,
             pick_color,
+            border_width,
+            border_width_updown,
             opacity,
             opacity_updown,
             shadow,
@@ -326,10 +286,10 @@ pub(super) fn build(b: &mut PageBuilder) {
         [
             APPEARANCE_FIRST,
             BORDER,
-            BORDER_WIDTH,
-            BORDER_WIDTH_UPDOWN,
             BORDER_COLOR,
             PICK_COLOR,
+            BORDER_WIDTH,
+            BORDER_WIDTH_UPDOWN,
             OPACITY,
             OPACITY_UPDOWN,
             SHADOW,

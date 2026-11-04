@@ -907,6 +907,9 @@ pub struct AppearanceOverrides {
     /// 枠の有無と色。
     pub border: Option<BorderOverride>,
     /// 枠の太さ（物理ピクセル）。枠の有無とは別に持つので、枠を隠したり色を変えたりしても残る。
+    /// 物理ピクセルのまま持つのは、全体の既定値 `Border::width`（設定の `[scrap] border_width`）をそのまま
+    /// 差し替える値だから。既定値が DPI で換算しない物理ピクセルなので、上書きだけを 96 DPI の値にすると、同じ数を
+    /// 書いても `[scrap]` と手とで太さが違って見える。96 DPI の値にするなら既定値と一緒に変える。
     pub border_width: Option<u32>,
     /// 影の有無。
     pub shadow: Option<bool>,
@@ -985,12 +988,11 @@ impl From<ScrapAppearance> for Appearance {
     /// 設定ファイルの `[scrap]` から作る。枠を出さない設定でも、枠の太さと色は持っておく。
     fn from(settings: ScrapAppearance) -> Appearance {
         let border = settings.border;
-        let (r, g, b) = (border.color.0, border.color.1, border.color.2);
         Appearance {
             opacity: settings.opacity,
             border: Border {
                 width: border.width,
-                color: u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
+                color: border.color.to_rrggbb(),
             },
             show_border: border.visible,
             shadow: settings.shadow,
