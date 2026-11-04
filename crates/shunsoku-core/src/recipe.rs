@@ -783,6 +783,29 @@ mod tests {
     }
 
     #[test]
+    fn resetting_the_appearance_goes_anywhere_and_moves_on_even_when_nothing_changes() {
+        let checked = plan(
+            &[
+                recipe("戻してコピー", &["reset_appearance", "copy"]),
+                recipe("コピーして戻す", &["copy", "reset_appearance"]),
+            ],
+            OPERATIONS,
+        );
+        assert_eq!(checked.problems, vec![]);
+        assert_eq!(checked.plans.len(), 2);
+
+        // もう既定の見た目なので何も変わらないが、次の手へ進む
+        let mut run = Run::new(checked.plans[0].steps.clone());
+        let mut model = model();
+        assert_eq!(step(&mut run, &mut model), ("reset_appearance", vec![]));
+        run.settle(Outcome::Succeeded);
+        assert_eq!(
+            step(&mut run, &mut model),
+            ("copy", vec![Effect::CopyToClipboard])
+        );
+    }
+
+    #[test]
     fn the_outcome_of_a_step_is_its_worst_effect() {
         use Outcome::*;
         assert_eq!(Outcome::of([]), Succeeded);

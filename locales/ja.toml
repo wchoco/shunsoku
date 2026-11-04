@@ -222,6 +222,7 @@ opacity_up = "濃くする"
 opacity_down = "薄くする"
 border = "枠"
 shadow = "影"
+reset_appearance = "見た目を既定に戻す"
 toggle_compact = "コンパクト表示"
 close = "閉じる"
 
