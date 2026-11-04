@@ -985,12 +985,11 @@ impl From<ScrapAppearance> for Appearance {
     /// 設定ファイルの `[scrap]` から作る。枠を出さない設定でも、枠の太さと色は持っておく。
     fn from(settings: ScrapAppearance) -> Appearance {
         let border = settings.border;
-        let (r, g, b) = (border.color.0, border.color.1, border.color.2);
         Appearance {
             opacity: settings.opacity,
             border: Border {
                 width: border.width,
-                color: u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
+                color: border.color.to_rrggbb(),
             },
             show_border: border.visible,
             shadow: settings.shadow,

@@ -420,6 +420,14 @@ impl std::fmt::Display for Rgb {
     }
 }
 
+impl Rgb {
+    /// `0xRRGGBB` の数（描画と、スクラップの見た目の色の持ち方）。
+    pub fn to_rrggbb(self) -> u32 {
+        let Rgb(r, g, b) = self;
+        u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+    }
+}
+
 /// `#RRGGBB`（大文字と小文字を問わない）でない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotRgb;
