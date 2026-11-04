@@ -79,7 +79,7 @@ use toml_edit::{DocumentMut, Item, TableLike};
 use crate::geometry::Rect;
 use crate::i18n::Language;
 use crate::keys::Chord;
-use crate::recipe::{self, Recipe, Step};
+use crate::recipe::{self, AppearanceStep, Recipe, Rejected, Rejection, Step};
 use crate::scrap::ops::{
     MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, ShortcutOwner, Shortcuts,
 };
@@ -643,6 +643,18 @@ pub enum Problem {
     NotAStep,
     /// レシピの `close` が最後以外にある。
     CloseNotLast,
+    /// レシピの値のある手の値が範囲外。
+    OutOfRange,
+    /// レシピの値のある手の値の型か書式の誤り。
+    BadValue,
+    /// レシピの値のある手の知らないキー。
+    UnknownKey,
+    /// レシピの値のある手の `op` が `appearance` でない。
+    NotAppearance,
+    /// レシピの値のある手に項目がない。
+    NoValues,
+    /// レシピの値のある手に `border = false` と枠の色を一緒に書いた。
+    BorderOffWithColor,
 }
 
 impl Problem {
@@ -736,6 +748,12 @@ pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
                 recipe::Problem::NoSteps => Problem::NoSteps,
                 recipe::Problem::NotAStep(_) => Problem::NotAStep,
                 recipe::Problem::CloseNotLast => Problem::CloseNotLast,
+                recipe::Problem::OutOfRange(_) => Problem::OutOfRange,
+                recipe::Problem::BadValue(_) => Problem::BadValue,
+                recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
+                recipe::Problem::NotAppearance => Problem::NotAppearance,
+                recipe::Problem::NoValues => Problem::NoValues,
+                recipe::Problem::BorderOffWithColor => Problem::BorderOffWithColor,
             },
         })
         .collect();
@@ -1148,12 +1166,77 @@ fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
     recipes
 }
 
-/// レシピの手の並び。値のない手（操作の id の文字列）の配列。
+/// レシピの手の並び。値のない手（操作の id の文字列）と、値のある手（インライン表）の配列。ほかの値があれば
+/// None。表の中身の誤りは `AppearanceStep::rejected` に残す（`recipe::plan` が問題にする）。
 fn recipe_steps(item: &Item) -> Option<Vec<Step>> {
     item.as_array()?
         .iter()
-        .map(|v| v.as_str().map(Step::from))
+        .map(|v| match v {
+            toml_edit::Value::String(_) => v.as_str().map(Step::from),
+            toml_edit::Value::InlineTable(t) => Some(Step::Appearance(appearance_step(t))),
+            _ => None,
+        })
         .collect()
+}
+
+/// 値のある手（`{ op = "appearance", ... }`）。キーと値の範囲は `[scrap]` と同じ。
+fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
+    let mut step = AppearanceStep::default();
+    let mut wrote_op = false;
+    for (key, value) in table.iter() {
+        let v = &mut step.values;
+        let reason = match key {
+            "op" => {
+                wrote_op = true;
+                (value.as_str() != Some(recipe::APPEARANCE)).then_some(Rejection::NotAppearance)
+            }
+            "opacity" => match value.as_integer() {
+                Some(n) => match u8::try_from(n).ok().filter(|n| OPACITY_RANGE.contains(n)) {
+                    Some(n) => {
+                        v.opacity = Some(n);
+                        None
+                    }
+                    None => Some(Rejection::OutOfRange),
+                },
+                None => Some(Rejection::BadValue),
+            },
+            "border" => read_into(&mut v.border, value.as_bool()),
+            "shadow" => read_into(&mut v.shadow, value.as_bool()),
+            "border_color" => read_into(
+                &mut v.border_color,
+                value.as_str().and_then(|s| s.parse().ok()),
+            ),
+            _ => Some(Rejection::UnknownKey),
+        };
+        if let Some(reason) = reason {
+            let mut written = value.clone();
+            written.decor_mut().clear();
+            step.rejected.push(Rejected {
+                key: key.to_owned(),
+                value: Some(written.to_string()),
+                reason,
+            });
+        }
+    }
+    if !wrote_op {
+        step.rejected.push(Rejected {
+            key: "op".to_owned(),
+            value: None,
+            reason: Rejection::NotAppearance,
+        });
+    }
+    step
+}
+
+/// 読めた値 `read` を `field` に入れる。読めなければ `BadValue`。
+fn read_into<T>(field: &mut Option<T>, read: Option<T>) -> Option<Rejection> {
+    match read {
+        Some(value) => {
+            *field = Some(value);
+            None
+        }
+        None => Some(Rejection::BadValue),
+    }
 }
 
 /// 定型領域の範囲（`x` / `y` / `width` / `height`）。どれかが読めなければ None。

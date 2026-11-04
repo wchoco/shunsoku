@@ -14,13 +14,14 @@
 //! - 「レシピ」タブの一覧の追加・削除は `add_recipe` / `remove_recipe`、名前は `set_recipe_name`。操作の並びは
 //!   `step_choices`（足せる操作）/ `add_step` / `move_step` / `remove_step`。ショートカットは `set_chord` の
 //!   `RecipeShortcut`。検査（`recipe::plan`）で引っかかったものは `mark` の `RecipeName` / `RecipeSteps` に出る。
+//!   操作の並びの行の文言は `step_label`（値のある手は書いた値の要約）。
 
 use std::collections::BTreeSet;
 
 use super::{Problem, Region, Settings, SettingsItem, new_region};
 use crate::geometry::Rect;
 use crate::keys::Chord;
-use crate::recipe::{self, Recipe};
+use crate::recipe::{self, Recipe, Step};
 use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationDescriptor};
 
 /// 設定 GUI の写し。
@@ -63,6 +64,12 @@ impl Mark {
             Mark::Problem(Problem::NoSteps) => "settings_gui.mark.no_steps",
             Mark::Problem(Problem::NotAStep) => "settings_gui.mark.not_a_step",
             Mark::Problem(Problem::CloseNotLast) => "settings_gui.mark.close_not_last",
+            Mark::Problem(Problem::OutOfRange) => "settings_gui.mark.out_of_range",
+            Mark::Problem(Problem::BadValue) => "settings_gui.mark.bad_value",
+            Mark::Problem(Problem::UnknownKey) => "settings_gui.mark.unknown_key",
+            Mark::Problem(Problem::NotAppearance) => "settings_gui.mark.not_appearance",
+            Mark::Problem(Problem::NoValues) => "settings_gui.mark.no_values",
+            Mark::Problem(Problem::BorderOffWithColor) => "settings_gui.mark.border_off_with_color",
         }
     }
 }
@@ -383,6 +390,44 @@ impl Editor {
     }
 }
 
+/// 「レシピ」タブの手の一覧の行の文言。値のない手は操作の名前（表にない id はそのまま）、値のある手は
+/// 「見た目: 枠 #FF0000」のように、書いた項目を書いた順（透明度、枠、影）に並べた要約。`text` は文言のキーから
+/// 文言を引く。
+pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> String {
+    let values = match step {
+        Step::Op(id) => {
+            return OPERATIONS
+                .iter()
+                .find(|op| op.id == id)
+                .map_or_else(|| id.clone(), |op| text(op.label_key).to_owned());
+        }
+        Step::Appearance(step) => step.values,
+    };
+    let mut items: Vec<String> = Vec::new();
+    if let Some(opacity) = values.opacity {
+        items.push(
+            text("settings_gui.recipes.step.opacity").replace("{percent}", &opacity.to_string()),
+        );
+    }
+    match (values.border, values.border_color) {
+        (_, Some(color)) => items.push(
+            text("settings_gui.recipes.step.border_color").replace("{color}", &color.to_string()),
+        ),
+        (Some(true), None) => items.push(text("settings_gui.recipes.step.border_on").to_owned()),
+        (Some(false), None) => items.push(text("settings_gui.recipes.step.border_off").to_owned()),
+        (None, None) => {}
+    }
+    match values.shadow {
+        Some(true) => items.push(text("settings_gui.recipes.step.shadow_on").to_owned()),
+        Some(false) => items.push(text("settings_gui.recipes.step.shadow_off").to_owned()),
+        None => {}
+    }
+    if items.is_empty() {
+        return text("scrap.op.set_appearance").to_owned();
+    }
+    text("settings_gui.recipes.step.appearance").replace("{items}", &items.join(" "))
+}
+
 /// 定型領域を動かす向き（`Editor::move_region`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Move {
@@ -679,6 +724,15 @@ mod tests {
             Mark::Problem(Problem::Overlap(c)),
             Mark::Problem(Problem::EmptyName),
             Mark::Problem(Problem::DuplicateName),
+            Mark::Problem(Problem::NoSteps),
+            Mark::Problem(Problem::NotAStep),
+            Mark::Problem(Problem::CloseNotLast),
+            Mark::Problem(Problem::OutOfRange),
+            Mark::Problem(Problem::BadValue),
+            Mark::Problem(Problem::UnknownKey),
+            Mark::Problem(Problem::NotAppearance),
+            Mark::Problem(Problem::NoValues),
+            Mark::Problem(Problem::BorderOffWithColor),
         ] {
             let key = mark.label_key();
             assert_ne!(catalog.text(key), key, "{mark:?}");
@@ -1067,6 +1121,82 @@ mod tests {
             shortcut: None,
         });
         Editor::new(settings)
+    }
+
+    /// `steps = [...]` のレシピ 1 つを設定ファイルから読んだ写し（ほかに適用を止める問題はない）。
+    fn with_steps_read(steps: &str) -> Editor {
+        let (settings, issues) = super::super::load(&format!(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Shift+A\"\n[[recipes]]\nname = \"R\"\nsteps = {steps}\n"
+        ));
+        assert_eq!(issues, vec![], "{steps}");
+        Editor::new(settings)
+    }
+
+    fn labels(editor: &Editor) -> Vec<String> {
+        let catalog = crate::i18n::catalog(crate::i18n::Language::Japanese);
+        editor.draft().recipes[0]
+            .steps
+            .iter()
+            .map(|s| step_label(s, |key| catalog.text(key)))
+            .collect()
+    }
+
+    #[test]
+    fn the_step_list_sums_up_a_step_with_values() {
+        let editor = with_steps_read(
+            r##"["copy", { op = "appearance", border_color = "#ff0000" }, { op = "appearance", opacity = 50, border = false, shadow = true }, { op = "appearance", border = true, shadow = false }, "nope"]"##,
+        );
+        assert_eq!(
+            labels(&editor),
+            [
+                "コピー",
+                "見た目: 枠 #FF0000",
+                "見た目: 透明度 50% 枠なし 影",
+                "見た目: 枠 影なし",
+                "nope",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrong_step_with_values_marks_the_steps_and_blocks_applying() {
+        let editor = with_steps_read(r#"[{ op = "appearance", opacity = 50 }]"#);
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().ok);
+        for (steps, problem) in [
+            (
+                r#"[{ op = "appearance", opacity = 5 }]"#,
+                Problem::OutOfRange,
+            ),
+            (
+                r#"[{ op = "appearance", opacity = "x" }]"#,
+                Problem::BadValue,
+            ),
+            (r#"[{ op = "appearance", width = 3 }]"#, Problem::UnknownKey),
+            (
+                r#"[{ op = "copy", shadow = true }]"#,
+                Problem::NotAppearance,
+            ),
+            (r#"[{ op = "appearance" }]"#, Problem::NoValues),
+            (
+                r##"[{ op = "appearance", border = false, border_color = "#000000" }]"##,
+                Problem::BorderOffWithColor,
+            ),
+        ] {
+            let editor = with_steps_read(steps);
+            assert_eq!(
+                editor.mark(&SettingsItem::RecipeSteps(0)),
+                Some(Mark::Problem(problem)),
+                "{steps}"
+            );
+            assert!(!editor.buttons().ok, "{steps}");
+        }
+    }
+
+    #[test]
+    fn setting_the_appearance_is_not_offered_as_a_step_without_values() {
+        let editor = with_steps(&["copy"]);
+        assert!(!choice_ids(&editor, 0).contains(&"appearance"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use crate::keys::Chord;
 use crate::scrap::ScrapModel;
 use crate::scrap::ops::{Effect, InRecipe, OpContext, OperationDescriptor, OperationId};
+use crate::settings::Rgb;
 
 /// 設定ファイルの `[[recipes]]` の 1 つ。中身の検査はまだしていない（書いたまま）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -50,17 +51,63 @@ impl From<&str> for Step {
     }
 }
 
-/// 見た目を指定する手の値（ADR-0008）。書いた項目だけを持つ。項目（透明度・枠・枠の色・枠の太さ・影）は、
-/// 見た目を指定する操作を足すときに足す。
+/// 見た目を指定する手（ADR-0008）。書いたまま（範囲と矛盾の検査は `plan` がする）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AppearanceStep {
+    /// 読めた項目。
+    pub values: AppearanceValues,
+    /// 読めなかった項目（書いた順）。どれか 1 つでもあれば、その手はレシピの問題になる。
+    pub rejected: Vec<Rejected>,
+}
+
+/// 見た目を指定する手に書いた値。書いた項目だけが Some。キーと値の範囲は設定ファイルの `[scrap]` と同じ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct AppearanceStep {}
+pub struct AppearanceValues {
+    /// 透明度（%、`settings::OPACITY_RANGE`）。
+    pub opacity: Option<u8>,
+    /// 枠を出すか。
+    pub border: Option<bool>,
+    /// 枠の色。書けば枠も出す。
+    pub border_color: Option<Rgb>,
+    /// 影の有無。
+    pub shadow: Option<bool>,
+}
+
+impl AppearanceValues {
+    /// 項目を 1 つも書いていない。
+    pub fn is_empty(&self) -> bool {
+        *self == AppearanceValues::default()
+    }
+}
+
+/// 見た目を指定する手の、読めなかった項目 1 つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejected {
+    pub key: String,
+    /// 書いた値（TOML の書き方のまま）。書き戻すときにそのまま書く。`op` を書いていないときは None。
+    pub value: Option<String>,
+    pub reason: Rejection,
+}
+
+/// 項目が読めなかったわけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejection {
+    /// 範囲外の数。
+    OutOfRange,
+    /// 値の型か書式の誤り（数でない透明度、`#RRGGBB` でない色など）。
+    BadValue,
+    /// 知らないキー。
+    UnknownKey,
+    /// `op` が `appearance` でない（書いていないときも）。
+    NotAppearance,
+}
 
 /// 検査を通った手 1 つ。
 #[derive(Debug, Clone)]
 pub struct PlannedStep {
     pub op: &'static OperationDescriptor,
-    /// 手に書いた値。値のない手は None。
-    pub values: Option<AppearanceStep>,
+    /// 手に書いた値。値のない手は None。実行するときに `OpContext::values` で操作へ渡す。
+    pub values: Option<AppearanceValues>,
 }
 
 /// 検査を通ったレシピ。ショートカットから実行できる。
@@ -86,6 +133,18 @@ pub enum Problem {
     NotAStep(String),
     /// 最後にだけ置ける操作（`InRecipe::Last`。`close`）が最後以外にある。
     CloseNotLast,
+    /// 値のある手の値が範囲外。書いたキー。
+    OutOfRange(String),
+    /// 値のある手の値の型か書式の誤り。書いたキー。
+    BadValue(String),
+    /// 値のある手の知らないキー。
+    UnknownKey(String),
+    /// 値のある手の `op` が `appearance` でない（書いていないときも）。
+    NotAppearance,
+    /// 値のある手に、項目を 1 つも書いていない。
+    NoValues,
+    /// 値のある手に、`border = false` と枠の色を一緒に書いた。
+    BorderOffWithColor,
 }
 
 impl Problem {
@@ -135,13 +194,21 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
         }
         let mut steps = Vec::with_capacity(recipe.steps.len());
         for step in &recipe.steps {
-            let id = step.op_id();
-            match ops.iter().find(|op| op.id == id && can_be_step(op)) {
-                Some(op) => steps.push(PlannedStep {
-                    op,
-                    values: step.values().copied(),
-                }),
-                None => problems.push(Problem::NotAStep(id.to_owned())),
+            match step {
+                Step::Op(id) => match ops.iter().find(|op| op.id == id && can_be_step(op)) {
+                    Some(op) => steps.push(PlannedStep { op, values: None }),
+                    None => problems.push(Problem::NotAStep(id.clone())),
+                },
+                Step::Appearance(step) => {
+                    let found = check_appearance(step, &mut problems);
+                    match ops.iter().find(|op| op.id == APPEARANCE) {
+                        Some(op) => steps.push(PlannedStep {
+                            op,
+                            values: Some(found),
+                        }),
+                        None => problems.push(Problem::NotAStep(APPEARANCE.to_owned())),
+                    }
+                }
             }
         }
         if let Some((_, before_last)) = recipe.steps.split_last()
@@ -163,6 +230,27 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
         }
     }
     checked
+}
+
+/// 見た目を指定する手の値を検査し、問題を `problems` に足す。読めた値を返す（問題があっても）。
+fn check_appearance(step: &AppearanceStep, problems: &mut Vec<Problem>) -> AppearanceValues {
+    for r in &step.rejected {
+        problems.push(match r.reason {
+            Rejection::OutOfRange => Problem::OutOfRange(r.key.clone()),
+            Rejection::BadValue => Problem::BadValue(r.key.clone()),
+            Rejection::UnknownKey => Problem::UnknownKey(r.key.clone()),
+            Rejection::NotAppearance => Problem::NotAppearance,
+        });
+    }
+    let values = step.values;
+    let wrote_an_item = !values.is_empty() || step.rejected.iter().any(|r| r.key != "op");
+    if !wrote_an_item {
+        problems.push(Problem::NoValues);
+    }
+    if values.border == Some(false) && values.border_color.is_some() {
+        problems.push(Problem::BorderOffWithColor);
+    }
+    values
 }
 
 /// 1 手の結果。Win32 層がその手の `Effect` を実行して決め、`Run::settle` で返す。
@@ -270,7 +358,7 @@ impl Run {
             State::Waiting => return Advance::Waiting(self.steps[self.next - 1].op.id),
             State::Ready => {}
         }
-        let Some(op) = self.steps.get(self.next).map(|s| s.op) else {
+        let Some(&PlannedStep { op, values }) = self.steps.get(self.next) else {
             return Advance::Finished;
         };
         if !(op.can_execute)(model) {
@@ -280,9 +368,13 @@ impl Run {
         }
         self.next += 1;
         self.state = State::Waiting;
+        let context = OpContext {
+            values,
+            ..context.clone()
+        };
         Advance::Step {
             op,
-            effects: (op.run)(model, context),
+            effects: (op.run)(model, &context),
         }
     }
 
@@ -358,9 +450,11 @@ impl<S: PartialEq, T: PartialEq> Parked<S, T> {
 mod tests {
     use super::*;
     use crate::geometry::{Point, Size};
-    use crate::scrap::ScrapModel;
     use crate::scrap::ops::{Effect, OPERATIONS, OpContext};
-    use crate::settings::{self, Keymap, Settings, SettingsIssue, SettingsItem, ValidationIssue};
+    use crate::scrap::{Appearance, Border, ScrapModel};
+    use crate::settings::{
+        self, Keymap, Rgb, Settings, SettingsIssue, SettingsItem, ValidationIssue,
+    };
 
     fn chord(s: &str) -> Chord {
         s.parse().unwrap()
@@ -836,6 +930,127 @@ mod tests {
         );
     }
 
+    /// `steps = [...]` の 1 つのレシピの `Run`。
+    fn run_of_steps(steps: &str) -> Run {
+        let checked = checked_steps(steps);
+        assert_eq!(checked.problems, vec![], "{steps}");
+        Run::new(checked.plans[0].steps.clone())
+    }
+
+    /// 全体の既定値: 透明度 100%、枠なし（設定の色は灰）、影あり。
+    fn no_border_context() -> OpContext {
+        OpContext {
+            appearance: Appearance {
+                show_border: false,
+                ..Appearance::default()
+            },
+            ..OpContext::default()
+        }
+    }
+
+    fn step_in(
+        run: &mut Run,
+        model: &mut ScrapModel,
+        context: &OpContext,
+    ) -> (&'static str, Vec<Effect>) {
+        match run.advance(model, context) {
+            Advance::Step { op, effects } => (op.id, effects),
+            other => panic!("not a step: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_border_color_step_shows_a_border_of_that_color_then_copies() {
+        let mut run =
+            run_of_steps(r##"[{ op = "appearance", border_color = "#FF0000" }, "copy"]"##);
+        let context = no_border_context();
+        let mut scrap = model();
+        assert_eq!(
+            step_in(&mut run, &mut scrap, &context),
+            ("appearance", vec![Effect::Redraw])
+        );
+        assert_eq!(
+            scrap.appearance(&context.appearance).shown_border(),
+            Some(Border {
+                width: 1,
+                color: 0xFF_00_00
+            })
+        );
+        run.settle(Outcome::Succeeded);
+        assert_eq!(
+            step_in(&mut run, &mut scrap, &context),
+            ("copy", vec![Effect::CopyToClipboard])
+        );
+    }
+
+    #[test]
+    fn a_step_with_values_changes_only_the_items_it_writes() {
+        let context = no_border_context();
+        let mut scrap = model();
+        let mut first = run_of_steps(
+            r##"[{ op = "appearance", opacity = 40, border_color = "#0000FF", shadow = false }]"##,
+        );
+        step_in(&mut first, &mut scrap, &context);
+        let mut run = run_of_steps(r#"[{ op = "appearance", opacity = 70 }]"#);
+        step_in(&mut run, &mut scrap, &context);
+        assert_eq!(
+            scrap.appearance(&context.appearance),
+            Appearance {
+                opacity: 70,
+                border: Border {
+                    width: 1,
+                    color: 0x00_00_FF
+                },
+                show_border: true,
+                shadow: false,
+            }
+        );
+        // 枠を出すだけなら今の色のまま。隠してから出すと、設定の色になる
+        let mut run = run_of_steps(r#"[{ op = "appearance", border = true }]"#);
+        assert_eq!(step_in(&mut run, &mut scrap, &context).1, vec![]);
+        let mut run = run_of_steps(r#"[{ op = "appearance", border = false }]"#);
+        step_in(&mut run, &mut scrap, &context);
+        assert_eq!(scrap.appearance(&context.appearance).shown_border(), None);
+        let mut run = run_of_steps(r#"[{ op = "appearance", border = true }]"#);
+        assert_eq!(
+            step_in(&mut run, &mut scrap, &context).1,
+            vec![Effect::Redraw]
+        );
+        assert_eq!(
+            scrap.appearance(&context.appearance).shown_border(),
+            Some(Border {
+                width: 1,
+                color: 0x80_80_80
+            })
+        );
+    }
+
+    #[test]
+    fn a_step_with_values_that_changes_nothing_still_goes_on_to_the_next_step() {
+        let context = no_border_context();
+        let mut scrap = model();
+        let mut run =
+            run_of_steps(r#"[{ op = "appearance", opacity = 100, shadow = true }, "copy"]"#);
+        let (_, effects) = step_in(&mut run, &mut scrap, &context);
+        assert_eq!(effects, vec![]);
+        run.settle(Outcome::of([]));
+        assert_eq!(
+            step_in(&mut run, &mut scrap, &context),
+            ("copy", vec![Effect::CopyToClipboard])
+        );
+    }
+
+    #[test]
+    fn a_step_with_values_does_not_run_on_a_compact_scrap() {
+        let mut run = run_of_steps(r#"[{ op = "appearance", shadow = false }, "copy"]"#);
+        let mut scrap = model();
+        assert!(scrap.enter_compact(crate::scrap::ZoomAnchor::Center));
+        assert_eq!(
+            run.advance(&mut scrap, &OpContext::default()),
+            Advance::Stopped(Stop::CannotRun("appearance"))
+        );
+    }
+
     #[test]
     fn the_outcome_of_a_step_is_its_worst_effect() {
         use Outcome::*;
@@ -843,6 +1058,115 @@ mod tests {
         assert_eq!(Outcome::of([Succeeded, Succeeded]), Succeeded);
         assert_eq!(Outcome::of([Succeeded, Cancelled]), Cancelled);
         assert_eq!(Outcome::of([Cancelled, Failed, Succeeded]), Failed);
+    }
+
+    /// `steps = [...]` の 1 つのレシピを読んで検査する。
+    fn checked_steps(steps: &str) -> Checked {
+        let (settings, issues) = settings::load(&format!(
+            "version = 1\n[[recipes]]\nname = \"r\"\nsteps = {steps}\n"
+        ));
+        assert_eq!(issues, vec![], "{steps}");
+        plan(&settings.recipes, OPERATIONS)
+    }
+
+    #[test]
+    fn a_step_with_appearance_values_becomes_a_plan_with_those_values() {
+        let checked = checked_steps(
+            r##"[{ op = "appearance", opacity = 50, border = true, border_color = "#ff0000", shadow = false }, "copy"]"##,
+        );
+        assert_eq!(checked.problems, vec![]);
+        let steps = &checked.plans[0].steps;
+        assert_eq!(ids(&checked.plans[0]), ["appearance", "copy"]);
+        assert_eq!(
+            steps[0].values,
+            Some(AppearanceValues {
+                opacity: Some(50),
+                border: Some(true),
+                border_color: Some(Rgb(0xFF, 0, 0)),
+                shadow: Some(false),
+            })
+        );
+        assert_eq!(steps[1].values, None);
+    }
+
+    #[test]
+    fn mistakes_in_a_step_with_values_make_the_recipe_an_error() {
+        for (steps, problems) in [
+            (
+                r#"[{ op = "appearance", opacity = 5 }]"#,
+                vec![Problem::OutOfRange("opacity".into())],
+            ),
+            (
+                r#"[{ op = "appearance", opacity = 101 }]"#,
+                vec![Problem::OutOfRange("opacity".into())],
+            ),
+            (
+                r#"[{ op = "appearance", opacity = "50" }]"#,
+                vec![Problem::BadValue("opacity".into())],
+            ),
+            (
+                r#"[{ op = "appearance", border_color = "red" }]"#,
+                vec![Problem::BadValue("border_color".into())],
+            ),
+            (
+                r##"[{ op = "appearance", border_color = "#FF00" }]"##,
+                vec![Problem::BadValue("border_color".into())],
+            ),
+            (
+                r#"[{ op = "appearance", shadow = 1 }]"#,
+                vec![Problem::BadValue("shadow".into())],
+            ),
+            (
+                r#"[{ op = "appearance", border = "true" }]"#,
+                vec![Problem::BadValue("border".into())],
+            ),
+            (
+                r##"[{ op = "appearance", shadow = true, colour = "#FF0000" }]"##,
+                vec![Problem::UnknownKey("colour".into())],
+            ),
+            // 太さは #140 まで知らないキー
+            (
+                r#"[{ op = "appearance", border_width = 3 }]"#,
+                vec![Problem::UnknownKey("border_width".into())],
+            ),
+            (
+                r#"[{ op = "copy", shadow = true }]"#,
+                vec![Problem::NotAppearance],
+            ),
+            (r#"[{ shadow = true }]"#, vec![Problem::NotAppearance]),
+            (r#"[{ op = "appearance" }]"#, vec![Problem::NoValues]),
+            (
+                r##"[{ op = "appearance", border = false, border_color = "#FF0000" }]"##,
+                vec![Problem::BorderOffWithColor],
+            ),
+            // 値のない手として appearance は書けない（値がないと実行できない）
+            (
+                r#"["appearance"]"#,
+                vec![Problem::NotAStep("appearance".into())],
+            ),
+        ] {
+            let checked = checked_steps(steps);
+            assert_eq!(
+                checked.problems,
+                problems.into_iter().map(|p| (0, p)).collect::<Vec<_>>(),
+                "{steps}"
+            );
+            assert!(checked.plans.is_empty(), "{steps}");
+        }
+    }
+
+    #[test]
+    fn a_recipe_with_a_wrong_step_with_values_takes_no_shortcut_and_marks_its_steps() {
+        let src = "version = 1\n[[recipes]]\nname = \"r\"\nsteps = [{ op = \"appearance\", opacity = 500 }, \"copy\"]\nshortcut = \"Ctrl+Shift+R\"\n";
+        let (settings, issues) = settings::load(src);
+        assert_eq!(issues, vec![]);
+        let keymap = settings::keymap(&settings, OPERATIONS);
+        assert_eq!(bound_recipe(&keymap, "Ctrl+Shift+R"), None);
+        assert_eq!(keymap.issues, vec![invalid("recipes[1].steps")]);
+        assert!(settings::validate(&settings).contains(&issue(
+            SettingsItem::RecipeSteps(0),
+            settings::Problem::OutOfRange
+        )));
     }
 
     #[test]

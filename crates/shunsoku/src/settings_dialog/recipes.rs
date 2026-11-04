@@ -17,7 +17,7 @@ use std::cell::{Cell, RefCell};
 
 use shunsoku_core::scrap::ops::{OPERATIONS, OperationId};
 use shunsoku_core::settings::SettingsItem;
-use shunsoku_core::settings::editor::Editor;
+use shunsoku_core::settings::editor::{Editor, step_label};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT,
@@ -389,10 +389,7 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     // 操作の並び。変わったときだけ入れ直す（一覧で手を選んだ通知の中で、行を消さないため）。レシピを選び直したら、
     // 手は選ばない
     let labels: Vec<String> = recipe.map_or_else(Vec::new, |(_, r)| {
-        r.steps
-            .iter()
-            .map(|s| step_label(s.op_id(), text))
-            .collect()
+        r.steps.iter().map(|s| step_label(s, text)).collect()
     });
     let steps = labels.len();
     if let Some(list) = item(hwnd, steps_id()) {
@@ -439,7 +436,7 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
         unsafe {
             SendMessageW(combo, CB_RESETCONTENT, None, None);
             for id in &choices {
-                let label = to_wide(&step_label(id, text));
+                let label = to_wide(&op_label(id, text));
                 SendMessageW(
                     combo,
                     CB_ADDSTRING,
@@ -471,8 +468,8 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     );
 }
 
-/// 手 `id` の文言。表にない id（設定ファイルに書いた知らない操作）は id のまま出す。
-fn step_label(id: &str, text: Text) -> String {
+/// 操作 `id` の文言（手に選べる操作の並びに出す）。
+fn op_label(id: &str, text: Text) -> String {
     OPERATIONS
         .iter()
         .find(|op| op.id == id)

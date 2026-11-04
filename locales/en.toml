@@ -164,6 +164,16 @@ shortcut_label = "Shortcut:"
 # Name of a recipe added with "Add" (a number follows)
 default_name = "Recipe"
 
+# Summary of an appearance step in the step list ("Appearance: border #FF0000")
+[settings_gui.recipes.step]
+appearance = "Appearance: {items}"
+opacity = "opacity {percent}%"
+border_on = "border"
+border_off = "no border"
+border_color = "border {color}"
+shadow_on = "shadow"
+shadow_off = "no shadow"
+
 [settings_gui.mark]
 unset = "Not set"
 conflict = "Overlaps"
@@ -175,6 +185,12 @@ duplicate_name = "The name is used twice"
 no_steps = "No operations"
 not_a_step = "Has an operation that cannot go in a recipe"
 close_not_last = "Close can only be the last operation"
+out_of_range = "An appearance value is out of range (opacity is 10-100)"
+bad_value = "An appearance value is written wrong (colors are #RRGGBB, border and shadow are true or false)"
+unknown_key = "An appearance step has an unknown key"
+not_appearance = "Only op = \"appearance\" can be written as a table"
+no_values = "An appearance step has no items"
+border_off_with_color = "border = false cannot go with a border color"
 
 [hotkey]
 failed = "Could not register these hotkeys (another app may be using them): "
@@ -201,6 +217,7 @@ zoom_in = "Zoom in"
 zoom_out = "Zoom out"
 zoom_actual = "Actual size"
 appearance = "Appearance"
+set_appearance = "Set appearance"
 opacity = "Opacity"
 opacity_up = "More opaque"
 opacity_down = "More transparent"
