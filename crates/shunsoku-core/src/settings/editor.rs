@@ -12,17 +12,18 @@
 //!   `move_region`。「範囲を選び直す」は `set_region_range`。GUI を開いている間にトレイから登録した定型領域は
 //!   `new_registered_region` で名前を決め、書いたら `registered` で base と写しに足す。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
 //! - 「レシピ」タブの一覧の追加・削除は `add_recipe` / `remove_recipe`、名前は `set_recipe_name`。操作の並びは
-//!   `step_choices`（足せる操作）/ `add_step` / `move_step` / `remove_step`。ショートカットは `set_chord` の
-//!   `RecipeShortcut`。検査（`recipe::plan`）で引っかかったものは `mark` の `RecipeName` / `RecipeSteps` に出る。
-//!   操作の並びの行の文言は `step_label`（値のある手は書いた値の要約）。
+//!   `step_choices`（足せる操作と見た目を指定する手）/ `add_step` / `move_step` / `remove_step`。見た目を指定する手の
+//!   欄（`AppearanceItem`）は `appearance` / `set_appearance` で読み書きする（「変えない」は書かない）。ショートカットは
+//!   `set_chord` の `RecipeShortcut`。検査（`recipe::plan`）で引っかかったもの（欄に打った範囲外の値を含む）は `mark` の
+//!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（値のある手は書いた値の要約）。
 
 use std::collections::BTreeSet;
 
 use super::{Problem, Region, Settings, SettingsItem, new_region};
 use crate::geometry::Rect;
 use crate::keys::Chord;
-use crate::recipe::{self, Recipe, Step};
-use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationDescriptor};
+use crate::recipe::{self, AppearanceStep, Recipe, Step};
+use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationId};
 
 /// 設定 GUI の写し。
 #[derive(Debug, Clone)]
@@ -315,10 +316,10 @@ impl Editor {
         }
     }
 
-    /// レシピ `index` の「操作を足す」で選べる操作（表の順）。レシピに入れられる操作（`recipe::can_be_step`）の
-    /// うち、`close` で終わるレシピには `close` を出さない（`add_step` は `close` の前に足すので、2 つ目の
-    /// `close` は最後に置けない）。`index` のレシピがなければ空。
-    pub fn step_choices(&self, index: usize) -> Vec<&'static OperationDescriptor> {
+    /// レシピ `index` の「操作を足す」で選べるもの。値のない操作（表の順）と、最後に見た目を指定する手。値のない
+    /// 操作は、レシピに入れられる操作（`recipe::can_be_step`）のうち、`close` で終わるレシピには `close` を出さない
+    /// （`add_step` は `close` の前に足すので、2 つ目の `close` は最後に置けない）。`index` のレシピがなければ空。
+    pub fn step_choices(&self, index: usize) -> Vec<StepChoice> {
         let Some(r) = self.draft.recipes.get(index) else {
             return Vec::new();
         };
@@ -330,12 +331,15 @@ impl Editor {
             .iter()
             .filter(|op| recipe::can_be_step(op))
             .filter(|op| !(ends_with_last_only && op.in_recipe == InRecipe::Last))
+            .map(|op| StepChoice::Op(op.id))
+            .chain(std::iter::once(StepChoice::Appearance))
             .collect()
     }
 
-    /// レシピ `index` に操作 `id` を足す。レシピが `close` で終わっていれば、その前に入れる（`close` は最後に
-    /// だけ置けるため）。入れた位置を返す。`index` のレシピがなければ何もせず None。
-    pub fn add_step(&mut self, index: usize, id: &str) -> Option<usize> {
+    /// レシピ `index` に `choice` を足す。見た目を指定する手は、全部の項目が「変えない」（そのままでは
+    /// `NoValues`）。レシピが `close` で終わっていれば、その前に入れる（`close` は最後にだけ置けるため）。入れた
+    /// 位置を返す。`index` のレシピがなければ何もせず None。
+    pub fn add_step(&mut self, index: usize, choice: impl Into<StepChoice>) -> Option<usize> {
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
         let at = if steps
             .last()
@@ -345,7 +349,11 @@ impl Editor {
         } else {
             steps.len()
         };
-        steps.insert(at, id.into());
+        let step = match choice.into() {
+            StepChoice::Op(id) => id.into(),
+            StepChoice::Appearance => Step::Appearance(AppearanceStep::default()),
+        };
+        steps.insert(at, step);
         Some(at)
     }
 
@@ -378,6 +386,94 @@ impl Editor {
         steps.remove(step);
         let len = steps.len();
         (len > 0).then(|| step.min(len - 1))
+    }
+
+    /// レシピ `index` の手 `step` が見た目を指定する手なら、その項目 `item` の欄に出す値。「変えない」は
+    /// `Switch(None)` か空の `Text`。読めなかった値（範囲外など）は書いたまま出す。見た目を指定する手でなければ None。
+    pub fn appearance(
+        &self,
+        index: usize,
+        step: usize,
+        item: AppearanceItem,
+    ) -> Option<AppearanceInput> {
+        let Some(Step::Appearance(step)) = self.draft.recipes.get(index)?.steps.get(step) else {
+            return None;
+        };
+        let v = &step.values;
+        let text = |value: Option<String>| {
+            let rejected = step
+                .rejected
+                .iter()
+                .find(|r| r.key == item.key())
+                .and_then(|r| r.value.as_deref())
+                .map(unquoted);
+            AppearanceInput::Text(value.or(rejected).unwrap_or_default())
+        };
+        Some(match item {
+            AppearanceItem::Border => AppearanceInput::Switch(v.border),
+            AppearanceItem::Shadow => AppearanceInput::Switch(v.shadow),
+            AppearanceItem::BorderColor => text(v.border_color.map(|c| c.to_string())),
+            AppearanceItem::BorderWidth => text(v.border_width.map(|w| w.to_string())),
+            AppearanceItem::Opacity => text(v.opacity.map(|o| o.to_string())),
+        })
+    }
+
+    /// レシピ `index` の手 `step`（見た目を指定する手）の項目 `item` を、欄の入力 `input` にする。「変えない」
+    /// （`Switch(None)`、空白だけの `Text`）は書かない。読めない文字（範囲外の数、`#RRGGBB` でない色）は書いたまま
+    /// 残し、設定ファイルから読めなかった値と同じくレシピの問題にする（適用できない）。項目を書き直したら、その
+    /// 項目の読めなかった値は消す。見た目を指定する手でないか、欄と違う種類の入力なら何もしない。
+    pub fn set_appearance(
+        &mut self,
+        index: usize,
+        step: usize,
+        item: AppearanceItem,
+        input: AppearanceInput,
+    ) {
+        let Some(Step::Appearance(step)) = self
+            .draft
+            .recipes
+            .get_mut(index)
+            .and_then(|r| r.steps.get_mut(step))
+        else {
+            return;
+        };
+        if item.is_switch() != matches!(input, AppearanceInput::Switch(_)) {
+            return;
+        }
+        step.rejected.retain(|r| r.key != item.key());
+        let v = &mut step.values;
+        let s = match input {
+            AppearanceInput::Switch(on) => {
+                match item {
+                    AppearanceItem::Border => v.border = on,
+                    _ => v.shadow = on,
+                }
+                return;
+            }
+            AppearanceInput::Text(s) => s,
+        };
+        let s = s.trim();
+        let rejection = match item {
+            AppearanceItem::BorderColor => read_text(&mut v.border_color, s, |s| {
+                s.parse().map_err(|_| recipe::Rejection::BadValue)
+            }),
+            AppearanceItem::BorderWidth => read_text(&mut v.border_width, s, |s| {
+                ranged(s, &super::BORDER_WIDTH_RANGE)
+            }),
+            _ => read_text(&mut v.opacity, s, |s| ranged(s, &super::OPACITY_RANGE)),
+        };
+        if let Some(reason) = rejection {
+            // 書いたまま残す（範囲外の数はそのまま、ほかは TOML の文字列として）
+            let value = match reason {
+                recipe::Rejection::OutOfRange => s.to_owned(),
+                _ => toml_edit::Value::from(s).to_string(),
+            };
+            step.rejected.push(recipe::Rejected {
+                key: item.key().to_owned(),
+                value: Some(value),
+                reason,
+            });
+        }
     }
 
     /// OK と適用を押せるか。OK は適用を止める問題がないとき、適用はそれに加えて写しが base と違うとき。
@@ -437,6 +533,161 @@ pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> S
         return text("scrap.op.set_appearance").to_owned();
     }
     text("settings_gui.recipes.step.appearance").replace("{items}", &items.join(" "))
+}
+
+/// 見た目を指定する手の項目（設定 GUI の欄の順）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppearanceItem {
+    /// 枠を出すか。
+    Border,
+    /// 枠の色。
+    BorderColor,
+    /// 枠の太さ。
+    BorderWidth,
+    /// 透明度。
+    Opacity,
+    /// 影の有無。
+    Shadow,
+}
+
+impl AppearanceItem {
+    /// 欄の順。
+    pub const ALL: [AppearanceItem; 5] = [
+        AppearanceItem::Border,
+        AppearanceItem::BorderColor,
+        AppearanceItem::BorderWidth,
+        AppearanceItem::Opacity,
+        AppearanceItem::Shadow,
+    ];
+
+    /// 設定ファイルの手のキー。
+    pub fn key(self) -> &'static str {
+        match self {
+            AppearanceItem::Border => "border",
+            AppearanceItem::BorderColor => "border_color",
+            AppearanceItem::BorderWidth => "border_width",
+            AppearanceItem::Opacity => "opacity",
+            AppearanceItem::Shadow => "shadow",
+        }
+    }
+
+    /// 欄の見出しの文言のキー。
+    pub fn label_key(self) -> &'static str {
+        match self {
+            AppearanceItem::Border => "settings_gui.recipes.appearance.border",
+            AppearanceItem::BorderColor => "settings_gui.recipes.appearance.border_color",
+            AppearanceItem::BorderWidth => "settings_gui.recipes.appearance.border_width",
+            AppearanceItem::Opacity => "settings_gui.recipes.appearance.opacity",
+            AppearanceItem::Shadow => "settings_gui.recipes.appearance.shadow",
+        }
+    }
+
+    /// オン・オフの欄か（ほかは文字の欄）。
+    pub fn is_switch(self) -> bool {
+        matches!(self, AppearanceItem::Border | AppearanceItem::Shadow)
+    }
+
+    /// 数の欄なら、その範囲（上下のボタンに付ける）。
+    pub fn number_range(self) -> Option<(u32, u32)> {
+        match self {
+            AppearanceItem::BorderWidth => Some((
+                *super::BORDER_WIDTH_RANGE.start(),
+                *super::BORDER_WIDTH_RANGE.end(),
+            )),
+            AppearanceItem::Opacity => Some((
+                u32::from(*super::OPACITY_RANGE.start()),
+                u32::from(*super::OPACITY_RANGE.end()),
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// 見た目を指定する手の欄の値（`Editor::appearance` / `set_appearance`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppearanceInput {
+    /// オン・オフの欄（枠・影）。None は「変えない」。
+    Switch(Option<bool>),
+    /// 文字の欄（色・太さ・透明度）。空は「変えない」。
+    Text(String),
+}
+
+/// オン・オフの欄の選択肢（ドロップダウンの順）と文言のキー。先頭の「変えない」が既定。
+pub const SWITCH_CHOICES: [(Option<bool>, &str); 3] = [
+    (None, UNCHANGED_KEY),
+    (Some(true), "settings_gui.recipes.appearance.on"),
+    (Some(false), "settings_gui.recipes.appearance.off"),
+];
+
+/// 「変えない」の文言のキー。文字の欄では、空のときに薄く出す。
+pub const UNCHANGED_KEY: &str = "settings_gui.recipes.appearance.unchanged";
+
+/// 文字の欄の `s`（前後の空白を除いたもの）を `field` に入れる。空なら「変えない」。`read` で読めなければ
+/// `field` を空にして、そのわけを返す。
+fn read_text<T>(
+    field: &mut Option<T>,
+    s: &str,
+    read: impl FnOnce(&str) -> Result<T, recipe::Rejection>,
+) -> Option<recipe::Rejection> {
+    let (value, rejection) = if s.is_empty() {
+        (None, None)
+    } else {
+        match read(s) {
+            Ok(value) => (Some(value), None),
+            Err(reason) => (None, Some(reason)),
+        }
+    };
+    *field = value;
+    rejection
+}
+
+/// 数の欄の `s`。整数でなければ `BadValue`、`range` の外なら `OutOfRange`。
+fn ranged<T: TryFrom<i64> + PartialOrd>(
+    s: &str,
+    range: &std::ops::RangeInclusive<T>,
+) -> Result<T, recipe::Rejection> {
+    let n: i64 = s.parse().map_err(|_| recipe::Rejection::BadValue)?;
+    T::try_from(n)
+        .ok()
+        .filter(|n| range.contains(n))
+        .ok_or(recipe::Rejection::OutOfRange)
+}
+
+/// 読めなかった値（TOML の書き方）を欄に出す文字にする。文字列なら中身、ほかはそのまま。
+fn unquoted(written: &str) -> String {
+    match written.parse::<toml_edit::Value>() {
+        Ok(toml_edit::Value::String(s)) => s.value().clone(),
+        _ => written.to_owned(),
+    }
+}
+
+/// 「操作を足す」で選べるもの（`Editor::step_choices`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepChoice {
+    /// 値のない操作。
+    Op(OperationId),
+    /// 見た目を指定する手（値は足してから欄で入れる）。
+    Appearance,
+}
+
+impl StepChoice {
+    /// ドロップダウンに出す文言のキー（表にない id は None）。
+    pub fn label_key(self) -> Option<&'static str> {
+        let id = match self {
+            StepChoice::Op(id) => id,
+            StepChoice::Appearance => recipe::APPEARANCE,
+        };
+        OPERATIONS
+            .iter()
+            .find(|op| op.id == id)
+            .map(|op| op.label_key)
+    }
+}
+
+impl From<OperationId> for StepChoice {
+    fn from(id: OperationId) -> StepChoice {
+        StepChoice::Op(id)
+    }
 }
 
 /// 定型領域を動かす向き（`Editor::move_region`）。
@@ -747,6 +998,21 @@ mod tests {
         ] {
             let key = mark.label_key();
             assert_ne!(catalog.text(key), key, "{mark:?}");
+        }
+    }
+
+    #[test]
+    fn every_appearance_field_and_choice_has_a_text_in_the_bundled_locale() {
+        let catalog =
+            crate::i18n::Catalog::parse(include_str!("../../../../locales/ja.toml")).unwrap();
+        let keys = AppearanceItem::ALL
+            .map(AppearanceItem::label_key)
+            .into_iter()
+            .chain(SWITCH_CHOICES.map(|(_, key)| key))
+            .chain([UNCHANGED_KEY])
+            .chain(StepChoice::Appearance.label_key());
+        for key in keys {
+            assert_ne!(catalog.text(key), key);
         }
     }
 
@@ -1092,7 +1358,42 @@ mod tests {
     }
 
     fn choice_ids(editor: &Editor, index: usize) -> Vec<&'static str> {
-        editor.step_choices(index).iter().map(|op| op.id).collect()
+        editor
+            .step_choices(index)
+            .iter()
+            .filter_map(|c| match c {
+                StepChoice::Op(id) => Some(*id),
+                StepChoice::Appearance => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_appearance_step_is_offered_last_and_starts_with_every_item_unchanged() {
+        let mut editor = with_steps(&["copy", "close"]);
+        let choices = editor.step_choices(0);
+        assert_eq!(choices.last(), Some(&StepChoice::Appearance));
+        assert_eq!(
+            choices
+                .iter()
+                .filter(|c| **c == StepChoice::Appearance)
+                .count(),
+            1
+        );
+
+        assert_eq!(editor.add_step(0, StepChoice::Appearance), Some(1));
+
+        assert_eq!(steps(&editor, 0), ["copy", "appearance", "close"]);
+        assert_eq!(
+            editor.draft().recipes[0].steps[1],
+            Step::Appearance(recipe::AppearanceStep::default())
+        );
+        // 項目のない手のままでは適用できない
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoValues))
+        );
+        assert!(!editor.buttons().ok);
     }
 
     #[test]
@@ -1204,6 +1505,254 @@ mod tests {
             );
             assert!(!editor.buttons().ok, "{steps}");
         }
+    }
+
+    /// レシピ 1 つに、全部の項目が「変えない」の見た目の手を 1 つ足した写し。
+    fn with_an_appearance_step() -> Editor {
+        let mut editor = with_steps(&["copy"]);
+        editor.add_step(0, StepChoice::Appearance);
+        editor
+    }
+
+    fn fields(editor: &Editor, step: usize) -> Vec<Option<AppearanceInput>> {
+        AppearanceItem::ALL
+            .iter()
+            .map(|&item| editor.appearance(0, step, item))
+            .collect()
+    }
+
+    #[test]
+    fn the_fields_of_a_new_appearance_step_are_all_unchanged() {
+        let editor = with_an_appearance_step();
+        let unchanged = |item: AppearanceItem| {
+            Some(if item.is_switch() {
+                AppearanceInput::Switch(None)
+            } else {
+                AppearanceInput::Text(String::new())
+            })
+        };
+        assert_eq!(
+            fields(&editor, 1),
+            AppearanceItem::ALL.map(unchanged).to_vec()
+        );
+        // 値のない手には欄がない
+        assert_eq!(fields(&editor, 0), vec![None; 5]);
+        assert_eq!(editor.appearance(0, 2, AppearanceItem::Border), None);
+    }
+
+    #[test]
+    fn values_set_in_the_fields_go_into_the_copy_and_the_step_list() {
+        let mut editor = with_an_appearance_step();
+        let text = |s: &str| AppearanceInput::Text(s.to_owned());
+        editor.set_appearance(
+            0,
+            1,
+            AppearanceItem::Border,
+            AppearanceInput::Switch(Some(true)),
+        );
+        editor.set_appearance(0, 1, AppearanceItem::BorderColor, text(" #ff0000 "));
+        editor.set_appearance(0, 1, AppearanceItem::BorderWidth, text("3"));
+        editor.set_appearance(0, 1, AppearanceItem::Opacity, text("50"));
+        editor.set_appearance(
+            0,
+            1,
+            AppearanceItem::Shadow,
+            AppearanceInput::Switch(Some(false)),
+        );
+
+        assert_eq!(
+            editor.draft().recipes[0].steps[1]
+                .values()
+                .map(|s| s.values),
+            Some(recipe::AppearanceValues {
+                opacity: Some(50),
+                border: Some(true),
+                border_color: Some(crate::settings::Rgb(0xFF, 0, 0)),
+                border_width: Some(3),
+                shadow: Some(false),
+            })
+        );
+        assert_eq!(
+            fields(&editor, 1),
+            [
+                Some(AppearanceInput::Switch(Some(true))),
+                Some(text("#FF0000")),
+                Some(text("3")),
+                Some(text("50")),
+                Some(AppearanceInput::Switch(Some(false))),
+            ]
+        );
+        assert_eq!(
+            labels(&editor)[1],
+            "見た目: 透明度 50% 枠 #FF0000 3px 影なし"
+        );
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().apply);
+
+        // 「変えない」に戻すと、その項目は書かない
+        editor.set_appearance(0, 1, AppearanceItem::Shadow, AppearanceInput::Switch(None));
+        editor.set_appearance(0, 1, AppearanceItem::BorderColor, text(""));
+        editor.set_appearance(0, 1, AppearanceItem::Opacity, text(" "));
+        assert_eq!(labels(&editor)[1], "見た目: 枠 3px");
+        assert_eq!(
+            editor.appearance(0, 1, AppearanceItem::BorderColor),
+            Some(text(""))
+        );
+    }
+
+    #[test]
+    fn values_the_fields_cannot_take_stay_as_typed_and_block_applying() {
+        let text = |s: &str| AppearanceInput::Text(s.to_owned());
+        for (item, typed, problem) in [
+            (AppearanceItem::Opacity, "5", Problem::OutOfRange),
+            (AppearanceItem::Opacity, "101", Problem::OutOfRange),
+            (AppearanceItem::BorderWidth, "17", Problem::OutOfRange),
+            (AppearanceItem::BorderWidth, "0", Problem::OutOfRange),
+            (AppearanceItem::BorderWidth, "x", Problem::BadValue),
+            (AppearanceItem::BorderColor, "#FF00", Problem::BadValue),
+        ] {
+            let mut editor = with_an_appearance_step();
+            editor.set_appearance(
+                0,
+                1,
+                AppearanceItem::Shadow,
+                AppearanceInput::Switch(Some(true)),
+            );
+
+            editor.set_appearance(0, 1, item, text(typed));
+
+            assert_eq!(editor.appearance(0, 1, item), Some(text(typed)), "{typed}");
+            assert_eq!(
+                editor.mark(&SettingsItem::RecipeSteps(0)),
+                Some(Mark::Problem(problem)),
+                "{typed}"
+            );
+            assert!(!editor.buttons().ok, "{typed}");
+
+            // 読める値に直せば、問題は消える
+            editor.set_appearance(0, 1, item, text(""));
+            assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None, "{typed}");
+            assert!(editor.buttons().ok, "{typed}");
+        }
+    }
+
+    #[test]
+    fn no_border_with_a_border_color_or_width_blocks_applying() {
+        let mut editor = with_an_appearance_step();
+        let text = |s: &str| AppearanceInput::Text(s.to_owned());
+        editor.set_appearance(
+            0,
+            1,
+            AppearanceItem::Border,
+            AppearanceInput::Switch(Some(false)),
+        );
+        assert!(editor.buttons().ok);
+
+        editor.set_appearance(0, 1, AppearanceItem::BorderWidth, text("2"));
+
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::BorderOffWithColorOrWidth))
+        );
+        assert!(!editor.buttons().ok);
+        editor.set_appearance(0, 1, AppearanceItem::Border, AppearanceInput::Switch(None));
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn a_value_read_from_the_file_that_was_out_of_range_shows_as_written_until_overwritten() {
+        let mut editor = with_steps_read(
+            r#"[{ op = "appearance", opacity = 500, border_color = "red", shadow = true }]"#,
+        );
+        let text = |s: &str| AppearanceInput::Text(s.to_owned());
+        assert_eq!(
+            editor.appearance(0, 0, AppearanceItem::Opacity),
+            Some(text("500"))
+        );
+        assert_eq!(
+            editor.appearance(0, 0, AppearanceItem::BorderColor),
+            Some(text("red"))
+        );
+        assert!(!editor.buttons().ok);
+
+        editor.set_appearance(0, 0, AppearanceItem::Opacity, text("50"));
+        editor.set_appearance(0, 0, AppearanceItem::BorderColor, text("#00ff00"));
+
+        // 書き直した項目の読めなかった値は残らない
+        assert_eq!(
+            editor.draft().recipes[0].steps[0]
+                .values()
+                .unwrap()
+                .rejected,
+            []
+        );
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert_eq!(labels(&editor), ["見た目: 透明度 50% 枠 #00FF00 影"]);
+    }
+
+    #[test]
+    fn a_step_made_in_the_fields_is_written_as_an_inline_table_and_reads_back_the_same() {
+        let mut editor = with_an_appearance_step();
+        let text = |s: &str| AppearanceInput::Text(s.to_owned());
+        editor.set_appearance(0, 1, AppearanceItem::BorderColor, text("#ff0000"));
+        editor.set_appearance(0, 1, AppearanceItem::Opacity, text("40"));
+        editor.set_appearance(
+            0,
+            1,
+            AppearanceItem::Shadow,
+            AppearanceInput::Switch(Some(false)),
+        );
+        assert!(editor.buttons().apply);
+
+        let written = super::super::write::rewrite("version = 1\n", editor.draft()).unwrap();
+
+        assert!(
+            written.contains(
+                r##"steps = ["copy", { op = "appearance", opacity = 40, border_color = "#FF0000", shadow = false }]"##
+            ),
+            "{written}"
+        );
+        let (read, issues) = super::super::load(&written);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, editor.draft().recipes);
+    }
+
+    #[test]
+    fn fields_of_a_step_without_values_or_of_a_missing_step_change_nothing() {
+        let mut editor = with_an_appearance_step();
+        let before = editor.draft().clone();
+        editor.set_appearance(
+            0,
+            0,
+            AppearanceItem::Opacity,
+            AppearanceInput::Text("50".into()),
+        );
+        editor.set_appearance(
+            0,
+            5,
+            AppearanceItem::Opacity,
+            AppearanceInput::Text("50".into()),
+        );
+        editor.set_appearance(
+            3,
+            1,
+            AppearanceItem::Opacity,
+            AppearanceInput::Text("50".into()),
+        );
+        // 欄と違う種類の入力は捨てる
+        editor.set_appearance(
+            0,
+            1,
+            AppearanceItem::Opacity,
+            AppearanceInput::Switch(Some(true)),
+        );
+        editor.set_appearance(
+            0,
+            1,
+            AppearanceItem::Border,
+            AppearanceInput::Text("true".into()),
+        );
+        assert_eq!(editor.draft(), &before);
     }
 
     #[test]

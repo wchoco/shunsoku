@@ -175,6 +175,18 @@ border_width = "{width}px"
 shadow_on = "shadow"
 shadow_off = "no shadow"
 
+# Fields of an appearance step (shown below the step list while it is selected)
+[settings_gui.recipes.appearance]
+border = "Border:"
+border_color = "Color:"
+border_width = "Width:"
+opacity = "Opacity:"
+shadow = "Shadow:"
+# First choice of each field (the item is not written). Shown dimmed in an empty number or color field
+unchanged = "Keep"
+on = "On"
+off = "Off"
+
 [settings_gui.mark]
 unset = "Not set"
 conflict = "Overlaps"

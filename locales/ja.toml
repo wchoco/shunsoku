@@ -189,6 +189,18 @@ border_width = "{width}px"
 shadow_on = "影"
 shadow_off = "影なし"
 
+# 見た目を指定する手の欄（手の一覧で選んでいる間、一覧の下に出す）
+[settings_gui.recipes.appearance]
+border = "枠:"
+border_color = "枠の色:"
+border_width = "太さ:"
+opacity = "透明度:"
+shadow = "影:"
+# 欄の先頭の選択肢（その項目を書かない）。数と色の欄では、空のときに薄く出す
+unchanged = "変えない"
+on = "あり"
+off = "なし"
+
 # 欄の横の印
 [settings_gui.mark]
 unset = "未設定"

@@ -38,7 +38,7 @@ use std::path::Path;
 use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::monitors;
-use shunsoku_core::settings::editor::{Editor, Move};
+use shunsoku_core::settings::editor::{AppearanceInput, AppearanceItem, Editor, Move};
 use shunsoku_core::settings::form::{ClickPlace, FieldEntry, PauseChange};
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::tab_step::{StepFocus, TabStep};
@@ -579,6 +579,19 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
             EN_KILLFOCUS => refresh(hwnd),
             _ => {}
         },
+        _ if recipes::appearance_item(id).is_some() => {
+            let Some(item) = recipes::appearance_item(id) else {
+                return;
+            };
+            match code {
+                CBN_SELCHANGE | EN_CHANGE if !recipes::is_syncing() => {
+                    set_appearance(hwnd, item, recipes::appearance_input(hwnd, item));
+                }
+                // 打っている間は書き換えない欄を、出たら写しの値に揃える
+                EN_KILLFOCUS => refresh(hwnd),
+                _ => {}
+            }
+        }
         _ if chord_field::is_field(control) => match code {
             EN_CHANGE => on_chord_changed(hwnd, id, chord_field::value(control)),
             EN_SETFOCUS | EN_KILLFOCUS => {
@@ -981,6 +994,45 @@ fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
             }
             refresh(hwnd);
         }
+        Button::PickColor => pick_appearance_color(hwnd),
+    }
+}
+
+/// 「レシピ」タブで選んでいる見た目の手の項目 `item` を `input` にする。
+fn set_appearance(hwnd: HWND, item: AppearanceItem, input: Option<AppearanceInput>) {
+    let (Some(i), Some(s), Some(input)) =
+        (recipes::selected(hwnd), recipes::selected_step(hwnd), input)
+    else {
+        return;
+    };
+    edit(hwnd, |editor| editor.set_appearance(i, s, item, input));
+}
+
+/// 「レシピ」タブの「選ぶ…」: 色の画面を開いて、選んだ色を見た目の手の枠の色にする。
+/// 初めの色は欄の色、欄が空ならスクラップの枠の色。
+fn pick_appearance_color(hwnd: HWND) {
+    let (Some(i), Some(s)) = (recipes::selected(hwnd), recipes::selected_step(hwnd)) else {
+        return;
+    };
+    let current = with_app(|app| {
+        let editor = &app.settings_gui.as_ref()?.editor;
+        let typed = match editor.appearance(i, s, AppearanceItem::BorderColor)? {
+            AppearanceInput::Text(typed) => typed.parse().ok(),
+            AppearanceInput::Switch(_) => None,
+        };
+        Some(typed.unwrap_or(editor.draft().scrap.border.color))
+    })
+    .flatten();
+    // 色の画面はモーダルで回るので、App を借りたまま開かない
+    let Some(current) = current else {
+        return;
+    };
+    if let Some(color) = fields::pick_color(hwnd, current) {
+        set_appearance(
+            hwnd,
+            AppearanceItem::BorderColor,
+            Some(AppearanceInput::Text(color.to_string())),
+        );
     }
 }
 
