@@ -77,7 +77,7 @@ const PAGE_ID_SPAN: i32 = 100;
 
 /// ダイアログの大きさ（ダイアログ単位）。
 const WIDTH: i16 = 340;
-const HEIGHT: i16 = 250;
+const HEIGHT: i16 = 280;
 const MARGIN: i16 = 7;
 const BUTTON_WIDTH: i16 = 50;
 const BUTTON_HEIGHT: i16 = 14;
