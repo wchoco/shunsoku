@@ -223,6 +223,7 @@ opacity_up = "More opaque"
 opacity_down = "More transparent"
 border = "Border"
 shadow = "Shadow"
+reset_appearance = "Reset appearance to default"
 toggle_compact = "Compact view"
 close = "Close"
 

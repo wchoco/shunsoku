@@ -28,6 +28,7 @@
 //! `opacity_up` / `opacity_down` に分ける。どれもスクラップごとの上書き（`ScrapModel::appearance_overrides`）を
 //! 変える。いまの見た目は全体の既定値に上書きを重ねて決まるので、既定値を `OpContext::appearance` と `menu` の
 //! 引数で受け取る。メニューでは 3 つの一覧を「見た目」の子メニュー（`FOLDERS`、`MenuEntry::Folder`）にまとめる。
+//! 上書きを全部消す `reset_appearance`（見た目を既定に戻す）は値のない操作で、同じ子メニューの区切りの下に置く。
 //!
 //! 見た目を指定（`appearance`）は、設定ファイルのレシピに値のある手（`{ op = "appearance", border_color = ... }`）
 //! として書いたときだけ動く（ADR-0008）。書いた値は `OpContext::values` で渡り、書いた項目だけを上書きする。
@@ -39,7 +40,7 @@ use crate::annotate::{Carryover, EditInput, Font, Style};
 use crate::geometry::Point;
 use crate::keys::{Chord, Key, Modifiers};
 use crate::recipe::{AppearanceValues, Plan};
-use crate::scrap::{Appearance, BorderOverride, Mode, ScrapModel, ZoomAnchor};
+use crate::scrap::{Appearance, AppearanceOverrides, BorderOverride, Mode, ScrapModel, ZoomAnchor};
 use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
@@ -569,6 +570,13 @@ fn set_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     redrawn(model.appearance(&context.appearance) != before)
 }
 
+/// 見た目のスクラップごとの上書きを全部消し、全体の既定値の見た目に戻す。見た目が変わったときだけ描き直す。
+fn reset_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let before = model.appearance(&context.appearance);
+    model.appearance_overrides = AppearanceOverrides::default();
+    redrawn(model.appearance(&context.appearance) != before)
+}
+
 /// コンパクト表示に畳む、または広げる。畳む基準点は拡大縮小と同じ（マウスならカーソル、ほかは中心）。
 fn toggle_compact(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     if model.is_compact() {
@@ -959,12 +967,28 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         run: shadow_to,
     },
     OperationDescriptor {
+        id: "reset_appearance",
+        label_key: "scrap.op.reset_appearance",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::View,
+        order: 25,
+        drag_only: false,
+        takes_values: false,
+        in_recipe: InRecipe::Anywhere,
+        in_menu: true,
+        can_execute: not_compact,
+        checked: None,
+        choices: None,
+        run: reset_appearance,
+    },
+    OperationDescriptor {
         id: "appearance",
         label_key: "scrap.op.set_appearance",
         default_shortcut: &[],
         default_mouse: None,
         group: Group::View,
-        order: 25,
+        order: 26,
         drag_only: false,
         takes_values: true,
         in_recipe: InRecipe::Anywhere,
@@ -1320,9 +1344,22 @@ impl Folder {
     }
 }
 
-/// メニューで子メニューにまとめる操作（文言のキー、操作の id）。まとめた操作は、最初の操作の位置に並ぶ。
-const FOLDERS: &[(&str, &[OperationId])] =
-    &[("scrap.op.appearance", &["opacity", "border", "shadow"])];
+/// メニューで子メニューにまとめる操作（文言のキー、区切りで分けた操作の id の並び）。まとめた操作は、最初の
+/// 操作の位置に並ぶ。子メニューの中では、違う並びの操作の間に区切りを入れる。
+const FOLDERS: &[(&str, &[&[OperationId]])] = &[(
+    "scrap.op.appearance",
+    &[&["opacity", "border", "shadow"], &["reset_appearance"]],
+)];
+
+/// `id` をまとめる子メニューの文言のキーと、その中の区切りで分けた並びの番号。
+fn folder_of(id: OperationId) -> Option<(&'static str, usize)> {
+    FOLDERS.iter().find_map(|&(label_key, sections)| {
+        sections
+            .iter()
+            .position(|ids| ids.contains(&id))
+            .map(|section| (label_key, section))
+    })
+}
 
 /// 子メニューに展開する操作。選んだ選択肢の `value` を `OpContext::choice` に入れて実行する。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1364,6 +1401,8 @@ pub fn menu(
     listed.sort_by_key(|op| (op.group, op.order));
     let mut entries = Vec::new();
     let mut group = None;
+    // 直前に子メニューへ入れた操作の、区切りで分けた並びの番号。
+    let mut folder_section = None;
     for op in listed {
         if group.is_some_and(|g| g != op.group) {
             entries.push(MenuEntry::Separator);
@@ -1385,12 +1424,16 @@ pub fn menu(
                 checked: op.checked.is_some_and(|checked| checked(model)),
             }),
         };
-        let Some(&(label_key, _)) = FOLDERS.iter().find(|(_, ids)| ids.contains(&op.id)) else {
+        let Some((label_key, section)) = folder_of(op.id) else {
             entries.push(entry);
+            folder_section = None;
             continue;
         };
         match entries.last_mut() {
             Some(MenuEntry::Folder(folder)) if folder.label_key == label_key => {
+                if folder_section != Some(section) {
+                    folder.entries.push(MenuEntry::Separator);
+                }
                 folder.entries.push(entry);
             }
             _ => entries.push(MenuEntry::Folder(Folder {
@@ -1398,6 +1441,7 @@ pub fn menu(
                 entries: vec![entry],
             })),
         }
+        folder_section = Some(section);
     }
     entries
 }
@@ -2048,6 +2092,57 @@ mod tests {
     }
 
     #[test]
+    fn resetting_the_appearance_drops_every_override_and_keeps_the_image_in_place() {
+        let defaults = Appearance::default();
+        let mut model = scrap();
+        let context = |choice| OpContext {
+            choice: Some(choice),
+            ..with_defaults(defaults)
+        };
+        execute(op("opacity"), &mut model, &context(40));
+        execute(op("border"), &mut model, &context(0xFF_00_00));
+        execute(op("shadow"), &mut model, &context(0));
+        assert_ne!(model.appearance(&defaults), defaults);
+
+        assert_eq!(
+            execute(op("reset_appearance"), &mut model, &with_defaults(defaults)),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(model.appearance(&defaults), defaults);
+        assert_eq!(model.window_rect(&defaults), scrap().window_rect(&defaults));
+        assert_eq!(model.position, scrap().position);
+    }
+
+    #[test]
+    fn resetting_an_appearance_already_at_the_defaults_changes_nothing() {
+        let defaults = Appearance::default();
+        let mut model = scrap();
+        assert_eq!(
+            execute(op("reset_appearance"), &mut model, &with_defaults(defaults)),
+            vec![]
+        );
+        assert_eq!(model, scrap());
+    }
+
+    #[test]
+    fn resetting_the_appearance_has_no_default_shortcut_and_takes_one_from_the_settings_file() {
+        assert_eq!(op("reset_appearance").default_shortcut, &[]);
+        let (settings, issues) = settings::load(
+            r#"version = 1
+[shortcuts]
+reset_appearance = "Ctrl+Shift+D"
+"#,
+        );
+        assert_eq!(issues, vec![]);
+        let keymap = settings::keymap(&settings, OPERATIONS);
+        assert_eq!(keymap.issues, vec![]);
+        assert_eq!(
+            bound(&keymap.shortcuts, "Ctrl+Shift+D"),
+            Some("reset_appearance")
+        );
+    }
+
+    #[test]
     fn the_appearance_lists_take_no_shortcut() {
         let overrides = ShortcutOverrides::from([
             ("opacity".to_owned(), Some(chord("O"))),
@@ -2193,6 +2288,7 @@ mod tests {
                 ("opacity", false),
                 ("border", false),
                 ("shadow", false),
+                ("reset_appearance", false),
                 ("toggle_compact", true),
                 ("close", true),
             ]
@@ -2335,7 +2431,9 @@ mod tests {
                             enabled: true,
                             choices: (op(id).choices.unwrap())(&scrap(), &Appearance::default()),
                         }))
-                        .to_vec(),
+                        .into_iter()
+                        .chain([MenuEntry::Separator, item("reset_appearance", true, None),])
+                        .collect(),
                 }),
                 item("toggle_compact", true, None),
                 MenuEntry::Separator,
@@ -2758,6 +2856,7 @@ mod tests {
                 "zoom_actual",
                 "opacity_up",
                 "opacity_down",
+                "reset_appearance",
                 "toggle_compact",
                 "close",
             ]

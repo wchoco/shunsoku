@@ -116,6 +116,7 @@ capture_cursor = false
 # zoom_actual     元のサイズに戻す                  Ctrl+0
 # opacity_up      濃くする                          （なし。Ctrl+ホイールを上へで濃くします）
 # opacity_down    薄くする                          （なし。Ctrl+ホイールを下へで薄くします）
+# reset_appearance 見た目を既定に戻す               （なし）
 # toggle_compact  コンパクト表示                    （なし。ダブルクリックで切り替えます）
 # close           閉じる                            Esc（マウスの中クリックでも閉じます）
 # （ドラッグでの移動はマウスだけの操作で、ショートカットは付けられません。右クリックメニューの
