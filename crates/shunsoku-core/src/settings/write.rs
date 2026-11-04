@@ -482,16 +482,35 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
     );
 }
 
-/// レシピの手 1 つ。値のない手は操作の id の文字列、値のある手は `op` と値のキーを持つインライン表。
+/// レシピの手 1 つ。値のない手は操作の id の文字列、値のある手は `op` と書いた項目のキーを持つインライン表
+/// （`op`、`opacity`、`border`、`border_color`、`shadow` の順）。読めなかった項目は、その後ろに書いたまま書く
+/// （`op` を読めなかったなら、その `op` で書く）。
 fn step_value(step: &Step) -> Value {
-    match step {
-        Step::Op(id) => id.as_str().into(),
-        Step::Appearance(_) => {
-            let mut table = toml_edit::InlineTable::new();
-            table.insert("op", APPEARANCE.into());
-            Value::InlineTable(table)
+    let step = match step {
+        Step::Op(id) => return id.as_str().into(),
+        Step::Appearance(step) => step,
+    };
+    let v = &step.values;
+    let mut table = toml_edit::InlineTable::new();
+    table.insert("op", APPEARANCE.into());
+    if let Some(opacity) = v.opacity {
+        table.insert("opacity", i64::from(opacity).into());
+    }
+    if let Some(border) = v.border {
+        table.insert("border", border.into());
+    }
+    if let Some(color) = v.border_color {
+        table.insert("border_color", color.to_string().into());
+    }
+    if let Some(shadow) = v.shadow {
+        table.insert("shadow", shadow.into());
+    }
+    for r in &step.rejected {
+        if let Some(value) = r.value.as_deref().and_then(|v| v.parse::<Value>().ok()) {
+            table.insert(&r.key, value);
         }
     }
+    Value::InlineTable(table)
 }
 
 /// 定型領域 1 つ。名前・モニタ・範囲は既定値がないので、読めなければ常に書く。
@@ -1177,6 +1196,79 @@ steps = ["shadow"]
         let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
         assert!(
             out.contains(r#"steps = [{ op = "appearance" }, "copy"]"#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_step_with_values_reads_back_the_same() {
+        let mut r = recipe("赤枠でコピー", &[], Some("Ctrl+Shift+R"));
+        r.steps = vec![
+            Step::Appearance(crate::recipe::AppearanceStep {
+                values: crate::recipe::AppearanceValues {
+                    opacity: Some(50),
+                    border: Some(true),
+                    border_color: Some(Rgb(0xFF, 0, 0)),
+                    shadow: Some(false),
+                },
+                rejected: vec![],
+            }),
+            "copy".into(),
+        ];
+        let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
+        assert!(
+            out.contains(
+                r##"steps = [{ op = "appearance", opacity = 50, border = true, border_color = "#FF0000", shadow = false }, "copy"]"##
+            ),
+            "{out}"
+        );
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, vec![r]);
+    }
+
+    const RECIPES_WITH_VALUES: &str = r##"version = 1
+
+# 赤枠
+[[recipes]]
+name = "赤枠でコピー"
+steps = [{op="appearance",border_color="#ff0000"}, "copy"]   # 手で書いた
+shortcut = "Ctrl+Shift+R"
+
+# 書き間違い
+[[recipes]]
+name = "影"
+steps = [{ op = "appearance", shadow = true, colour = "#FF0000", opacity = 500 }]
+"##;
+
+    #[test]
+    fn writing_recipes_with_values_that_were_read_changes_nothing() {
+        assert_eq!(written(RECIPES_WITH_VALUES, |_| {}), RECIPES_WITH_VALUES);
+        let out = written(RECIPES_WITH_VALUES, |s| {
+            s.recipes[1].name = "影だけ".to_owned();
+        });
+        assert_eq!(
+            out,
+            RECIPES_WITH_VALUES.replace("name = \"影\"", "name = \"影だけ\"")
+        );
+    }
+
+    #[test]
+    fn a_step_rewritten_with_items_it_could_not_read_keeps_them_as_written() {
+        let out = written(RECIPES_WITH_VALUES, |s| {
+            s.recipes[1].steps.push("copy".into());
+        });
+        assert!(
+            out.contains(
+                r##"steps = [{ op = "appearance", shadow = true, colour = "#FF0000", opacity = 500 }, "copy"]"##
+            ),
+            "{out}"
+        );
+        let wrong_op =
+            "version = 1\n[[recipes]]\nname = \"a\"\nsteps = [{ op = \"copy\", shadow = true }]\n";
+        let out = written(wrong_op, |s| s.recipes[0].steps.push("copy".into()));
+        assert!(
+            out.contains(r#"steps = [{ op = "copy", shadow = true }, "copy"]"#),
             "{out}"
         );
     }

@@ -29,13 +29,17 @@
 //! 変える。いまの見た目は全体の既定値に上書きを重ねて決まるので、既定値を `OpContext::appearance` と `menu` の
 //! 引数で受け取る。メニューでは 3 つの一覧を「見た目」の子メニュー（`FOLDERS`、`MenuEntry::Folder`）にまとめる。
 //! 上書きを全部消す `reset_appearance`（見た目を既定に戻す）は値のない操作で、同じ子メニューの区切りの下に置く。
+//!
+//! 見た目を指定（`appearance`）は、設定ファイルのレシピに値のある手（`{ op = "appearance", border_color = ... }`）
+//! として書いたときだけ動く（ADR-0008）。書いた値は `OpContext::values` で渡り、書いた項目だけを上書きする。
+//! `takes_values` の操作はショートカット・マウス・「スクラップ操作」タブの行・メニューのどれにも出さない。
 
 use std::collections::BTreeMap;
 
 use crate::annotate::{Carryover, EditInput, Font, Style};
 use crate::geometry::Point;
 use crate::keys::{Chord, Key, Modifiers};
-use crate::recipe::Plan;
+use crate::recipe::{AppearanceValues, Plan};
 use crate::scrap::{Appearance, AppearanceOverrides, BorderOverride, Mode, ScrapModel, ZoomAnchor};
 use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, ShortcutOverrides};
 
@@ -57,6 +61,9 @@ pub struct OperationDescriptor {
     /// ドラッグの量（`OpContext::drag`）を引数に取る操作。ドラッグでしか呼べないので、メニューにも
     /// ショートカットの対応表にも出さない。
     pub drag_only: bool,
+    /// レシピの値のある手の値（`OpContext::values`）を引数に取る操作（`appearance`。ADR-0008）。値のある手から
+    /// だけ呼ぶので、メニューにも、ショートカットとマウスの対応表にも、値のない手にも出さない。
+    pub takes_values: bool,
     /// レシピのどこに置けるか（ADR-0007）。引数のある操作とドラッグ専用の操作は `Never` にする。
     pub in_recipe: InRecipe,
     /// 右クリックメニューに出すか。キーやマウスで足りる操作（移動、拡大・縮小）は出さず、メニューを spec の
@@ -76,7 +83,7 @@ pub struct OperationDescriptor {
 impl OperationDescriptor {
     /// ショートカットとマウスの割り当てを設定で変えられるか。引数のない操作だけ。
     pub(crate) fn takes_binding(&self) -> bool {
-        self.choices.is_none() && !self.drag_only
+        self.choices.is_none() && !self.drag_only && !self.takes_values
     }
 }
 
@@ -248,6 +255,8 @@ pub struct OpContext {
     pub carryover: Carryover,
     /// 文字の書き込みの書体と大きさの既定値（設定ファイルの `[annotation]`）。
     pub font: Font,
+    /// レシピの値のある手に書いた値（`takes_values` の操作に渡す）。ほかから呼んだときは None。
+    pub values: Option<AppearanceValues>,
 }
 
 /// 操作の結果、Win32 層がすること。
@@ -532,6 +541,35 @@ fn shadow_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     vec![Effect::Redraw]
 }
 
+/// レシピの値のある手に書いた項目だけを、スクラップごとの上書きに重ねる（ADR-0008）。書かなかった項目は今の
+/// 値のまま。枠の色を書けば枠も出す。見た目が変わらなければ何もしない（手は成功として次へ進む）。
+fn set_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let Some(values) = context.values else {
+        return Vec::new();
+    };
+    let before = model.appearance(&context.appearance);
+    let overrides = &mut model.appearance_overrides;
+    if let Some(opacity) = values.opacity {
+        overrides.opacity = Some(opacity);
+    }
+    if let Some(shadow) = values.shadow {
+        overrides.shadow = Some(shadow);
+    }
+    let color = values
+        .border_color
+        .map(|settings::Rgb(r, g, b)| u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b));
+    match (values.border, color) {
+        (Some(false), _) => overrides.border = Some(BorderOverride::Hidden),
+        (_, Some(color)) => overrides.border = Some(BorderOverride::Color(color)),
+        // 枠を出すだけなら、色は今の色のまま
+        (Some(true), None) if !before.show_border => {
+            overrides.border = Some(BorderOverride::Color(before.border.color));
+        }
+        _ => {}
+    }
+    redrawn(model.appearance(&context.appearance) != before)
+}
+
 /// 見た目のスクラップごとの上書きを全部消し、全体の既定値の見た目に戻す。見た目が変わったときだけ描き直す。
 fn reset_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     let before = model.appearance(&context.appearance);
@@ -610,6 +648,7 @@ const fn keyboard_move(
         group: Group::Move,
         order,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: normal,
@@ -629,6 +668,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 10,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: normal,
@@ -644,6 +684,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 20,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: not_compact,
@@ -659,6 +700,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 30,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: not_compact,
@@ -674,6 +716,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Edit,
         order: 10,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
@@ -689,6 +732,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Edit,
         order: 20,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: trimmed,
@@ -704,6 +748,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Edit,
         order: 30,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: can_annotate,
@@ -769,6 +814,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Move,
         order: 0,
         drag_only: true,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: false,
         can_execute: normal,
@@ -784,6 +830,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 10,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
@@ -799,6 +846,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 11,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -814,6 +862,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 12,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -829,6 +878,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 13,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -844,6 +894,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 20,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
@@ -859,6 +910,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 21,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -874,6 +926,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 22,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -889,6 +942,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 23,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
@@ -904,6 +958,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 24,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
@@ -919,12 +974,29 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 25,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: not_compact,
         checked: None,
         choices: None,
         run: reset_appearance,
+    },
+    OperationDescriptor {
+        id: "appearance",
+        label_key: "scrap.op.set_appearance",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::View,
+        order: 26,
+        drag_only: false,
+        takes_values: true,
+        in_recipe: InRecipe::Anywhere,
+        in_menu: false,
+        can_execute: not_compact,
+        checked: None,
+        choices: None,
+        run: set_appearance,
     },
     OperationDescriptor {
         id: "toggle_compact",
@@ -934,6 +1006,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 30,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: normal,
@@ -949,6 +1022,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Close,
         order: 10,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Last,
         in_menu: true,
         can_execute: normal,
@@ -993,10 +1067,10 @@ impl BindingRow {
 
 /// 設定 GUI の「スクラップ操作」タブの行の一覧。`ops`（ふつうは `OPERATIONS`）の表の順で、ショートカットか
 /// マウスを割り当てられる操作の行を作る。引数の選択肢を持つ操作（`choices` が Some）はメニュー専用なので
-/// 行にしない。左ドラッグの移動（`drag_only`）は行にするが、ショートカットの欄はない。
+/// 行にしない。レシピの値のある手からだけ呼ぶ操作（`takes_values`）も行にしない。左ドラッグの移動（`drag_only`）は行にするが、ショートカットの欄はない。
 pub fn binding_rows(ops: &'static [OperationDescriptor]) -> Vec<BindingRow> {
     ops.iter()
-        .filter(|op| op.choices.is_none())
+        .filter(|op| op.choices.is_none() && !op.takes_values)
         .map(|op| BindingRow {
             op,
             default_shortcut: op.takes_binding().then_some(op.default_shortcut),
@@ -2085,6 +2159,44 @@ reset_appearance = "Ctrl+Shift+D"
     }
 
     #[test]
+    fn setting_the_appearance_by_values_is_only_for_recipe_steps() {
+        let overrides = ShortcutOverrides::from([("appearance".to_owned(), Some(chord("Q")))]);
+        let shortcuts = Shortcuts::new(OPERATIONS, &overrides);
+        assert_eq!(shortcuts.ignored_overrides(), ["appearance"]);
+        assert_eq!(bound(&shortcuts, "Q"), None);
+        let mouse = MouseBindings::new(
+            OPERATIONS,
+            &MouseOverrides::from([("appearance".to_owned(), Some(MouseGesture::WheelUp))]),
+        );
+        assert_eq!(mouse.ignored_overrides(), ["appearance"]);
+        assert!(
+            binding_rows(OPERATIONS)
+                .iter()
+                .all(|row| row.op.id != "appearance")
+        );
+        fn ids(entries: &[MenuEntry]) -> Vec<&'static str> {
+            entries
+                .iter()
+                .flat_map(|e| match e {
+                    MenuEntry::Item(item) => vec![item.id],
+                    MenuEntry::Submenu(sub) => vec![sub.id],
+                    MenuEntry::Folder(folder) => ids(&folder.entries),
+                    MenuEntry::Separator => vec![],
+                })
+                .collect()
+        }
+        let entries = menu(OPERATIONS, &scrap(), &shortcuts, &Appearance::default());
+        assert!(!ids(&entries).contains(&"appearance"));
+        // 値なしで呼んでも何もしない
+        let mut model = scrap();
+        assert_eq!(
+            execute(op("appearance"), &mut model, &OpContext::default()),
+            vec![]
+        );
+        assert_eq!(model, scrap());
+    }
+
+    #[test]
     fn a_double_click_folds_around_the_cursor_and_toggles_back() {
         let mouse = MouseBindings::new(OPERATIONS, &MouseOverrides::new());
         let id = |g| mouse_bound(&mouse, g);
@@ -2455,6 +2567,7 @@ reset_appearance = "Ctrl+Shift+D"
             test_op("b", Group::Move, 20, &[]),
             OperationDescriptor {
                 drag_only: true,
+                takes_values: false,
                 ..test_op("drag", Group::Move, 0, &[])
             },
             OperationDescriptor {
@@ -2674,6 +2787,7 @@ reset_appearance = "Ctrl+Shift+D"
             group,
             order,
             drag_only: false,
+            takes_values: false,
             in_recipe: InRecipe::Anywhere,
             in_menu: true,
             can_execute: normal,

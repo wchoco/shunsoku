@@ -178,6 +178,16 @@ shortcut_label = "ショートカット:"
 # 「追加」で足すレシピの名前（後ろに番号が付く）
 default_name = "レシピ"
 
+# 手の一覧の、見た目を指定する手の要約（「見た目: 枠 #FF0000」）
+[settings_gui.recipes.step]
+appearance = "見た目: {items}"
+opacity = "透明度 {percent}%"
+border_on = "枠"
+border_off = "枠なし"
+border_color = "枠 {color}"
+shadow_on = "影"
+shadow_off = "影なし"
+
 # 欄の横の印
 [settings_gui.mark]
 unset = "未設定"
@@ -190,6 +200,12 @@ duplicate_name = "名前が重なっています"
 no_steps = "操作がありません"
 not_a_step = "レシピに入れられない操作があります"
 close_not_last = "閉じるは最後にだけ置けます"
+out_of_range = "見た目の値が範囲外です（透明度は 10〜100）"
+bad_value = "見た目の値の書き方が違います（色は #RRGGBB、枠と影は true か false）"
+unknown_key = "見た目の手に知らないキーがあります"
+not_appearance = "表で書ける手は op = \"appearance\" だけです"
+no_values = "見た目の手に項目がありません"
+border_off_with_color = "border = false と枠の色は一緒に書けません"
 
 [hotkey]
 failed = "次のホットキーを登録できませんでした（他のアプリが使っている可能性があります）: "
@@ -217,6 +233,7 @@ zoom_in = "拡大"
 zoom_out = "縮小"
 zoom_actual = "元のサイズに戻す"
 appearance = "見た目"
+set_appearance = "見た目を指定"
 opacity = "透明度"
 opacity_up = "濃くする"
 opacity_down = "薄くする"
