@@ -38,6 +38,8 @@ mod pipe_server;
 #[cfg(windows)]
 mod render;
 #[cfg(windows)]
+mod rotate;
+#[cfg(windows)]
 mod save;
 #[cfg(windows)]
 mod scrap_window;
@@ -45,6 +47,8 @@ mod scrap_window;
 mod settings_dialog;
 #[cfg(windows)]
 mod settings_watch;
+#[cfg(windows)]
+mod shader;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]

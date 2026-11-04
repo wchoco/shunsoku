@@ -79,7 +79,7 @@ scripts/win-driver.sh --help                                  # コマンドの�
 - **マウスの座標**: lParam の座標は符号つき 16 bit（`lp.0 as i16`）。主モニタの左や上のモニタでは負になる。
 - **モニタをまたぐドラッグ**: 始めたウィンドウで `SetCapture` し、client 座標はそのウィンドウの原点で screen 座標に直す。
 - **キー入力**: オーバーレイではフォーカスが 1 枚のウィンドウにしか来ない。キーはウィンドウごとではなく共有の選択状態に流す。Alt つきは `WM_SYSKEYDOWN` で来る。
-- **Desktop Duplication**: 出力はアダプタに属し、D3D11 デバイスはアダプタごとに作る（別アダプタのデバイスでは `DXGI_ERROR_UNSUPPORTED`）。`DuplicateOutput` 直後のフレームは `LastPresentTime == 0` で空のことがある。`DXGI_ERROR_ACCESS_LOST` は作り直し、セキュアデスクトップでの `E_ACCESSDENIED` は「いまは撮れない」として扱う。回転したモニタのテクスチャは回転前の向き。
+- **Desktop Duplication**: 出力はアダプタに属し、D3D11 デバイスはアダプタごとに作る（別アダプタのデバイスでは `DXGI_ERROR_UNSUPPORTED`）。`DuplicateOutput` 直後のフレームは `LastPresentTime == 0` で空のことがある。`DXGI_ERROR_ACCESS_LOST` は作り直し、セキュアデスクトップでの `E_ACCESSDENIED` は「いまは撮れない」として扱う。回転したモニタのテクスチャは回転前の向き。shunsoku は取得の直後（HDR の変換の前）に GPU 上で画面で見えている向きに回し直し（`rotate::to_upright`、対応は core の `capture::rotation`）、以後のモニタの画像はいつも画面で見えている向き。
 - **HDR**: `DuplicateOutput` は HDR のモニタの画像を 8bit に落として返す。FP16（scRGB、1.0 = 80 nit）で受けるには `IDXGIOutput5::DuplicateOutput1` に `[R16G16B16A16_FLOAT, B8G8R8A8_UNORM]` を渡す（SDR のモニタは BGRA8 のまま来る）。「SDR コンテンツの明るさ」は `DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL)`（1000 が 80 nit）。HMONITOR とは `GetMonitorInfoW` の `szDevice` と、パスの `GET_SOURCE_NAME` の `viewGdiDeviceName` で突き合わせる。変換は `crates/shunsoku/src/hdr.rs`。
 - **flip model のスワップチェーン**: `WS_EX_LAYERED` とは併用できない。Alt+Enter を止めるため `MakeWindowAssociation(DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES)`。
 - **レイヤードウィンドウ**: `UpdateLayeredWindow` には premultiplied alpha の 32bpp DIB を渡す。alpha 0 の画素はクリックが下に抜ける。
