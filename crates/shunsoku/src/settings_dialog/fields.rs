@@ -1014,28 +1014,44 @@ impl PageBuilder<'_> {
 
     /// 数の欄（上下のボタン付き）。
     pub fn number(&mut self, field: Field, x: i16, y: i16, cx: i16) {
+        let (id, updown) = self.number_controls(x, y, cx);
+        self.push(field, id, Kind::Number { updown });
+    }
+
+    /// 数の欄と上下のボタンを置いて、その ID を返す（`Field` の行には入れない）。
+    pub(super) fn number_controls(&mut self, x: i16, y: i16, cx: i16) -> (i32, i32) {
         let id = self.edit(WINDOW_STYLE(ES_NUMBER as u32), x, y, cx);
         // 上下のボタンは直前の欄（Z 順の前）に付く
         let style = WINDOW_STYLE(
             UDS_AUTOBUDDY | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_SETBUDDYINT | UDS_NOTHOUSANDS,
         );
         let updown = self.control(Class::UpDown, "", style, x + cx, y, 10, 14);
-        self.push(field, id, Kind::Number { updown });
+        (id, updown)
     }
 
     /// ドロップダウン（`list` は開いたときの一覧の高さ）。
     pub fn choice(&mut self, field: Field, x: i16, y: i16, cx: i16, list: i16) {
-        let style = WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32);
-        let id = self.control(Class::ComboBox, "", style, x, y, cx, list);
+        let id = self.choice_control(x, y, cx, list);
         self.push(field, id, Kind::Choice);
+    }
+
+    /// ドロップダウンを置いて、その ID を返す（`Field` の行には入れない）。
+    pub(super) fn choice_control(&mut self, x: i16, y: i16, cx: i16, list: i16) -> i32 {
+        let style = WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(CBS_DROPDOWNLIST as u32);
+        self.control(Class::ComboBox, "", style, x, y, cx, list)
     }
 
     /// 欄の横のボタン。
     pub fn button(&mut self, action: Action, key: &'static str, x: i16, y: i16, cx: i16) {
+        let id = self.button_control(key, x, y, cx);
+        self.fields.buttons.push(ButtonRow { id, action });
+    }
+
+    /// 文言のキー `key` のボタンを置いて、その ID を返す（`Action` の行には入れない）。
+    fn button_control(&mut self, key: &'static str, x: i16, y: i16, cx: i16) -> i32 {
         let text = (self.text)(key);
         let style = WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
-        let id = self.control(Class::Button, text, style, x, y, cx, 14);
-        self.fields.buttons.push(ButtonRow { id, action });
+        self.control(Class::Button, text, style, x, y, cx, 14)
     }
 
     /// 保存先の欄と「参照…」（幅は合わせて `cx`）。
@@ -1052,14 +1068,24 @@ impl PageBuilder<'_> {
 
     /// 色の欄（`#RRGGBB`）と「選ぶ…」。
     pub fn color_field(&mut self, field: Field, x: i16, y: i16) {
-        self.text(field, x, y, 50);
-        self.button(
-            Action::PickColor(field),
+        let (id, pick) = self.color_controls(x, y);
+        self.push(field, id, kind(field));
+        self.fields.buttons.push(ButtonRow {
+            id: pick,
+            action: Action::PickColor(field),
+        });
+    }
+
+    /// 色の欄と「選ぶ…」を置いて、その ID を返す（`Field` と `Action` の行には入れない）。
+    pub(super) fn color_controls(&mut self, x: i16, y: i16) -> (i32, i32) {
+        let id = self.edit(WINDOW_STYLE(0), x, y, COLOR_WIDTH);
+        let pick = self.button_control(
             "settings_gui.pick_color",
-            x + 50 + BUTTON_GAP,
+            x + COLOR_WIDTH + BUTTON_GAP,
             y,
             SIDE_BUTTON,
         );
+        (id, pick)
     }
 
     /// ファイル名テンプレートの欄と「変数を挿入」（幅は合わせて `cx`）、その下のプレビュー。プレビューを
@@ -1094,3 +1120,5 @@ impl PageBuilder<'_> {
 /// 欄の横のボタンの幅と、欄との間。
 const SIDE_BUTTON: i16 = 50;
 const BUTTON_GAP: i16 = 4;
+/// 色の欄（`#RRGGBB`）の幅。
+const COLOR_WIDTH: i16 = 50;

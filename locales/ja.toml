@@ -193,7 +193,7 @@ shadow_off = "影なし"
 [settings_gui.recipes.appearance]
 border = "枠:"
 border_color = "枠の色:"
-border_width = "太さ:"
+border_width = "枠の太さ:"
 opacity = "透明度:"
 shadow = "影:"
 # 欄の先頭の選択肢（その項目を書かない）。数と色の欄では、空のときに薄く出す
