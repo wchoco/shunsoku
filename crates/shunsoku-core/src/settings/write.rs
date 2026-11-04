@@ -21,7 +21,7 @@ use super::{
     optional_gesture, read_regions_at, recipe_steps, region_number, rgb, save_dir, selection_mode,
 };
 use crate::i18n::Language;
-use crate::recipe::{APPEARANCE, Recipe, Step};
+use crate::recipe::{APPEARANCE, AppearanceItem, ItemValue, Recipe, Step, StepKey};
 use crate::selection::Mode;
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
@@ -483,34 +483,27 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
 }
 
 /// レシピの手 1 つ。値のない手は操作の id の文字列、値のある手は `op` と書いた項目のキーを持つインライン表
-/// （`op`、`opacity`、`border`、`border_color`、`border_width`、`shadow` の順）。読めなかった項目は、その後ろに書いたまま書く
-/// （`op` を読めなかったなら、その `op` で書く）。
+/// （`op` のあと、項目は `AppearanceItem::ALL` の順）。読めなかった項目は、その後ろに書いたまま書く（`op` を
+/// 読めなかったなら、その `op` で書く）。
 fn step_value(step: &Step) -> Value {
     let step = match step {
         Step::Op(id) => return id.as_str().into(),
         Step::Appearance(step) => step,
     };
-    let v = &step.values;
     let mut table = toml_edit::InlineTable::new();
-    table.insert("op", APPEARANCE.into());
-    if let Some(opacity) = v.opacity {
-        table.insert("opacity", i64::from(opacity).into());
-    }
-    if let Some(border) = v.border {
-        table.insert("border", border.into());
-    }
-    if let Some(color) = v.border_color {
-        table.insert("border_color", color.to_string().into());
-    }
-    if let Some(width) = v.border_width {
-        table.insert("border_width", i64::from(width).into());
-    }
-    if let Some(shadow) = v.shadow {
-        table.insert("shadow", shadow.into());
+    table.insert(StepKey::Op.as_str(), APPEARANCE.into());
+    for item in AppearanceItem::ALL {
+        let value = match step.values.get(item) {
+            None => continue,
+            Some(ItemValue::Switch(on)) => Value::from(on),
+            Some(ItemValue::Color(color)) => color.to_string().into(),
+            Some(ItemValue::Number(n)) => i64::from(n).into(),
+        };
+        table.insert(item.key(), value);
     }
     for r in &step.rejected {
         if let Some(value) = r.value.as_deref().and_then(|v| v.parse::<Value>().ok()) {
-            table.insert(&r.key, value);
+            table.insert(r.key.as_str(), value);
         }
     }
     Value::InlineTable(table)
@@ -1222,7 +1215,7 @@ steps = ["shadow"]
         let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
         assert!(
             out.contains(
-                r##"steps = [{ op = "appearance", opacity = 50, border = true, border_color = "#FF0000", border_width = 3, shadow = false }, "copy"]"##
+                r##"steps = [{ op = "appearance", border = true, border_color = "#FF0000", border_width = 3, opacity = 50, shadow = false }, "copy"]"##
             ),
             "{out}"
         );
