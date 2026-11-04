@@ -16,4 +16,4 @@ cargo workspace を `shunsoku-core`（lib）、`shunsoku`（常駐本体）、`s
 - core の `cargo test` は Windows API なしで走る。core が Win32 の情報（モニタやウィンドウの一覧）を必要とするときは、Win32 層が集めた値を引数で受け取る。
 - スクラップ操作の `run` は `fn(&mut ScrapModel, &OpContext) -> Vec<Effect>` の形にする。クリップボード、保存、ごみ箱への移動、トリムや編集モードへの切り替え、再描画などは `Effect` として返し、Win32 層の `app` が実行する。右クリックメニュー、ショートカットの対応表、設定 GUI の「スクラップ操作」タブは、この表から作る。
 - 描画（Direct2D/DirectWrite）、DXGI・WGC による取得、ウィンドウ、トレイ、ホットキー、名前付きパイプは Win32 層に置き、テストの境目の外になる。
-- Win32 層のモジュール同士は直接呼び合わず、`app` を通す。
+- Win32 層のモジュール同士は直接呼び合わず、`app` を通す。ただし、取得した GPU のテクスチャを加工する状態を持たない下回り（`grab`・`window_grab`・`hdr`・`rotate`・`gpu_pass`）は、1 つの層として互いに直接呼んでよい。1 回の取得の中で 1 枚のテクスチャを回して変換する流れを、UI スレッドとの行き来に分けないため。
