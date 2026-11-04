@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 
 use shunsoku_core::capture::hdr::{HIGHLIGHT_ROLLOFF, SCRGB_WHITE_NITS};
 
+use crate::shader;
+
 use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
     DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
@@ -16,18 +18,17 @@ use windows::Win32::Devices::Display::{
     GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
 };
 use windows::Win32::Foundation::{E_FAIL, E_POINTER, ERROR_SUCCESS};
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::{D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BUFFER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_USAGE_IMMUTABLE, D3D11_VIEWPORT, ID3D11Device, ID3D11Texture2D,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BUFFER_DESC,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
+    D3D11_VIEWPORT, ID3D11Device, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW};
-use windows::core::{PCSTR, Result, s};
+use windows::core::{Result, s};
 
 /// HDR の画像のテクスチャの形式（scRGB、線形、1.0 = 80 nit）。
 pub const HDR_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -216,48 +217,12 @@ fn shaders() -> Result<&'static Shaders> {
     static SHADERS: OnceLock<std::result::Result<Shaders, String>> = OnceLock::new();
     SHADERS
         .get_or_init(|| {
-            let vs = compile(s!("vs"), s!("vs_4_0"))?;
-            let ps = compile(s!("ps"), s!("ps_4_0"))?;
+            let vs = shader::compile(SHADER, "HDR", s!("vs"), s!("vs_4_0"))?;
+            let ps = shader::compile(SHADER, "HDR", s!("ps"), s!("ps_4_0"))?;
             Ok((vs, ps))
         })
         .as_ref()
         .map_err(|e| windows::core::Error::new(E_FAIL, e.as_str()))
-}
-
-fn compile(entry: PCSTR, target: PCSTR) -> std::result::Result<Vec<u8>, String> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: ソースの長さを渡す。返ったバッファはその場で写す
-    unsafe {
-        let result = D3DCompile(
-            SHADER.as_ptr().cast(),
-            SHADER.len(),
-            s!("hdr"),
-            None,
-            None,
-            entry,
-            target,
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        );
-        let blob_bytes = |b: &ID3DBlob| {
-            std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize())
-                .to_vec()
-        };
-        match (result, code) {
-            (Ok(()), Some(code)) => Ok(blob_bytes(&code)),
-            (result, _) => {
-                let message = errors
-                    .map(|e| String::from_utf8_lossy(&blob_bytes(&e)).into_owned())
-                    .unwrap_or_default();
-                Err(format!(
-                    "HDR shader did not compile ({result:?}): {message}"
-                ))
-            }
-        }
-    }
 }
 
 /// HDR の画像（`HDR_FORMAT`）を、同じ大きさの 8bit sRGB の BGRA のテクスチャ（`D3D11_USAGE_DEFAULT`）にする。
@@ -275,28 +240,7 @@ pub fn to_sdr_texture(
         let context = device.GetImmediateContext()?;
 
         // シェーダーから読めないテクスチャ（Desktop Duplication の写し）は、読める写しを作る
-        let readable = if desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 != 0 {
-            source.clone()
-        } else {
-            let copy_desc = D3D11_TEXTURE2D_DESC {
-                MipLevels: 1,
-                ArraySize: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-                ..desc
-            };
-            let mut copy = None;
-            device.CreateTexture2D(&copy_desc, None, Some(&mut copy))?;
-            let copy = copy.ok_or(E_POINTER)?;
-            context.CopySubresourceRegion(&copy, 0, 0, 0, 0, source, 0, None);
-            copy
-        };
+        let readable = shader::readable(device, &context, source, &desc)?;
 
         let out_desc = D3D11_TEXTURE2D_DESC {
             Width: desc.Width,
