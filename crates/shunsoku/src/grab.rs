@@ -7,9 +7,13 @@
 //! - カーソルを写すときは、フレームと一緒に返るカーソルの形と位置を、自前のテクスチャに重ねる
 //!   （`draw_cursor`）。切り出す前の画面の画像に重ねるので、範囲選択・定型領域・CLI のどれにも効き、
 //!   範囲選択の画面にも止まったカーソルとして出る。重ねるのは HDR の変換のあと（8bit BGRA の画像）。
+//!   カーソルの位置と形は回転したモニタでも画面で見えている向きとして扱い、回し直したあとの画像に
+//!   そのまま重ねる（根拠は `docs/agents/windows-dev.md` の Desktop Duplication の注記）。
 //! - Duplication はフレームを自前のテクスチャへ写したらすぐ閉じる。開いたままにすると常駐時の
 //!   メモリが増える（ADR-0002）。
-//! - HDR のモニタは FP16（scRGB）で取り、全モニタの取得が終わった直後に `hdr::to_sdr_texture` で
+//! - 回転したモニタの画像は回転前の向きで来る。全モニタの取得が終わった直後に `rotate::to_upright` で
+//!   画面で見えている向きに回し直す（HDR の変換の前）。以後、`Shot::texture` はいつも画面で見えている向き。
+//! - HDR のモニタは FP16（scRGB）で取り、回し直したあとに `hdr::to_sdr_texture` で
 //!   8bit sRGB の BGRA にする（モニタごとに、そのモニタの「SDR コンテンツの明るさ」で）。
 //!   範囲選択の画面・スクラップ・保存画像は、どれも変換後の `Shot::texture` を使う。
 
@@ -17,11 +21,13 @@ use std::ffi::c_void;
 use std::fmt;
 use std::thread;
 
+use shunsoku_core::capture::rotation::Rotation;
 use shunsoku_core::cursor::{Cursor, Shape, ShapeKind};
 use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::image::{Fragment, Image};
 
 use crate::hdr;
+use crate::rotate;
 
 use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE, LUID, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -32,8 +38,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY,
-    DXGI_MODE_ROTATION_UNSPECIFIED,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90,
+    DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -76,9 +82,9 @@ pub struct Shot {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
     /// 画面の画像（`rect` と同じ大きさ、`DXGI_FORMAT_B8G8R8A8_UNORM`、`D3D11_USAGE_DEFAULT`）。
-    /// HDR のモニタでは SDR に変換したあとの画像。
+    /// いつも画面で見えている向き（回転したモニタは回し直したあと）。HDR のモニタでは SDR に変換したあとの画像。
     /// 切り出すときは、ここから重なる部分だけを staging のテクスチャへ写して CPU に書き戻す。
-    /// None は、この画像をそのまま出せないモニタ（回転したモニタ、変換できなかった HDR のモニタ）。
+    /// None は、この画像を出せないモニタ（8bit BGRA でも FP16 でもない形式、回し直しや変換に失敗したモニタ）。
     pub texture: Option<ID3D11Texture2D>,
 }
 
@@ -284,8 +290,17 @@ impl Gpu {
         for ((device, _, rect, dpi), result) in jobs.into_iter().zip(results) {
             let grabbed = result?;
             let adapter = &self.adapters[device];
+            // 回す → SDR に変換の順。回したら元のテクスチャは手放す
             let texture = grabbed
                 .texture
+                // 回せなければ None（そのモニタは黒で出す）
+                .and_then(|t| {
+                    rotate::to_upright(&adapter.device, t, grabbed.rotation)
+                        .inspect_err(|e| {
+                            log::warn!("could not turn the rotated output upright: {e}")
+                        })
+                        .ok()
+                })
                 .and_then(|t| to_sdr(&adapter.device, &rect, t));
             // カーソルは 8bit BGRA の画像にしか重ねられないので、HDR の変換のあとに重ねる
             if let (Some(texture), Some(cursor)) = (&texture, &grabbed.cursor) {
@@ -388,6 +403,16 @@ impl Gpu {
     }
 }
 
+/// `DXGI_MODE_ROTATION` を core の向きにする。`UNSPECIFIED`（と知らない値）は回転なし。
+fn core_rotation(rotation: DXGI_MODE_ROTATION) -> Rotation {
+    match rotation {
+        DXGI_MODE_ROTATION_ROTATE90 => Rotation::Rotate90,
+        DXGI_MODE_ROTATION_ROTATE180 => Rotation::Rotate180,
+        DXGI_MODE_ROTATION_ROTATE270 => Rotation::Rotate270,
+        _ => Rotation::Identity,
+    }
+}
+
 /// HDR のモニタの画像（FP16）を、そのモニタの「SDR コンテンツの明るさ」で 8bit sRGB にする。
 /// 8bit BGRA の画像はそのまま返す。変換できなければ None（そのモニタは黒で出す）。
 fn to_sdr(device: &ID3D11Device, rect: &RECT, texture: ID3D11Texture2D) -> Option<ID3D11Texture2D> {
@@ -435,17 +460,28 @@ fn attached_outputs(adapter: &IDXGIAdapter1) -> Result<Vec<(IDXGIOutput1, RECT, 
 
 /// 1 モニタ分の取得の結果。
 struct Grabbed {
+    /// 回転前の向きの画像。
     texture: Option<ID3D11Texture2D>,
+    /// モニタの回転（UI スレッドに戻ってから `Gpu::grab_outputs` で回し直す）。
+    rotation: Rotation,
     /// まだ重ねていないカーソル（HDR の変換のあとに `Gpu::grab_outputs` で重ねる）。
     cursor: Option<Cursor>,
 }
 
 /// スレッドから返すための `Grabbed`。
-struct RawGrabbed(Option<Raw>, Option<Cursor>);
+struct RawGrabbed {
+    texture: Option<Raw>,
+    rotation: Rotation,
+    cursor: Option<Cursor>,
+}
 
 impl Grabbed {
     fn into_raw(self) -> RawGrabbed {
-        RawGrabbed(self.texture.map(|t| Raw(t.into_raw())), self.cursor)
+        RawGrabbed {
+            texture: self.texture.map(|t| Raw(t.into_raw())),
+            rotation: self.rotation,
+            cursor: self.cursor,
+        }
     }
 }
 
@@ -454,9 +490,10 @@ impl RawGrabbed {
         Grabbed {
             // SAFETY: into_raw で手放した参照を 1 回だけ取り戻す
             texture: self
-                .0
+                .texture
                 .map(|raw| unsafe { ID3D11Texture2D::from_raw(raw.0) }),
-            cursor: self.1,
+            rotation: self.rotation,
+            cursor: self.cursor,
         }
     }
 }
@@ -483,27 +520,23 @@ fn grab_once(device: &ID3D11Device, output: &IDXGIOutput1, cursor: bool) -> Resu
     // SAFETY: device はこの出力が属するアダプタのもの。フレームは ReleaseFrame まで使う
     unsafe {
         let duplication = duplicate(device, output)?;
-        let rotation = duplication.GetDesc().Rotation;
+        let rotation = core_rotation(duplication.GetDesc().Rotation);
         let (frame, pointer) = acquire_frame(&duplication, cursor)?;
         let result = copy_frame(device, &frame);
         drop(frame);
         let _ = duplication.ReleaseFrame();
         let texture = result?;
 
-        // 回転したモニタの画像は回転前の向きで来る。M1 では回して出さない（下で None にする）
-        let upright =
-            rotation == DXGI_MODE_ROTATION_IDENTITY || rotation == DXGI_MODE_ROTATION_UNSPECIFIED;
+        // 回転したモニタの画像は回転前の向きで来る。回し直しと FP16（HDR）の SDR への変換は、
+        // UI スレッドに戻ってから行う（`Gpu::grab_outputs`）
         let format = texture_format(&texture);
-        if !upright {
-            log::warn!("output is rotated ({rotation:?}); it is not shown in M1");
-        }
-        // FP16（HDR）は UI スレッドに戻ってから SDR に変換する（`Gpu::grab`）
         let known = format == DXGI_FORMAT_B8G8R8A8_UNORM || format == hdr::HDR_FORMAT;
         if !known {
             log::warn!("output format is {format:?}, neither 8-bit BGRA nor FP16; it is not shown");
         }
         Ok(Grabbed {
-            texture: (upright && known).then_some(texture),
+            texture: known.then_some(texture),
+            rotation,
             cursor: pointer,
         })
     }

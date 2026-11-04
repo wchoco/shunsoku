@@ -10,6 +10,8 @@ mod autostart;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
+mod gpu_pass;
+#[cfg(windows)]
 mod grab;
 #[cfg(windows)]
 mod hdr;
@@ -37,6 +39,8 @@ mod perf;
 mod pipe_server;
 #[cfg(windows)]
 mod render;
+#[cfg(windows)]
+mod rotate;
 #[cfg(windows)]
 mod save;
 #[cfg(windows)]

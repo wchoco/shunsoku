@@ -479,7 +479,7 @@ impl Overlay {
 
     /// 拡大鏡を、カーソルのあるモニタの DPI の大きさで組む。拡大した画素の下に `label`（カーソルの横の
     /// 座標）と色コードを並べ、全体を `magnifier::place` で置く。カーソルのあるモニタの画面を読めなければ
-    /// （HDR・回転など）None。
+    /// （変換できなかった HDR など）None。
     fn magnifier(
         &mut self,
         selection: &Selection,

@@ -2,4 +2,5 @@
 
 pub mod hdr;
 pub mod request;
+pub mod rotation;
 pub mod window;
