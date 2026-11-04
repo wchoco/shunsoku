@@ -389,7 +389,10 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     // 操作の並び。変わったときだけ入れ直す（一覧で手を選んだ通知の中で、行を消さないため）。レシピを選び直したら、
     // 手は選ばない
     let labels: Vec<String> = recipe.map_or_else(Vec::new, |(_, r)| {
-        r.steps.iter().map(|id| step_label(id, text)).collect()
+        r.steps
+            .iter()
+            .map(|s| step_label(s.op_id(), text))
+            .collect()
     });
     let steps = labels.len();
     if let Some(list) = item(hwnd, steps_id()) {
