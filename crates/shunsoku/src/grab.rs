@@ -293,7 +293,14 @@ impl Gpu {
             // 回す → SDR に変換の順。回したら元のテクスチャは手放す
             let texture = grabbed
                 .texture
-                .and_then(|t| upright(&adapter.device, t, grabbed.rotation))
+                // 回せなければ None（そのモニタは黒で出す）
+                .and_then(|t| {
+                    rotate::to_upright(&adapter.device, t, grabbed.rotation)
+                        .inspect_err(|e| {
+                            log::warn!("could not turn the rotated output upright: {e}")
+                        })
+                        .ok()
+                })
                 .and_then(|t| to_sdr(&adapter.device, &rect, t));
             // カーソルは 8bit BGRA の画像にしか重ねられないので、HDR の変換のあとに重ねる
             if let (Some(texture), Some(cursor)) = (&texture, &grabbed.cursor) {
@@ -396,20 +403,6 @@ impl Gpu {
     }
 }
 
-/// 回転したモニタの画像を画面で見えている向きにする。回せなければ None（そのモニタは黒で出す）。
-fn upright(
-    device: &ID3D11Device,
-    texture: ID3D11Texture2D,
-    rotation: Rotation,
-) -> Option<ID3D11Texture2D> {
-    if rotation != Rotation::Identity {
-        log::info!("turning a rotated output ({rotation:?}) upright");
-    }
-    rotate::to_upright(device, texture, rotation)
-        .inspect_err(|e| log::warn!("could not turn the rotated output upright: {e}"))
-        .ok()
-}
-
 /// `DXGI_MODE_ROTATION` を core の向きにする。`UNSPECIFIED`（と知らない値）は回転なし。
 fn core_rotation(rotation: DXGI_MODE_ROTATION) -> Rotation {
     match rotation {
@@ -476,15 +469,19 @@ struct Grabbed {
 }
 
 /// スレッドから返すための `Grabbed`。
-struct RawGrabbed(Option<Raw>, Rotation, Option<Cursor>);
+struct RawGrabbed {
+    texture: Option<Raw>,
+    rotation: Rotation,
+    cursor: Option<Cursor>,
+}
 
 impl Grabbed {
     fn into_raw(self) -> RawGrabbed {
-        RawGrabbed(
-            self.texture.map(|t| Raw(t.into_raw())),
-            self.rotation,
-            self.cursor,
-        )
+        RawGrabbed {
+            texture: self.texture.map(|t| Raw(t.into_raw())),
+            rotation: self.rotation,
+            cursor: self.cursor,
+        }
     }
 }
 
@@ -493,10 +490,10 @@ impl RawGrabbed {
         Grabbed {
             // SAFETY: into_raw で手放した参照を 1 回だけ取り戻す
             texture: self
-                .0
+                .texture
                 .map(|raw| unsafe { ID3D11Texture2D::from_raw(raw.0) }),
-            rotation: self.1,
-            cursor: self.2,
+            rotation: self.rotation,
+            cursor: self.cursor,
         }
     }
 }
