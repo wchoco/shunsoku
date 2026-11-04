@@ -1,5 +1,6 @@
 //! shunsoku のロジック層。`windows` クレートに依存せず、Windows API なしでテストできる（ADR-0005）。
 
+pub mod adjust;
 pub mod annotate;
 pub mod app_window;
 pub mod autostart;
@@ -17,11 +18,13 @@ pub mod monitors;
 pub mod notice;
 pub mod perf;
 pub mod protocol;
+pub mod recipe;
 pub mod scrap;
 pub mod selection;
 pub mod settings;
 pub mod template;
 pub mod trash;
+pub mod tray;
 
 /// アプリの名前。
 pub const APP_NAME: &str = "shunsoku";

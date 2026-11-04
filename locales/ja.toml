@@ -77,6 +77,7 @@ capture = "キャプチャ"
 regions = "定型領域"
 scrap = "スクラップ"
 scrap_ops = "スクラップ操作"
+recipes = "レシピ"
 annotation = "書き込み"
 
 [settings_gui.general]
@@ -103,6 +104,7 @@ mode = "範囲選択の既定のモード:"
 mode_normal = "通常（離すと確定）"
 mode_precise = "精密（調整してから確定）"
 crosshair = "範囲選択の画面に十字線を出す"
+crosshair_color = "十字線の色:"
 hint = "欄を選んでキーを押すと割り当てます。Tab で次の欄へ移ります。"
 
 [settings_gui.regions]
@@ -164,6 +166,18 @@ mouse_label = "マウス:"
 reset = "既定に戻す"
 none = "なし"
 
+[settings_gui.recipes]
+name = "名前"
+shortcut = "ショートカット"
+add = "追加"
+remove = "削除"
+name_label = "名前:"
+steps_label = "操作:"
+add_step = "追加"
+shortcut_label = "ショートカット:"
+# 「追加」で足すレシピの名前（後ろに番号が付く）
+default_name = "レシピ"
+
 # 欄の横の印
 [settings_gui.mark]
 unset = "未設定"
@@ -173,6 +187,9 @@ overlap = "ショートカットと重なっています（ホットキーが優
 not_registered = "登録できませんでした（他のアプリが使っている可能性があります）"
 empty_name = "名前が空です"
 duplicate_name = "名前が重なっています"
+no_steps = "操作がありません"
+not_a_step = "レシピに入れられない操作があります"
+close_not_last = "閉じるは最後にだけ置けます"
 
 [hotkey]
 failed = "次のホットキーを登録できませんでした（他のアプリが使っている可能性があります）: "

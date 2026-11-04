@@ -7,8 +7,14 @@
 //!   捨てる（常駐時のメモリを増やさないため）。書き終えるまでと、書けなかったときはメモリに持つ。
 //!   書き終えたら `PostMessageW(window, message)` で UI スレッドを起こし、`app` が `on_written` を呼ぶ。
 //! - 退避する画素は `Stash` 1 つずつ。いまは元の画像（`Entry::image`）だけ。
+//! - 一覧に付けるサムネイル（`Entry::thumbnail`、閉じたときの見た目を縮めたもの）は小さいのでメモリに持ち、
+//!   一覧を出すたびに一時ファイルを読まない。項目と一緒に捨てる。
 //! - ごみ箱から消えたもの（上限で捨てた・戻した）の一時ファイルは消す。drop（終了時）でフォルダごと消す。
 //!   起動時（`new`）には前回の残り（`%TEMP%\shunsoku\` の下のほかのフォルダ）も消す。
+//! - `%TEMP%\shunsoku` は同じユーザーのどのプロセスも書き換えられる。管理者として動く常駐本体が、下の整合性
+//!   レベルのプロセスが置いた junction をたどって別の場所を消したり書いたりしないよう、`%TEMP%\shunsoku` と
+//!   自分のフォルダは、別の場所を指すもの（reparse point）でないと確かめてから、消せず名前も変えられない形で
+//!   開いたまま（`Pinned`）にする。確かめられなければ一時ファイルは使わず、画素はメモリに持つ。
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -23,7 +29,13 @@ use shunsoku_core::image::Image;
 use shunsoku_core::scrap::ScrapModel;
 use shunsoku_core::template::LocalTime;
 use shunsoku_core::trash::{Trash, TrashId};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, OPEN_EXISTING,
+};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 /// 終了時に、書き込み中の一時ファイルを書き終えるまで待つ時間の上限。
@@ -39,6 +51,8 @@ pub struct Trashed {
 pub struct Listed<'a> {
     pub id: TrashId,
     pub model: &'a ScrapModel,
+    /// 閉じたときの見た目（トリムと書き込みを反映したもの）を縮めた画像。
+    pub thumbnail: &'a Image,
     /// 閉じた時刻。
     pub closed_at: LocalTime,
 }
@@ -48,6 +62,7 @@ struct Entry {
     model: ScrapModel,
     closed_at: LocalTime,
     image: Stash,
+    thumbnail: Image,
 }
 
 impl Entry {
@@ -115,8 +130,8 @@ struct Written {
 /// ごみ箱と、その画素の一時ファイル。
 pub struct TrashStore {
     trash: Trash<Entry>,
-    /// `%TEMP%\shunsoku\<プロセス ID>`。
-    dir: PathBuf,
+    /// `%TEMP%\shunsoku\<プロセス ID>`。確かめられなかったら None（画素はメモリに持つ）。
+    folder: Option<Folder>,
     /// 一時ファイルの名前の番号。
     next_file: u64,
     /// 書き込み中の一時ファイルの数。終了時に待つ。
@@ -132,10 +147,17 @@ impl TrashStore {
     pub fn new(limit: u8, window: HWND, message: u32) -> TrashStore {
         let root = std::env::temp_dir().join(APP_NAME);
         let own = std::process::id().to_string();
-        remove_leftovers(&root, &own);
+        let folder = Folder::prepare(&root, &own)
+            .inspect_err(|e| {
+                log::warn!(
+                    "could not prepare {}; keeping the trashed pixels in memory: {e}",
+                    root.display()
+                )
+            })
+            .ok();
         TrashStore {
             trash: Trash::new(usize::from(limit)),
-            dir: root.join(own),
+            folder,
             next_file: 0,
             in_flight: 0,
             written: mpsc::channel(),
@@ -145,11 +167,19 @@ impl TrashStore {
     }
 
     /// 閉じたスクラップを入れ、画素を裏のスレッドで一時ファイルに書き始める。上限が 0 なら、そのまま捨てる。
-    pub fn push(&mut self, model: ScrapModel, image: Image, closed_at: LocalTime) {
+    /// `thumbnail` は一覧に付ける縮めた見た目。
+    pub fn push(
+        &mut self,
+        model: ScrapModel,
+        image: Image,
+        thumbnail: Image,
+        closed_at: LocalTime,
+    ) {
         let entry = Entry {
             model,
             closed_at,
             image: Stash::new(image),
+            thumbnail,
         };
         let pushed = self.trash.push(entry);
         for mut discarded in pushed.discarded {
@@ -160,18 +190,14 @@ impl TrashStore {
             return;
         };
         log::info!("scrap moved to the trash");
-        if let Err(e) = fs::create_dir_all(&self.dir) {
-            log::warn!(
-                "could not create {}; keeping the trashed pixels in memory: {e}",
-                self.dir.display()
-            );
+        let Some(folder) = &self.folder else {
             return;
-        }
+        };
+        let path = folder.path.join(format!("{}.bgra", self.next_file));
         let Some(entry) = self.trash.get_mut(id) else {
             return;
         };
         let stash = &mut entry.image;
-        let path = self.dir.join(format!("{}.bgra", self.next_file));
         self.next_file += 1;
         let Some(image) = stash.memory.clone() else {
             return;
@@ -242,6 +268,7 @@ impl TrashStore {
             .map(|(id, entry)| Listed {
                 id,
                 model: &entry.model,
+                thumbnail: &entry.thumbnail,
                 closed_at: entry.closed_at,
             })
             .collect()
@@ -278,7 +305,97 @@ impl TrashStore {
                 }
             }
         }
-        remove_dir(&self.dir);
+        if let Some(folder) = self.folder.take() {
+            folder.remove();
+        }
+    }
+}
+
+/// 開いている間、消すことも名前を変えることも、別の場所を指すものに差し替えることもできないフォルダ。
+/// 読み取りのアクセスで、`FILE_SHARE_DELETE` を付けずに開く（共有の確かめは中身へのアクセスを持つハンドルにだけ
+/// かかるので、属性だけのアクセスでは足りない）。
+struct Pinned(HANDLE);
+
+impl Pinned {
+    /// `path` を開き、reparse point（junction・シンボリックリンク）でないふつうのフォルダであることを確かめる。
+    /// 開くときにリンクをたどらないので、確かめたものと開いたままにするものは同じ。
+    fn open(path: &Path) -> std::io::Result<Pinned> {
+        let name = windows::core::HSTRING::from(path.as_os_str());
+        // SAFETY: name は呼び出しの間生きている。開いたハンドルは Pinned が閉じる
+        let handle = unsafe {
+            CreateFileW(
+                &name,
+                (FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }?;
+        let pinned = Pinned(handle);
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: info はこの関数の中で生きている
+        unsafe { GetFileInformationByHandle(pinned.0, &mut info) }?;
+        let attributes = info.dwFileAttributes;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(std::io::Error::other(format!(
+                "{} points elsewhere (a reparse point)",
+                path.display()
+            )));
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+            return Err(std::io::Error::other(format!(
+                "{} is not a folder",
+                path.display()
+            )));
+        }
+        Ok(pinned)
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        // SAFETY: 開いたハンドルを 1 回だけ閉じる
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// 一時ファイルを置く自分のフォルダ（`<root>\<own>`）。`root` と自分のフォルダを開いたままにする。
+struct Folder {
+    path: PathBuf,
+    // 落とす順に並べる（自分のフォルダを先に閉じる）
+    _own: Pinned,
+    _root: Pinned,
+}
+
+impl Folder {
+    /// `root` を確かめて開いたままにし、その下の前回までの残りを消してから、自分のフォルダを新しく作る。
+    fn prepare(root: &Path, own: &str) -> std::io::Result<Folder> {
+        match fs::create_dir(root) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+        let pinned_root = Pinned::open(root)?;
+        remove_leftovers(root);
+        let path = root.join(own);
+        // 残りを消したあとなので、ここにあるのは消したあとに置かれたもの。使わない
+        fs::create_dir(&path)?;
+        let pinned_own = Pinned::open(&path)?;
+        Ok(Folder {
+            path,
+            _own: pinned_own,
+            _root: pinned_root,
+        })
+    }
+
+    /// 自分のフォルダを閉じてから消す。
+    fn remove(self) {
+        let Folder { path, _own, _root } = self;
+        drop(_own);
+        remove_entry(&path);
     }
 }
 
@@ -304,16 +421,14 @@ fn write_pixels(path: &Path, image: &Image) -> std::io::Result<()> {
     written
 }
 
-/// `root` の下の、`own` 以外のフォルダ（前回までのプロセスの残り）を消す。
-fn remove_leftovers(root: &Path, own: &str) {
+/// `root` の下のもの（前回までのプロセスの残り）をすべて消す。`root` は `Pinned` で確かめて開いたものを渡す。
+fn remove_leftovers(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     for entry in entries.filter_map(|e| e.ok()) {
-        if entry.file_name() != own {
-            log::info!("removing leftover trash {}", entry.path().display());
-            remove_dir(&entry.path());
-        }
+        log::info!("removing leftover trash {}", entry.path().display());
+        remove_entry(&entry.path());
     }
 }
 
@@ -325,15 +440,123 @@ fn remove_file(path: &Path) {
     }
 }
 
-fn remove_dir(path: &Path) {
-    let removed = if path.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
+/// `path` を消す。フォルダなら中身ごと消す。別の場所を指すもの（junction・シンボリックリンク）は、指す先を
+/// たどらずにリンクだけを消す。
+fn remove_entry(path: &Path) {
+    let removed = match fs::symlink_metadata(path) {
+        Err(e) => Err(e),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::remove_dir(path).or_else(|_| fs::remove_file(path))
+        }
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
     };
     if let Err(e) = removed
         && e.kind() != std::io::ErrorKind::NotFound
     {
         log::warn!("could not remove {}: {e}", path.display());
+    }
+}
+
+/// 前回の残りの片付けが junction をたどらないこと。試験用のフォルダはビルドの出力（テストの exe の隣）に作り、
+/// ユーザーの `%TEMP%` には触れない。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// ビルドの出力の下の試験用のフォルダ。落ちて残ったものは次の回の始めに消える。
+    struct Sandbox(PathBuf);
+
+    impl Sandbox {
+        fn new(name: &str) -> Sandbox {
+            let exe = std::env::current_exe().unwrap();
+            let root = exe
+                .parent()
+                .unwrap()
+                .join("test-sandbox")
+                .join(format!("shunsoku-trash-{name}"));
+            remove_entry(&root);
+            fs::create_dir_all(&root).unwrap();
+            Sandbox(root)
+        }
+
+        /// 消されては困るファイルを置いたフォルダ（junction の指す先）。
+        fn protected(&self) -> PathBuf {
+            let dir = self.0.join("protected");
+            fs::create_dir_all(dir.join("inner")).unwrap();
+            fs::write(dir.join("keep.txt"), b"keep").unwrap();
+            fs::write(dir.join("inner").join("keep.txt"), b"keep").unwrap();
+            dir
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            remove_entry(&self.0);
+        }
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let made = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed: {made:?}");
+    }
+
+    fn protected_is_intact(dir: &Path) -> bool {
+        dir.join("keep.txt").is_file() && dir.join("inner").join("keep.txt").is_file()
+    }
+
+    #[test]
+    fn a_root_that_is_a_junction_is_refused_and_its_target_is_left_alone() {
+        let sandbox = Sandbox::new("root-junction");
+        let protected = sandbox.protected();
+        let root = sandbox.0.join("shunsoku");
+        junction(&root, &protected);
+
+        assert!(Folder::prepare(&root, "1").is_err());
+        assert!(protected_is_intact(&protected));
+        assert!(!protected.join("1").exists());
+    }
+
+    #[test]
+    fn a_leftover_junction_is_removed_without_following_it() {
+        let sandbox = Sandbox::new("leftover-junction");
+        let protected = sandbox.protected();
+        let root = sandbox.0.join("shunsoku");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("2")).unwrap();
+        fs::write(root.join("2").join("0.bgra"), b"old").unwrap();
+        junction(&root.join("3"), &protected);
+
+        let folder = Folder::prepare(&root, "1").unwrap();
+
+        assert!(protected_is_intact(&protected));
+        assert!(!root.join("2").exists());
+        assert!(!root.join("3").exists());
+        assert!(folder.path.is_dir());
+        folder.remove();
+        assert!(!root.join("1").exists());
+    }
+
+    #[test]
+    fn the_root_cannot_be_swapped_while_the_folder_is_open() {
+        let sandbox = Sandbox::new("pinned");
+        let root = sandbox.0.join("shunsoku");
+        let folder = Folder::prepare(&root, "1").unwrap();
+
+        assert!(fs::rename(&root, sandbox.0.join("moved")).is_err());
+        assert!(fs::remove_dir_all(&root).is_err());
+        assert!(root.join("1").is_dir());
+
+        folder.remove();
+        assert!(!root.join("1").exists());
+        assert!(fs::rename(&root, sandbox.0.join("moved")).is_ok());
     }
 }

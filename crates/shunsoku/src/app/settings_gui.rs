@@ -17,6 +17,9 @@
 //!   あとの `region_registered`。開いていれば写しと base にも足す）。
 //!   「範囲を選び直す」と「試しに撮る」は、ダイアログを隠してから（写り込まないように）依頼し、範囲選択の画面を
 //!   閉じたか撮り終えたら出し直す（`capture_done`）。選び直した範囲は写しに入れるだけ（`region_reselected`）。
+//! - 「レシピ」タブ（`settings_dialog::recipes`）: 一覧で行を選んだら、ショートカットの欄の `ChordRow::item` を
+//!   そのレシピに結び直す。一覧の下のボタンと操作の並びの横のボタン、名前の欄の入力は写しのレシピを変える
+//!   （`Editor::add_recipe` など）。出し直すときは、定型領域と同じく一覧の行を先に写しに揃える。
 //! - キーの組み合わせの欄にフォーカスがある間は、全体のホットキーの登録を外す（`App::hotkey_pause`）。欄の
 //!   フォーカスの出入りで `WM_APP_SETTINGS_FOCUS` を自分に送り、届いた時点のフォーカスで決める（`check_focus`）。
 //! - 適用（`apply`）: その時点のファイルと写しを 3 者で突き合わせ（`settings::merge`）、両方で変えた項目があれば
@@ -36,7 +39,7 @@ use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::monitors;
 use shunsoku_core::settings::editor::{Editor, Move};
-use shunsoku_core::settings::form::{FieldEntry, PauseChange};
+use shunsoku_core::settings::form::{ClickPlace, FieldEntry, PauseChange};
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::tab_step::{StepFocus, TabStep};
 use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
@@ -55,8 +58,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, IDCANCEL, IDOK, IsDialogMessageW, IsIconic, MB_DEFBUTTON2, MB_ICONWARNING,
     MB_OKCANCEL, MSG, MessageBoxW, PostMessageW, PostQuitMessage, SW_HIDE, SW_RESTORE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_INITDIALOG, WM_NEXTDLGCTL, WM_NOTIFY, WM_SETTINGCHANGE,
+    SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WM_ACTIVATE, WM_COMMAND, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INITDIALOG, WM_LBUTTONDOWN, WM_NEXTDLGCTL, WM_NOTIFY,
+    WM_SETFOCUS, WM_SETTINGCHANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetDlgCtrlID, IsChild, WM_KEYDOWN};
 use windows::core::{BOOL, PCWSTR};
@@ -67,6 +71,7 @@ use super::{
     write_settings,
 };
 use crate::settings_dialog::fields::{self, Action, Fields, Input, Kind};
+use crate::settings_dialog::recipes;
 use crate::settings_dialog::regions::{self, ListButton};
 use crate::settings_dialog::{
     self, ChordRow, During, Env, ID_APPLY, ID_TAB, Page, chord_field, scrap_ops,
@@ -108,6 +113,18 @@ impl SettingsGui {
         readable: bool,
     ) -> Option<String> {
         self.entry.applying(field, text, readable)
+    }
+
+    /// 「レシピ」タブのショートカットの欄が結ばれているレシピの位置。
+    fn bound_recipe(&self) -> Option<usize> {
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.field == recipes::shortcut_id())?;
+        match row.item {
+            SettingsItem::RecipeShortcut(i) => Some(i),
+            _ => None,
+        }
     }
 
     /// 一覧の行で変わるキーの欄（ID `field`）を、設定の項目 `item` に結び直す。
@@ -331,6 +348,7 @@ fn refresh(hwnd: HWND) {
     .flatten();
     if let Some((editor, bound, env)) = list {
         regions::sync_list(hwnd, &editor, bound, text, &env);
+        recipes::sync_list(hwnd, &editor, bound_recipe(), text);
     }
     let snapshot = with_app(|app| {
         app.settings_gui.as_mut().map(|gui| {
@@ -429,6 +447,14 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
                 on_scrap_op_selected(hwnd);
             } else if header.idFrom == regions::list_id() as usize && row_selected(header, lparam) {
                 on_region_selected(hwnd);
+            } else if header.idFrom == recipes::list_id() as usize && row_selected(header, lparam) {
+                on_recipe_selected(hwnd);
+            } else if header.idFrom == recipes::steps_id() as usize
+                && row_selected(header, lparam)
+                && !recipes::is_syncing()
+            {
+                // 上へ・下へ・削除を押せるかを出し直す
+                refresh(hwnd);
             }
             false
         }
@@ -452,6 +478,15 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
             check_focus();
             true
         }
+        // 欄の外のクリックで、欄からフォーカスを外す（#118）。ページの中のクリックはタブが拾う
+        WM_LBUTTONDOWN => {
+            settings_dialog::blur_on_click(hwnd, ClickPlace::Background);
+            false
+        }
+        // 外したフォーカスを、ダイアログの既定の処理で欄へ戻させない
+        WM_SETFOCUS => settings_dialog::blurring(),
+        // 欄から外したまま前面から外れたら、戻ったときに欄へフォーカスを戻させない（#118）
+        WM_ACTIVATE => settings_dialog::on_activate(hwnd, wparam),
         WM_DPICHANGED => {
             // ダイアログが大きさと書体を直し終えてから、一覧の列の幅を合わせ直す
             // SAFETY: 自分のダイアログに送る
@@ -463,6 +498,7 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
         WM_APP_SETTINGS_DPI => {
             regions::fit_columns(hwnd);
             scrap_ops::fit_columns(hwnd);
+            recipes::fit_columns(hwnd);
             true
         }
         WM_DESTROY => {
@@ -528,6 +564,21 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
                 on_region_list_button(hwnd, button);
             }
         }
+        _ if code == BN_CLICKED && recipes::button(id).is_some() => {
+            if let Some(button) = recipes::button(id) {
+                on_recipe_button(hwnd, button);
+            }
+        }
+        _ if id == recipes::name_id() => match code {
+            EN_CHANGE if !recipes::is_syncing() => {
+                if let (Some(i), Some(name)) = (recipes::selected(hwnd), recipes::name_text(hwnd)) {
+                    edit(hwnd, |editor| editor.set_recipe_name(i, &name));
+                }
+            }
+            // 打っている間は書き換えない欄を、出たら写しの名前（前後の空白を除いたもの）に揃える
+            EN_KILLFOCUS => refresh(hwnd),
+            _ => {}
+        },
         _ if chord_field::is_field(control) => match code {
             EN_CHANGE => on_chord_changed(hwnd, id, chord_field::value(control)),
             EN_SETFOCUS | EN_KILLFOCUS => {
@@ -856,6 +907,80 @@ fn on_region_selected(hwnd: HWND) {
     if !regions::is_syncing() {
         refresh_monitors();
         refresh(hwnd);
+    }
+}
+
+/// 「レシピ」タブのショートカットの欄が指しているレシピの位置（一覧を揃えて選ぶ行）。
+fn bound_recipe() -> usize {
+    with_app(|app| app.settings_gui.as_ref()?.bound_recipe())
+        .flatten()
+        .unwrap_or(0)
+}
+
+/// 「レシピ」タブの一覧で行を選んだ。ショートカットの欄をそのレシピに結び直す。
+fn on_recipe_selected(hwnd: HWND) {
+    let Some(index) = recipes::selected(hwnd) else {
+        return;
+    };
+    let field = recipes::shortcut_id();
+    with_app(|app| {
+        if let Some(gui) = app.settings_gui.as_mut() {
+            gui.rebind_chord_row(field, SettingsItem::RecipeShortcut(index));
+        }
+    });
+    // 一覧を揃えている途中なら、揃えたあとで出す（`refresh`）
+    if !recipes::is_syncing() {
+        refresh(hwnd);
+    }
+}
+
+/// 「レシピ」タブのボタン。写しを変えて、移った行（レシピか手）を選ぶ。足したレシピは名前の欄にフォーカスを置く。
+fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
+    use recipes::Button;
+    let selected = recipes::selected(hwnd);
+    let step = recipes::selected_step(hwnd);
+    let in_range = |editor: &Editor| selected.filter(|&i| i < editor.draft().recipes.len());
+    // 選んでいるレシピの選んでいる手を `change(editor, レシピ, 手)` で変え、移った手を選ぶ
+    let change_step = |change: fn(&mut Editor, usize, usize) -> Option<usize>| {
+        let to = edit(hwnd, |editor| {
+            let i = in_range(editor)?;
+            let s = step.filter(|&s| s < editor.draft().recipes[i].steps.len())?;
+            change(editor, i, s)
+        })
+        .flatten();
+        if let Some(to) = to {
+            recipes::select_step(hwnd, to);
+        }
+        refresh(hwnd);
+    };
+    match button {
+        Button::Add => {
+            let base = text("settings_gui.recipes.default_name");
+            if let Some(index) = edit(hwnd, |editor| editor.add_recipe(base)) {
+                recipes::select(hwnd, index);
+                set_focus(hwnd, recipes::name_id());
+            }
+        }
+        Button::Remove => {
+            if let Some(index) =
+                edit(hwnd, |editor| editor.remove_recipe(in_range(editor)?)).flatten()
+            {
+                recipes::select(hwnd, index);
+            }
+        }
+        Button::StepUp => change_step(|editor, i, s| Some(editor.move_step(i, s, Move::Up))),
+        Button::StepDown => change_step(|editor, i, s| Some(editor.move_step(i, s, Move::Down))),
+        Button::StepRemove => change_step(|editor, i, s| editor.remove_step(i, s)),
+        Button::StepAdd => {
+            let Some(id) = recipes::chosen_step(hwnd) else {
+                return;
+            };
+            let to = edit(hwnd, |editor| editor.add_step(in_range(editor)?, id)).flatten();
+            if let Some(to) = to {
+                recipes::select_step(hwnd, to);
+            }
+            refresh(hwnd);
+        }
     }
 }
 

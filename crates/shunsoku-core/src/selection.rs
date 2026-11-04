@@ -15,9 +15,13 @@
 //! - 矢印で動かすカーソルは、どれかのモニタの画素に留める（隙間や画面の外には出ない）。
 //! - ウィンドウの一覧（`WindowInfo`）も Win32 層が集めて渡す。`Shift` を押している間はカーソルの下の
 //!   ウィンドウ（`Ctrl` も押していれば部品）をハイライトし、クリックか `Enter` でそれを選ぶ（`chosen_window`）。
+//! - ハイライトのないまま動かさずにクリックしたら（モードによらず）、`Esc` と同じく中止する。
+//!   定型領域の登録では中止せず、何も選んでいない状態に戻す。
 //! - 定型領域の登録（`registering`）は常に精密モードで、`Tab` は効かない。範囲は 1 枚のモニタの中に限り、
 //!   ウィンドウを選んだら、その矩形をモニタの中に切り詰めて調整に入る。
 
+use crate::adjust::{self, Grab};
+pub use crate::adjust::{CursorShape, Direction, Handle};
 use crate::geometry::{Point, Rect};
 
 mod highlight;
@@ -40,15 +44,6 @@ pub enum Button {
     Right,
 }
 
-/// 矢印キーの向き。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
 /// 範囲選択の画面のモード。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -58,91 +53,6 @@ pub enum Mode {
     /// 範囲を調整してから確定する。十字線とカーソルの横の座標を常に出す。
     Precise,
 }
-
-/// 調整の状態で、範囲の大きさを変えるつまみ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Handle {
-    TopLeft,
-    Top,
-    TopRight,
-    Right,
-    BottomRight,
-    Bottom,
-    BottomLeft,
-    Left,
-}
-
-impl Handle {
-    /// すべて。角を先に並べる（重なったら角を選ぶ）。
-    pub const ALL: [Handle; 8] = [
-        Handle::TopLeft,
-        Handle::TopRight,
-        Handle::BottomRight,
-        Handle::BottomLeft,
-        Handle::Top,
-        Handle::Right,
-        Handle::Bottom,
-        Handle::Left,
-    ];
-
-    /// 動かす辺（左、上、右、下）。
-    const fn edges(self) -> (bool, bool, bool, bool) {
-        match self {
-            Handle::TopLeft => (true, true, false, false),
-            Handle::Top => (false, true, false, false),
-            Handle::TopRight => (false, true, true, false),
-            Handle::Right => (false, false, true, false),
-            Handle::BottomRight => (false, false, true, true),
-            Handle::Bottom => (false, false, false, true),
-            Handle::BottomLeft => (true, false, false, true),
-            Handle::Left => (true, false, false, false),
-        }
-    }
-
-    /// つまみの中心（範囲の枠の上の点）。右と下は範囲に含まない側の座標。
-    fn center(self, r: Rect) -> Point {
-        let cx = r.left + (r.right - r.left) / 2;
-        let cy = r.top + (r.bottom - r.top) / 2;
-        let x = match self {
-            Handle::TopLeft | Handle::BottomLeft | Handle::Left => r.left,
-            Handle::Top | Handle::Bottom => cx,
-            Handle::TopRight | Handle::Right | Handle::BottomRight => r.right,
-        };
-        let y = match self {
-            Handle::TopLeft | Handle::Top | Handle::TopRight => r.top,
-            Handle::Left | Handle::Right => cy,
-            Handle::BottomLeft | Handle::Bottom | Handle::BottomRight => r.bottom,
-        };
-        Point::new(x, y)
-    }
-}
-
-/// カーソルの形。Win32 層が `WM_SETCURSOR` で当てる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CursorShape {
-    /// 十字（既定）。
-    Cross,
-    /// 範囲の中（ドラッグで動かす）。
-    Move,
-    /// 左上・右下のつまみ。
-    ResizeNwse,
-    /// 右上・左下のつまみ。
-    ResizeNesw,
-    /// 上・下のつまみ。
-    ResizeNs,
-    /// 左・右のつまみ。
-    ResizeWe,
-}
-
-/// つまみの一辺（96 DPI での物理ピクセル。モニタの DPI で換算する）。
-const HANDLE_SIDE: i32 = 7;
-/// つまみをつかめる、見た目より外側の幅（96 DPI での物理ピクセル）。
-const HANDLE_GRIP: i32 = 3;
-
-/// 矢印でカーソルを動かす量（物理ピクセル）。
-const ARROW_STEP: i32 = 1;
-/// Shift+矢印でカーソルを動かす量（物理ピクセル）。
-const SHIFT_ARROW_STEP: i32 = 10;
 
 /// 範囲選択の画面への入力。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +136,9 @@ pub struct Selection {
     adjusted: Option<Rect>,
     /// 調整の状態でつかんでいるもの。左ボタンを押している間だけ Some。
     grab: Option<Grab>,
+    /// 調整の状態で範囲の外を押した画素。押している間だけ Some。そこから動かしたら選び直し、動かさずに
+    /// 離したら今の範囲を残す（トリムと同じ）。
+    pressed_outside: Option<Point>,
     /// 定型領域の登録（`registering`）。
     registering: bool,
 }
@@ -239,17 +152,6 @@ struct Windows {
     ctrl: bool,
     /// ハイライトから撮るウィンドウに決まった（`State::Confirmed`）。
     chosen: Option<Highlight>,
-}
-
-/// 調整の状態でつかんだもの。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Grab {
-    /// つまみ。None なら範囲の中（位置を動かす）。
-    handle: Option<Handle>,
-    /// 押した点。
-    from: Point,
-    /// 押したときの範囲。
-    start: Rect,
 }
 
 /// 範囲選択の画面に描くもの。Win32 層は入力の前後でこれを比べ、変わったときだけ描き直す。
@@ -284,6 +186,7 @@ impl Selection {
             crosshair: false,
             adjusted: None,
             grab: None,
+            pressed_outside: None,
             registering: false,
         }
     }
@@ -393,10 +296,14 @@ impl Selection {
                 if self.state == State::Selecting {
                     if self.anchor == Some(at) {
                         // 動かさずに離した（クリック）。ハイライトしていればそのウィンドウを撮り、
-                        // していなければ何も選ばなかったことにする
+                        // していなければ取りやめる（定型領域の登録では選び直す）
                         let highlight = self.highlight();
                         self.reset();
-                        self.choose_window(highlight);
+                        if highlight.is_some() {
+                            self.choose_window(highlight);
+                        } else if !self.registering {
+                            self.state = State::Cancelled;
+                        }
                     } else {
                         self.decide();
                     }
@@ -510,20 +417,23 @@ impl Selection {
                             start: rect,
                         })
                     }
-                    None => self.reselect(at),
+                    None => self.pressed_outside = Some(at),
                 }
             }
             Input::DoubleClick { at } => {
                 self.cursor = at;
                 match self.hit(rect, at) {
                     Some(_) => self.confirm(rect),
-                    None => self.reselect(at),
+                    // 範囲の外なら押したのと同じ
+                    None => self.pressed_outside = Some(at),
                 }
             }
             Input::Move { at } => {
                 self.cursor = at;
                 if let Some(grab) = self.grab {
-                    self.adjusted = Some(self.dragged(grab, at));
+                    self.adjusted = Some(grab.dragged(at, self.bounds()));
+                } else if let Some(from) = self.pressed_outside.filter(|&from| from != at) {
+                    self.reselect(from);
                 }
             }
             Input::Release {
@@ -531,8 +441,10 @@ impl Selection {
                 at,
             } => {
                 self.cursor = at;
+                // 範囲の外を動かさずに押して離しただけなら、今の範囲を残す
+                self.pressed_outside = None;
                 if let Some(grab) = self.grab.take() {
-                    self.adjusted = Some(self.dragged(grab, at));
+                    self.adjusted = Some(grab.dragged(at, self.bounds()));
                 }
             }
             Input::Press {
@@ -545,15 +457,10 @@ impl Selection {
                 ..
             } => {}
             Input::Arrow { direction, shift } => {
-                let (dx, dy) = step(direction, shift);
-                self.adjusted = Some(self.keep_inside(rect.offset(dx, dy)));
+                self.adjusted = Some(adjust::moved(rect, direction, shift, self.bounds()));
             }
             Input::ResizeArrow { direction, shift } => {
-                let (dx, dy) = step(direction, shift);
-                let b = self.bounds();
-                let right = (rect.right + dx).clamp(rect.left + 1, b.right.max(rect.left + 1));
-                let bottom = (rect.bottom + dy).clamp(rect.top + 1, b.bottom.max(rect.top + 1));
-                self.adjusted = Some(Rect::new(rect.left, rect.top, right, bottom));
+                self.adjusted = Some(adjust::resized(rect, direction, shift, self.bounds()));
             }
             Input::Enter | Input::Space => self.confirm(rect),
             Input::ToggleMode => self.toggle_mode(),
@@ -565,65 +472,24 @@ impl Selection {
         }
     }
 
-    /// 調整の状態で範囲の外を押した。そこを始点に選び直す。
+    /// 調整の状態で範囲の外を押して動かした。押した画素を始点に選び直す。
     fn reselect(&mut self, at: Point) {
         self.adjusted = None;
         self.grab = None;
+        self.pressed_outside = None;
         self.anchor = Some(at);
         self.state = State::Selecting;
     }
 
     /// 調整の状態で `at` にあるもの。つまみなら Some(Some)、範囲の中なら Some(None)、外なら None。
     fn hit(&self, rect: Rect, at: Point) -> Option<Option<Handle>> {
-        let found = Handle::ALL.into_iter().find(|&handle| {
-            let grip = self.scaled(HANDLE_GRIP, handle.center(rect));
-            self.handle_rect(rect, handle).inflate(grip).contains(at)
-        });
-        match found {
-            Some(handle) => Some(Some(handle)),
-            None => rect.contains(at).then_some(None),
-        }
-    }
-
-    /// つまみの見た目の矩形。中心のあるモニタの DPI で大きさを換算する。
-    fn handle_rect(&self, rect: Rect, handle: Handle) -> Rect {
-        let c = handle.center(rect);
-        let side = self.scaled(HANDLE_SIDE, c);
-        let left = c.x - side / 2;
-        let top = c.y - side / 2;
-        Rect::new(left, top, left + side, top + side)
+        adjust::hit(rect, at, |len, at| self.scaled(len, at))
     }
 
     /// 96 DPI での長さ `len` を、`at` のあるモニタ（なければ 96 DPI）の物理ピクセルにする。
     fn scaled(&self, len: i32, at: Point) -> i32 {
         let dpi = self.monitor_at(at).map_or(96, |m| m.dpi) as i32;
         (len * dpi + 48) / 96
-    }
-
-    /// つかんだものを `at` まで引いたあとの範囲。大きさは 1 画素より小さくせず、全モニタを囲む矩形の
-    /// 外には出さない。
-    fn dragged(&self, grab: Grab, at: Point) -> Rect {
-        let (dx, dy) = (at.x - grab.from.x, at.y - grab.from.y);
-        let r = grab.start;
-        let Some(handle) = grab.handle else {
-            return self.keep_inside(r.offset(dx, dy));
-        };
-        let b = self.bounds();
-        let (left, top, right, bottom) = handle.edges();
-        let mut out = r;
-        if left {
-            out.left = (r.left + dx).clamp(b.left.min(r.right - 1), r.right - 1);
-        }
-        if top {
-            out.top = (r.top + dy).clamp(b.top.min(r.bottom - 1), r.bottom - 1);
-        }
-        if right {
-            out.right = (r.right + dx).clamp(r.left + 1, b.right.max(r.left + 1));
-        }
-        if bottom {
-            out.bottom = (r.bottom + dy).clamp(r.top + 1, b.bottom.max(r.top + 1));
-        }
-        out
     }
 
     /// 範囲を動かせる・広げられる矩形。定型領域の登録では範囲のあるモニタ、ほかは全モニタを囲む矩形。
@@ -655,29 +521,9 @@ impl Selection {
         self.monitor_at(at).map(|m| m.rect)
     }
 
-    /// 大きさを変えずに、`rect` を範囲を動かせる矩形（`bounds`）の中に戻す。
-    fn keep_inside(&self, rect: Rect) -> Rect {
-        let b = self.bounds();
-        let dx = if rect.left < b.left {
-            b.left - rect.left
-        } else if rect.right > b.right {
-            (b.right - rect.right).max(b.left - rect.left)
-        } else {
-            0
-        };
-        let dy = if rect.top < b.top {
-            b.top - rect.top
-        } else if rect.bottom > b.bottom {
-            (b.bottom - rect.bottom).max(b.top - rect.top)
-        } else {
-            0
-        };
-        rect.offset(dx, dy)
-    }
-
     /// 矢印でカーソルを動かす。
     fn move_cursor(&mut self, direction: Direction, shift: bool) {
-        let (dx, dy) = step(direction, shift);
+        let (dx, dy) = adjust::step(direction, shift);
         let to = Point::new(self.cursor.x + dx, self.cursor.y + dy);
         if self.monitor_at(to).is_some() {
             self.cursor = to;
@@ -710,6 +556,7 @@ impl Selection {
         self.anchor = None;
         self.adjusted = None;
         self.grab = None;
+        self.pressed_outside = None;
         self.state = State::Idle;
     }
 
@@ -753,10 +600,9 @@ impl Selection {
     /// 調整の状態のつまみ（スクリーン座標）。ほかの状態では空。
     pub fn handles(&self) -> Vec<Rect> {
         match (self.state, self.adjusted) {
-            (State::Adjusting, Some(rect)) => Handle::ALL
-                .into_iter()
-                .map(|handle| self.handle_rect(rect, handle))
-                .collect(),
+            (State::Adjusting, Some(rect)) => {
+                adjust::handle_rects(rect, |len, at| self.scaled(len, at))
+            }
             _ => Vec::new(),
         }
     }
@@ -767,17 +613,9 @@ impl Selection {
         let (State::Adjusting, Some(rect)) = (self.state, self.adjusted) else {
             return CursorShape::Cross;
         };
-        let target = match self.grab {
-            Some(grab) => Some(grab.handle),
-            None => self.hit(rect, self.cursor),
-        };
-        match target {
-            None => CursorShape::Cross,
-            Some(None) => CursorShape::Move,
-            Some(Some(Handle::TopLeft | Handle::BottomRight)) => CursorShape::ResizeNwse,
-            Some(Some(Handle::TopRight | Handle::BottomLeft)) => CursorShape::ResizeNesw,
-            Some(Some(Handle::Top | Handle::Bottom)) => CursorShape::ResizeNs,
-            Some(Some(Handle::Left | Handle::Right)) => CursorShape::ResizeWe,
+        match self.grab {
+            Some(grab) => grab.cursor_shape(),
+            None => adjust::cursor_shape(self.hit(rect, self.cursor)),
         }
     }
 
@@ -832,17 +670,6 @@ impl Selection {
             parts.iter().map(|part| size_text(part.rect)).collect()
         };
         Some(label)
-    }
-}
-
-/// 矢印 1 回で動かす量。
-fn step(direction: Direction, shift: bool) -> (i32, i32) {
-    let step = if shift { SHIFT_ARROW_STEP } else { ARROW_STEP };
-    match direction {
-        Direction::Left => (-step, 0),
-        Direction::Right => (step, 0),
-        Direction::Up => (0, -step),
-        Direction::Down => (0, step),
     }
 }
 
@@ -914,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn a_click_without_dragging_does_nothing() {
+    fn a_click_without_dragging_cancels() {
         let mut s = one_monitor();
         s.handle(Input::Press {
             button: Button::Left,
@@ -924,8 +751,17 @@ mod tests {
             button: Button::Left,
             at: p(10, 20),
         });
-        assert_eq!(state, State::Idle);
-        assert_eq!(s.rect(), None);
+        assert_eq!(state, State::Cancelled);
+        assert_eq!(s.chosen_window(), None);
+    }
+
+    #[test]
+    fn space_twice_on_the_same_pixel_confirms_a_one_pixel_range() {
+        let mut s = one_monitor();
+        s.handle(Input::Move { at: p(10, 20) });
+        s.handle(Input::Space);
+        assert_eq!(s.handle(Input::Space), State::Confirmed);
+        assert_eq!(s.rect(), Some(Rect::new(10, 20, 11, 21)));
     }
 
     fn start_drag(s: &mut Selection) {
@@ -1407,8 +1243,9 @@ mod tests {
             button: Button::Left,
             at: p(500, 500),
         });
-        assert_eq!(s.state(), State::Selecting);
+        assert_eq!(s.state(), State::Adjusting);
         s.handle(Input::Move { at: p(549, 529) });
+        assert_eq!(s.state(), State::Selecting);
         assert_eq!(s.rect(), Some(Rect::new(500, 500, 550, 530)));
         assert_eq!(
             s.handle(Input::Release {
@@ -1420,10 +1257,40 @@ mod tests {
     }
 
     #[test]
-    fn a_click_outside_the_range_leaves_nothing_selected() {
+    fn a_click_without_dragging_in_precise_mode_cancels() {
+        let mut s = precise();
+        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Cancelled);
+    }
+
+    #[test]
+    fn a_click_outside_the_adjusted_range_keeps_the_range() {
         let mut s = adjusting();
-        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Idle);
-        assert_eq!(s.rect(), None);
+        let before = s.rect();
+        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Adjusting);
+        assert_eq!(s.rect(), before);
+    }
+
+    #[test]
+    fn a_double_click_outside_the_adjusted_range_keeps_the_range() {
+        let mut s = adjusting();
+        let before = s.rect();
+        s.handle(Input::DoubleClick { at: p(500, 500) });
+        s.handle(Input::Release {
+            button: Button::Left,
+            at: p(500, 500),
+        });
+        assert_eq!(s.state(), State::Adjusting);
+        assert_eq!(s.rect(), before);
+    }
+
+    #[test]
+    fn a_one_pixel_range_in_precise_mode_is_confirmed_with_enter() {
+        let mut s = precise();
+        s.handle(Input::Move { at: p(10, 20) });
+        s.handle(Input::Space);
+        assert_eq!(s.handle(Input::Space), State::Adjusting);
+        assert_eq!(s.handle(Input::Enter), State::Confirmed);
+        assert_eq!(s.rect(), Some(Rect::new(10, 20, 11, 21)));
     }
 
     #[test]
@@ -1595,6 +1462,13 @@ mod tests {
             p(0, 0),
         )
         .registering()
+    }
+
+    #[test]
+    fn a_click_without_dragging_while_registering_starts_over_instead_of_cancelling() {
+        let mut s = registering();
+        assert_eq!(drag(&mut s, p(500, 500), p(500, 500)), State::Idle);
+        assert_eq!(s.rect(), None);
     }
 
     #[test]

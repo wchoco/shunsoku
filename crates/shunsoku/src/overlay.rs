@@ -23,6 +23,7 @@ use shunsoku_core::geometry::{Point, Rect};
 use shunsoku_core::image::Fragment;
 use shunsoku_core::magnifier;
 use shunsoku_core::selection::{CursorShape, MonitorInfo, Part, Selection};
+use shunsoku_core::settings::{DEFAULT_CROSSHAIR_COLOR, Rgb};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
@@ -125,13 +126,6 @@ const MAGNIFIER_OUTSIDE: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 0.25,
     a: 1.0,
 };
-/// 十字線の色。どんな背景でも見えるよう、半透明のマゼンタにする。
-const CROSSHAIR: D2D1_COLOR_F = D2D1_COLOR_F {
-    r: 1.0,
-    g: 0.0,
-    b: 1.0,
-    a: 0.7,
-};
 
 /// ウィンドウのクラスを登録する。`wndproc` は `app` のもの。
 pub fn register_class(module: HINSTANCE, wndproc: WNDPROC) -> Result<()> {
@@ -164,6 +158,8 @@ pub struct Overlay {
     banner: Option<String>,
     /// モニタをまたいだ範囲のサイズの、モニタごとのサイズのつなぎ（文言の `selection.size_plus`）。
     size_plus: String,
+    /// 十字線の色（`[selection] crosshair_color`、`set_crosshair_color`）。不透明で引く。
+    crosshair_color: Rgb,
 }
 
 /// 1 モニタ分のウィンドウと、そこに出す固定された画面。
@@ -210,7 +206,8 @@ struct Scene {
     rect: Option<Rect>,
     size_label: Option<Label>,
     handles: Vec<Rect>,
-    crosshair: Option<Point>,
+    /// 十字線の中心と色。1px の不透明な線で、縁は付けない。
+    crosshair: Option<(Point, D2D1_COLOR_F)>,
     cursor_label: Option<Label>,
     /// ハイライトしているウィンドウの矩形。名前とサイズは `size_label` に入れる。
     highlight: Option<Rect>,
@@ -262,6 +259,7 @@ impl Overlay {
             painter: None,
             banner: None,
             size_plus: size_plus.to_owned(),
+            crosshair_color: DEFAULT_CROSSHAIR_COLOR,
         };
         // 途中で失敗したら、overlay の drop で作った分を片付ける
         for shot in shots {
@@ -320,6 +318,11 @@ impl Overlay {
         self.banner = text.map(str::to_owned);
     }
 
+    /// 十字線の色（`[selection] crosshair_color`）。次の `redraw` から使う。
+    pub fn set_crosshair_color(&mut self, color: Rgb) {
+        self.crosshair_color = color;
+    }
+
     /// 全モニタのウィンドウを描き直す。描くもの（`Selection::view`）がなければ固定された画面を
     /// そのまま出し、あれば範囲の枠とサイズ、つまみ、十字線、カーソルの横の座標を出す。
     pub fn redraw(&mut self, selection: &Selection) {
@@ -372,7 +375,9 @@ impl Overlay {
             rect: view.rect,
             size_label,
             handles: view.handles,
-            crosshair: view.crosshair,
+            crosshair: view
+                .crosshair
+                .map(|at| (at, rgb_color(self.crosshair_color))),
             cursor_label,
             highlight: view.highlight.map(|h| h.rect),
             magnifier,
@@ -668,6 +673,11 @@ fn color_f([b, g, r, _]: [u8; 4]) -> D2D1_COLOR_F {
     }
 }
 
+/// 設定の色を、不透明の Direct2D の色にする。
+fn rgb_color(Rgb(r, g, b): Rgb) -> D2D1_COLOR_F {
+    color_f([b, g, r, 0xFF])
+}
+
 /// `at` の画素を含むモニタ。
 fn monitor_at(selection: &Selection, at: Point) -> Option<MonitorInfo> {
     selection
@@ -805,7 +815,9 @@ impl MonitorView {
             context.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
         }
         // 十字線はカーソルのあるモニタにだけ、そのモニタいっぱいに引く
-        if let Some(at) = scene.crosshair.filter(|&at| monitor.contains(at)) {
+        if let Some((at, color)) = scene.crosshair.filter(|&(at, _)| monitor.contains(at)) {
+            // SAFETY: このモニタのブラシ。BeginDraw と EndDraw の間で呼ぶ
+            unsafe { d2d.crosshair.SetColor(&color) };
             fill(
                 Rect::new(monitor.left, at.y, monitor.right, at.y + 1),
                 &d2d.crosshair,
@@ -973,7 +985,9 @@ impl D2dTarget {
                 label_text: context.CreateSolidColorBrush(&LABEL_TEXT, None)?,
                 highlight_frame: context.CreateSolidColorBrush(&HIGHLIGHT_FRAME, None)?,
                 highlight_fill: context.CreateSolidColorBrush(&HIGHLIGHT_FILL, None)?,
-                crosshair: context.CreateSolidColorBrush(&CROSSHAIR, None)?,
+                // 色は描くたびに十字線の設定の色にする
+                crosshair: context
+                    .CreateSolidColorBrush(&rgb_color(DEFAULT_CROSSHAIR_COLOR), None)?,
                 pixel: context.CreateSolidColorBrush(&MAGNIFIER_OUTSIDE, None)?,
                 _target: target,
                 context,

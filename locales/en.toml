@@ -70,6 +70,7 @@ capture = "Capture"
 regions = "Saved regions"
 scrap = "Scraps"
 scrap_ops = "Scrap actions"
+recipes = "Recipes"
 annotation = "Drawing"
 
 [settings_gui.general]
@@ -93,6 +94,7 @@ mode = "Default selection mode:"
 mode_normal = "Normal (release to capture)"
 mode_precise = "Precise (adjust, then capture)"
 crosshair = "Show a crosshair when selecting"
+crosshair_color = "Crosshair color:"
 hint = "Select a field and press keys to assign them. Tab moves to the next field."
 
 [settings_gui.regions]
@@ -150,6 +152,18 @@ mouse_label = "Mouse:"
 reset = "Reset to default"
 none = "None"
 
+[settings_gui.recipes]
+name = "Name"
+shortcut = "Shortcut"
+add = "Add"
+remove = "Remove"
+name_label = "Name:"
+steps_label = "Operations:"
+add_step = "Add"
+shortcut_label = "Shortcut:"
+# Name of a recipe added with "Add" (a number follows)
+default_name = "Recipe"
+
 [settings_gui.mark]
 unset = "Not set"
 conflict = "Overlaps"
@@ -158,6 +172,9 @@ overlap = "Overlaps a shortcut (the hotkey wins)"
 not_registered = "Could not register (another app may be using it)"
 empty_name = "The name is empty"
 duplicate_name = "The name is used twice"
+no_steps = "No operations"
+not_a_step = "Has an operation that cannot go in a recipe"
+close_not_last = "Close can only be the last operation"
 
 [hotkey]
 failed = "Could not register these hotkeys (another app may be using them): "

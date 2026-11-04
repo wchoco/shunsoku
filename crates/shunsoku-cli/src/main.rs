@@ -281,7 +281,8 @@ mod pipe {
         }
     }
 
-    /// 相手が同じセッションの同じユーザーのプロセスか確かめる（名前を先に取られていたときのため）。
+    /// 相手が同じセッションの同じユーザーのプロセスで、整合性レベルが低すぎないか確かめる（名前を先に取られて
+    /// いたときのため。同じユーザーでも、整合性レベルの低いプロセスなら名前を取れる）。
     /// 確かめた相手のプロセス ID を返す。
     fn verify_server(pipe: &Pipe, session: u32, sid: &str) -> Result<u32, Failure> {
         let refused = || Failure::unavailable("パイプの相手が常駐本体ではありません");
@@ -294,6 +295,11 @@ mod pipe {
         }
         let user = pipe_identity::process_user_sid(pid).map_err(|_| refused())?;
         if server_session != session || user != sid {
+            return Err(refused());
+        }
+        let own = pipe_identity::current_integrity().map_err(|_| refused())?;
+        let server = pipe_identity::process_integrity(pid).map_err(|_| refused())?;
+        if !own.trusts_server(server) {
             return Err(refused());
         }
         Ok(pid)

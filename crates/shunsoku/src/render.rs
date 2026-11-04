@@ -5,7 +5,9 @@
 //!   （`ScrapModel::display_size`）に伸び縮みさせて描く。拡大と等倍は補間せず（画素が見えるように）、
 //!   縮小は線形補間で描く。
 //! - 倍率を変えた直後は、画像の左上に倍率（`ZoomLabel`）を重ねて描く。
-//! - トリムの範囲を選んでいる間は、選んだ範囲の外を暗くし、範囲の縁に線を引く（`TrimOverlay`）。
+//! - トリムの範囲を選んでいる間は、選んだ範囲の外を暗くし、範囲の縁に線を引く（`TrimOverlay`）。範囲選択の
+//!   画面の精密モードと同じく、つまみ、十字線（画像の矩形の中だけ）、拡大鏡と座標・サイズ・色コードも描く。
+//!   拡大鏡の画素は表示している画像（`ScrapModel::shown_image`）から読み、ウィンドウの中に収まるように置く。
 //! - 書き込み（`annotate::Annotation`）は画像の上、トリムの範囲の上の重ねものの下に、画像の矩形の中だけに
 //!   描く（`draw_annotations`）。座標の換算は core の `annotate::View` で、表示なら `ScrapModel::annotation_view`、
 //!   保存とコピーなら `ScrapModel::output_view` を渡す。画像は補間せずに描くが、書き込みはアンチエイリアスする。
@@ -26,7 +28,9 @@ use shunsoku_core::annotate::{
 };
 use shunsoku_core::geometry::{Point, Rect, Size};
 use shunsoku_core::image::Image;
+use shunsoku_core::magnifier;
 use shunsoku_core::scrap::{Appearance, SHADOW_WIDTH};
+use shunsoku_core::settings::Rgb;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
@@ -73,11 +77,37 @@ const TRIM_SHADE_ALPHA: f32 = 0.45;
 /// トリムの範囲の縁の線の色。
 const TRIM_EDGE_COLOR: u32 = 0xFF_FF_FF;
 
-/// トリムの範囲を選んでいる間に画像に重ねるもの。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// トリムの拡大鏡の、画像の外の画素の色。
+const TRIM_MAGNIFIER_OUTSIDE: u32 = 0x40_40_40;
+/// トリムの拡大鏡の下の文字の大きさと余白（DPI 96 のときの物理ピクセル）。
+const TRIM_LABEL_FONT: f32 = 12.0;
+const TRIM_LABEL_PADDING_X: f32 = 6.0;
+const TRIM_LABEL_PADDING_Y: f32 = 3.0;
+
+/// トリムの範囲を選んでいる間に画像に重ねるもの（core の `TrimView` をウィンドウの中の座標にしたもの）。
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrimOverlay {
     /// 選んだ範囲（ウィンドウの中の座標）。まだ選んでいなければ None（画像全体を暗くする）。
     pub selection: Option<Rect>,
+    /// 範囲のつまみ（ウィンドウの中の座標）。
+    pub handles: Vec<Rect>,
+    /// 十字線を通す点（ウィンドウの中の座標）と色（`[selection] crosshair_color`）。画像の矩形の中だけに引く。
+    pub crosshair: Option<(Point, Rgb)>,
+    /// 拡大鏡。
+    pub magnifier: Option<TrimMagnifier>,
+    /// 拡大鏡と文字の大きさの倍率（ウィンドウのあるモニタの DPI / 96）。
+    pub scale: f32,
+}
+
+/// トリムの拡大鏡。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrimMagnifier {
+    /// カーソルの位置（ウィンドウの中の座標）。拡大鏡はこの横に置く。
+    pub cursor: Point,
+    /// 拡大して見せる画素（表示している画像の画素）。
+    pub pixel: Point,
+    /// 拡大した画素の下に出す座標とサイズ（色コードはその下に足す）。
+    pub label: Option<String>,
 }
 
 /// 画像に重ねる書き込み。
@@ -115,7 +145,7 @@ pub struct Overlays<'a> {
     /// あれば、画像の左上に倍率を出す。
     pub label: Option<ZoomLabel>,
     /// あれば、トリムの範囲を出す。
-    pub trim: Option<TrimOverlay>,
+    pub trim: Option<&'a TrimOverlay>,
 }
 
 /// 画像に重ねる倍率の表示。
@@ -265,10 +295,13 @@ impl Renderer {
         } = overlays;
         let margin = appearance.margin();
         let image_rect = Rect::from_origin_size(Point::new(margin, margin), display);
-        let dwrite = match label {
-            Some(_) => Some(self.dwrite()?),
-            None => None,
+        let magnified = trim.and_then(|t| t.magnifier.as_ref().map(|m| (m, t.scale)));
+        let dwrite = if label.is_some() || magnified.is_some() {
+            Some(self.dwrite()?)
+        } else {
+            None
         };
+        let window = Rect::from_origin_size(Point::default(), canvas.size());
         let mut caret = None;
         self.paint(canvas, |target| {
             // SAFETY: BeginDraw と EndDraw の間で呼ぶ
@@ -305,8 +338,13 @@ impl Renderer {
             if let Some(trim) = trim {
                 draw_trim_overlay(target, image_rect, trim)?;
             }
-            match (label, dwrite) {
-                (Some(label), Some(dwrite)) => draw_zoom_label(target, &dwrite, image_rect, label),
+            if let (Some(label), Some(dwrite)) = (label, &dwrite) {
+                draw_zoom_label(target, dwrite, image_rect, label)?;
+            }
+            match (magnified, &dwrite) {
+                (Some((m, scale)), Some(dwrite)) => {
+                    draw_trim_magnifier(target, dwrite, image, window, m, scale)
+                }
                 _ => Ok(()),
             }
         })?;
@@ -753,34 +791,171 @@ fn vec2((x, y): (f64, f64)) -> Vector2 {
     }
 }
 
-/// トリムの範囲の外（画像の中だけ）を暗くし、範囲の縁に 1px の線を引く。
+/// トリムの範囲の外（画像の中だけ）を暗くし、範囲の縁に 1px の線を引く。十字線（画像の中だけ）とつまみを重ねる。
 fn draw_trim_overlay(
     target: &ID2D1RenderTarget,
     image_rect: Rect,
-    trim: TrimOverlay,
+    trim: &TrimOverlay,
 ) -> Result<()> {
+    // 範囲の縁の線、十字線、つまみの縁取りは、DPI によらず物理ピクセルで 1px にする（範囲選択の画面の精密
+    // モードと同じ）。画素の境目を指す細い線なので、太らせると選んでいる画素が隠れる。つまみの大きさは core が
+    // DPI で換算して渡す
     let selection = trim.selection.and_then(|r| r.intersect(&image_rect));
     // SAFETY: BeginDraw と EndDraw の間で呼ぶ
     unsafe {
         let shade = target.CreateSolidColorBrush(&rgb(0, TRIM_SHADE_ALPHA), None)?;
-        let Some(selection) = selection else {
-            target.FillRectangle(&to_rect_f(image_rect), &shade);
-            return Ok(());
-        };
-        for strip in ring(image_rect, selection) {
-            if !strip.is_empty() {
-                target.FillRectangle(&to_rect_f(strip), &shade);
+        let edge = target.CreateSolidColorBrush(&rgb(TRIM_EDGE_COLOR, 1.0), None)?;
+        match selection {
+            None => target.FillRectangle(&to_rect_f(image_rect), &shade),
+            Some(selection) => {
+                for strip in ring(image_rect, selection) {
+                    if !strip.is_empty() {
+                        target.FillRectangle(&to_rect_f(strip), &shade);
+                    }
+                }
+                // 範囲の内側に線を引く（画像の端でも見えるように）
+                let inner = selection.inflate(-1);
+                if inner.is_empty() {
+                    target.FillRectangle(&to_rect_f(selection), &edge);
+                } else {
+                    for strip in ring(selection, inner) {
+                        target.FillRectangle(&to_rect_f(strip), &edge);
+                    }
+                }
             }
         }
-        let edge = target.CreateSolidColorBrush(&rgb(TRIM_EDGE_COLOR, 1.0), None)?;
-        // 範囲の内側に線を引く（画像の端でも見えるように）
-        let inner = selection.inflate(-1);
-        if inner.is_empty() {
-            target.FillRectangle(&to_rect_f(selection), &edge);
-        } else {
-            for strip in ring(selection, inner) {
-                target.FillRectangle(&to_rect_f(strip), &edge);
+        if let Some((at, color)) = trim.crosshair {
+            let brush = target.CreateSolidColorBrush(&rgb_color(color), None)?;
+            let lines = [
+                Rect::new(image_rect.left, at.y, image_rect.right, at.y + 1),
+                Rect::new(at.x, image_rect.top, at.x + 1, image_rect.bottom),
+            ];
+            for line in lines.iter().filter_map(|l| l.intersect(&image_rect)) {
+                target.FillRectangle(&to_rect_f(line), &brush);
             }
+        }
+        // つまみは黒で縁取った白い四角
+        let outline = target.CreateSolidColorBrush(&rgb(0, 1.0), None)?;
+        for &handle in &trim.handles {
+            target.FillRectangle(&to_rect_f(handle.inflate(1)), &outline);
+            target.FillRectangle(&to_rect_f(handle), &edge);
+        }
+    }
+    Ok(())
+}
+
+/// トリムの拡大鏡: カーソルの下の画素のまわりを拡大し、その下に座標とサイズ、色コードを並べる。置き場所は
+/// core の `magnifier::place` で、ウィンドウ（`window`）の中に収める。
+fn draw_trim_magnifier(
+    target: &ID2D1RenderTarget,
+    dwrite: &IDWriteFactory,
+    image: &Image,
+    window: Rect,
+    m: &TrimMagnifier,
+    scale: f32,
+) -> Result<()> {
+    let color_at = |p: Point| {
+        let inside =
+            (0..image.width() as i32).contains(&p.x) && (0..image.height() as i32).contains(&p.y);
+        inside.then(|| image.pixel(p.x as u32, p.y as u32))
+    };
+    let Some(under) = color_at(m.pixel) else {
+        return Ok(());
+    };
+    let scaled = |len: i32| (len as f32 * scale).round() as i32;
+    let cell = scaled(magnifier::ZOOM).max(1);
+    let side = cell * magnifier::SPAN;
+    let texts: Vec<String> = m
+        .label
+        .clone()
+        .into_iter()
+        .chain([magnifier::color_code(under)])
+        .collect();
+    let font_scale = scale.max(1.0);
+    let pad_x = TRIM_LABEL_PADDING_X * font_scale;
+    let pad_y = TRIM_LABEL_PADDING_Y * font_scale;
+    // SAFETY: BeginDraw と EndDraw の間で呼ぶ。文字列と書式はこの関数の中で生きている
+    unsafe {
+        let format = dwrite.CreateTextFormat(
+            w!("Segoe UI"),
+            None,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            TRIM_LABEL_FONT * font_scale,
+            w!(""),
+        )?;
+        format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        let mut measured = Vec::with_capacity(texts.len());
+        for text in &texts {
+            let text: Vec<u16> = text.encode_utf16().collect();
+            let layout = dwrite.CreateTextLayout(&text, &format, 4096.0, 1024.0)?;
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut metrics)?;
+            let width = (metrics.width + pad_x * 2.0).ceil() as i32;
+            let height = (metrics.height + pad_y * 2.0).ceil() as i32;
+            measured.push((text, width, height));
+        }
+        let width = measured.iter().map(|&(_, w, _)| w).fold(side, i32::max);
+        let height = side + measured.iter().map(|&(_, _, h)| h).sum::<i32>();
+        let panel = magnifier::place(m.cursor, width, height, scaled(magnifier::OFFSET), window);
+        let area = Rect::new(panel.left, panel.top, panel.left + side, panel.top + side);
+
+        let black = target.CreateSolidColorBrush(&rgb(0, 1.0), None)?;
+        let white = target.CreateSolidColorBrush(&rgb(0xFF_FF_FF, 1.0), None)?;
+        let cell_brush = target.CreateSolidColorBrush(&rgb(0, 1.0), None)?;
+        target.FillRectangle(&to_rect_f(area.inflate(1)), &black);
+        let source = magnifier::source(m.pixel);
+        let mut center = area;
+        for row in 0..magnifier::SPAN {
+            for col in 0..magnifier::SPAN {
+                let at = Point::new(source.left + col, source.top + row);
+                let left = area.left + col * cell;
+                let top = area.top + row * cell;
+                let rect = Rect::new(left, top, left + cell, top + cell);
+                if at == m.pixel {
+                    center = rect;
+                }
+                let color = match color_at(at) {
+                    Some([b, g, r, _]) => rgb_color(Rgb(r, g, b)),
+                    None => rgb(TRIM_MAGNIFIER_OUTSIDE, 1.0),
+                };
+                cell_brush.SetColor(&color);
+                target.FillRectangle(&to_rect_f(rect), &cell_brush);
+            }
+        }
+        for band in ring(center.inflate(2), center.inflate(1)) {
+            target.FillRectangle(&to_rect_f(band), &black);
+        }
+        for band in ring(center.inflate(1), center) {
+            target.FillRectangle(&to_rect_f(band), &white);
+        }
+        target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        let back = target.CreateSolidColorBrush(&rgb(0, ZOOM_LABEL_BACK_ALPHA), None)?;
+        let mut top = area.bottom as f32;
+        for (text, _, height) in measured {
+            let rect = D2D_RECT_F {
+                left: panel.left as f32,
+                top,
+                right: (panel.left + width) as f32,
+                bottom: top + height as f32,
+            };
+            target.FillRectangle(&rect, &back);
+            let text_rect = D2D_RECT_F {
+                left: rect.left + pad_x,
+                top: rect.top + pad_y,
+                right: rect.right - pad_x,
+                bottom: rect.bottom - pad_y,
+            };
+            target.DrawText(
+                &text,
+                &format,
+                &text_rect,
+                &white,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            top += height as f32;
         }
     }
     Ok(())
@@ -1151,6 +1326,11 @@ fn rgb(color: u32, alpha: f32) -> D2D1_COLOR_F {
         b: channel(0),
         a: alpha,
     }
+}
+
+/// 設定の色を、不透明の色にする。
+fn rgb_color(Rgb(r, g, b): Rgb) -> D2D1_COLOR_F {
+    rgb(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b), 1.0)
 }
 
 fn to_rect_f(r: Rect) -> D2D_RECT_F {

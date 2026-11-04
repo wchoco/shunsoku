@@ -11,13 +11,17 @@
 //! - 「定型領域」タブの一覧の追加・複製・削除・並べ替えは `add_region` / `duplicate_region` / `remove_region` /
 //!   `move_region`。「範囲を選び直す」は `set_region_range`。GUI を開いている間にトレイから登録した定型領域は
 //!   `new_registered_region` で名前を決め、書いたら `registered` で base と写しに足す。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
+//! - 「レシピ」タブの一覧の追加・削除は `add_recipe` / `remove_recipe`、名前は `set_recipe_name`。操作の並びは
+//!   `step_choices`（足せる操作）/ `add_step` / `move_step` / `remove_step`。ショートカットは `set_chord` の
+//!   `RecipeShortcut`。検査（`recipe::plan`）で引っかかったものは `mark` の `RecipeName` / `RecipeSteps` に出る。
 
 use std::collections::BTreeSet;
 
 use super::{Problem, Region, Settings, SettingsItem, new_region};
 use crate::geometry::Rect;
 use crate::keys::Chord;
-use crate::scrap::ops::{BindingRow, MouseGesture};
+use crate::recipe::{self, Recipe};
+use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationDescriptor};
 
 /// 設定 GUI の写し。
 #[derive(Debug, Clone)]
@@ -56,6 +60,9 @@ impl Mark {
             Mark::Problem(Problem::Overlap(_)) => "settings_gui.mark.overlap",
             Mark::Problem(Problem::EmptyName) => "settings_gui.mark.empty_name",
             Mark::Problem(Problem::DuplicateName) => "settings_gui.mark.duplicate_name",
+            Mark::Problem(Problem::NoSteps) => "settings_gui.mark.no_steps",
+            Mark::Problem(Problem::NotAStep) => "settings_gui.mark.not_a_step",
+            Mark::Problem(Problem::CloseNotLast) => "settings_gui.mark.close_not_last",
         }
     }
 }
@@ -266,6 +273,104 @@ impl Editor {
             .retain(|item| !matches!(item, SettingsItem::RegionHotkey(_)));
     }
 
+    /// レシピを末尾に足す（「追加」）。名前はどのレシピとも重ならない `"{base} N"`（N は 1 から）。操作の並びと
+    /// ショートカットは空。足した位置を返す。
+    pub fn add_recipe(&mut self, base: &str) -> usize {
+        let used = |n: &str| self.draft.recipes.iter().any(|r| r.name == n);
+        let name = (1..)
+            .map(|n: u64| format!("{base} {n}"))
+            .find(|n| !used(n))
+            .expect("some number is unused");
+        self.draft.recipes.push(Recipe {
+            name,
+            ..Recipe::default()
+        });
+        self.draft.recipes.len() - 1
+    }
+
+    /// レシピ `index` を消す（「削除」）。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を返す。
+    /// `index` のレシピがなければ何もせず None。
+    pub fn remove_recipe(&mut self, index: usize) -> Option<usize> {
+        if index >= self.draft.recipes.len() {
+            return None;
+        }
+        self.draft.recipes.remove(index);
+        let len = self.draft.recipes.len();
+        (len > 0).then(|| index.min(len - 1))
+    }
+
+    /// レシピ `index` の名前を `name`（前後の空白を除く）にする。`index` のレシピがなければ何もしない。
+    pub fn set_recipe_name(&mut self, index: usize, name: &str) {
+        if let Some(r) = self.draft.recipes.get_mut(index) {
+            r.name = name.trim().to_owned();
+        }
+    }
+
+    /// レシピ `index` の「操作を足す」で選べる操作（表の順）。レシピに入れられる操作（`recipe::can_be_step`）の
+    /// うち、`close` で終わるレシピには `close` を出さない（`add_step` は `close` の前に足すので、2 つ目の
+    /// `close` は最後に置けない）。`index` のレシピがなければ空。
+    pub fn step_choices(&self, index: usize) -> Vec<&'static OperationDescriptor> {
+        let Some(r) = self.draft.recipes.get(index) else {
+            return Vec::new();
+        };
+        let ends_with_last_only = r
+            .steps
+            .last()
+            .is_some_and(|id| recipe::is_last_only(id, OPERATIONS));
+        OPERATIONS
+            .iter()
+            .filter(|op| recipe::can_be_step(op))
+            .filter(|op| !(ends_with_last_only && op.in_recipe == InRecipe::Last))
+            .collect()
+    }
+
+    /// レシピ `index` に操作 `id` を足す。レシピが `close` で終わっていれば、その前に入れる（`close` は最後に
+    /// だけ置けるため）。入れた位置を返す。`index` のレシピがなければ何もせず None。
+    pub fn add_step(&mut self, index: usize, id: &str) -> Option<usize> {
+        let steps = &mut self.draft.recipes.get_mut(index)?.steps;
+        let at = if steps
+            .last()
+            .is_some_and(|s| recipe::is_last_only(s, OPERATIONS))
+        {
+            steps.len() - 1
+        } else {
+            steps.len()
+        };
+        steps.insert(at, id.to_owned());
+        Some(at)
+    }
+
+    /// レシピ `index` の手 `step` を隣と入れ替える（「上へ」「下へ」）。端か、手がなければ動かさない。移った
+    /// 位置を返す。
+    pub fn move_step(&mut self, index: usize, step: usize, to: Move) -> usize {
+        let Some(r) = self.draft.recipes.get_mut(index) else {
+            return step;
+        };
+        let other = match to {
+            Move::Up => step.checked_sub(1),
+            Move::Down => Some(step + 1),
+        };
+        match other.filter(|&o| o < r.steps.len() && step < r.steps.len()) {
+            Some(other) => {
+                r.steps.swap(step, other);
+                other
+            }
+            None => step,
+        }
+    }
+
+    /// レシピ `index` の手 `step` を消す。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を
+    /// 返す。手がなければ何もせず None。
+    pub fn remove_step(&mut self, index: usize, step: usize) -> Option<usize> {
+        let steps = &mut self.draft.recipes.get_mut(index)?.steps;
+        if step >= steps.len() {
+            return None;
+        }
+        steps.remove(step);
+        let len = steps.len();
+        (len > 0).then(|| step.min(len - 1))
+    }
+
     /// OK と適用を押せるか。OK は適用を止める問題がないとき、適用はそれに加えて写しが base と違うとき。
     pub fn buttons(&self) -> Buttons {
         let ok = !super::validate(&self.draft)
@@ -314,7 +419,11 @@ fn chord_of(settings: &Settings, item: &SettingsItem) -> Option<Chord> {
         SettingsItem::ActiveWindowCaptureHotkey => settings.hotkeys.active_window_capture,
         SettingsItem::RegionHotkey(i) => settings.regions.get(*i).and_then(|r| r.hotkey),
         SettingsItem::Shortcut(id) => settings.shortcuts.get(id).copied().flatten(),
-        SettingsItem::Mouse(_) | SettingsItem::RegionName(_) => None,
+        SettingsItem::RecipeShortcut(i) => settings.recipes.get(*i).and_then(|r| r.shortcut),
+        SettingsItem::Mouse(_)
+        | SettingsItem::RegionName(_)
+        | SettingsItem::RecipeName(_)
+        | SettingsItem::RecipeSteps(_) => None,
     }
 }
 
@@ -331,7 +440,11 @@ fn chord_slot<'a>(
         }
         SettingsItem::RegionHotkey(i) => settings.regions.get_mut(*i).map(|r| &mut r.hotkey),
         SettingsItem::Shortcut(id) => Some(settings.shortcuts.entry(id.clone()).or_default()),
-        SettingsItem::Mouse(_) | SettingsItem::RegionName(_) => None,
+        SettingsItem::RecipeShortcut(i) => settings.recipes.get_mut(*i).map(|r| &mut r.shortcut),
+        SettingsItem::Mouse(_)
+        | SettingsItem::RegionName(_)
+        | SettingsItem::RecipeName(_)
+        | SettingsItem::RecipeSteps(_) => None,
     }
 }
 
@@ -866,6 +979,163 @@ mod tests {
             editor.mark(&SettingsItem::RegionName(1)),
             Some(Mark::Problem(Problem::EmptyName))
         );
+        assert!(!editor.buttons().ok);
+    }
+    fn recipe_names(editor: &Editor) -> Vec<&str> {
+        editor
+            .draft()
+            .recipes
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_added_recipe_gets_the_next_free_number_goes_last_and_needs_steps() {
+        let mut editor = Editor::new(Settings::default());
+        assert_eq!(editor.add_recipe("レシピ"), 0);
+        assert_eq!(editor.add_recipe("レシピ"), 1);
+        editor.draft_mut().recipes[0].name = "コピー".to_owned();
+        assert_eq!(editor.add_recipe("レシピ"), 2);
+        assert_eq!(recipe_names(&editor), ["コピー", "レシピ 2", "レシピ 1"]);
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(2)),
+            Some(Mark::Problem(Problem::NoSteps))
+        );
+        assert_eq!(editor.draft().recipes[2].shortcut, None);
+    }
+    #[test]
+    fn a_removed_recipe_leaves_the_next_one_selected() {
+        let mut editor = Editor::new(Settings::default());
+        for _ in 0..3 {
+            editor.add_recipe("R");
+        }
+        assert_eq!(editor.remove_recipe(1), Some(1));
+        assert_eq!(recipe_names(&editor), ["R 1", "R 3"]);
+        assert_eq!(editor.remove_recipe(1), Some(0));
+        assert_eq!(editor.remove_recipe(0), None);
+        assert!(editor.draft().recipes.is_empty());
+        assert_eq!(editor.remove_recipe(0), None);
+    }
+
+    fn steps(editor: &Editor, index: usize) -> Vec<&str> {
+        editor.draft().recipes[index]
+            .steps
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn choice_ids(editor: &Editor, index: usize) -> Vec<&'static str> {
+        editor.step_choices(index).iter().map(|op| op.id).collect()
+    }
+
+    #[test]
+    fn only_operations_a_recipe_can_take_are_offered_as_steps() {
+        let mut editor = Editor::new(Settings::default());
+        editor.add_recipe("R");
+        let ids = choice_ids(&editor, 0);
+        for id in ["copy", "zoom_in", "toggle_compact", "close"] {
+            assert!(ids.contains(&id), "{id} in {ids:?}");
+        }
+        // モードを切り替える操作、引数を取る操作、ドラッグ専用の操作は出さない
+        for id in ["trim", "annotate", "zoom", "opacity", "move"] {
+            assert!(!ids.contains(&id), "{id} in {ids:?}");
+        }
+    }
+
+    #[test]
+    fn a_step_added_after_close_goes_before_it_and_close_is_offered_only_once() {
+        let mut editor = Editor::new(Settings::default());
+        editor.add_recipe("R");
+        assert_eq!(editor.add_step(0, "close"), Some(0));
+        assert!(!choice_ids(&editor, 0).contains(&"close"));
+        assert_eq!(editor.add_step(0, "copy"), Some(0));
+        assert_eq!(editor.add_step(0, "copy"), Some(1));
+        assert_eq!(steps(&editor, 0), ["copy", "copy", "close"]);
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert_eq!(editor.add_step(1, "copy"), None);
+    }
+
+    /// 操作の並びが `ids` のレシピ 1 つを持つ写し（ほかに適用を止める問題はない）。
+    fn with_steps(ids: &[&str]) -> Editor {
+        let mut settings = Settings::default();
+        settings.hotkeys.select_capture = Some(chord("Ctrl+Shift+A"));
+        settings.recipes.push(Recipe {
+            name: "R".to_owned(),
+            steps: ids.iter().map(|&id| id.to_owned()).collect(),
+            shortcut: None,
+        });
+        Editor::new(settings)
+    }
+
+    #[test]
+    fn a_moved_step_swaps_with_its_neighbour_and_stops_at_the_ends() {
+        let mut editor = with_steps(&["copy", "zoom_in", "close"]);
+        assert_eq!(editor.move_step(0, 1, Move::Up), 0);
+        assert_eq!(steps(&editor, 0), ["zoom_in", "copy", "close"]);
+        assert_eq!(editor.move_step(0, 0, Move::Up), 0);
+        assert_eq!(editor.move_step(0, 2, Move::Down), 2);
+        assert_eq!(steps(&editor, 0), ["zoom_in", "copy", "close"]);
+        // close を最後から動かすと、適用できない印が付く
+        assert_eq!(editor.move_step(0, 2, Move::Up), 1);
+        assert_eq!(steps(&editor, 0), ["zoom_in", "close", "copy"]);
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::CloseNotLast))
+        );
+        assert_eq!(editor.move_step(1, 0, Move::Down), 0);
+    }
+
+    #[test]
+    fn a_removed_step_leaves_the_next_one_selected() {
+        let mut editor = with_steps(&["copy", "zoom_in", "close"]);
+        assert_eq!(editor.remove_step(0, 1), Some(1));
+        assert_eq!(steps(&editor, 0), ["copy", "close"]);
+        assert_eq!(editor.remove_step(0, 1), Some(0));
+        assert_eq!(editor.remove_step(0, 0), None);
+        assert!(steps(&editor, 0).is_empty());
+        assert_eq!(editor.remove_step(0, 0), None);
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoSteps))
+        );
+    }
+
+    #[test]
+    fn recipe_names_are_trimmed_and_must_be_filled_and_unique_before_applying() {
+        let mut editor = with_steps(&["copy"]);
+        editor.add_recipe("R");
+        editor.add_step(1, "close");
+        editor.set_recipe_name(1, "  R  ");
+        assert_eq!(recipe_names(&editor), ["R", "R"]);
+        let duplicate = Some(Mark::Problem(Problem::DuplicateName));
+        assert_eq!(editor.mark(&SettingsItem::RecipeName(0)), duplicate);
+        assert_eq!(editor.mark(&SettingsItem::RecipeName(1)), duplicate);
+        assert!(!editor.buttons().ok);
+
+        editor.set_recipe_name(1, " ");
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeName(1)),
+            Some(Mark::Problem(Problem::EmptyName))
+        );
+        editor.set_recipe_name(1, "閉じる");
+        assert_eq!(editor.mark(&SettingsItem::RecipeName(1)), None);
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn recipe_shortcuts_overlapping_an_operation_are_marked_and_block_applying() {
+        let mut editor = with_steps(&["copy"]);
+        editor.set_chord(&SettingsItem::RecipeShortcut(0), Some(chord("Ctrl+C")));
+        assert_eq!(
+            editor.chord(&SettingsItem::RecipeShortcut(0)),
+            Some(chord("Ctrl+C"))
+        );
+        assert!(matches!(
+            editor.mark(&SettingsItem::RecipeShortcut(0)),
+            Some(Mark::Problem(Problem::Conflict(_)))
+        ));
         assert!(!editor.buttons().ok);
     }
 }

@@ -9,7 +9,6 @@
 
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use shunsoku_core::APP_NAME;
@@ -18,12 +17,13 @@ use shunsoku_core::template::{self, LocalTime};
 use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::Common::{COMDLG_FILTERSPEC, ITEMIDLIST};
 use windows::Win32::UI::Shell::{
     FOLDERID_Pictures, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS,
-    FOS_STRICTFILETYPES, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog,
-    IShellItem, KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderPath,
-    SIGDN_FILESYSPATH, ShellExecuteW,
+    FOS_STRICTFILETYPES, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, ILFree,
+    IShellItem, KF_FLAG_DEFAULT, SEE_MASK_CLASSNAME, SEE_MASK_IDLIST, SHCreateItemFromParsingName,
+    SHELLEXECUTEINFOW, SHGetKnownFolderPath, SHParseDisplayName, SIGDN_FILESYSPATH,
+    ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
@@ -201,18 +201,33 @@ pub fn write_png(path: &Path, image: &Image, overwrite: Overwrite) -> std::io::R
 }
 
 /// フォルダをエクスプローラーで開く。UI スレッドで COM を初期化してから呼ぶ。
+///
+/// パスを "open" で開くと既定の動作になるので、覚えていたフォルダが実行ファイルに差し替えられていると、それを
+/// 起動してしまう。ディレクトリであることを確かめ、PIDL にしてから、クラスを `Folder` に決めて開く（項目の種類の
+/// 動作ではなく、フォルダの "open" を使う）。`SHOpenFolderAndSelectItems` は 1 つの項目だけを渡すと親を開いて
+/// その項目を選ぶので、フォルダの中は開けない。
 pub fn open_folder(dir: &Path) -> bool {
-    let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
-    // SAFETY: path は呼び出しの間生きている
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(path.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        )
-    };
-    result.0 as isize > 32
+    if !dir.is_dir() {
+        return false;
+    }
+    let path = HSTRING::from(dir.as_os_str());
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    // SAFETY: path と pidl は呼び出しの間生きている。返った PIDL は ILFree で返す
+    unsafe {
+        if SHParseDisplayName(&path, None, &mut pidl, 0, None).is_err() || pidl.is_null() {
+            return false;
+        }
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_IDLIST | SEE_MASK_CLASSNAME,
+            lpVerb: w!("open"),
+            lpClass: w!("Folder"),
+            lpIDList: pidl.cast(),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        let opened = ShellExecuteExW(&mut info);
+        ILFree(Some(pidl));
+        opened.is_ok()
+    }
 }
