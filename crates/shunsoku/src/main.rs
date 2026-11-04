@@ -10,6 +10,8 @@ mod autostart;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
+mod gpu_pass;
+#[cfg(windows)]
 mod grab;
 #[cfg(windows)]
 mod hdr;
@@ -47,8 +49,6 @@ mod scrap_window;
 mod settings_dialog;
 #[cfg(windows)]
 mod settings_watch;
-#[cfg(windows)]
-mod shader;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]

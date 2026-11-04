@@ -3,26 +3,19 @@
 //! 対応は core の `capture::rotation`。シェーダーは `Rotation::source_pixel` を 1 次の式の係数にして
 //! 受け取るので、向きごとの式はここには書かない。
 
-use std::sync::OnceLock;
-
 use shunsoku_core::capture::rotation::Rotation;
 use shunsoku_core::geometry::{Point, Size};
 
-use crate::shader;
+use crate::gpu_pass::{self, PixelShader};
 
-use windows::Win32::Foundation::{E_FAIL, E_POINTER};
-use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BUFFER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_USAGE_IMMUTABLE, D3D11_VIEWPORT, ID3D11Device, ID3D11Texture2D,
-};
-use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-use windows::core::{Result, s};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::core::Result;
 
 /// 回すシェーダー。正しい向きの画素 p の値を、回転前の画素 `origin + p.x * step_x + p.y * step_y` から
-/// そのまま写す（形式は入力と同じなので、値は変わらない）。
-const SHADER: &str = r"
+/// そのまま写す（形式は入力と同じなので、値は変わらない）。定数は `Params`。
+static SHADER: PixelShader = PixelShader::new(
+    "rotation",
+    r"
 cbuffer Params : register(b0) {
     int2 origin;
     int2 step_x;
@@ -31,38 +24,38 @@ cbuffer Params : register(b0) {
 };
 Texture2D<float4> source : register(t0);
 
-float4 vs(uint id : SV_VertexID) : SV_Position {
-    float2 uv = float2((id << 1) & 2, id & 2);
-    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
-}
-
 float4 ps(float4 pos : SV_Position) : SV_Target {
     int2 p = int2(pos.xy);
     return source.Load(int3(origin + p.x * step_x + p.y * step_y, 0));
 }
-";
+",
+);
 
-/// コンパイル済みのシェーダー（頂点、ピクセル）。
-type Shaders = (Vec<u8>, Vec<u8>);
-
-/// コンパイル済みのシェーダー。デバイスによらないので 1 回だけ作る。
-fn shaders() -> Result<&'static Shaders> {
-    static SHADERS: OnceLock<std::result::Result<Shaders, String>> = OnceLock::new();
-    SHADERS
-        .get_or_init(|| {
-            let vs = shader::compile(SHADER, "rotation", s!("vs"), s!("vs_4_0"))?;
-            let ps = shader::compile(SHADER, "rotation", s!("ps"), s!("ps_4_0"))?;
-            Ok((vs, ps))
-        })
-        .as_ref()
-        .map_err(|e| windows::core::Error::new(E_FAIL, e.as_str()))
+/// `SHADER` の cbuffer `Params`。`Rotation::source_pixel` を 1 次の式の係数にしたもの。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Params {
+    /// 正しい向きの (0, 0) に写る、回転前の画素。
+    origin: [i32; 2],
+    /// 正しい向きで x が 1 増えたときの、回転前の画素の増え方。
+    step_x: [i32; 2],
+    /// 正しい向きで y が 1 増えたときの、回転前の画素の増え方。
+    step_y: [i32; 2],
+    /// cbuffer を 16 バイトの倍数にする詰め物。
+    pad: [i32; 2],
 }
 
-/// `Rotation::source_pixel` を、シェーダーに渡す 1 次の式の係数（`origin`、`step_x`、`step_y`）にする。
-fn coefficients(rotation: Rotation, raw: Size) -> [i32; 8] {
-    let at = |x, y| rotation.source_pixel(raw, Point::new(x, y));
-    let (o, x, y) = (at(0, 0), at(1, 0), at(0, 1));
-    [o.x, o.y, x.x - o.x, x.y - o.y, y.x - o.x, y.y - o.y, 0, 0]
+impl Params {
+    fn new(rotation: Rotation, raw: Size) -> Self {
+        let at = |x, y| rotation.source_pixel(raw, Point::new(x, y));
+        let (o, x, y) = (at(0, 0), at(1, 0), at(0, 1));
+        Self {
+            origin: [o.x, o.y],
+            step_x: [x.x - o.x, x.y - o.y],
+            step_y: [y.x - o.x, y.y - o.y],
+            pad: [0, 0],
+        }
+    }
 }
 
 /// 回転前の向きの `source`（8bit BGRA か FP16）を、画面で見えている向きの同じ形式のテクスチャ
@@ -76,81 +69,17 @@ pub fn to_upright(
     if rotation == Rotation::Identity {
         return Ok(source);
     }
-    let (vs_code, ps_code) = shaders()?;
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    // SAFETY: 以下はすべて同じデバイスのリソースに対する呼び出し。コンテキストは
-    // SetMultithreadProtected 済みで、UI スレッドから呼ぶ
-    unsafe {
-        source.GetDesc(&mut desc);
-        let context = device.GetImmediateContext()?;
-        let readable = shader::readable(device, &context, &source, &desc)?;
-        // 読める写しを作ったら、元のテクスチャはもう要らない
-        drop(source);
-
-        let raw = Size::new(desc.Width, desc.Height);
-        let upright = rotation.upright_size(raw);
-        let out_desc = D3D11_TEXTURE2D_DESC {
-            Width: upright.width,
-            Height: upright.height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: desc.Format,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            // HDR の変換がこのテクスチャをそのまま読めるように、シェーダーからも読めるようにする
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let mut out = None;
-        device.CreateTexture2D(&out_desc, None, Some(&mut out))?;
-        let out = out.ok_or(E_POINTER)?;
-
-        let mut srv = None;
-        device.CreateShaderResourceView(&readable, None, Some(&mut srv))?;
-        let mut rtv = None;
-        device.CreateRenderTargetView(&out, None, Some(&mut rtv))?;
-        let mut vs = None;
-        device.CreateVertexShader(vs_code, None, Some(&mut vs))?;
-        let mut ps = None;
-        device.CreatePixelShader(ps_code, None, Some(&mut ps))?;
-        let params = coefficients(rotation, raw);
-        let buffer_desc = D3D11_BUFFER_DESC {
-            ByteWidth: size_of_val(&params) as u32,
-            Usage: D3D11_USAGE_IMMUTABLE,
-            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-            ..Default::default()
-        };
-        let data = D3D11_SUBRESOURCE_DATA {
-            pSysMem: params.as_ptr().cast(),
-            ..Default::default()
-        };
-        let mut buffer = None;
-        device.CreateBuffer(&buffer_desc, Some(&data), Some(&mut buffer))?;
-
-        context.ClearState();
-        context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        context.VSSetShader(vs.as_ref(), None);
-        context.PSSetShader(ps.as_ref(), None);
-        context.PSSetShaderResources(0, Some(&[srv]));
-        context.PSSetConstantBuffers(0, Some(&[buffer]));
-        context.OMSetRenderTargets(Some(&[rtv]), None);
-        context.RSSetViewports(Some(&[D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: upright.width as f32,
-            Height: upright.height as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        }]));
-        context.Draw(3, 0);
-        // 後で同じコンテキストを使う描画（範囲選択の画面）にこの状態を残さない
-        context.ClearState();
-        Ok(out)
-    }
+    log::info!("turning a rotated output ({rotation:?}) upright");
+    let desc = gpu_pass::desc(&source);
+    let raw = Size::new(desc.Width, desc.Height);
+    gpu_pass::draw(
+        device,
+        source,
+        rotation.upright_size(raw),
+        desc.Format,
+        &SHADER,
+        &Params::new(rotation, raw),
+    )
 }
 
 #[cfg(test)]
