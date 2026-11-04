@@ -316,7 +316,7 @@ impl Editor {
         let ends_with_last_only = r
             .steps
             .last()
-            .is_some_and(|id| recipe::is_last_only(id, OPERATIONS));
+            .is_some_and(|s| recipe::is_last_only(s.op_id(), OPERATIONS));
         OPERATIONS
             .iter()
             .filter(|op| recipe::can_be_step(op))
@@ -330,13 +330,13 @@ impl Editor {
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
         let at = if steps
             .last()
-            .is_some_and(|s| recipe::is_last_only(s, OPERATIONS))
+            .is_some_and(|s| recipe::is_last_only(s.op_id(), OPERATIONS))
         {
             steps.len() - 1
         } else {
             steps.len()
         };
-        steps.insert(at, id.to_owned());
+        steps.insert(at, id.into());
         Some(at)
     }
 
@@ -1022,7 +1022,7 @@ mod tests {
         editor.draft().recipes[index]
             .steps
             .iter()
-            .map(String::as_str)
+            .map(recipe::Step::op_id)
             .collect()
     }
 
@@ -1063,7 +1063,7 @@ mod tests {
         settings.hotkeys.select_capture = Some(chord("Ctrl+Shift+A"));
         settings.recipes.push(Recipe {
             name: "R".to_owned(),
-            steps: ids.iter().map(|&id| id.to_owned()).collect(),
+            steps: ids.iter().map(|&id| id.into()).collect(),
             shortcut: None,
         });
         Editor::new(settings)

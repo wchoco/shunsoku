@@ -8,9 +8,59 @@ use crate::scrap::ops::{Effect, InRecipe, OpContext, OperationDescriptor, Operat
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Recipe {
     pub name: String,
-    /// スクラップ操作の id の並び。
-    pub steps: Vec<String>,
+    /// 手の並び。
+    pub steps: Vec<Step>,
     pub shortcut: Option<Chord>,
+}
+
+/// 値のある手の操作の id（設定ファイルの `op = "appearance"`）。ADR-0008。
+pub const APPEARANCE: &str = "appearance";
+
+/// レシピの手 1 つ（設定ファイルの `steps` の要素）。中身の検査はまだしていない（書いたまま）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// 値のない手。スクラップ操作の id（設定ファイルでは文字列）。
+    Op(String),
+    /// 値のある手。見た目を指定する操作（`APPEARANCE`）と、その値（設定ファイルではインライン表）。
+    Appearance(AppearanceStep),
+}
+
+impl Step {
+    /// 手が呼ぶ操作の id。
+    pub fn op_id(&self) -> &str {
+        match self {
+            Step::Op(id) => id,
+            Step::Appearance(_) => APPEARANCE,
+        }
+    }
+
+    /// 手に書いた値。値のない手は None。
+    pub fn values(&self) -> Option<&AppearanceStep> {
+        match self {
+            Step::Op(_) => None,
+            Step::Appearance(values) => Some(values),
+        }
+    }
+}
+
+impl From<&str> for Step {
+    /// 値のない手。
+    fn from(id: &str) -> Step {
+        Step::Op(id.to_owned())
+    }
+}
+
+/// 見た目を指定する手の値（ADR-0008）。書いた項目だけを持つ。項目（透明度・枠・枠の色・枠の太さ・影）は、
+/// 見た目を指定する操作を足すときに足す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppearanceStep {}
+
+/// 検査を通った手 1 つ。
+#[derive(Debug, Clone)]
+pub struct PlannedStep {
+    pub op: &'static OperationDescriptor,
+    /// 手に書いた値。値のない手は None。
+    pub values: Option<AppearanceStep>,
 }
 
 /// 検査を通ったレシピ。ショートカットから実行できる。
@@ -19,7 +69,7 @@ pub struct Plan {
     /// `Settings::recipes` の中の位置。
     pub index: usize,
     pub name: String,
-    pub steps: Vec<&'static OperationDescriptor>,
+    pub steps: Vec<PlannedStep>,
     pub shortcut: Option<Chord>,
 }
 
@@ -84,14 +134,18 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
             problems.push(Problem::NoSteps);
         }
         let mut steps = Vec::with_capacity(recipe.steps.len());
-        for id in &recipe.steps {
+        for step in &recipe.steps {
+            let id = step.op_id();
             match ops.iter().find(|op| op.id == id && can_be_step(op)) {
-                Some(op) => steps.push(op),
-                None => problems.push(Problem::NotAStep(id.clone())),
+                Some(op) => steps.push(PlannedStep {
+                    op,
+                    values: step.values().copied(),
+                }),
+                None => problems.push(Problem::NotAStep(id.to_owned())),
             }
         }
         if let Some((_, before_last)) = recipe.steps.split_last()
-            && before_last.iter().any(|id| is_last_only(id, ops))
+            && before_last.iter().any(|s| is_last_only(s.op_id(), ops))
         {
             problems.push(Problem::CloseNotLast);
         }
@@ -185,7 +239,7 @@ impl PartialEq for Advance {
 /// `advance` を続ける。`Effect` を実行する前にスクラップが閉じられたら、`Run` を捨てる。
 #[derive(Debug, Clone)]
 pub struct Run {
-    steps: Vec<&'static OperationDescriptor>,
+    steps: Vec<PlannedStep>,
     /// 次に実行する手の位置。
     next: usize,
     state: State,
@@ -201,7 +255,7 @@ enum State {
 }
 
 impl Run {
-    pub fn new(steps: Vec<&'static OperationDescriptor>) -> Run {
+    pub fn new(steps: Vec<PlannedStep>) -> Run {
         Run {
             steps,
             next: 0,
@@ -213,10 +267,10 @@ impl Run {
     pub fn advance(&mut self, model: &mut ScrapModel, context: &OpContext) -> Advance {
         match self.state {
             State::Stopped(stop) => return Advance::Stopped(stop),
-            State::Waiting => return Advance::Waiting(self.steps[self.next - 1].id),
+            State::Waiting => return Advance::Waiting(self.steps[self.next - 1].op.id),
             State::Ready => {}
         }
-        let Some(&op) = self.steps.get(self.next) else {
+        let Some(op) = self.steps.get(self.next).map(|s| s.op) else {
             return Advance::Finished;
         };
         if !(op.can_execute)(model) {
@@ -234,7 +288,7 @@ impl Run {
 
     /// 結果を待っている手の id。
     pub fn waiting_for(&self) -> Option<OperationId> {
-        (self.state == State::Waiting).then(|| self.steps[self.next - 1].id)
+        (self.state == State::Waiting).then(|| self.steps[self.next - 1].op.id)
     }
 
     /// 実行した手の結果を受ける。成功なら次の手へ進めるようにし、失敗か取り消しなら止める。結果を待って
@@ -321,13 +375,13 @@ mod tests {
     fn recipe(name: &str, steps: &[&str]) -> Recipe {
         Recipe {
             name: name.into(),
-            steps: steps.iter().map(|&s| s.to_owned()).collect(),
+            steps: steps.iter().map(|&s| s.into()).collect(),
             shortcut: None,
         }
     }
 
     fn ids(plan: &Plan) -> Vec<&'static str> {
-        plan.steps.iter().map(|op| op.id).collect()
+        plan.steps.iter().map(|s| s.op.id).collect()
     }
 
     #[test]
@@ -465,7 +519,7 @@ mod tests {
             keymap.shortcuts.recipe(chord("Ctrl+Shift+C")).map(|p| p
                 .steps
                 .iter()
-                .map(|op| op.id)
+                .map(|s| s.op.id)
                 .collect::<Vec<_>>()),
             Some(vec!["copy", "close"])
         );

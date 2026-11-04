@@ -104,7 +104,7 @@ use shunsoku_core::monitors::{self, LocateError};
 use shunsoku_core::notice::Notices;
 use shunsoku_core::perf::Mark;
 use shunsoku_core::protocol::{ErrorKind, Response};
-use shunsoku_core::recipe::{Advance, Outcome, Parked, Run};
+use shunsoku_core::recipe::{Advance, Outcome, Parked, PlannedStep, Run};
 use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseBindings, MouseGesture, OpContext,
     OperationDescriptor, OperationId, Shortcuts,
@@ -2078,12 +2078,12 @@ fn on_scrap_key(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
 enum Bound {
     Operation(&'static OperationDescriptor),
     /// レシピの名前（ログ用）と手。
-    Recipe(String, Vec<&'static OperationDescriptor>),
+    Recipe(String, Vec<PlannedStep>),
 }
 
 /// レシピを実行する。手を 1 つずつ実行し、その手の `Effect` を実行し終えてから結果を返して次の手へ進む
 /// （ADR-0007）。保存の結果を待っているレシピがあれば捨てる。
-fn run_recipe(hwnd: HWND, name: &str, steps: Vec<&'static OperationDescriptor>) {
+fn run_recipe(hwnd: HWND, name: &str, steps: Vec<PlannedStep>) {
     if with_app(|app| app.recipe.discard()).flatten().is_some() {
         log::info!("the recipe waiting for a save was discarded");
     }

@@ -79,7 +79,7 @@ use toml_edit::{DocumentMut, Item, TableLike};
 use crate::geometry::Rect;
 use crate::i18n::Language;
 use crate::keys::Chord;
-use crate::recipe::{self, Recipe};
+use crate::recipe::{self, Recipe, Step};
 use crate::scrap::ops::{
     MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, ShortcutOwner, Shortcuts,
 };
@@ -1148,11 +1148,11 @@ fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
     recipes
 }
 
-/// レシピの操作の並び。文字列の配列。
-fn recipe_steps(item: &Item) -> Option<Vec<String>> {
+/// レシピの手の並び。値のない手（操作の id の文字列）の配列。
+fn recipe_steps(item: &Item) -> Option<Vec<Step>> {
     item.as_array()?
         .iter()
-        .map(|v| v.as_str().map(str::to_owned))
+        .map(|v| v.as_str().map(Step::from))
         .collect()
 }
 
@@ -2519,7 +2519,7 @@ width = 0
             settings.recipes,
             vec![Recipe {
                 name: "コピーして閉じる".to_owned(),
-                steps: vec!["copy".to_owned(), "close".to_owned()],
+                steps: vec!["copy".into(), "close".into()],
                 shortcut: Some("Ctrl+Q".parse().unwrap()),
             }]
         );
