@@ -653,8 +653,8 @@ pub enum Problem {
     NotAppearance,
     /// レシピの値のある手に項目がない。
     NoValues,
-    /// レシピの値のある手に `border = false` と枠の色を一緒に書いた。
-    BorderOffWithColor,
+    /// レシピの値のある手に `border = false` と枠の色か太さを一緒に書いた。
+    BorderOffWithColorOrWidth,
 }
 
 impl Problem {
@@ -753,7 +753,7 @@ pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
                 recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
                 recipe::Problem::NotAppearance => Problem::NotAppearance,
                 recipe::Problem::NoValues => Problem::NoValues,
-                recipe::Problem::BorderOffWithColor => Problem::BorderOffWithColor,
+                recipe::Problem::BorderOffWithColorOrWidth => Problem::BorderOffWithColorOrWidth,
             },
         })
         .collect();
@@ -1190,16 +1190,8 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
                 wrote_op = true;
                 (value.as_str() != Some(recipe::APPEARANCE)).then_some(Rejection::NotAppearance)
             }
-            "opacity" => match value.as_integer() {
-                Some(n) => match u8::try_from(n).ok().filter(|n| OPACITY_RANGE.contains(n)) {
-                    Some(n) => {
-                        v.opacity = Some(n);
-                        None
-                    }
-                    None => Some(Rejection::OutOfRange),
-                },
-                None => Some(Rejection::BadValue),
-            },
+            "opacity" => read_ranged(&mut v.opacity, value, OPACITY_RANGE),
+            "border_width" => read_ranged(&mut v.border_width, value, BORDER_WIDTH_RANGE),
             "border" => read_into(&mut v.border, value.as_bool()),
             "shadow" => read_into(&mut v.shadow, value.as_bool()),
             "border_color" => read_into(
@@ -1226,6 +1218,24 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
         });
     }
     step
+}
+
+/// 整数 `value` が `range` に入っていれば `field` に入れる。整数でなければ `BadValue`、範囲外なら `OutOfRange`。
+fn read_ranged<T: TryFrom<i64> + PartialOrd>(
+    field: &mut Option<T>,
+    value: &toml_edit::Value,
+    range: std::ops::RangeInclusive<T>,
+) -> Option<Rejection> {
+    let Some(n) = value.as_integer() else {
+        return Some(Rejection::BadValue);
+    };
+    match T::try_from(n).ok().filter(|n| range.contains(n)) {
+        Some(n) => {
+            *field = Some(n);
+            None
+        }
+        None => Some(Rejection::OutOfRange),
+    }
 }
 
 /// 読めた値 `read` を `field` に入れる。読めなければ `BadValue`。

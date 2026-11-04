@@ -483,7 +483,7 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
 }
 
 /// レシピの手 1 つ。値のない手は操作の id の文字列、値のある手は `op` と書いた項目のキーを持つインライン表
-/// （`op`、`opacity`、`border`、`border_color`、`shadow` の順）。読めなかった項目は、その後ろに書いたまま書く
+/// （`op`、`opacity`、`border`、`border_color`、`border_width`、`shadow` の順）。読めなかった項目は、その後ろに書いたまま書く
 /// （`op` を読めなかったなら、その `op` で書く）。
 fn step_value(step: &Step) -> Value {
     let step = match step {
@@ -501,6 +501,9 @@ fn step_value(step: &Step) -> Value {
     }
     if let Some(color) = v.border_color {
         table.insert("border_color", color.to_string().into());
+    }
+    if let Some(width) = v.border_width {
+        table.insert("border_width", i64::from(width).into());
     }
     if let Some(shadow) = v.shadow {
         table.insert("shadow", shadow.into());
@@ -1209,6 +1212,7 @@ steps = ["shadow"]
                     opacity: Some(50),
                     border: Some(true),
                     border_color: Some(Rgb(0xFF, 0, 0)),
+                    border_width: Some(3),
                     shadow: Some(false),
                 },
                 rejected: vec![],
@@ -1218,7 +1222,7 @@ steps = ["shadow"]
         let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
         assert!(
             out.contains(
-                r##"steps = [{ op = "appearance", opacity = 50, border = true, border_color = "#FF0000", shadow = false }, "copy"]"##
+                r##"steps = [{ op = "appearance", opacity = 50, border = true, border_color = "#FF0000", border_width = 3, shadow = false }, "copy"]"##
             ),
             "{out}"
         );
