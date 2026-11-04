@@ -542,7 +542,7 @@ fn shadow_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
 }
 
 /// レシピの値のある手に書いた項目だけを、スクラップごとの上書きに重ねる（ADR-0008）。書かなかった項目は今の
-/// 値のまま。枠の色を書けば枠も出す。見た目が変わらなければ何もしない（手は成功として次へ進む）。
+/// 値のまま。枠の色か太さを書けば枠も出す。見た目が変わらなければ何もしない（手は成功として次へ進む）。
 fn set_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     let Some(values) = context.values else {
         return Vec::new();
@@ -558,11 +558,15 @@ fn set_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     let color = values
         .border_color
         .map(|settings::Rgb(r, g, b)| u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b));
+    if let Some(width) = values.border_width {
+        overrides.border_width = Some(width);
+    }
+    let shows = values.border == Some(true) || values.border_width.is_some();
     match (values.border, color) {
         (Some(false), _) => overrides.border = Some(BorderOverride::Hidden),
         (_, Some(color)) => overrides.border = Some(BorderOverride::Color(color)),
-        // 枠を出すだけなら、色は今の色のまま
-        (Some(true), None) if !before.show_border => {
+        // 枠を出すだけ（太さだけを書いたときも）なら、色は今の色のまま
+        (_, None) if shows && !before.show_border => {
             overrides.border = Some(BorderOverride::Color(before.border.color));
         }
         _ => {}
@@ -2111,6 +2115,66 @@ mod tests {
         assert_eq!(model.appearance(&defaults), defaults);
         assert_eq!(model.window_rect(&defaults), scrap().window_rect(&defaults));
         assert_eq!(model.position, scrap().position);
+    }
+
+    #[test]
+    fn a_border_width_step_shows_that_width_and_the_menu_changes_only_the_color() {
+        let defaults = Appearance {
+            show_border: false,
+            ..Appearance::default()
+        };
+        let mut model = scrap();
+        let width = |w| OpContext {
+            values: Some(AppearanceValues {
+                border_width: Some(w),
+                ..AppearanceValues::default()
+            }),
+            ..with_defaults(defaults)
+        };
+        // 太さを書けば、既定値で枠を出さなくても枠が出る
+        assert_eq!(
+            execute(op("appearance"), &mut model, &width(4)),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(
+            model.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 4,
+                color: 0x80_80_80
+            })
+        );
+        assert_eq!(execute(op("appearance"), &mut model, &width(4)), vec![]);
+        let choose = |choice| OpContext {
+            choice: Some(choice),
+            ..with_defaults(defaults)
+        };
+        execute(op("border"), &mut model, &choose(0xFF_00_00));
+        assert_eq!(
+            model.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 4,
+                color: 0xFF_00_00
+            })
+        );
+        execute(op("border"), &mut model, &choose(NO_BORDER));
+        execute(op("border"), &mut model, &choose(0x00_00_FF));
+        assert_eq!(
+            model.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 4,
+                color: 0x00_00_FF
+            })
+        );
+        // 既定に戻すと太さの上書きも消える
+        execute(op("reset_appearance"), &mut model, &with_defaults(defaults));
+        execute(op("border"), &mut model, &choose(0x00_00_FF));
+        assert_eq!(
+            model.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 1,
+                color: 0x00_00_FF
+            })
+        );
     }
 
     #[test]

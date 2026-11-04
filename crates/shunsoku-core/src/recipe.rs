@@ -69,6 +69,8 @@ pub struct AppearanceValues {
     pub border: Option<bool>,
     /// 枠の色。書けば枠も出す。
     pub border_color: Option<Rgb>,
+    /// 枠の太さ（物理ピクセル、`settings::BORDER_WIDTH_RANGE`）。書けば枠も出す。
+    pub border_width: Option<u32>,
     /// 影の有無。
     pub shadow: Option<bool>,
 }
@@ -143,8 +145,8 @@ pub enum Problem {
     NotAppearance,
     /// 値のある手に、項目を 1 つも書いていない。
     NoValues,
-    /// 値のある手に、`border = false` と枠の色を一緒に書いた。
-    BorderOffWithColor,
+    /// 値のある手に、`border = false` と枠の色か太さを一緒に書いた。
+    BorderOffWithColorOrWidth,
 }
 
 impl Problem {
@@ -247,8 +249,10 @@ fn check_appearance(step: &AppearanceStep, problems: &mut Vec<Problem>) -> Appea
     if !wrote_an_item {
         problems.push(Problem::NoValues);
     }
-    if values.border == Some(false) && values.border_color.is_some() {
-        problems.push(Problem::BorderOffWithColor);
+    if values.border == Some(false)
+        && (values.border_color.is_some() || values.border_width.is_some())
+    {
+        problems.push(Problem::BorderOffWithColorOrWidth);
     }
     values
 }
@@ -1095,7 +1099,7 @@ mod tests {
     #[test]
     fn a_step_with_appearance_values_becomes_a_plan_with_those_values() {
         let checked = checked_steps(
-            r##"[{ op = "appearance", opacity = 50, border = true, border_color = "#ff0000", shadow = false }, "copy"]"##,
+            r##"[{ op = "appearance", opacity = 50, border = true, border_color = "#ff0000", border_width = 3, shadow = false }, "copy"]"##,
         );
         assert_eq!(checked.problems, vec![]);
         let steps = &checked.plans[0].steps;
@@ -1106,6 +1110,7 @@ mod tests {
                 opacity: Some(50),
                 border: Some(true),
                 border_color: Some(Rgb(0xFF, 0, 0)),
+                border_width: Some(3),
                 shadow: Some(false),
             })
         );
@@ -1147,10 +1152,17 @@ mod tests {
                 r##"[{ op = "appearance", shadow = true, colour = "#FF0000" }]"##,
                 vec![Problem::UnknownKey("colour".into())],
             ),
-            // 太さは #140 まで知らないキー
             (
-                r#"[{ op = "appearance", border_width = 3 }]"#,
-                vec![Problem::UnknownKey("border_width".into())],
+                r#"[{ op = "appearance", border_width = 0 }]"#,
+                vec![Problem::OutOfRange("border_width".into())],
+            ),
+            (
+                r#"[{ op = "appearance", border_width = 17 }]"#,
+                vec![Problem::OutOfRange("border_width".into())],
+            ),
+            (
+                r#"[{ op = "appearance", border_width = 2.5 }]"#,
+                vec![Problem::BadValue("border_width".into())],
             ),
             (
                 r#"[{ op = "copy", shadow = true }]"#,
@@ -1160,7 +1172,11 @@ mod tests {
             (r#"[{ op = "appearance" }]"#, vec![Problem::NoValues]),
             (
                 r##"[{ op = "appearance", border = false, border_color = "#FF0000" }]"##,
-                vec![Problem::BorderOffWithColor],
+                vec![Problem::BorderOffWithColorOrWidth],
+            ),
+            (
+                r#"[{ op = "appearance", border = false, border_width = 3 }]"#,
+                vec![Problem::BorderOffWithColorOrWidth],
             ),
             // 値のない手として appearance は書けない（値がないと実行できない）
             (

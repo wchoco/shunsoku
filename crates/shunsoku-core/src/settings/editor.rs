@@ -69,7 +69,9 @@ impl Mark {
             Mark::Problem(Problem::UnknownKey) => "settings_gui.mark.unknown_key",
             Mark::Problem(Problem::NotAppearance) => "settings_gui.mark.not_appearance",
             Mark::Problem(Problem::NoValues) => "settings_gui.mark.no_values",
-            Mark::Problem(Problem::BorderOffWithColor) => "settings_gui.mark.border_off_with_color",
+            Mark::Problem(Problem::BorderOffWithColorOrWidth) => {
+                "settings_gui.mark.border_off_with_color_or_width"
+            }
         }
     }
 }
@@ -391,7 +393,7 @@ impl Editor {
 }
 
 /// 「レシピ」タブの手の一覧の行の文言。値のない手は操作の名前（表にない id はそのまま）、値のある手は
-/// 「見た目: 枠 #FF0000」のように、書いた項目を書いた順（透明度、枠、影）に並べた要約。`text` は文言のキーから
+/// 「見た目: 枠 #FF0000 3px」のように、書いた項目を決まった順（透明度、枠、枠の太さ、影）に並べた要約。`text` は文言のキーから
 /// 文言を引く。
 pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> String {
     let values = match step {
@@ -409,13 +411,22 @@ pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> S
             text("settings_gui.recipes.step.opacity").replace("{percent}", &opacity.to_string()),
         );
     }
-    match (values.border, values.border_color) {
-        (_, Some(color)) => items.push(
+    match (values.border, values.border_color, values.border_width) {
+        (_, Some(color), _) => items.push(
             text("settings_gui.recipes.step.border_color").replace("{color}", &color.to_string()),
         ),
-        (Some(true), None) => items.push(text("settings_gui.recipes.step.border_on").to_owned()),
-        (Some(false), None) => items.push(text("settings_gui.recipes.step.border_off").to_owned()),
-        (None, None) => {}
+        (Some(false), None, _) => {
+            items.push(text("settings_gui.recipes.step.border_off").to_owned());
+        }
+        (Some(true), None, _) | (None, None, Some(_)) => {
+            items.push(text("settings_gui.recipes.step.border_on").to_owned());
+        }
+        (None, None, None) => {}
+    }
+    if let Some(width) = values.border_width {
+        items.push(
+            text("settings_gui.recipes.step.border_width").replace("{width}", &width.to_string()),
+        );
     }
     match values.shadow {
         Some(true) => items.push(text("settings_gui.recipes.step.shadow_on").to_owned()),
@@ -732,7 +743,7 @@ mod tests {
             Mark::Problem(Problem::UnknownKey),
             Mark::Problem(Problem::NotAppearance),
             Mark::Problem(Problem::NoValues),
-            Mark::Problem(Problem::BorderOffWithColor),
+            Mark::Problem(Problem::BorderOffWithColorOrWidth),
         ] {
             let key = mark.label_key();
             assert_ne!(catalog.text(key), key, "{mark:?}");
@@ -1144,7 +1155,7 @@ mod tests {
     #[test]
     fn the_step_list_sums_up_a_step_with_values() {
         let editor = with_steps_read(
-            r##"["copy", { op = "appearance", border_color = "#ff0000" }, { op = "appearance", opacity = 50, border = false, shadow = true }, { op = "appearance", border = true, shadow = false }, "nope"]"##,
+            r##"["copy", { op = "appearance", border_color = "#ff0000" }, { op = "appearance", opacity = 50, border = false, shadow = true }, { op = "appearance", border = true, shadow = false }, { op = "appearance", border_width = 3, border_color = "#ff0000" }, { op = "appearance", shadow = true, border_width = 16 }, "nope"]"##,
         );
         assert_eq!(
             labels(&editor),
@@ -1153,6 +1164,8 @@ mod tests {
                 "見た目: 枠 #FF0000",
                 "見た目: 透明度 50% 枠なし 影",
                 "見た目: 枠 影なし",
+                "見た目: 枠 #FF0000 3px",
+                "見た目: 枠 16px 影",
                 "nope",
             ]
         );
@@ -1180,7 +1193,7 @@ mod tests {
             (r#"[{ op = "appearance" }]"#, Problem::NoValues),
             (
                 r##"[{ op = "appearance", border = false, border_color = "#000000" }]"##,
-                Problem::BorderOffWithColor,
+                Problem::BorderOffWithColorOrWidth,
             ),
         ] {
             let editor = with_steps_read(steps);

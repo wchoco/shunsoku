@@ -904,8 +904,10 @@ pub struct Appearance {
 pub struct AppearanceOverrides {
     /// 透明度（%）。
     pub opacity: Option<u8>,
-    /// 枠。
+    /// 枠の有無と色。
     pub border: Option<BorderOverride>,
+    /// 枠の太さ（物理ピクセル）。枠の有無とは別に持つので、枠を隠したり色を変えたりしても残る。
+    pub border_width: Option<u32>,
     /// 影の有無。
     pub shadow: Option<bool>,
 }
@@ -915,20 +917,25 @@ pub struct AppearanceOverrides {
 pub enum BorderOverride {
     /// 枠を出さない。
     Hidden,
-    /// その色（`0xRRGGBB`）の枠を出す。太さは既定値の太さ（既定値で枠を出さなくても設定の太さ）。
+    /// その色（`0xRRGGBB`）の枠を出す。太さは `AppearanceOverrides::border_width`、上書きがなければ既定値の太さ
+    /// （既定値で枠を出さなくても設定の太さ）。
     Color(u32),
 }
 
 impl AppearanceOverrides {
     /// `defaults` に重ねた見た目。
     fn apply(&self, defaults: &Appearance) -> Appearance {
+        let configured = Border {
+            width: self.border_width.unwrap_or(defaults.border.width),
+            ..defaults.border
+        };
         let (border, show_border) = match self.border {
-            None => (defaults.border, defaults.show_border),
-            Some(BorderOverride::Hidden) => (defaults.border, false),
+            None => (configured, defaults.show_border),
+            Some(BorderOverride::Hidden) => (configured, false),
             Some(BorderOverride::Color(color)) => (
                 Border {
                     color,
-                    ..defaults.border
+                    ..configured
                 },
                 true,
             ),
@@ -1182,6 +1189,7 @@ mod tests {
         scrap.appearance_overrides = AppearanceOverrides {
             opacity: Some(30),
             border: Some(BorderOverride::Color(0x00_00_FF)),
+            border_width: None,
             shadow: Some(true),
         };
         let plain = Appearance {
@@ -1227,6 +1235,36 @@ mod tests {
         // 透明度は大きさに関係しない
         scrap.appearance_overrides.opacity = Some(10);
         assert_eq!(scrap.window_rect(&defaults), Rect::new(-100, 50, 200, 250));
+    }
+
+    #[test]
+    fn a_thicker_border_grows_the_window_outward_and_keeps_the_image_in_place() {
+        let mut scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
+        let defaults = Appearance::default();
+        let image = scrap.image_rect();
+        scrap.appearance_overrides.border_width = Some(5);
+        assert_eq!(
+            scrap.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 5,
+                color: 0x80_80_80
+            })
+        );
+        assert_eq!(scrap.window_rect(&defaults), Rect::new(-113, 37, 213, 263));
+        scrap.appearance_overrides.border_width = Some(16);
+        assert_eq!(scrap.window_rect(&defaults), Rect::new(-124, 26, 224, 274));
+        assert_eq!(scrap.image_rect(), image);
+        // 枠を隠しても太さは持っておき、色を付けて出すとその太さ
+        scrap.appearance_overrides.border = Some(BorderOverride::Hidden);
+        assert_eq!(scrap.window_rect(&defaults), Rect::new(-108, 42, 208, 258));
+        scrap.appearance_overrides.border = Some(BorderOverride::Color(0xFF_00_00));
+        assert_eq!(
+            scrap.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 16,
+                color: 0xFF_00_00
+            })
+        );
     }
 
     #[test]
