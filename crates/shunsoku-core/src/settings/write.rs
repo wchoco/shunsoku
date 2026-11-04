@@ -21,7 +21,7 @@ use super::{
     optional_gesture, read_regions_at, recipe_steps, region_number, rgb, save_dir, selection_mode,
 };
 use crate::i18n::Language;
-use crate::recipe::Recipe;
+use crate::recipe::{APPEARANCE, Recipe, Step};
 use crate::selection::Mode;
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
@@ -470,7 +470,7 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
         |s| Some(s.as_str().into()),
     );
     put(t, "steps", recipe_steps, None, &r.steps, |steps| {
-        Some(Value::Array(steps.iter().map(String::as_str).collect()))
+        Some(Value::Array(steps.iter().map(step_value).collect()))
     });
     put(
         t,
@@ -480,6 +480,18 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
         &r.shortcut,
         |c| c.map(|c| c.to_string().into()),
     );
+}
+
+/// レシピの手 1 つ。値のない手は操作の id の文字列、値のある手は `op` と値のキーを持つインライン表。
+fn step_value(step: &Step) -> Value {
+    match step {
+        Step::Op(id) => id.as_str().into(),
+        Step::Appearance(_) => {
+            let mut table = toml_edit::InlineTable::new();
+            table.insert("op", APPEARANCE.into());
+            Value::InlineTable(table)
+        }
+    }
 }
 
 /// 定型領域 1 つ。名前・モニタ・範囲は既定値がないので、読めなければ常に書く。
@@ -1127,7 +1139,7 @@ font = "Meiryo"     # 書体
     fn recipe(name: &str, steps: &[&str], shortcut: Option<&str>) -> crate::recipe::Recipe {
         crate::recipe::Recipe {
             name: name.to_owned(),
-            steps: steps.iter().map(|&s| s.to_owned()).collect(),
+            steps: steps.iter().map(|&s| s.into()).collect(),
             shortcut: shortcut.and_then(chord),
         }
     }
@@ -1159,6 +1171,17 @@ steps = ["shadow"]
 "#;
 
     #[test]
+    fn a_step_with_values_is_written_as_an_inline_table_beside_the_plain_steps() {
+        let mut r = recipe("見た目", &[], None);
+        r.steps = vec![Step::Appearance(Default::default()), "copy".into()];
+        let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
+        assert!(
+            out.contains(r#"steps = [{ op = "appearance" }, "copy"]"#),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn writing_the_recipes_that_were_read_changes_nothing() {
         assert_eq!(written(RECIPES, |_| {}), RECIPES);
     }
@@ -1167,7 +1190,7 @@ steps = ["shadow"]
     fn an_edited_recipe_rewrites_only_its_changed_items_and_keeps_comments() {
         let out = written(RECIPES, |s| {
             s.recipes[0].name = "コピーだけ".to_owned();
-            s.recipes[0].steps = vec!["copy".to_owned()];
+            s.recipes[0].steps = vec!["copy".into()];
             s.recipes[0].shortcut = None;
         });
         assert_eq!(
