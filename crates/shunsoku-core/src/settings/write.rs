@@ -21,7 +21,7 @@ use super::{
     optional_gesture, read_regions_at, recipe_steps, region_number, rgb, save_dir, selection_mode,
 };
 use crate::i18n::Language;
-use crate::recipe::Recipe;
+use crate::recipe::{APPEARANCE, AppearanceItem, ItemValue, Recipe, Step, StepKey};
 use crate::selection::Mode;
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
@@ -470,7 +470,7 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
         |s| Some(s.as_str().into()),
     );
     put(t, "steps", recipe_steps, None, &r.steps, |steps| {
-        Some(Value::Array(steps.iter().map(String::as_str).collect()))
+        Some(Value::Array(steps.iter().map(step_value).collect()))
     });
     put(
         t,
@@ -480,6 +480,33 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
         &r.shortcut,
         |c| c.map(|c| c.to_string().into()),
     );
+}
+
+/// レシピの手 1 つ。値のない手は操作の id の文字列、値のある手は `op` と書いた項目のキーを持つインライン表
+/// （`op` のあと、項目は `AppearanceItem::ALL` の順）。読めなかった項目は、その後ろに書いたまま書く（`op` を
+/// 読めなかったなら、その `op` で書く）。
+fn step_value(step: &Step) -> Value {
+    let step = match step {
+        Step::Op(id) => return id.as_str().into(),
+        Step::Appearance(step) => step,
+    };
+    let mut table = toml_edit::InlineTable::new();
+    table.insert(StepKey::Op.as_str(), APPEARANCE.into());
+    for item in AppearanceItem::ALL {
+        let value = match step.values.get(item) {
+            None => continue,
+            Some(ItemValue::Switch(on)) => Value::from(on),
+            Some(ItemValue::Color(color)) => color.to_string().into(),
+            Some(ItemValue::Number(n)) => i64::from(n).into(),
+        };
+        table.insert(item.key(), value);
+    }
+    for r in &step.rejected {
+        if let Some(value) = r.value.as_deref().and_then(|v| v.parse::<Value>().ok()) {
+            table.insert(r.key.as_str(), value);
+        }
+    }
+    Value::InlineTable(table)
 }
 
 /// 定型領域 1 つ。名前・モニタ・範囲は既定値がないので、読めなければ常に書く。
@@ -1127,7 +1154,7 @@ font = "Meiryo"     # 書体
     fn recipe(name: &str, steps: &[&str], shortcut: Option<&str>) -> crate::recipe::Recipe {
         crate::recipe::Recipe {
             name: name.to_owned(),
-            steps: steps.iter().map(|&s| s.to_owned()).collect(),
+            steps: steps.iter().map(|&s| s.into()).collect(),
             shortcut: shortcut.and_then(chord),
         }
     }
@@ -1159,6 +1186,91 @@ steps = ["shadow"]
 "#;
 
     #[test]
+    fn a_step_with_values_is_written_as_an_inline_table_beside_the_plain_steps() {
+        let mut r = recipe("見た目", &[], None);
+        r.steps = vec![Step::Appearance(Default::default()), "copy".into()];
+        let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
+        assert!(
+            out.contains(r#"steps = [{ op = "appearance" }, "copy"]"#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_step_with_values_reads_back_the_same() {
+        let mut r = recipe("赤枠でコピー", &[], Some("Ctrl+Shift+R"));
+        r.steps = vec![
+            Step::Appearance(crate::recipe::AppearanceStep {
+                values: crate::recipe::AppearanceValues {
+                    opacity: Some(50),
+                    border: Some(true),
+                    border_color: Some(Rgb(0xFF, 0, 0)),
+                    border_width: Some(3),
+                    shadow: Some(false),
+                },
+                rejected: vec![],
+            }),
+            "copy".into(),
+        ];
+        let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
+        assert!(
+            out.contains(
+                r##"steps = [{ op = "appearance", border = true, border_color = "#FF0000", border_width = 3, opacity = 50, shadow = false }, "copy"]"##
+            ),
+            "{out}"
+        );
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, vec![r]);
+    }
+
+    const RECIPES_WITH_VALUES: &str = r##"version = 1
+
+# 赤枠
+[[recipes]]
+name = "赤枠でコピー"
+steps = [{op="appearance",border_color="#ff0000"}, "copy"]   # 手で書いた
+shortcut = "Ctrl+Shift+R"
+
+# 書き間違い
+[[recipes]]
+name = "影"
+steps = [{ op = "appearance", shadow = true, colour = "#FF0000", opacity = 500 }]
+"##;
+
+    #[test]
+    fn writing_recipes_with_values_that_were_read_changes_nothing() {
+        assert_eq!(written(RECIPES_WITH_VALUES, |_| {}), RECIPES_WITH_VALUES);
+        let out = written(RECIPES_WITH_VALUES, |s| {
+            s.recipes[1].name = "影だけ".to_owned();
+        });
+        assert_eq!(
+            out,
+            RECIPES_WITH_VALUES.replace("name = \"影\"", "name = \"影だけ\"")
+        );
+    }
+
+    #[test]
+    fn a_step_rewritten_with_items_it_could_not_read_keeps_them_as_written() {
+        let out = written(RECIPES_WITH_VALUES, |s| {
+            s.recipes[1].steps.push("copy".into());
+        });
+        assert!(
+            out.contains(
+                r##"steps = [{ op = "appearance", shadow = true, colour = "#FF0000", opacity = 500 }, "copy"]"##
+            ),
+            "{out}"
+        );
+        let wrong_op =
+            "version = 1\n[[recipes]]\nname = \"a\"\nsteps = [{ op = \"copy\", shadow = true }]\n";
+        let out = written(wrong_op, |s| s.recipes[0].steps.push("copy".into()));
+        assert!(
+            out.contains(r#"steps = [{ op = "copy", shadow = true }, "copy"]"#),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn writing_the_recipes_that_were_read_changes_nothing() {
         assert_eq!(written(RECIPES, |_| {}), RECIPES);
     }
@@ -1167,7 +1279,7 @@ steps = ["shadow"]
     fn an_edited_recipe_rewrites_only_its_changed_items_and_keeps_comments() {
         let out = written(RECIPES, |s| {
             s.recipes[0].name = "コピーだけ".to_owned();
-            s.recipes[0].steps = vec!["copy".to_owned()];
+            s.recipes[0].steps = vec!["copy".into()];
             s.recipes[0].shortcut = None;
         });
         assert_eq!(

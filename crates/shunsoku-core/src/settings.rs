@@ -79,7 +79,9 @@ use toml_edit::{DocumentMut, Item, TableLike};
 use crate::geometry::Rect;
 use crate::i18n::Language;
 use crate::keys::Chord;
-use crate::recipe::{self, Recipe};
+use crate::recipe::{
+    self, AppearanceItem, AppearanceStep, Recipe, Rejected, Rejection, Step, StepKey, Written,
+};
 use crate::scrap::ops::{
     MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, ShortcutOwner, Shortcuts,
 };
@@ -420,6 +422,14 @@ impl std::fmt::Display for Rgb {
     }
 }
 
+impl Rgb {
+    /// `0xRRGGBB` の数（描画と、スクラップの見た目の色の持ち方）。
+    pub fn to_rrggbb(self) -> u32 {
+        let Rgb(r, g, b) = self;
+        u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+    }
+}
+
 /// `#RRGGBB`（大文字と小文字を問わない）でない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotRgb;
@@ -643,6 +653,18 @@ pub enum Problem {
     NotAStep,
     /// レシピの `close` が最後以外にある。
     CloseNotLast,
+    /// レシピの値のある手の値が範囲外。
+    OutOfRange,
+    /// レシピの値のある手の値の型か書式の誤り。
+    BadValue,
+    /// レシピの値のある手の知らないキー。
+    UnknownKey,
+    /// レシピの値のある手の `op` が `appearance` でない。
+    NotAppearance,
+    /// レシピの値のある手に項目がない。
+    NoValues,
+    /// レシピの値のある手に `border = false` と枠の色か太さを一緒に書いた。
+    BorderOffWithColorOrWidth,
 }
 
 impl Problem {
@@ -736,6 +758,12 @@ pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
                 recipe::Problem::NoSteps => Problem::NoSteps,
                 recipe::Problem::NotAStep(_) => Problem::NotAStep,
                 recipe::Problem::CloseNotLast => Problem::CloseNotLast,
+                recipe::Problem::OutOfRange(_) => Problem::OutOfRange,
+                recipe::Problem::BadValue(_) => Problem::BadValue,
+                recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
+                recipe::Problem::NotAppearance => Problem::NotAppearance,
+                recipe::Problem::NoValues => Problem::NoValues,
+                recipe::Problem::BorderOffWithColorOrWidth => Problem::BorderOffWithColorOrWidth,
             },
         })
         .collect();
@@ -1148,12 +1176,68 @@ fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
     recipes
 }
 
-/// レシピの操作の並び。文字列の配列。
-fn recipe_steps(item: &Item) -> Option<Vec<String>> {
+/// レシピの手の並び。値のない手（操作の id の文字列）と、値のある手（インライン表）の配列。ほかの値があれば
+/// None。表の中身の誤りは `AppearanceStep::rejected` に残す（`recipe::plan` が問題にする）。
+fn recipe_steps(item: &Item) -> Option<Vec<Step>> {
     item.as_array()?
         .iter()
-        .map(|v| v.as_str().map(str::to_owned))
+        .map(|v| match v {
+            toml_edit::Value::String(_) => v.as_str().map(Step::from),
+            toml_edit::Value::InlineTable(t) => Some(Step::Appearance(appearance_step(t))),
+            _ => None,
+        })
         .collect()
+}
+
+/// 値のある手（`{ op = "appearance", ... }`）。項目のキーと値の範囲は `[scrap]` と同じ（`AppearanceValues::set`）。
+fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
+    let mut step = AppearanceStep::default();
+    let mut wrote_op = false;
+    for (key, value) in table.iter() {
+        let (key, reason) = if key == "op" {
+            wrote_op = true;
+            let other = value.as_str() != Some(recipe::APPEARANCE);
+            (StepKey::Op, other.then_some(Rejection::NotAppearance))
+        } else {
+            match AppearanceItem::from_key(key) {
+                Some(item) => (
+                    StepKey::Item(item),
+                    step.values.set(item, written(value)).err(),
+                ),
+                None => (
+                    StepKey::Unknown(key.to_owned()),
+                    Some(Rejection::UnknownKey),
+                ),
+            }
+        };
+        if let Some(reason) = reason {
+            let mut written = value.clone();
+            written.decor_mut().clear();
+            step.rejected.push(Rejected {
+                key,
+                value: Some(written.to_string()),
+                reason,
+            });
+        }
+    }
+    if !wrote_op {
+        step.rejected.push(Rejected {
+            key: StepKey::Op,
+            value: None,
+            reason: Rejection::NotAppearance,
+        });
+    }
+    step
+}
+
+/// 設定ファイルの値を、見た目の項目に書いた値として読む。
+fn written(value: &toml_edit::Value) -> Written<'_> {
+    match value {
+        toml_edit::Value::Integer(n) => Written::Integer(*n.value()),
+        toml_edit::Value::Boolean(b) => Written::Bool(*b.value()),
+        toml_edit::Value::String(s) => Written::Text(s.value()),
+        _ => Written::Other,
+    }
 }
 
 /// 定型領域の範囲（`x` / `y` / `width` / `height`）。どれかが読めなければ None。
@@ -2519,7 +2603,7 @@ width = 0
             settings.recipes,
             vec![Recipe {
                 name: "コピーして閉じる".to_owned(),
-                steps: vec!["copy".to_owned(), "close".to_owned()],
+                steps: vec!["copy".into(), "close".into()],
                 shortcut: Some("Ctrl+Q".parse().unwrap()),
             }]
         );

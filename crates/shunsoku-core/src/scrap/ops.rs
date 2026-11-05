@@ -28,14 +28,19 @@
 //! `opacity_up` / `opacity_down` に分ける。どれもスクラップごとの上書き（`ScrapModel::appearance_overrides`）を
 //! 変える。いまの見た目は全体の既定値に上書きを重ねて決まるので、既定値を `OpContext::appearance` と `menu` の
 //! 引数で受け取る。メニューでは 3 つの一覧を「見た目」の子メニュー（`FOLDERS`、`MenuEntry::Folder`）にまとめる。
+//! 上書きを全部消す `reset_appearance`（見た目を既定に戻す）は値のない操作で、同じ子メニューの区切りの下に置く。
+//!
+//! 見た目を指定（`appearance`）は、設定ファイルのレシピに値のある手（`{ op = "appearance", border_color = ... }`）
+//! として書いたときだけ動く（ADR-0008）。書いた値は `OpContext::values` で渡り、書いた項目だけを上書きする。
+//! `takes_values` の操作はショートカット・マウス・「スクラップ操作」タブの行・メニューのどれにも出さない。
 
 use std::collections::BTreeMap;
 
 use crate::annotate::{Carryover, EditInput, Font, Style};
 use crate::geometry::Point;
 use crate::keys::{Chord, Key, Modifiers};
-use crate::recipe::Plan;
-use crate::scrap::{Appearance, BorderOverride, Mode, ScrapModel, ZoomAnchor};
+use crate::recipe::{AppearanceValues, Plan};
+use crate::scrap::{Appearance, AppearanceOverrides, BorderOverride, Mode, ScrapModel, ZoomAnchor};
 use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
@@ -56,6 +61,9 @@ pub struct OperationDescriptor {
     /// ドラッグの量（`OpContext::drag`）を引数に取る操作。ドラッグでしか呼べないので、メニューにも
     /// ショートカットの対応表にも出さない。
     pub drag_only: bool,
+    /// レシピの値のある手の値（`OpContext::values`）を引数に取る操作（`appearance`。ADR-0008）。値のある手から
+    /// だけ呼ぶので、メニューにも、ショートカットとマウスの対応表にも、値のない手にも出さない。
+    pub takes_values: bool,
     /// レシピのどこに置けるか（ADR-0007）。引数のある操作とドラッグ専用の操作は `Never` にする。
     pub in_recipe: InRecipe,
     /// 右クリックメニューに出すか。キーやマウスで足りる操作（移動、拡大・縮小）は出さず、メニューを spec の
@@ -75,7 +83,7 @@ pub struct OperationDescriptor {
 impl OperationDescriptor {
     /// ショートカットとマウスの割り当てを設定で変えられるか。引数のない操作だけ。
     pub(crate) fn takes_binding(&self) -> bool {
-        self.choices.is_none() && !self.drag_only
+        self.choices.is_none() && !self.drag_only && !self.takes_values
     }
 }
 
@@ -247,6 +255,8 @@ pub struct OpContext {
     pub carryover: Carryover,
     /// 文字の書き込みの書体と大きさの既定値（設定ファイルの `[annotation]`）。
     pub font: Font,
+    /// レシピの値のある手に書いた値（`takes_values` の操作に渡す）。ほかから呼んだときは None。
+    pub values: Option<AppearanceValues>,
 }
 
 /// 操作の結果、Win32 層がすること。
@@ -531,6 +541,46 @@ fn shadow_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     vec![Effect::Redraw]
 }
 
+/// レシピの値のある手に書いた項目だけを、スクラップごとの上書きに重ねる（ADR-0008）。書かなかった項目は今の
+/// 値のまま。枠の色か太さを書けば枠も出す。見た目が変わらなければ何もしない（手は成功として次へ進む）。
+fn set_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let Some(values) = context.values else {
+        return Vec::new();
+    };
+    let before = model.appearance(&context.appearance);
+    let overrides = &mut model.appearance_overrides;
+    if let Some(opacity) = values.opacity {
+        overrides.opacity = Some(opacity);
+    }
+    if let Some(shadow) = values.shadow {
+        overrides.shadow = Some(shadow);
+    }
+    if let Some(width) = values.border_width {
+        overrides.border_width = Some(width);
+    }
+    // 枠を出す（色か太さを書いたときも）なら、全体の既定値で枠を出していても、枠を出す上書きを入れる（あとで
+    // 既定値が枠を出さなくなっても、この手で決めた枠は残す）。色を書かなければ今の色のまま
+    let shows = values.border == Some(true)
+        || values.border_color.is_some()
+        || values.border_width.is_some();
+    if values.border == Some(false) {
+        overrides.border = Some(BorderOverride::Hidden);
+    } else if shows {
+        let color = values
+            .border_color
+            .map_or(before.border.color, settings::Rgb::to_rrggbb);
+        overrides.border = Some(BorderOverride::Color(color));
+    }
+    redrawn(model.appearance(&context.appearance) != before)
+}
+
+/// 見た目のスクラップごとの上書きを全部消し、全体の既定値の見た目に戻す。見た目が変わったときだけ描き直す。
+fn reset_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let before = model.appearance(&context.appearance);
+    model.appearance_overrides = AppearanceOverrides::default();
+    redrawn(model.appearance(&context.appearance) != before)
+}
+
 /// コンパクト表示に畳む、または広げる。畳む基準点は拡大縮小と同じ（マウスならカーソル、ほかは中心）。
 fn toggle_compact(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     if model.is_compact() {
@@ -602,6 +652,7 @@ const fn keyboard_move(
         group: Group::Move,
         order,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: normal,
@@ -621,6 +672,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 10,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: normal,
@@ -636,6 +688,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 20,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: not_compact,
@@ -651,6 +704,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Output,
         order: 30,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: not_compact,
@@ -666,6 +720,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Edit,
         order: 10,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
@@ -681,6 +736,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Edit,
         order: 20,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: trimmed,
@@ -696,6 +752,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Edit,
         order: 30,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: can_annotate,
@@ -761,6 +818,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Move,
         order: 0,
         drag_only: true,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: false,
         can_execute: normal,
@@ -776,6 +834,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 10,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
@@ -791,6 +850,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 11,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -806,6 +866,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 12,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -821,6 +882,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 13,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -836,6 +898,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 20,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
@@ -851,6 +914,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 21,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -866,6 +930,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 22,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: false,
         can_execute: not_compact,
@@ -881,6 +946,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 23,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
@@ -896,12 +962,45 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 24,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Never,
         in_menu: true,
         can_execute: not_compact,
         checked: None,
         choices: Some(shadow_choices),
         run: shadow_to,
+    },
+    OperationDescriptor {
+        id: "reset_appearance",
+        label_key: "scrap.op.reset_appearance",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::View,
+        order: 25,
+        drag_only: false,
+        takes_values: false,
+        in_recipe: InRecipe::Anywhere,
+        in_menu: true,
+        can_execute: not_compact,
+        checked: None,
+        choices: None,
+        run: reset_appearance,
+    },
+    OperationDescriptor {
+        id: "appearance",
+        label_key: "scrap.op.set_appearance",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::View,
+        order: 26,
+        drag_only: false,
+        takes_values: true,
+        in_recipe: InRecipe::Anywhere,
+        in_menu: false,
+        can_execute: not_compact,
+        checked: None,
+        choices: None,
+        run: set_appearance,
     },
     OperationDescriptor {
         id: "toggle_compact",
@@ -911,6 +1010,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::View,
         order: 30,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Anywhere,
         in_menu: true,
         can_execute: normal,
@@ -926,6 +1026,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         group: Group::Close,
         order: 10,
         drag_only: false,
+        takes_values: false,
         in_recipe: InRecipe::Last,
         in_menu: true,
         can_execute: normal,
@@ -970,10 +1071,10 @@ impl BindingRow {
 
 /// 設定 GUI の「スクラップ操作」タブの行の一覧。`ops`（ふつうは `OPERATIONS`）の表の順で、ショートカットか
 /// マウスを割り当てられる操作の行を作る。引数の選択肢を持つ操作（`choices` が Some）はメニュー専用なので
-/// 行にしない。左ドラッグの移動（`drag_only`）は行にするが、ショートカットの欄はない。
+/// 行にしない。レシピの値のある手からだけ呼ぶ操作（`takes_values`）も行にしない。左ドラッグの移動（`drag_only`）は行にするが、ショートカットの欄はない。
 pub fn binding_rows(ops: &'static [OperationDescriptor]) -> Vec<BindingRow> {
     ops.iter()
-        .filter(|op| op.choices.is_none())
+        .filter(|op| op.choices.is_none() && !op.takes_values)
         .map(|op| BindingRow {
             op,
             default_shortcut: op.takes_binding().then_some(op.default_shortcut),
@@ -1247,9 +1348,22 @@ impl Folder {
     }
 }
 
-/// メニューで子メニューにまとめる操作（文言のキー、操作の id）。まとめた操作は、最初の操作の位置に並ぶ。
-const FOLDERS: &[(&str, &[OperationId])] =
-    &[("scrap.op.appearance", &["opacity", "border", "shadow"])];
+/// メニューで子メニューにまとめる操作（文言のキー、区切りで分けた操作の id の並び）。まとめた操作は、最初の
+/// 操作の位置に並ぶ。子メニューの中では、違う並びの操作の間に区切りを入れる。
+const FOLDERS: &[(&str, &[&[OperationId]])] = &[(
+    "scrap.op.appearance",
+    &[&["opacity", "border", "shadow"], &["reset_appearance"]],
+)];
+
+/// `id` をまとめる子メニューの文言のキーと、その中の区切りで分けた並びの番号。
+fn folder_of(id: OperationId) -> Option<(&'static str, usize)> {
+    FOLDERS.iter().find_map(|&(label_key, sections)| {
+        sections
+            .iter()
+            .position(|ids| ids.contains(&id))
+            .map(|section| (label_key, section))
+    })
+}
 
 /// 子メニューに展開する操作。選んだ選択肢の `value` を `OpContext::choice` に入れて実行する。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1291,6 +1405,8 @@ pub fn menu(
     listed.sort_by_key(|op| (op.group, op.order));
     let mut entries = Vec::new();
     let mut group = None;
+    // 直前に子メニューへ入れた操作の、区切りで分けた並びの番号。
+    let mut folder_section = None;
     for op in listed {
         if group.is_some_and(|g| g != op.group) {
             entries.push(MenuEntry::Separator);
@@ -1312,12 +1428,16 @@ pub fn menu(
                 checked: op.checked.is_some_and(|checked| checked(model)),
             }),
         };
-        let Some(&(label_key, _)) = FOLDERS.iter().find(|(_, ids)| ids.contains(&op.id)) else {
+        let Some((label_key, section)) = folder_of(op.id) else {
             entries.push(entry);
+            folder_section = None;
             continue;
         };
         match entries.last_mut() {
             Some(MenuEntry::Folder(folder)) if folder.label_key == label_key => {
+                if folder_section != Some(section) {
+                    folder.entries.push(MenuEntry::Separator);
+                }
                 folder.entries.push(entry);
             }
             _ => entries.push(MenuEntry::Folder(Folder {
@@ -1325,6 +1445,7 @@ pub fn menu(
                 entries: vec![entry],
             })),
         }
+        folder_section = Some(section);
     }
     entries
 }
@@ -1975,6 +2096,157 @@ mod tests {
     }
 
     #[test]
+    fn resetting_the_appearance_drops_every_override_and_keeps_the_image_in_place() {
+        let defaults = Appearance::default();
+        let mut model = scrap();
+        let context = |choice| OpContext {
+            choice: Some(choice),
+            ..with_defaults(defaults)
+        };
+        execute(op("opacity"), &mut model, &context(40));
+        execute(op("border"), &mut model, &context(0xFF_00_00));
+        execute(op("shadow"), &mut model, &context(0));
+        assert_ne!(model.appearance(&defaults), defaults);
+
+        assert_eq!(
+            execute(op("reset_appearance"), &mut model, &with_defaults(defaults)),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(model.appearance(&defaults), defaults);
+        assert_eq!(model.window_rect(&defaults), scrap().window_rect(&defaults));
+        assert_eq!(model.position, scrap().position);
+    }
+
+    #[test]
+    fn a_border_width_step_shows_that_width_and_the_menu_changes_only_the_color() {
+        let defaults = Appearance {
+            show_border: false,
+            ..Appearance::default()
+        };
+        let mut model = scrap();
+        let width = |w| OpContext {
+            values: Some(AppearanceValues {
+                border_width: Some(w),
+                ..AppearanceValues::default()
+            }),
+            ..with_defaults(defaults)
+        };
+        // 太さを書けば、既定値で枠を出さなくても枠が出る
+        assert_eq!(
+            execute(op("appearance"), &mut model, &width(4)),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(
+            model.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 4,
+                color: 0x80_80_80
+            })
+        );
+        assert_eq!(execute(op("appearance"), &mut model, &width(4)), vec![]);
+        let choose = |choice| OpContext {
+            choice: Some(choice),
+            ..with_defaults(defaults)
+        };
+        execute(op("border"), &mut model, &choose(0xFF_00_00));
+        assert_eq!(
+            model.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 4,
+                color: 0xFF_00_00
+            })
+        );
+        execute(op("border"), &mut model, &choose(NO_BORDER));
+        execute(op("border"), &mut model, &choose(0x00_00_FF));
+        assert_eq!(
+            model.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 4,
+                color: 0x00_00_FF
+            })
+        );
+        // 既定に戻すと太さの上書きも消える
+        execute(op("reset_appearance"), &mut model, &with_defaults(defaults));
+        execute(op("border"), &mut model, &choose(0x00_00_FF));
+        assert_eq!(
+            model.appearance(&defaults).shown_border(),
+            Some(Border {
+                width: 1,
+                color: 0x00_00_FF
+            })
+        );
+    }
+
+    #[test]
+    fn a_step_that_writes_the_border_keeps_it_shown_when_the_default_stops_showing_it() {
+        let shown = Appearance::default();
+        let hidden = Appearance {
+            show_border: false,
+            ..shown
+        };
+        for values in [
+            AppearanceValues {
+                border_width: Some(3),
+                ..AppearanceValues::default()
+            },
+            AppearanceValues {
+                border: Some(true),
+                ..AppearanceValues::default()
+            },
+            AppearanceValues {
+                border_color: Some(settings::Rgb(0x80, 0x80, 0x80)),
+                ..AppearanceValues::default()
+            },
+        ] {
+            let mut model = scrap();
+            let context = OpContext {
+                values: Some(values),
+                ..with_defaults(shown)
+            };
+            execute(op("appearance"), &mut model, &context);
+
+            // 全体の既定値で枠を出さなくなっても、手で書いた枠は出たまま
+            assert_eq!(
+                model.appearance(&hidden).shown_border(),
+                Some(Border {
+                    width: values.border_width.unwrap_or(1),
+                    color: 0x80_80_80
+                }),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resetting_an_appearance_already_at_the_defaults_changes_nothing() {
+        let defaults = Appearance::default();
+        let mut model = scrap();
+        assert_eq!(
+            execute(op("reset_appearance"), &mut model, &with_defaults(defaults)),
+            vec![]
+        );
+        assert_eq!(model, scrap());
+    }
+
+    #[test]
+    fn resetting_the_appearance_has_no_default_shortcut_and_takes_one_from_the_settings_file() {
+        assert_eq!(op("reset_appearance").default_shortcut, &[]);
+        let (settings, issues) = settings::load(
+            r#"version = 1
+[shortcuts]
+reset_appearance = "Ctrl+Shift+D"
+"#,
+        );
+        assert_eq!(issues, vec![]);
+        let keymap = settings::keymap(&settings, OPERATIONS);
+        assert_eq!(keymap.issues, vec![]);
+        assert_eq!(
+            bound(&keymap.shortcuts, "Ctrl+Shift+D"),
+            Some("reset_appearance")
+        );
+    }
+
+    #[test]
     fn the_appearance_lists_take_no_shortcut() {
         let overrides = ShortcutOverrides::from([
             ("opacity".to_owned(), Some(chord("O"))),
@@ -1988,6 +2260,44 @@ mod tests {
             ["border", "opacity", "shadow"]
         );
         assert_eq!(bound(&shortcuts, "Ctrl+Up"), Some("opacity_up"));
+    }
+
+    #[test]
+    fn setting_the_appearance_by_values_is_only_for_recipe_steps() {
+        let overrides = ShortcutOverrides::from([("appearance".to_owned(), Some(chord("Q")))]);
+        let shortcuts = Shortcuts::new(OPERATIONS, &overrides);
+        assert_eq!(shortcuts.ignored_overrides(), ["appearance"]);
+        assert_eq!(bound(&shortcuts, "Q"), None);
+        let mouse = MouseBindings::new(
+            OPERATIONS,
+            &MouseOverrides::from([("appearance".to_owned(), Some(MouseGesture::WheelUp))]),
+        );
+        assert_eq!(mouse.ignored_overrides(), ["appearance"]);
+        assert!(
+            binding_rows(OPERATIONS)
+                .iter()
+                .all(|row| row.op.id != "appearance")
+        );
+        fn ids(entries: &[MenuEntry]) -> Vec<&'static str> {
+            entries
+                .iter()
+                .flat_map(|e| match e {
+                    MenuEntry::Item(item) => vec![item.id],
+                    MenuEntry::Submenu(sub) => vec![sub.id],
+                    MenuEntry::Folder(folder) => ids(&folder.entries),
+                    MenuEntry::Separator => vec![],
+                })
+                .collect()
+        }
+        let entries = menu(OPERATIONS, &scrap(), &shortcuts, &Appearance::default());
+        assert!(!ids(&entries).contains(&"appearance"));
+        // 値なしで呼んでも何もしない
+        let mut model = scrap();
+        assert_eq!(
+            execute(op("appearance"), &mut model, &OpContext::default()),
+            vec![]
+        );
+        assert_eq!(model, scrap());
     }
 
     #[test]
@@ -2082,6 +2392,7 @@ mod tests {
                 ("opacity", false),
                 ("border", false),
                 ("shadow", false),
+                ("reset_appearance", false),
                 ("toggle_compact", true),
                 ("close", true),
             ]
@@ -2224,7 +2535,9 @@ mod tests {
                             enabled: true,
                             choices: (op(id).choices.unwrap())(&scrap(), &Appearance::default()),
                         }))
-                        .to_vec(),
+                        .into_iter()
+                        .chain([MenuEntry::Separator, item("reset_appearance", true, None),])
+                        .collect(),
                 }),
                 item("toggle_compact", true, None),
                 MenuEntry::Separator,
@@ -2358,6 +2671,7 @@ mod tests {
             test_op("b", Group::Move, 20, &[]),
             OperationDescriptor {
                 drag_only: true,
+                takes_values: false,
                 ..test_op("drag", Group::Move, 0, &[])
             },
             OperationDescriptor {
@@ -2577,6 +2891,7 @@ mod tests {
             group,
             order,
             drag_only: false,
+            takes_values: false,
             in_recipe: InRecipe::Anywhere,
             in_menu: true,
             can_execute: normal,
@@ -2645,6 +2960,7 @@ mod tests {
                 "zoom_actual",
                 "opacity_up",
                 "opacity_down",
+                "reset_appearance",
                 "toggle_compact",
                 "close",
             ]

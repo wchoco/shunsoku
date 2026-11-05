@@ -6,6 +6,11 @@
 //!   `Editor::set_recipe_name` で写しに入れる。
 //! - 操作の並びは、見出しのない 1 列の一覧と、横の「上へ」「下へ」「削除」。下のドロップダウンには、その時点で
 //!   レシピに足せる操作（`Editor::step_choices`）だけを出し、「足す」で足す（`chosen_step`）。
+//! - 操作の並びの下に、見た目の手の 5 項目（枠を出すか・枠の色・枠の太さ・透明度・影、#141）。並びで見た目の手を選んでいる
+//!   間だけ使え、ほかの手では無効にする（ページを出し直すと全部見えるので、隠さずに無効にする）。どの欄も先頭が
+//!   「変えない」で、枠と影はドロップダウン、太さと透明度は数の欄、枠の色は文字の欄と「選ぶ…」（部品は
+//!   「スクラップ」タブと同じ `PageBuilder` の `choice_control` / `number_controls` / `color_controls`）。値の出し入れは
+//!   `Editor::appearance` / `set_appearance` で、呼び出し側が `appearance_item` / `appearance_input` で受ける。
 //! - ショートカットは全体のホットキーと同じ入力欄（`chord_field`）で、`ChordRow` の 1 つ。行を選び直したら、
 //!   呼び出し側が `ChordRow::item` をその行の `SettingsItem::RecipeShortcut` に差し替える（`shortcut_id`）。
 //! - 一覧の行の数は `sync_list` で写しに揃える。揃えて選んでいる行がなくなったら、ショートカットの欄が指していた
@@ -15,22 +20,22 @@
 
 use std::cell::{Cell, RefCell};
 
-use shunsoku_core::scrap::ops::{OPERATIONS, OperationId};
 use shunsoku_core::settings::SettingsItem;
-use shunsoku_core::settings::editor::Editor;
+use shunsoku_core::settings::editor::{
+    AppearanceInput, AppearanceItem, Editor, SWITCH_CHOICES, StepChoice, UNCHANGED_KEY, step_label,
+};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL,
+    EM_SETCUEBANNER, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
+    LVM_GETITEMCOUNT, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_NOSORTHEADER, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, UDM_SETRANGE32,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCOUNT, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
-    CBS_DROPDOWNLIST, SM_CXVSCROLL, SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WS_BORDER,
-    WS_TABSTOP, WS_VSCROLL,
+    SM_CXVSCROLL, SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WS_BORDER, WS_TABSTOP,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -52,10 +57,35 @@ const STEP_UP: i32 = 8;
 const STEP_DOWN: i32 = 9;
 const STEP_REMOVE: i32 = 10;
 const STEPS_MARK: i32 = 11;
-const STEP_CHOICE: i32 = 12;
-const STEP_ADD: i32 = 13;
-const SHORTCUT: i32 = 15;
-const DETAIL_END: i32 = 17;
+/// 見た目を指定する手の欄（見出しと上下のボタンを含む）。ここから `APPEARANCE_END` の手前までを、見た目を
+/// 指定する手を選んでいなければ使えなくする。
+const APPEARANCE_FIRST: i32 = 12;
+const BORDER: i32 = 13;
+const BORDER_COLOR: i32 = 15;
+const PICK_COLOR: i32 = 16;
+const BORDER_WIDTH: i32 = 18;
+const BORDER_WIDTH_UPDOWN: i32 = 19;
+const OPACITY: i32 = 21;
+const OPACITY_UPDOWN: i32 = 22;
+const SHADOW: i32 = 24;
+const APPEARANCE_END: i32 = 25;
+const STEP_CHOICE: i32 = 25;
+const STEP_ADD: i32 = 26;
+const SHORTCUT: i32 = 28;
+const DETAIL_END: i32 = 30;
+/// 見た目を指定する手の項目と、その欄。
+const APPEARANCE_FIELDS: [(AppearanceItem, i32); 5] = [
+    (AppearanceItem::Border, BORDER),
+    (AppearanceItem::BorderColor, BORDER_COLOR),
+    (AppearanceItem::BorderWidth, BORDER_WIDTH),
+    (AppearanceItem::Opacity, OPACITY),
+    (AppearanceItem::Shadow, SHADOW),
+];
+/// 数の欄の上下のボタン。
+const UPDOWNS: [(AppearanceItem, i32); 2] = [
+    (AppearanceItem::BorderWidth, BORDER_WIDTH_UPDOWN),
+    (AppearanceItem::Opacity, OPACITY_UPDOWN),
+];
 
 /// 一覧の幅と高さ、その下のボタン（ページの中のダイアログ単位）。
 const LIST_WIDTH: i16 = 112;
@@ -68,11 +98,21 @@ const FIELD_X: i16 = DETAIL_X + LABEL_WIDTH + 2;
 const FIELD_WIDTH: i16 = PAGE_WIDTH - FIELD_X;
 /// 操作の並びの一覧と、その横のボタン。
 const STEPS_Y: i16 = 30;
-const STEPS_HEIGHT: i16 = 62;
+const STEPS_HEIGHT: i16 = 46;
+/// 並びの下の印。範囲外の文言は 2 行になる。
+const STEPS_MARK_HEIGHT: i16 = 20;
 const STEP_BUTTON_WIDTH: i16 = 40;
 const STEPS_WIDTH: i16 = FIELD_WIDTH - STEP_BUTTON_WIDTH - 4;
 const STEP_BUTTON_X: i16 = FIELD_X + STEPS_WIDTH + 4;
-const STEP_CHOICE_Y: i16 = STEPS_Y + STEPS_HEIGHT + 14;
+/// 見た目を指定する手の欄（4 行）。上から枠を出すか、枠の色、枠の太さ、透明度と影。2 列目の見出しと欄の左端。
+const APPEARANCE_Y: i16 = STEPS_Y + STEPS_HEIGHT + 2 + STEPS_MARK_HEIGHT + 2;
+const APPEARANCE_ROW: i16 = 16;
+const SWITCH_WIDTH: i16 = 56;
+const NUMBER_WIDTH: i16 = 48;
+const SECOND_LABEL_X: i16 = FIELD_X + SWITCH_WIDTH + 6;
+const SECOND_LABEL_WIDTH: i16 = 32;
+const SECOND_FIELD_X: i16 = FIELD_X + 96;
+const STEP_CHOICE_Y: i16 = APPEARANCE_Y + 4 * APPEARANCE_ROW + 2;
 const SHORTCUT_Y: i16 = STEP_CHOICE_Y + 22;
 /// 一覧の列の見出し。幅は中身に合わせる（`fit_columns`）。
 const COLUMNS: [&str; 3] = [
@@ -159,18 +199,38 @@ pub(super) fn build(b: &mut PageBuilder) {
         FIELD_X,
         STEPS_Y + STEPS_HEIGHT + 2,
         FIELD_WIDTH,
-        10,
+        STEPS_MARK_HEIGHT,
     );
+    // 見た目を指定する手の欄。部品は「スクラップ」タブと同じ（数は上下のボタン付き、色は「選ぶ…」付き）。
+    // オン・オフは「変えない」を先頭に置くドロップダウン
+    let appearance_first = b.next_id;
+    let label = |b: &mut PageBuilder, item: AppearanceItem, x: i16, y: i16, cx: i16| {
+        b.label(item.label_key(), x, y + 2, cx, 10);
+    };
+    let mut y = APPEARANCE_Y;
+    label(b, AppearanceItem::Border, DETAIL_X, y, LABEL_WIDTH);
+    let border = b.choice_control(FIELD_X, y, SWITCH_WIDTH, 60);
+    y += APPEARANCE_ROW;
+    label(b, AppearanceItem::BorderColor, DETAIL_X, y, LABEL_WIDTH);
+    let (border_color, pick_color) = b.color_controls(FIELD_X, y);
+    y += APPEARANCE_ROW;
+    label(b, AppearanceItem::BorderWidth, DETAIL_X, y, LABEL_WIDTH);
+    let (border_width, border_width_updown) = b.number_controls(FIELD_X, y, NUMBER_WIDTH);
+    y += APPEARANCE_ROW;
+    label(b, AppearanceItem::Opacity, DETAIL_X, y, LABEL_WIDTH);
+    let (opacity, opacity_updown) = b.number_controls(FIELD_X, y, NUMBER_WIDTH);
+    label(
+        b,
+        AppearanceItem::Shadow,
+        SECOND_LABEL_X,
+        y,
+        SECOND_LABEL_WIDTH,
+    );
+    let shadow_width = PAGE_WIDTH - SECOND_FIELD_X;
+    let shadow = b.choice_control(SECOND_FIELD_X, y, shadow_width, 60);
+    let appearance_end = b.next_id;
     // 足す操作を選ぶドロップダウン（高さは開いたときの一覧の高さ）と「足す」
-    let choice = b.control(
-        Class::ComboBox,
-        "",
-        WS_TABSTOP | WS_VSCROLL | style(CBS_DROPDOWNLIST as u32),
-        FIELD_X,
-        STEP_CHOICE_Y,
-        STEPS_WIDTH,
-        120,
-    );
+    let choice = b.choice_control(FIELD_X, STEP_CHOICE_Y, STEPS_WIDTH, 120);
     let add_text = (b.text)("settings_gui.recipes.add_step");
     let step_add = b.control(
         Class::Button,
@@ -210,6 +270,32 @@ pub(super) fn build(b: &mut PageBuilder) {
         ]
     );
     debug_assert_eq!(offsets(&step_buttons), [STEP_UP, STEP_DOWN, STEP_REMOVE]);
+    debug_assert_eq!(
+        offsets(&[
+            appearance_first,
+            border,
+            border_color,
+            pick_color,
+            border_width,
+            border_width_updown,
+            opacity,
+            opacity_updown,
+            shadow,
+            appearance_end
+        ]),
+        [
+            APPEARANCE_FIRST,
+            BORDER,
+            BORDER_COLOR,
+            PICK_COLOR,
+            BORDER_WIDTH,
+            BORDER_WIDTH_UPDOWN,
+            OPACITY,
+            OPACITY_UPDOWN,
+            SHADOW,
+            APPEARANCE_END
+        ]
+    );
     debug_assert_eq!(b.next_id - first, DETAIL_END);
 }
 
@@ -252,6 +338,8 @@ pub enum Button {
     StepRemove,
     /// ドロップダウンで選んだ操作を足す。
     StepAdd,
+    /// 見た目を指定する手の枠の色を、色を選ぶダイアログで選ぶ。
+    PickColor,
 }
 
 /// ID `id` がタブのボタンならそれ。
@@ -263,6 +351,7 @@ pub fn button(id: i32) -> Option<Button> {
         STEP_DOWN => Some(Button::StepDown),
         STEP_REMOVE => Some(Button::StepRemove),
         STEP_ADD => Some(Button::StepAdd),
+        PICK_COLOR => Some(Button::PickColor),
         _ => None,
     }
 }
@@ -291,6 +380,35 @@ pub fn select_step(hwnd: HWND, index: usize) {
     }
 }
 
+/// ID `id` が見た目を指定する手の欄なら、その項目。
+pub fn appearance_item(id: i32) -> Option<AppearanceItem> {
+    let offset = id - page_first_id(Page::Recipes);
+    APPEARANCE_FIELDS
+        .iter()
+        .find(|&&(_, o)| o == offset)
+        .map(|&(item, _)| item)
+}
+
+/// 見た目を指定する手の欄 `item` の今の入力。
+pub fn appearance_input(hwnd: HWND, item: AppearanceItem) -> Option<AppearanceInput> {
+    let control = self::item(hwnd, appearance_id(item))?;
+    if !item.is_switch() {
+        return Some(AppearanceInput::Text(window_text(control)));
+    }
+    // SAFETY: 自分のダイアログのドロップダウンへのメッセージ
+    let index = unsafe { SendMessageW(control, CB_GETCURSEL, None, None) }.0;
+    let (on, _) = SWITCH_CHOICES.get(usize::try_from(index).ok()?)?;
+    Some(AppearanceInput::Switch(*on))
+}
+
+fn appearance_id(item: AppearanceItem) -> i32 {
+    let offset = APPEARANCE_FIELDS
+        .iter()
+        .find(|&&(i, _)| i == item)
+        .map_or(BORDER, |&(_, o)| o);
+    id(offset)
+}
+
 /// 名前の欄の今の文字。
 pub fn name_text(hwnd: HWND) -> Option<String> {
     item(hwnd, name_id()).map(window_text)
@@ -299,8 +417,8 @@ pub fn name_text(hwnd: HWND) -> Option<String> {
 thread_local! {
     /// `sync_list` か `fill` が一覧の行や名前の欄を揃えている間。
     static SYNCING: Cell<bool> = const { Cell::new(false) };
-    /// ドロップダウンに出している操作の id（`chosen_step`）。
-    static CHOICES: RefCell<Vec<OperationId>> = const { RefCell::new(Vec::new()) };
+    /// ドロップダウンに出している、足せるもの（`chosen_step`）。
+    static CHOICES: RefCell<Vec<StepChoice>> = const { RefCell::new(Vec::new()) };
     /// 操作の並びの一覧に出しているレシピの位置と、手の文言。
     static STEPS_SHOWN: RefCell<(Option<usize>, Vec<String>)> = const { RefCell::new((None, Vec::new())) };
 }
@@ -310,8 +428,8 @@ pub fn is_syncing() -> bool {
     SYNCING.get()
 }
 
-/// ドロップダウンで選んでいる、足す操作。
-pub fn chosen_step(hwnd: HWND) -> Option<OperationId> {
+/// ドロップダウンで選んでいる、足すもの。
+pub fn chosen_step(hwnd: HWND) -> Option<StepChoice> {
     let combo = item(hwnd, id(STEP_CHOICE))?;
     // SAFETY: 自分のダイアログのドロップダウンへのメッセージ
     let index = unsafe { SendMessageW(combo, CB_GETCURSEL, None, None) }.0;
@@ -389,7 +507,7 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     // 操作の並び。変わったときだけ入れ直す（一覧で手を選んだ通知の中で、行を消さないため）。レシピを選び直したら、
     // 手は選ばない
     let labels: Vec<String> = recipe.map_or_else(Vec::new, |(_, r)| {
-        r.steps.iter().map(|id| step_label(id, text)).collect()
+        r.steps.iter().map(|s| step_label(s, text)).collect()
     });
     let steps = labels.len();
     if let Some(list) = item(hwnd, steps_id()) {
@@ -422,9 +540,7 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     let step = selected_step(hwnd).filter(|&s| s < steps);
 
     // 足せる操作。変わったときだけ入れ直す（選んでいる操作を残すため）
-    let choices: Vec<OperationId> = selected
-        .map(|i| editor.step_choices(i).iter().map(|op| op.id).collect())
-        .unwrap_or_default();
+    let choices: Vec<StepChoice> = selected.map(|i| editor.step_choices(i)).unwrap_or_default();
     if let Some(combo) = item(hwnd, id(STEP_CHOICE))
         // SAFETY: 自分のダイアログのドロップダウンへのメッセージ
         && (CHOICES.with_borrow(|c| *c != choices)
@@ -435,8 +551,8 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
         // SAFETY: 自分のダイアログのドロップダウンへのメッセージ。文字列は呼び出しの間生きている
         unsafe {
             SendMessageW(combo, CB_RESETCONTENT, None, None);
-            for id in &choices {
-                let label = to_wide(&step_label(id, text));
+            for choice in &choices {
+                let label = to_wide(&choice_label(*choice, text));
                 SendMessageW(
                     combo,
                     CB_ADDSTRING,
@@ -454,8 +570,15 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
         CHOICES.set(choices.clone());
     }
 
+    let appearance = fill_appearance(hwnd, editor, selected.zip(step), text);
+
     for offset in DETAIL_FIRST..DETAIL_END {
-        enable(hwnd, id(offset), selected.is_some());
+        let in_appearance = (APPEARANCE_FIRST..APPEARANCE_END).contains(&offset);
+        enable(
+            hwnd,
+            id(offset),
+            selected.is_some() && (appearance || !in_appearance),
+        );
     }
     enable(hwnd, id(REMOVE), selected.is_some());
     enable(hwnd, id(STEP_UP), step.is_some_and(|s| s > 0));
@@ -468,12 +591,95 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     );
 }
 
-/// 手 `id` の文言。表にない id（設定ファイルに書いた知らない操作）は id のまま出す。
-fn step_label(id: &str, text: Text) -> String {
-    OPERATIONS
-        .iter()
-        .find(|op| op.id == id)
-        .map_or_else(|| id.to_owned(), |op| text(op.label_key).to_owned())
+/// 見た目を指定する手の欄に、レシピと手 `at` の値を出す。見た目を指定する手でなければ、欄を空にする。初めて
+/// 出すときに、ドロップダウンの選択肢・数の範囲・空のときの「変えない」を入れる。見た目を指定する手か
+/// （欄を使えるか）を返す。
+fn fill_appearance(hwnd: HWND, editor: &Editor, at: Option<(usize, usize)>, text: Text) -> bool {
+    // SAFETY: フォーカスのあるウィンドウを読むだけ
+    let focus = unsafe { GetFocus() };
+    let shown = at
+        .and_then(|(i, s)| editor.appearance(i, s, AppearanceItem::Border))
+        .is_some();
+    for (item, offset) in APPEARANCE_FIELDS {
+        let Some(control) = self::item(hwnd, id(offset)) else {
+            continue;
+        };
+        let value = at.and_then(|(i, s)| editor.appearance(i, s, item));
+        if item.is_switch() {
+            // SAFETY: 自分のダイアログのドロップダウンへのメッセージ。文字列は呼び出しの間生きている
+            unsafe {
+                if SendMessageW(control, CB_GETCOUNT, None, None).0 == 0 {
+                    for (_, key) in SWITCH_CHOICES {
+                        let label = to_wide(text(key));
+                        SendMessageW(
+                            control,
+                            CB_ADDSTRING,
+                            None,
+                            Some(LPARAM(label.as_ptr() as isize)),
+                        );
+                    }
+                }
+                // 見た目を指定する手でなければ、何も選ばない（-1）
+                let index = match value {
+                    Some(AppearanceInput::Switch(on)) => SWITCH_CHOICES
+                        .iter()
+                        .position(|(v, _)| *v == on)
+                        .map_or(-1, |i| i as isize),
+                    _ => -1,
+                };
+                SendMessageW(control, CB_SETCURSEL, Some(WPARAM(index as usize)), None);
+            }
+        } else {
+            let value = match value {
+                Some(AppearanceInput::Text(s)) => s,
+                _ => String::new(),
+            };
+            // 打っている途中の欄は書き換えない
+            if control != focus && window_text(control) != value {
+                set_window_text(control, &value);
+            }
+            // 空のときは「変えない」を薄く出す（見た目を指定する手を選んでいる間だけ）
+            let cue = to_wide(if shown && value.is_empty() {
+                text(UNCHANGED_KEY)
+            } else {
+                ""
+            });
+            // SAFETY: 自分のエディットへのメッセージ。文字列は呼び出しの間生きている（エディットが写す）
+            unsafe {
+                SendMessageW(
+                    control,
+                    EM_SETCUEBANNER,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(cue.as_ptr() as isize)),
+                );
+            }
+        }
+    }
+    for (item, offset) in UPDOWNS {
+        if let (Some(updown), Some((min, max))) =
+            (self::item(hwnd, id(offset)), item.number_range())
+        {
+            // SAFETY: 自分のダイアログの上下のボタンへのメッセージ
+            unsafe {
+                SendMessageW(
+                    updown,
+                    UDM_SETRANGE32,
+                    Some(WPARAM(min as usize)),
+                    Some(LPARAM(max as isize)),
+                );
+            }
+        }
+    }
+    shown
+}
+
+/// 足せるもの `choice` の文言（ドロップダウンに出す）。表にない id はそのまま。
+fn choice_label(choice: StepChoice, text: Text) -> String {
+    match (choice.label_key(), choice) {
+        (Some(key), _) => text(key).to_owned(),
+        (None, StepChoice::Op(id)) => id.to_owned(),
+        (None, StepChoice::Appearance) => String::new(),
+    }
 }
 
 /// 一覧 `list` の行を `count` 行にする（数が違えば空の行で作り直す）。
