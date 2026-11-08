@@ -942,13 +942,13 @@ fn on_recipe_selected(hwnd: HWND) {
     }
 }
 
-/// 「レシピ」タブのボタン。写しを変えて、移った行（レシピか手）を選ぶ。足したレシピは名前の欄にフォーカスを置く。
+/// 「レシピ」タブのボタン。写しを変えて、移った行（レシピか操作）を選ぶ。足したレシピは名前の欄にフォーカスを置く。
 fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
     use recipes::Button;
     let selected = recipes::selected(hwnd);
     let step = recipes::selected_step(hwnd);
     let in_range = |editor: &Editor| selected.filter(|&i| i < editor.draft().recipes.len());
-    // 選んでいるレシピの選んでいる手を `change(editor, レシピ, 手)` で変え、移った手を選ぶ
+    // 選んでいるレシピの選んでいる操作を `change(editor, レシピ, 操作)` で変え、移った操作を選ぶ
     let change_step = |change: fn(&mut Editor, usize, usize) -> Option<usize>| {
         let to = edit(hwnd, |editor| {
             let i = in_range(editor)?;
@@ -993,7 +993,7 @@ fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
     }
 }
 
-/// 「レシピ」タブで選んでいる見た目の手の項目 `item` を `input` にする。
+/// 「レシピ」タブで選んでいる見た目を指定する操作の項目 `item` を `input` にする。
 fn set_appearance(hwnd: HWND, item: AppearanceItem, input: Option<AppearanceInput>) {
     let (Some(i), Some(s), Some(input)) =
         (recipes::selected(hwnd), recipes::selected_step(hwnd), input)
@@ -1003,7 +1003,7 @@ fn set_appearance(hwnd: HWND, item: AppearanceItem, input: Option<AppearanceInpu
     edit(hwnd, |editor| editor.set_appearance(i, s, item, input));
 }
 
-/// 「レシピ」タブの「選ぶ…」: 色の画面を開いて、選んだ色を見た目の手の枠の色にする。
+/// 「レシピ」タブの「選ぶ…」: 色の画面を開いて、選んだ色を見た目を指定する操作の枠の色にする。
 /// 初めの色は欄の色、欄が空ならスクラップの枠の色。
 fn pick_appearance_color(hwnd: HWND) {
     let (Some(i), Some(s)) = (recipes::selected(hwnd), recipes::selected_step(hwnd)) else {

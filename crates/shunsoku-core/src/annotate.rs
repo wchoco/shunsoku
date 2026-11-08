@@ -277,7 +277,7 @@ impl Annotation {
     }
 
     /// 元の画像の画素の範囲 `area`（トリムで見えている部分）に、少しでも映るか。外接矩形（`bounds`）で見るので、
-    /// 図形の種類ごとの手は要らない。
+    /// 図形の種類ごとに分けて調べなくてよい。
     pub fn is_visible_in(&self, area: Rect) -> bool {
         self.bounds().intersect(&area).is_some()
     }

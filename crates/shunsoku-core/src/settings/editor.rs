@@ -12,10 +12,10 @@
 //!   `move_region`。「範囲を選び直す」は `set_region_range`。GUI を開いている間にトレイから登録した定型領域は
 //!   `new_registered_region` で名前を決め、書いたら `registered` で base と写しに足す。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
 //! - 「レシピ」タブの一覧の追加・削除は `add_recipe` / `remove_recipe`、名前は `set_recipe_name`。操作の並びは
-//!   `step_choices`（足せる操作と見た目を指定する手）/ `add_step` / `move_step` / `remove_step`。見た目を指定する手の
+//!   `step_choices`（足せる操作と見た目を指定する操作）/ `add_step` / `move_step` / `remove_step`。見た目を指定する操作の
 //!   欄（`AppearanceItem`）は `appearance` / `set_appearance` で読み書きする（「変えない」は書かない）。ショートカットは
 //!   `set_chord` の `RecipeShortcut`。検査（`recipe::plan`）で引っかかったもの（欄に打った範囲外の値を含む）は `mark` の
-//!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（値のある手は書いた値の要約）。
+//!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（パラメータを添えた操作はパラメータの要約）。
 
 use std::collections::BTreeSet;
 
@@ -318,7 +318,7 @@ impl Editor {
         }
     }
 
-    /// レシピ `index` の「操作を足す」で選べるもの。値のない操作（表の順）と、最後に見た目を指定する手。値のない
+    /// レシピ `index` の「操作を足す」で選べるもの。パラメータのない操作（表の順）と、最後に見た目を指定する操作。値のない
     /// 操作は、レシピに入れられる操作（`recipe::can_be_step`）のうち、`close` で終わるレシピには `close` を出さない
     /// （`add_step` は `close` の前に足すので、2 つ目の `close` は最後に置けない）。`index` のレシピがなければ空。
     pub fn step_choices(&self, index: usize) -> Vec<StepChoice> {
@@ -338,7 +338,7 @@ impl Editor {
             .collect()
     }
 
-    /// レシピ `index` に `choice` を足す。見た目を指定する手は、全部の項目が「変えない」（そのままでは
+    /// レシピ `index` に `choice` を足す。見た目を指定する操作は、全部の項目が「変えない」（そのままでは
     /// `NoValues`）。レシピが `close` で終わっていれば、その前に入れる（`close` は最後にだけ置けるため）。入れた
     /// 位置を返す。`index` のレシピがなければ何もせず None。
     pub fn add_step(&mut self, index: usize, choice: impl Into<StepChoice>) -> Option<usize> {
@@ -359,7 +359,7 @@ impl Editor {
         Some(at)
     }
 
-    /// レシピ `index` の手 `step` を隣と入れ替える（「上へ」「下へ」）。端か、手がなければ動かさない。移った
+    /// レシピ `index` の操作 `step` を隣と入れ替える（「上へ」「下へ」）。端か、操作がなければ動かさない。移った
     /// 位置を返す。
     pub fn move_step(&mut self, index: usize, step: usize, to: Move) -> usize {
         let Some(r) = self.draft.recipes.get_mut(index) else {
@@ -378,8 +378,8 @@ impl Editor {
         }
     }
 
-    /// レシピ `index` の手 `step` を消す。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を
-    /// 返す。手がなければ何もせず None。
+    /// レシピ `index` の操作 `step` を消す。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を
+    /// 返す。操作がなければ何もせず None。
     pub fn remove_step(&mut self, index: usize, step: usize) -> Option<usize> {
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
         if step >= steps.len() {
@@ -390,8 +390,8 @@ impl Editor {
         (len > 0).then(|| step.min(len - 1))
     }
 
-    /// レシピ `index` の手 `step` が見た目を指定する手なら、その項目 `item` の欄に出す値。「変えない」は
-    /// `Switch(None)` か空の `Text`。読めなかった値（範囲外など）は書いたまま出す。見た目を指定する手でなければ None。
+    /// レシピ `index` の操作 `step` が見た目を指定する操作なら、その項目 `item` の欄に出す値。「変えない」は
+    /// `Switch(None)` か空の `Text`。読めなかった値（範囲外など）は書いたまま出す。見た目を指定する操作でなければ None。
     pub fn appearance(
         &self,
         index: usize,
@@ -420,10 +420,10 @@ impl Editor {
         ))
     }
 
-    /// レシピ `index` の手 `step`（見た目を指定する手）の項目 `item` を、欄の入力 `input` にする。「変えない」
+    /// レシピ `index` の操作 `step`（見た目を指定する操作）の項目 `item` を、欄の入力 `input` にする。「変えない」
     /// （`Switch(None)`、空白だけの `Text`）は書かない。読めない文字（範囲外の数、`#RRGGBB` でない色）は書いたまま
     /// 残し、設定ファイルから読めなかった値と同じくレシピの問題にする（適用できない）。項目を書き直したら、その
-    /// 項目の読めなかった値は消す。見た目を指定する手でないか、欄と違う種類の入力なら何もしない。
+    /// 項目の読めなかった値は消す。見た目を指定する操作でないか、欄と違う種類の入力なら何もしない。
     pub fn set_appearance(
         &mut self,
         index: usize,
@@ -481,7 +481,7 @@ impl Editor {
     }
 }
 
-/// 「レシピ」タブの手の一覧の行の文言。値のない手は操作の名前（表にない id はそのまま）、値のある手は
+/// 「レシピ」タブの操作の一覧の行の文言。パラメータのない操作は操作の名前（表にない id はそのまま）、パラメータを添えた操作は
 /// 「見た目: 枠 #FF0000 3px」のように、書いた項目を決まった順（透明度、枠、枠の太さ、影）に並べた要約。`text` は文言のキーから
 /// 文言を引く。
 pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> String {
@@ -565,7 +565,7 @@ impl AppearanceItem {
     }
 }
 
-/// 見た目を指定する手の欄の値（`Editor::appearance` / `set_appearance`）。
+/// 見た目を指定する操作の欄の値（`Editor::appearance` / `set_appearance`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppearanceInput {
     /// オン・オフの欄（枠・影）。None は「変えない」。
@@ -597,7 +597,7 @@ fn unquoted(written: &str) -> String {
 pub enum StepChoice {
     /// 値のない操作。
     Op(OperationId),
-    /// 見た目を指定する手（値は足してから欄で入れる）。
+    /// 見た目を指定する操作（パラメータは足してから欄で入れる）。
     Appearance,
 }
 
@@ -1321,7 +1321,7 @@ mod tests {
             editor.draft().recipes[0].steps[1],
             Step::Appearance(recipe::AppearanceStep::default())
         );
-        // 項目のない手のままでは適用できない
+        // 項目を 1 つも書いていない操作のままでは適用できない
         assert_eq!(
             editor.mark(&SettingsItem::RecipeSteps(0)),
             Some(Mark::Problem(Problem::NoValues))
@@ -1448,7 +1448,7 @@ mod tests {
         }
     }
 
-    /// レシピ 1 つに、全部の項目が「変えない」の見た目の手を 1 つ足した写し。
+    /// レシピ 1 つに、全部の項目が「変えない」の見た目を指定する操作を 1 つ足した写し。
     fn with_an_appearance_step() -> Editor {
         let mut editor = with_steps(&["copy"]);
         editor.add_step(0, StepChoice::Appearance);
@@ -1476,7 +1476,7 @@ mod tests {
             fields(&editor, 1),
             AppearanceItem::ALL.map(unchanged).to_vec()
         );
-        // 値のない手には欄がない
+        // パラメータのない操作には欄がない
         assert_eq!(fields(&editor, 0), vec![None; 5]);
         assert_eq!(editor.appearance(0, 2, AppearanceItem::Border), None);
     }
