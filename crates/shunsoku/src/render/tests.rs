@@ -77,8 +77,19 @@ fn framed() -> Appearance {
     }
 }
 
-/// `image` を書き込みと枠・影を付けて、表示の大きさ `display` で `renderer` で描いた画素。
+/// `image` を書き込みと枠・影を付けて、表示の大きさ `display` で `renderer` で新しい描き先に描いた画素。
 fn paint(
+    renderer: &mut Renderer,
+    image: &CachedImage,
+    display: Size,
+    hit_alpha: Option<u8>,
+) -> Image {
+    paint_on(&mut None, renderer, image, display, hit_alpha)
+}
+
+/// `paint` と同じものを、描き先 `canvas` を使い回して（大きさが違えば作り直して）描いた画素。
+fn paint_on(
+    canvas: &mut Option<Canvas>,
     renderer: &mut Renderer,
     image: &CachedImage,
     display: Size,
@@ -87,7 +98,7 @@ fn paint(
     let appearance = framed();
     let margin = appearance.margin() as u32;
     let window = Size::new(display.width + margin * 2, display.height + margin * 2);
-    let canvas = Canvas::new(window).unwrap();
+    let canvas = Canvas::reuse(canvas, window).unwrap();
     let annotations = annotations();
     let size = image.image().size();
     let overlays = Overlays {
@@ -108,7 +119,7 @@ fn paint(
         trim: None,
     };
     renderer
-        .paint_scrap(&canvas, image, display, &appearance, hit_alpha, overlays)
+        .paint_scrap(canvas, image, display, &appearance, hit_alpha, overlays)
         .unwrap();
     canvas.to_image().unwrap()
 }
@@ -164,4 +175,46 @@ fn reused_renderer_paints_the_same_pixels_as_a_new_one() {
     let fresh = CachedImage::new(first.image().clone());
     let want = paint(&mut Renderer::new().unwrap(), &fresh, small, None);
     assert!(got == want, "a recreated renderer drew other pixels");
+}
+
+#[test]
+fn reused_canvas_paints_the_same_pixels_as_a_new_one() {
+    let large = Size::new(96, 80);
+    let small = Size::new(40, 32);
+    let hit_alpha = Appearance::default().hit_alpha();
+    // 並び: 大 → 同じ大きさで別の画像 → 小 → 大（作り直した描き先）→ 透明な部分のある画像（前に描いた不透明な
+    // 画素が残らないこと）
+    let first = CachedImage::new(solid(large, [0x10, 0x80, 0xF0, 0xFF]));
+    let other = CachedImage::new(solid(large, [0xF0, 0x20, 0x40, 0xFF]));
+    let see_through = CachedImage::new(half_transparent(large, [0x00, 0x00, 0xFF, 0x80]));
+    let steps = [
+        (&first, large, None),
+        (&other, large, None),
+        (&first, small, None),
+        (&other, large, None),
+        (&see_through, large, Some(hit_alpha)),
+    ];
+
+    let mut renderer = Renderer::new().unwrap();
+    let mut canvas = None;
+    for (i, (image, display, alpha)) in steps.iter().enumerate() {
+        let got = paint_on(&mut canvas, &mut renderer, image, *display, *alpha);
+        let want = paint(&mut renderer, image, *display, *alpha);
+        assert!(got == want, "step {i}: the reused canvas drew other pixels");
+        let margin = framed().margin() as u32;
+        assert_eq!(
+            got.size(),
+            Size::new(display.width + margin * 2, display.height + margin * 2),
+            "step {i}"
+        );
+        // 画像の右下の隅（書き込みの外）
+        let corner = got.pixel(margin + display.width - 2, margin + display.height - 2);
+        let expected = match i {
+            0 | 2 => [0x10, 0x80, 0xF0, 0xFF],
+            1 | 3 => [0xF0, 0x20, 0x40, 0xFF],
+            // 透明な部分には当たり判定の下敷き（黒）だけが残る
+            _ => [0, 0, 0, hit_alpha],
+        };
+        assert_eq!(corner, expected, "step {i}");
+    }
 }
