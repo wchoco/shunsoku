@@ -159,12 +159,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
-// スクラップファイル（#147）で足したもの
-use windows::Win32::Foundation::POINT;
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, IDC_SIZEALL, LoadCursorW, MA_NOACTIVATE, SetCursor, WM_MOUSEACTIVATE,
 };
+// 消しゴム（#145）で足したもの
+use shunsoku_core::annotate::Tool;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, IDC_ARROW, WindowFromPoint};
 
 mod cli;
 mod settings_gui;
@@ -214,7 +215,8 @@ const CMD_HIDE_ALL: u32 = 4;
 const CMD_SHOW_ALL: u32 = 5;
 const CMD_ADD_REGION: u32 = 6;
 const CMD_SETTINGS: u32 = 7;
-const CMD_OPEN: u32 = 8;
+const CMD_BLANK_SCRAP: u32 = 8;
+const CMD_OPEN: u32 = 9;
 /// ごみ箱の一覧の項目の番号は、これに一覧の添字を足したもの。
 const CMD_TRASH_FIRST: u32 = 100;
 /// 「定型領域」の項目の番号は、これに `Settings::regions` の添字を足したもの。
@@ -601,13 +603,19 @@ fn paint_scrap(
         }
     });
     let annotations = model.annotations_to_draw();
+    let selected: Vec<Rect> = model
+        .selected_annotations()
+        .iter()
+        .map(|a| a.bounds())
+        .collect();
     let typing = model.typing_annotation();
     let composition = model.edit_state().and_then(EditState::composition);
     let overlays = render::Overlays {
         annotations: render::AnnotationLayer {
             annotations: &annotations,
             view: model.annotation_view(),
-            selected: model.selected_annotation().map(|a| a.bounds()),
+            selected: &selected,
+            selection_range: model.selection_range(),
             typing: typing.as_ref().map(|annotation| render::TypingLayer {
                 annotation,
                 composition: composition.map_or("", |c| c.text.as_str()),
@@ -1218,31 +1226,50 @@ fn on_tray(owner: HWND, event: tray::Event) {
                 )
             })
             .unwrap_or_default();
-            let hide_or_show = if any_hidden {
-                menu::Entry::item(CMD_SHOW_ALL, text("tray.menu.show_all"), true)
-            } else {
-                menu::Entry::item(CMD_HIDE_ALL, text("tray.menu.hide_all"), any_scrap)
-            };
-            let items = [
-                menu::Entry::item(CMD_SELECT_CAPTURE, text("tray.menu.select_capture"), true),
-                menu::Entry::Submenu {
-                    label: text("tray.menu.regions").into(),
-                    enabled: true,
-                    items: region_entries,
-                },
-                menu::Entry::item(CMD_ADD_REGION, text("tray.menu.add_region"), true),
-                menu::Entry::item(CMD_OPEN, text("tray.menu.open"), true),
-                menu::Entry::Submenu {
-                    label: text("tray.menu.trash").into(),
-                    enabled: true,
-                    items: trash_entries,
-                },
-                menu::Entry::item(CMD_CLOSE_ALL, text("tray.menu.close_all"), any_scrap),
-                hide_or_show,
-                menu::Entry::Separator,
-                menu::Entry::item(CMD_SETTINGS, text("tray.menu.settings"), true),
-                menu::Entry::item(CMD_EXIT, text("tray.menu.exit"), true),
-            ];
+            use shunsoku_core::tray::MenuItem;
+            let (mut region_entries, mut trash_entries) =
+                (Some(region_entries), Some(trash_entries));
+            let items: Vec<menu::Entry> = shunsoku_core::tray::menu(any_hidden)
+                .into_iter()
+                .map(|item| match item {
+                    MenuItem::SelectCapture => menu::Entry::item(
+                        CMD_SELECT_CAPTURE,
+                        text("tray.menu.select_capture"),
+                        true,
+                    ),
+                    MenuItem::BlankScrap => {
+                        menu::Entry::item(CMD_BLANK_SCRAP, text("tray.menu.blank_scrap"), true)
+                    }
+                    MenuItem::Regions => menu::Entry::Submenu {
+                        label: text("tray.menu.regions").into(),
+                        enabled: true,
+                        items: region_entries.take().unwrap_or_default(),
+                    },
+                    MenuItem::AddRegion => {
+                        menu::Entry::item(CMD_ADD_REGION, text("tray.menu.add_region"), true)
+                    }
+                    MenuItem::Open => menu::Entry::item(CMD_OPEN, text("tray.menu.open"), true),
+                    MenuItem::Trash => menu::Entry::Submenu {
+                        label: text("tray.menu.trash").into(),
+                        enabled: true,
+                        items: trash_entries.take().unwrap_or_default(),
+                    },
+                    MenuItem::CloseAll => {
+                        menu::Entry::item(CMD_CLOSE_ALL, text("tray.menu.close_all"), any_scrap)
+                    }
+                    MenuItem::HideAll => {
+                        menu::Entry::item(CMD_HIDE_ALL, text("tray.menu.hide_all"), any_scrap)
+                    }
+                    MenuItem::ShowAll => {
+                        menu::Entry::item(CMD_SHOW_ALL, text("tray.menu.show_all"), true)
+                    }
+                    MenuItem::Separator => menu::Entry::Separator,
+                    MenuItem::Settings => {
+                        menu::Entry::item(CMD_SETTINGS, text("tray.menu.settings"), true)
+                    }
+                    MenuItem::Exit => menu::Entry::item(CMD_EXIT, text("tray.menu.exit"), true),
+                })
+                .collect();
             // モーダルなので App を借りずに呼ぶ
             let Some(command) = menu::show(owner, &items, x, y) else {
                 return;
@@ -1282,6 +1309,10 @@ fn on_command(command: u32) {
         CMD_ADD_REGION => {
             chosen_from_menu();
             request_capture(Source::AddRegion);
+        }
+        CMD_BLANK_SCRAP => {
+            chosen_from_menu();
+            request_capture(Source::BlankScrap);
         }
         CMD_CLOSE_ALL => close_all_scraps(),
         CMD_HIDE_ALL => set_scraps_visible(false),
@@ -1390,7 +1421,13 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             // SAFETY: 自分のウィンドウ
             unsafe { SetCapture(hwnd) };
             let at = message_screen_point();
-            if on_edit_input(hwnd, EditInput::Press(at)).is_some() {
+            // Shift を押していれば、選択の道具では選択に足したり外したりする
+            let press = if wparam.0 & MK_SHIFT != 0 {
+                EditInput::ShiftPress(at)
+            } else {
+                EditInput::Press(at)
+            };
+            if on_edit_input(hwnd, press).is_some() {
                 return Some(LRESULT(0));
             }
             if !on_trim_input(hwnd, TrimInput::Press(at)) {
@@ -1470,6 +1507,11 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
                 .flatten()
                 .unwrap_or(CursorShape::Cross);
             overlay::set_cursor(shape);
+            Some(LRESULT(1))
+        }
+        // 書き込みの編集モードで消しゴムを選んでいる間は、消しゴムのカーソルにする
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && has_eraser(hwnd) => {
+            scrap_window::set_eraser_cursor();
             Some(LRESULT(1))
         }
         // 文字を打っている間の文字（TranslateMessage が作る）
@@ -1757,13 +1799,14 @@ fn is_editing(hwnd: HWND) -> bool {
     .unwrap_or(false)
 }
 
+/// マウスのメッセージの wparam の、`Shift` を押しているかの印。Win32_System_SystemServices を足さないよう値で持つ。
+const MK_SHIFT: usize = 0x0004;
+
 /// 書き込みの編集モードのカーソルの移動。押したままでなければ（離したことを取りこぼしたなど）離したことにする。
 fn on_edit_move(hwnd: HWND, wparam: WPARAM, at: Point) {
     let pointer = pointer_on_move(hwnd, wparam);
     let input = if pointer.holding() {
-        // Shift を押していれば図形に制約をかける（正方形・円・45° 刻み）。wparam の MK_SHIFT は
-        // Win32_System_SystemServices を足さないよう値で持つ
-        const MK_SHIFT: usize = 0x0004;
+        // Shift を押していれば図形に制約をかける（正方形・円・45° 刻み）
         let shift = wparam.0 & MK_SHIFT != 0;
         EditInput::Move { at, shift }
     } else {
@@ -1782,6 +1825,9 @@ fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
         if outputs.contains(&EditOutput::CompositionTaken) {
             ime::cancel(hwnd);
         }
+        if outputs.contains(&EditOutput::ToolChanged) {
+            refresh_edit_cursor(hwnd);
+        }
         if !outputs.is_empty() {
             let switch = outputs
                 .iter()
@@ -1790,6 +1836,38 @@ fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
         }
     }
     outputs
+}
+
+/// 書き込みの編集モードで消しゴムを選んでいるか。
+fn has_eraser(hwnd: HWND) -> bool {
+    with_app(|app| {
+        app.scrap(hwnd)
+            .is_some_and(|s| s.model.edit_state().is_some_and(|e| e.tool == Tool::Eraser))
+    })
+    .unwrap_or(false)
+}
+
+/// 道具が替わったら、カーソルがスクラップの上にあればその形にし直す（キーで替えたとき、動かすまで前の形の
+/// ままにならないように）。ツールバーの上なら、スクラップに戻ったときの `WM_SETCURSOR` に任せる。
+fn refresh_edit_cursor(hwnd: HWND) {
+    let mut at = POINT::default();
+    // SAFETY: 書き込み先は生きている
+    if unsafe { GetCursorPos(&mut at) }.is_err() {
+        return;
+    }
+    // SAFETY: 問い合わせだけ
+    if unsafe { WindowFromPoint(at) } != hwnd {
+        return;
+    }
+    if has_eraser(hwnd) {
+        scrap_window::set_eraser_cursor();
+    } else {
+        // SAFETY: 共有のカーソルなので壊さなくてよい
+        if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+            // SAFETY: UI スレッドで呼ぶ
+            unsafe { SetCursor(Some(cursor)) };
+        }
+    }
 }
 
 /// 文字を打っているか。
@@ -2284,7 +2362,8 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
     let layer = render::AnnotationLayer {
         annotations: scrap.model.annotations().items(),
         view: scrap.model.output_view(),
-        selected: None,
+        selected: &[],
+        selection_range: None,
         typing: None,
         // 選択の印もキャレットも描かない
         scale: 1.0,
@@ -2824,7 +2903,8 @@ fn trash_thumbnail(scrap: &Scrap) -> Image {
     let layer = render::AnnotationLayer {
         annotations: scrap.model.annotations().items(),
         view: scrap.model.output_view(),
-        selected: None,
+        selected: &[],
+        selection_range: None,
         typing: None,
         scale: 1.0,
     };
@@ -3092,6 +3172,21 @@ fn finish_selection() {
         }
         return;
     }
+    if request.method == CaptureMethod::BlankScrap {
+        // 白紙スクラップは選んだ範囲（ウィンドウならその矩形）の位置と大きさだけを使い、画素は使わない
+        let rect = selection
+            .chosen_window()
+            .map(|chosen| chosen.rect)
+            .or_else(|| selection.rect());
+        // スクラップを前面にしてから範囲選択の画面を閉じる（前面にする権利を失わないように）
+        if let Some(rect) = rect {
+            create_blank_scrap(rect);
+        }
+        drop(overlay);
+        end_capture();
+        log::info!("overlay closed");
+        return;
+    }
     if let Some(chosen) = selection.chosen_window() {
         // ハイライトから選んだウィンドウは、範囲選択の画面を閉じてから WGC で撮る
         log::info!("window chosen on the overlay");
@@ -3284,7 +3379,8 @@ fn take_capture() {
         Some(
             request::CaptureMethod::Select
             | request::CaptureMethod::RegisterRegion
-            | request::CaptureMethod::ReselectRegion(_),
+            | request::CaptureMethod::ReselectRegion(_)
+            | request::CaptureMethod::BlankScrap,
         ) => open_overlay(),
         Some(request::CaptureMethod::ActiveWindow) => capture_active_window(),
         Some(request::CaptureMethod::Window(target)) => {
@@ -3675,6 +3771,7 @@ fn on_hotkey(wparam: WPARAM) {
         Some(settings::HotkeyAction::ActiveWindowCapture) => {
             request_capture(Source::ActiveWindowHotkey)
         }
+        Some(settings::HotkeyAction::BlankScrap) => request_capture(Source::BlankScrap),
         None => log::warn!("unknown hotkey id {}", wparam.0),
     }
 }
@@ -4067,23 +4164,63 @@ fn resolve_save_target(
 
 /// 画像をスクラップとして `at`（スクリーン座標）に等倍で浮かべ、`App::scraps` に入れる。出せなければ理由を返す。
 fn float_scrap(at: Point, image: Image, focus: bool) -> std::result::Result<(), String> {
+    let model = ScrapModel::new(at, image.size());
+    float_model(model, image, focus).map(|_| ())
+}
+
+/// `model` のスクラップ（元の画像は `image`）を浮かべ、`App::scraps` に入れる。出したウィンドウを返す。
+/// 出せなければ理由を返す。
+fn float_model(model: ScrapModel, image: Image, focus: bool) -> std::result::Result<HWND, String> {
     let Some((module, appearance)) =
         with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
     else {
         return Err(text("job.panicked").to_owned());
     };
     // ウィンドウを作るとメッセージが届くので、App を借りずに作る
-    let model = ScrapModel::new(at, image.size());
     match open_scrap(module, model, image, &appearance, focus) {
         Ok(scrap) => {
+            let hwnd = scrap.window.hwnd();
             if with_app(|app| app.scraps.push(scrap)).is_none() {
                 log::warn!("could not keep the scrap");
             }
-            Ok(())
+            Ok(hwnd)
         }
         Err(e) => {
             log::error!("could not open a scrap: {e}");
             Err(e.to_string())
+        }
+    }
+}
+
+/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移し、すぐに書き込みの
+/// 編集モードに入る。出せなければ通知する。
+fn create_blank_scrap(rect: Rect) {
+    let Some(background) = with_app(|app| app.settings.annotation.background) else {
+        return;
+    };
+    let model = ScrapModel::blank(rect.origin(), rect.size(), background);
+    let Some(image) = model.blank_image() else {
+        log::error!("could not paint the blank scrap of {:?}", rect.size());
+        return;
+    };
+    log::info!(
+        "blank scrap {}x{} at ({}, {})",
+        rect.width(),
+        rect.height(),
+        rect.left,
+        rect.top
+    );
+    match float_model(model, image, true) {
+        Ok(hwnd) => {
+            if let Some(op) = ops::find("annotate") {
+                run_scrap_operation(hwnd, op, OpContext::default());
+            }
+        }
+        Err(reason) => {
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{reason}", text("blank_scrap.failed")),
+            );
         }
     }
 }
@@ -4125,26 +4262,14 @@ fn open_scrap_file() {
             return;
         }
     };
-    let Some((module, appearance)) =
-        with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
-    else {
-        return;
-    };
     let (model, content) = file.into_scrap(cursor_monitor());
     let scrap_file::Content::Image(image) = content;
-    // ウィンドウを作るとメッセージが届くので、App を借りずに作る
-    match open_scrap(module, model, image, &appearance, true) {
-        Ok(scrap) => {
-            log::info!("opened {}", path.display());
-            if with_app(|app| app.scraps.push(scrap)).is_none() {
-                log::warn!("could not keep the scrap");
-            }
-        }
-        Err(e) => {
-            log::error!("could not open a scrap: {e}");
+    match float_model(model, image, true) {
+        Ok(_) => log::info!("opened {}", path.display()),
+        Err(reason) => {
             notify_user(
                 notify::Level::Error,
-                &format!("{}\n{e}", text("scrap_file.unreadable")),
+                &format!("{}\n{reason}", text("scrap_file.unreadable")),
             );
         }
     }

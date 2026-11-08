@@ -7,6 +7,7 @@ tooltip = "shunsoku"
 
 [tray.menu]
 select_capture = "Region capture"
+blank_scrap = "Blank scrap"
 regions = "Saved regions"
 regions_empty = "(None)"
 add_region = "Add saved region…"
@@ -142,6 +143,8 @@ width = "Width:"
 font_size = "Text size:"
 font = "Font:"
 hint = "Defaults for new drawings. Existing drawings do not change."
+blank_scrap = "Blank scrap:"
+blank_background = "Blank background:"
 
 [settings_gui.scrap_ops]
 operation = "Action"
@@ -328,3 +331,6 @@ time = "{time}  Time (090504)"
 datetime = "{datetime:…}  Date and time format (2026-03-07_09-05-04)"
 seq = "{seq}  Sequence number (1, 2, …)"
 seq3 = "{seq:3}  3-digit sequence number (001, 002, …)"
+
+[blank_scrap]
+failed = "Could not create a blank scrap."

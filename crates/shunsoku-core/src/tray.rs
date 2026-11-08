@@ -2,6 +2,7 @@
 //! wParam）から、本体が何をするかを決める。Win32 層の `tray` はメッセージの値をそのまま渡すだけにする。
 //!
 //! 左クリックも右クリックもキーボードでの選択も、同じメニューを出す（#119）。ダブルクリックには何も割り当てない。
+//! メニューに並べる項目と順番は `menu` で決め、Win32 層は項目ごとの文言と中身（定型領域・ごみ箱の一覧）を付けて出す。
 
 /// `NIN_SELECT`（`WM_USER + 0`）。左クリック。
 pub const NIN_SELECT: u32 = 0x0400;
@@ -39,12 +40,95 @@ pub fn event(code: u32, wparam: usize) -> Event {
     }
 }
 
+/// トレイのメニューの項目。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuItem {
+    /// 範囲選択キャプチャ。
+    SelectCapture,
+    /// 白紙スクラップ（範囲選択の画面で位置と大きさを選んで作る）。
+    BlankScrap,
+    /// 定型領域のサブメニュー。
+    Regions,
+    /// 定型領域を追加…。
+    AddRegion,
+    /// 開く…（スクラップファイルを選んで開く）。
+    Open,
+    /// ごみ箱のサブメニュー。
+    Trash,
+    /// すべてのスクラップを閉じる。
+    CloseAll,
+    /// すべて隠す。
+    HideAll,
+    /// すべて表示。
+    ShowAll,
+    Separator,
+    /// 設定…。
+    Settings,
+    /// 終了。
+    Exit,
+}
+
+/// メニューに並べる項目（上から）。1 枚でも隠れたスクラップがあれば（`any_hidden`）「すべて表示」、なければ
+/// 「すべて隠す」を出す。
+pub fn menu(any_hidden: bool) -> Vec<MenuItem> {
+    vec![
+        MenuItem::SelectCapture,
+        MenuItem::BlankScrap,
+        MenuItem::Regions,
+        MenuItem::AddRegion,
+        MenuItem::Open,
+        MenuItem::Trash,
+        MenuItem::CloseAll,
+        if any_hidden {
+            MenuItem::ShowAll
+        } else {
+            MenuItem::HideAll
+        },
+        MenuItem::Separator,
+        MenuItem::Settings,
+        MenuItem::Exit,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// x = 100, y = 200 を wParam の形にしたもの。
     const AT_100_200: usize = (200 << 16) | 100;
+
+    #[test]
+    fn the_menu_offers_a_blank_scrap_right_after_the_select_capture() {
+        let items = menu(false);
+        let at = items
+            .iter()
+            .position(|&i| i == MenuItem::SelectCapture)
+            .unwrap();
+        assert_eq!(items.get(at + 1), Some(&MenuItem::BlankScrap));
+    }
+
+    #[test]
+    fn the_menu_offers_to_open_a_scrap_file_after_the_saved_regions() {
+        let items = menu(false);
+        let at = items
+            .iter()
+            .position(|&i| i == MenuItem::AddRegion)
+            .unwrap();
+        assert_eq!(items.get(at + 1), Some(&MenuItem::Open));
+    }
+
+    #[test]
+    fn the_menu_offers_to_show_all_only_while_some_scrap_is_hidden() {
+        assert!(menu(false).contains(&MenuItem::HideAll));
+        assert!(!menu(false).contains(&MenuItem::ShowAll));
+        assert!(menu(true).contains(&MenuItem::ShowAll));
+        assert!(!menu(true).contains(&MenuItem::HideAll));
+    }
+
+    #[test]
+    fn the_menu_ends_with_the_settings_and_exit() {
+        assert!(menu(false).ends_with(&[MenuItem::Separator, MenuItem::Settings, MenuItem::Exit]));
+    }
 
     #[test]
     fn a_left_click_opens_the_menu_at_the_icon() {
