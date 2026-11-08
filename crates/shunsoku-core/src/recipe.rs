@@ -1449,6 +1449,46 @@ mod tests {
     }
 
     #[test]
+    fn a_background_step_can_make_a_written_blank_scrap_transparent_then_goes_on() {
+        let checked = checked_steps(r#"[{ op = "background", color = "transparent" }, "copy"]"#);
+        assert_eq!(checked.problems, vec![]);
+        assert_eq!(
+            checked.plans[0].steps[0].values,
+            Some(StepValues::Background(Background::Transparent))
+        );
+        let mut run = run_of_steps(r#"[{ op = "background", color = "transparent" }, "copy"]"#);
+        let mut scrap = ScrapModel::blank(
+            Point::new(0, 0),
+            Size::new(20, 10),
+            Background::Color(Rgb(0x21, 0x21, 0x21)),
+        );
+        scrap.start_editing(crate::annotate::Style::default());
+        scrap.edit_input(crate::annotate::EditInput::Press(Point::new(1, 1)));
+        scrap.edit_input(crate::annotate::EditInput::Move {
+            at: Point::new(8, 8),
+            shift: false,
+        });
+        scrap.edit_input(crate::annotate::EditInput::Leave);
+        assert_eq!(
+            step(&mut run, &mut scrap),
+            ("background", vec![Effect::Redraw])
+        );
+        assert_eq!(scrap.background(), Some(Background::Transparent));
+        run.settle(Outcome::Succeeded);
+        assert_eq!(
+            step(&mut run, &mut scrap),
+            ("copy", vec![Effect::CopyToClipboard])
+        );
+    }
+
+    #[test]
+    fn a_background_step_with_a_misspelt_transparent_makes_the_recipe_an_error() {
+        let checked = checked_steps(r#"[{ op = "background", color = "Transparent" }]"#);
+        assert_eq!(checked.problems.len(), 1, "{:?}", checked.problems);
+        assert!(checked.plans.is_empty());
+    }
+
+    #[test]
     fn a_background_step_repaints_a_blank_scrap_then_goes_on() {
         let mut run = run_of_steps(r##"[{ op = "background", color = "#212121" }, "copy"]"##);
         let mut scrap = white_blank();

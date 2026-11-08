@@ -24,6 +24,7 @@ use crate::geometry::Rect;
 use crate::keys::Chord;
 pub use crate::recipe::AppearanceItem;
 use crate::recipe::{self, AppearanceStep, ItemValue, Recipe, Step, StepKey, Written};
+use crate::scrap::Background;
 use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationId};
 
 /// 設定 GUI の写し。
@@ -494,6 +495,8 @@ pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> S
         Step::Appearance(step) => step.values,
         Step::Background(step) => {
             return match step.color {
+                Some(Background::Transparent) => text("settings_gui.recipes.step.background")
+                    .replace("{color}", text("scrap.background.transparent")),
                 Some(color) => text("settings_gui.recipes.step.background")
                     .replace("{color}", &color.to_string()),
                 None => text("scrap.op.background").to_owned(),
@@ -1381,6 +1384,14 @@ mod tests {
             .iter()
             .map(|s| step_label(s, |key| catalog.text(key)))
             .collect()
+    }
+
+    #[test]
+    fn the_step_list_names_a_transparent_background_in_words() {
+        let editor = with_steps_read(
+            r##"[{ op = "background", color = "transparent" }, { op = "background", color = "#ffffff" }]"##,
+        );
+        assert_eq!(labels(&editor), ["背景色: 透明", "背景色: #FFFFFF"]);
     }
 
     #[test]

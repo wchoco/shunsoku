@@ -247,6 +247,9 @@ const WM_APP_SCRAP_DPI: u32 = WM_APP + 0x100;
 /// スクラップが非アクティブになった（`WM_ACTIVATE` の `WA_INACTIVE`）。隠す・壊すなど App を借りている間にも届くので、
 /// 自分に送り直して借りられるときに編集モードを抜ける。
 const WM_APP_SCRAP_INACTIVE: u32 = WM_APP + 0x101;
+/// 何も書かれていない透明な白紙スクラップが書き込みの編集モードを抜けた。抜けるのはキー・マウス・ツールバー・
+/// 非アクティブなど、どのメッセージの途中でもありうるので、自分に送って、そのメッセージを終えてから捨てる。
+const WM_APP_SCRAP_DISCARD: u32 = WM_APP + 0x102;
 
 /// UI スレッドのパニックで終わったときの終了コード（Rust の既定と同じ）。
 const EXIT_PANIC: i32 = 101;
@@ -631,10 +634,13 @@ fn paint_scrap(
         label,
         trim: trim.as_ref(),
     };
-    let caret = painter.paint_scrap(&canvas, image, display, appearance, overlays)?;
+    // 透明な白紙スクラップは、透明な部分も当たり判定に入るよう、見えないほど小さいアルファを敷く
+    let see_through = model.background() == Some(Background::Transparent);
+    let hit_alpha = see_through.then(|| appearance.hit_alpha());
+    let caret = painter.paint_scrap(&canvas, image, display, appearance, hit_alpha, overlays)?;
     *renderer = Some(painter);
     // レイヤード ウィンドウは中身を写して持つので、canvas はここで捨ててよい
-    window.present(canvas.dc(), rect, appearance.opacity)?;
+    window.present(canvas.dc(), rect, appearance.constant_alpha())?;
     Ok(caret)
 }
 
@@ -1587,6 +1593,10 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             on_scrap_dpi_changed(hwnd, wparam.0 as u32);
             Some(LRESULT(0))
         }
+        WM_APP_SCRAP_DISCARD => {
+            discard_scrap(hwnd);
+            Some(LRESULT(0))
+        }
         _ => None,
     }
 }
@@ -1940,6 +1950,14 @@ fn edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
             );
             // ツールバーのウィンドウを壊すときに届くメッセージでは App を借りない
             scrap.toolbar = None;
+            if scrap.model.is_empty_transparent_blank() {
+                // SAFETY: 自分のウィンドウに送る
+                if let Err(e) =
+                    unsafe { PostMessageW(Some(hwnd), WM_APP_SCRAP_DISCARD, WPARAM(0), LPARAM(0)) }
+                {
+                    log::warn!("could not post the discard of an empty transparent scrap: {e}");
+                }
+            }
         }
         for output in &outputs {
             if let EditOutput::Picked(pick) = output {
@@ -2350,6 +2368,8 @@ struct Performed {
 /// `App` を返したあとに行う `Effect`。
 enum Deferred {
     Copy(Image),
+    /// 透明な白紙スクラップのコピー: アルファつきの PNG と、白の上に描いたビットマップの両方を置く。
+    CopyWithAlpha(Image),
     Save(Image),
     SaveAs(Image),
     SaveScrapFile(Box<ScrapFile>),
@@ -2359,6 +2379,8 @@ enum Deferred {
         reason: String,
     },
     Close,
+    /// ごみ箱に入れずに捨てる（`Effect::Discard`）。
+    Discard,
     /// 「その他の色…」: 今の背景の色から色の選択ダイアログを出す。
     PickBackground(Rgb),
 }
@@ -2475,9 +2497,15 @@ fn perform(
                 }
                 Effect::ShowZoom => {}
                 Effect::MoveToTrash => deferred.push(Deferred::Close),
+                Effect::Discard => deferred.push(Deferred::Discard),
                 // 描くだけでメッセージは届かないので、借りたまま描く
                 Effect::CopyToClipboard => {
-                    deferred.push(render_for(scrap, Deferred::Copy, "copy.failed"));
+                    let job = if scrap.model.background() == Some(Background::Transparent) {
+                        Deferred::CopyWithAlpha
+                    } else {
+                        Deferred::Copy
+                    };
+                    deferred.push(render_for(scrap, job, "copy.failed"));
                 }
                 Effect::SaveDefault => {
                     deferred.push(render_for(scrap, Deferred::Save, "save.failed"));
@@ -2518,7 +2546,8 @@ fn perform(
     let outcomes: Vec<Outcome> = deferred
         .into_iter()
         .map(|action| match action {
-            Deferred::Copy(image) => copy_to_clipboard(&image),
+            Deferred::Copy(image) => copy_to_clipboard(&image, false),
+            Deferred::CopyWithAlpha(image) => copy_to_clipboard(&image, true),
             Deferred::Save(image) => save(save_default(image)),
             Deferred::SaveAs(image) => save(save_as(hwnd, image)),
             Deferred::SaveScrapFile(file) => save(save_scrap_file(hwnd, file)),
@@ -2532,6 +2561,10 @@ fn perform(
             }
             Deferred::Close => {
                 close_scrap(hwnd);
+                Outcome::Succeeded
+            }
+            Deferred::Discard => {
+                discard_scrap(hwnd);
                 Outcome::Succeeded
             }
             Deferred::PickBackground(current) => pick_background(hwnd, current),
@@ -2563,9 +2596,10 @@ fn pick_background(hwnd: HWND, current: Rgb) -> Outcome {
     .map_or(Outcome::Failed, |performed| performed.outcome)
 }
 
-/// `Effect::CopyToClipboard`: 画像をクリップボードに置く。失敗したらエラーの通知を出し、失敗を返す。
-fn copy_to_clipboard(image: &Image) -> Outcome {
-    match copy_image(image) {
+/// `Effect::CopyToClipboard`: 画像をクリップボードに置く（`with_alpha` なら `clipboard::copy_with_alpha`）。
+/// 失敗したらエラーの通知を出し、失敗を返す。
+fn copy_to_clipboard(image: &Image, with_alpha: bool) -> Outcome {
+    match copy_image(image, with_alpha) {
         Ok(()) => Outcome::Succeeded,
         Err(reason) => {
             notify_user(notify::Level::Error, &reason);
@@ -2574,12 +2608,18 @@ fn copy_to_clipboard(image: &Image) -> Outcome {
     }
 }
 
-/// 画像をクリップボードに置く。失敗したら通知に出す理由を返す（通知はしない）。
-fn copy_image(image: &Image) -> std::result::Result<(), String> {
+/// 画像をクリップボードに置く（`with_alpha` なら PNG と白の上に描いたビットマップの両方）。失敗したら通知に
+/// 出す理由を返す（通知はしない）。
+fn copy_image(image: &Image, with_alpha: bool) -> std::result::Result<(), String> {
     let Some(owner) = with_app(|app| app.windows.message) else {
         return Err(text("job.panicked").to_owned());
     };
-    match clipboard::copy(owner, image) {
+    let copied = if with_alpha {
+        clipboard::copy_with_alpha(owner, image)
+    } else {
+        clipboard::copy(owner, image)
+    };
+    match copied {
         Ok(()) => {
             log::info!(
                 "copied {}x{} to the clipboard",
@@ -2899,8 +2939,28 @@ fn save_failed(path: Option<&Path>, reason: &str) {
     notify_user(notify::Level::Error, &body);
 }
 
-/// スクラップを閉じて、閉じる直前の状態のままごみ箱に移す（上限が 0 なら破棄する）。
+/// スクラップを閉じて、閉じる直前の状態のままごみ箱に移す（上限が 0 なら破棄する）。何も書かれていない透明な
+/// 白紙スクラップ（編集モードの途中で閉じたものも）は、ごみ箱に入れずに捨てる。
 fn close_scrap(hwnd: HWND) {
+    remove_scrap(hwnd, true);
+}
+
+/// 何も書かれていない透明な白紙スクラップを、ごみ箱に入れずに捨てる（`Effect::Discard` と、編集モードを
+/// 抜けたあとの `WM_APP_SCRAP_DISCARD`）。送ってから届くまでの間に書き込みの編集モードに入り直したか、
+/// 何か書かれていれば捨てない。
+fn discard_scrap(hwnd: HWND) {
+    let discardable = with_app(|app| {
+        app.scrap(hwnd)
+            .is_some_and(|s| !s.model.is_editing() && s.model.is_empty_transparent_blank())
+    })
+    .unwrap_or(false);
+    if discardable {
+        remove_scrap(hwnd, false);
+    }
+}
+
+/// スクラップを閉じる。`to_trash` で、何も書かれていない透明な白紙スクラップでなければ、ごみ箱に移す。
+fn remove_scrap(hwnd: HWND, to_trash: bool) {
     let removed = with_app(|app| {
         // 保存を待っているレシピは、スクラップと一緒に捨てる
         if app.recipe.discard_for(&(hwnd.0 as isize)).is_some() {
@@ -2910,7 +2970,8 @@ fn close_scrap(hwnd: HWND) {
         let mut scrap = app.scraps.remove(index);
         // トリムの範囲を選んでいる途中で閉じたら選ぶ前の状態で、書き込みの編集モードなら抜けてから入れる
         scrap.model.settle();
-        let thumbnail = trash_thumbnail(&scrap);
+        let to_trash = to_trash && !scrap.model.is_empty_transparent_blank();
+        let thumbnail = to_trash.then(|| trash_thumbnail(&scrap));
         let Scrap {
             toolbar,
             window,
@@ -2919,15 +2980,21 @@ fn close_scrap(hwnd: HWND) {
             ..
         } = scrap;
         // 一時ファイルは裏のスレッドで書くので、借りたままでよい
-        app.trash.push(model, image, thumbnail, save::now());
-        Some((toolbar, window))
+        if let Some(thumbnail) = thumbnail {
+            app.trash.push(model, image, thumbnail, save::now());
+        }
+        Some((toolbar, window, to_trash))
     })
     .flatten();
     // ウィンドウを壊すとメッセージが届くので、App を借りずに壊す（ツールバーが先）
-    if let Some((toolbar, window)) = removed {
+    if let Some((toolbar, window, to_trash)) = removed {
         drop(toolbar);
         drop(window);
-        log::info!("scrap closed");
+        if to_trash {
+            log::info!("scrap closed");
+        } else {
+            log::info!("empty transparent blank scrap discarded");
+        }
     }
 }
 
@@ -3467,7 +3534,7 @@ fn output(request: CaptureRequest, area: Rect, image: Image) {
         reply_failed(reply_to, reason);
     };
     if outputs.copy
-        && let Err(reason) = copy_image(&image)
+        && let Err(reason) = copy_image(&image, false)
     {
         if strict {
             fail(&reason);

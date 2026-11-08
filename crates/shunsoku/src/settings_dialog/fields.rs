@@ -548,8 +548,10 @@ pub fn color_of(settings: &Settings, field: Field) -> Option<Rgb> {
     match field {
         Field::BorderColor => Some(settings.scrap.border.color),
         Field::AnnotationColor => Some(settings.annotation.color),
+        // 透明なら、色の選択ダイアログは白から始める（欄には `transparent` とも書ける）
         Field::BlankBackground => match settings.annotation.background {
             Background::Color(c) => Some(c),
+            Background::Transparent => Some(Rgb(0xFF, 0xFF, 0xFF)),
         },
         Field::CrosshairColor => Some(settings.selection.crosshair_color),
         _ => None,
@@ -597,6 +599,8 @@ pub enum Rejected {
     Number { min: u32, max: u32 },
     /// `#RRGGBB`。
     Color,
+    /// `#RRGGBB` か `transparent`（白紙の背景色）。
+    Background,
     /// 絶対パスのフォルダ（空なら既定）。
     Folder,
     /// 空でないテンプレート。
@@ -615,6 +619,7 @@ impl Rejected {
                 .replace("{min}", &min.to_string())
                 .replace("{max}", &max.to_string()),
             Rejected::Color => text("settings_gui.invalid.color").to_owned(),
+            Rejected::Background => text("settings_gui.invalid.background").to_owned(),
             Rejected::Folder => text("settings_gui.invalid.folder").to_owned(),
             Rejected::Template => text("settings_gui.invalid.template").to_owned(),
         }
@@ -645,7 +650,7 @@ pub fn rejected(field: Field, s: &str) -> Option<Rejected> {
             .trim()
             .parse::<Background>()
             .is_err()
-            .then_some(Rejected::Color),
+            .then_some(Rejected::Background),
         _ => None,
     }
 }

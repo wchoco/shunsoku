@@ -112,6 +112,22 @@ impl Image {
         Some(Image { size, pixels })
     }
 
+    /// 白の上に描いた、不透明な画像（アルファを扱えないアプリに貼るクリップボードの画像）。
+    pub fn on_white(&self) -> Image {
+        let mut pixels = self.pixels.clone();
+        for px in pixels.chunks_exact_mut(BPP) {
+            let a = u32::from(px[3]);
+            for c in &mut px[..3] {
+                *c = ((u32::from(*c) * a + 255 * (255 - a) + 127) / 255) as u8;
+            }
+            px[3] = 255;
+        }
+        Image {
+            size: self.size,
+            pixels,
+        }
+    }
+
     /// PNG（8 bit の RGBA）に書き出す。
     pub fn write_png(&self, out: impl std::io::Write) -> Result<(), png::EncodingError> {
         let mut encoder = png::Encoder::new(out, self.size.width, self.size.height);
@@ -260,6 +276,22 @@ mod tests {
         (0..image.height())
             .map(|y| (0..image.width()).map(|x| image.pixel(x, y)).collect())
             .collect()
+    }
+
+    #[test]
+    fn flattening_onto_white_blends_by_alpha_and_makes_every_pixel_opaque() {
+        let image =
+            Image::from_bgra(Size::new(3, 1), [CLEAR, RED, [0, 0, 255, 128]].concat()).unwrap();
+        let flat = image.on_white();
+        assert_eq!(
+            rows(&flat),
+            [vec![
+                [255, 255, 255, 255],
+                RED,
+                // 赤の半分と白の半分
+                [127, 127, 255, 255]
+            ]]
+        );
     }
 
     #[test]
