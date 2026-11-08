@@ -313,10 +313,20 @@ impl ScrapModel {
         }
     }
 
+    /// 白紙スクラップか（画像を持たず、背景色の一色を下地にする）。
+    pub fn is_blank(&self) -> bool {
+        self.background.is_some()
+    }
+
+    /// 背景が透明な白紙スクラップか。透明な部分も当たり判定に入れ、コピーではアルファを残す。
+    pub fn is_transparent_blank(&self) -> bool {
+        self.background == Some(Background::Transparent)
+    }
+
     /// 何も書かれていない透明な白紙スクラップか。画面では見えずにつかめるだけなので、書き込みの編集モードを
     /// 抜けたら（どの抜け方でも）ごみ箱に入れずに捨てる。
     pub fn is_empty_transparent_blank(&self) -> bool {
-        self.background == Some(Background::Transparent) && self.annotations.is_empty()
+        self.is_transparent_blank() && self.annotations.is_empty()
     }
 
     /// 白紙スクラップの元の画像に当たる下地（大きさが `image_size` の、背景色の一色）。画素は持たずに背景色から
@@ -1280,6 +1290,17 @@ mod tests {
         for wrong in ["Transparent", "clear", "none", ""] {
             assert_eq!(wrong.parse::<Background>(), Err(NotBackground), "{wrong}");
         }
+    }
+
+    #[test]
+    fn a_blank_scrap_is_transparent_only_with_the_transparent_background() {
+        let size = Size::new(4, 4);
+        let transparent = ScrapModel::blank(Point::default(), size, Background::Transparent);
+        let white = ScrapModel::blank(Point::default(), size, Background::WHITE);
+        let captured = ScrapModel::new(Point::default(), size);
+        assert!(transparent.is_blank() && transparent.is_transparent_blank());
+        assert!(white.is_blank() && !white.is_transparent_blank());
+        assert!(!captured.is_blank() && !captured.is_transparent_blank());
     }
 
     #[test]

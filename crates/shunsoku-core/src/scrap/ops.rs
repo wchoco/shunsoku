@@ -617,7 +617,7 @@ pub const TRANSPARENT_BACKGROUND: i32 = -2;
 
 /// 白紙スクラップで、畳んでいなければ実行できる。
 fn blank_and_not_compact(model: &ScrapModel) -> bool {
-    not_compact(model) && model.background().is_some()
+    not_compact(model) && model.is_blank()
 }
 
 /// 背景色の一覧: ツールバーと同じ 8 色（`PALETTE`）、「透明」と「その他の色…」。並びにない色なら
@@ -1539,7 +1539,7 @@ pub fn menu(
     let mut listed: Vec<&OperationDescriptor> = ops
         .iter()
         .filter(|op| op.in_menu && !op.drag_only)
-        .filter(|op| model.background().is_some() || !BLANK_ONLY.contains(&op.id))
+        .filter(|op| model.is_blank() || !BLANK_ONLY.contains(&op.id))
         .collect();
     listed.sort_by_key(|op| (op.group, op.order));
     let mut entries = Vec::new();

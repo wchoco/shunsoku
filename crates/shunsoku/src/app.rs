@@ -632,7 +632,7 @@ fn paint_scrap(
         trim: trim.as_ref(),
     };
     // 透明な白紙スクラップは、透明な部分も当たり判定に入るよう、見えないほど小さいアルファを敷く
-    let see_through = model.background() == Some(Background::Transparent);
+    let see_through = model.is_transparent_blank();
     let hit_alpha = see_through.then(|| appearance.hit_alpha());
     let caret = painter.paint_scrap(&canvas, image, display, appearance, hit_alpha, overlays)?;
     *renderer = Some(painter);
@@ -2497,7 +2497,7 @@ fn perform(
                 Effect::Discard => deferred.push(Deferred::Discard),
                 // 描くだけでメッセージは届かないので、借りたまま描く
                 Effect::CopyToClipboard => {
-                    let job = if scrap.model.background() == Some(Background::Transparent) {
+                    let job = if scrap.model.is_transparent_blank() {
                         Deferred::CopyWithAlpha
                     } else {
                         Deferred::Copy
