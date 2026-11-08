@@ -476,7 +476,7 @@ impl Editor {
     /// レシピ `index` の操作 `step` を選んでいる間に出すパラメータの欄。パラメータの欄のない操作か、操作が
     /// なければ None（欄を出さない）。
     pub fn param_fields(&self, index: usize, step: usize) -> Option<ParamFields> {
-        match self.draft.recipes.get(index)?.steps.get(step)? {
+        match self.step(index, step)? {
             Step::Appearance(_) => Some(ParamFields::Appearance),
             Step::Background(_) => Some(ParamFields::Background),
             Step::CaptureRegion(_) => Some(ParamFields::Region),
@@ -488,7 +488,7 @@ impl Editor {
     /// いる位置（選んでいないか、名前が読めなければ None）。写しにない名前を選んでいれば、それも末尾に足して選んで
     /// おく（表示だけ）。定型領域キャプチャでなければ None。
     pub fn capture_region(&self, index: usize, step: usize) -> Option<RegionChoices> {
-        let Step::CaptureRegion(step) = self.draft.recipes.get(index)?.steps.get(step)? else {
+        let Step::CaptureRegion(step) = self.step(index, step)? else {
             return None;
         };
         let mut names: Vec<String> = self.draft.regions.iter().map(|r| r.name.clone()).collect();
@@ -501,25 +501,30 @@ impl Editor {
         Some(RegionChoices { names, selected })
     }
 
+    /// レシピ `index` の操作 `step`。
+    fn step(&self, index: usize, step: usize) -> Option<&Step> {
+        self.draft.recipes.get(index)?.steps.get(step)
+    }
+
+    /// レシピ `index` の操作 `step`（書き換える）。
+    fn step_mut(&mut self, index: usize, step: usize) -> Option<&mut Step> {
+        self.draft.recipes.get_mut(index)?.steps.get_mut(step)
+    }
+
     /// レシピ `index` の操作 `step`（定型領域キャプチャ）で撮る定型領域を、名前 `name` の定型領域にする。設定
     /// ファイルから読めなかった名前は消す。定型領域キャプチャでなければ何もしない。
     pub fn set_capture_region(&mut self, index: usize, step: usize, name: &str) {
-        let Some(Step::CaptureRegion(step)) = self
-            .draft
-            .recipes
-            .get_mut(index)
-            .and_then(|r| r.steps.get_mut(step))
-        else {
+        let Some(Step::CaptureRegion(step)) = self.step_mut(index, step) else {
             return;
         };
-        step.rejected.retain(|r| r.key != StepKey::Region);
+        forget_rejected(&mut step.rejected, &StepKey::Region);
         step.region = Some(name.to_owned());
     }
 
     /// レシピ `index` の操作 `step` が背景色を指定する操作なら、その色（選んでいないか、設定ファイルに書いた色が
     /// 読めなければ None）。背景色を指定する操作でなければ None。
     pub fn background(&self, index: usize, step: usize) -> Option<Option<Background>> {
-        match self.draft.recipes.get(index)?.steps.get(step)? {
+        match self.step(index, step)? {
             Step::Background(step) => Some(step.color),
             Step::Op(_) | Step::Appearance(_) | Step::CaptureRegion(_) => None,
         }
@@ -529,15 +534,10 @@ impl Editor {
     /// チェックで `Transparent`。チェックを外したら None で、色を選ぶまで `NoValues`）。設定ファイルから読めなかった
     /// 色は消す。背景色を指定する操作でなければ何もしない。
     pub fn set_background(&mut self, index: usize, step: usize, color: Option<Background>) {
-        let Some(Step::Background(step)) = self
-            .draft
-            .recipes
-            .get_mut(index)
-            .and_then(|r| r.steps.get_mut(step))
-        else {
+        let Some(Step::Background(step)) = self.step_mut(index, step) else {
             return;
         };
-        step.rejected.retain(|r| r.key != StepKey::Color);
+        forget_rejected(&mut step.rejected, &StepKey::Color);
         step.color = color;
     }
 
@@ -549,7 +549,7 @@ impl Editor {
         step: usize,
         item: AppearanceItem,
     ) -> Option<AppearanceInput> {
-        let Some(Step::Appearance(step)) = self.draft.recipes.get(index)?.steps.get(step) else {
+        let Some(Step::Appearance(step)) = self.step(index, step) else {
             return None;
         };
         let text = match step.values.get(item) {
@@ -582,18 +582,13 @@ impl Editor {
         item: AppearanceItem,
         input: AppearanceInput,
     ) {
-        let Some(Step::Appearance(step)) = self
-            .draft
-            .recipes
-            .get_mut(index)
-            .and_then(|r| r.steps.get_mut(step))
-        else {
+        let Some(Step::Appearance(step)) = self.step_mut(index, step) else {
             return;
         };
         if item.is_switch() != matches!(input, AppearanceInput::Switch(_)) {
             return;
         }
-        step.rejected.retain(|r| r.key != StepKey::Item(item));
+        forget_rejected(&mut step.rejected, &StepKey::Item(item));
         let written = match &input {
             AppearanceInput::Switch(on) => on.map(Written::Bool),
             AppearanceInput::Text(s) => {
@@ -746,6 +741,11 @@ pub const SWITCH_CHOICES: [(Option<bool>, &str); 3] = [
 
 /// 「変えない」の文言のキー。文字の欄では、空のときに薄く出す。
 pub const UNCHANGED_KEY: &str = "settings_gui.recipes.appearance.unchanged";
+
+/// 操作のパラメータ `key` を設定 GUI の欄で書き直すので、設定ファイルから読めなかったその値（`rejected`）を消す。
+fn forget_rejected(rejected: &mut Vec<recipe::Rejected>, key: &StepKey) {
+    rejected.retain(|r| &r.key != key);
+}
 
 /// 読めなかった値（TOML の書き方）を欄に出す文字にする。文字列なら中身、ほかはそのまま。
 fn unquoted(written: &str) -> String {
