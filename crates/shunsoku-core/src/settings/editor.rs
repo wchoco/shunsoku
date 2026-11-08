@@ -492,6 +492,13 @@ pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> S
                 .map_or_else(|| id.clone(), |op| text(op.label_key).to_owned());
         }
         Step::Appearance(step) => step.values,
+        Step::Background(step) => {
+            return match step.color {
+                Some(color) => text("settings_gui.recipes.step.background")
+                    .replace("{color}", &color.to_string()),
+                None => text("scrap.op.background").to_owned(),
+            };
+        }
     };
     let mut items: Vec<String> = Vec::new();
     if let Some(opacity) = values.opacity {

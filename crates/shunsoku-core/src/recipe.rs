@@ -1,8 +1,8 @@
 //! レシピ（名前を付けた、スクラップ操作の並び）。ADR-0007。
 
 use crate::keys::Chord;
-use crate::scrap::ScrapModel;
 use crate::scrap::ops::{Effect, InRecipe, OpContext, OperationDescriptor, OperationId};
+use crate::scrap::{Background, ScrapModel};
 use crate::settings::{BORDER_WIDTH_RANGE, OPACITY_RANGE, Rgb};
 
 /// 設定ファイルの `[[recipes]]` の 1 つ。中身の検査はまだしていない（書いたまま）。
@@ -17,6 +17,9 @@ pub struct Recipe {
 /// 値のある手の操作の id（設定ファイルの `op = "appearance"`）。ADR-0008。
 pub const APPEARANCE: &str = "appearance";
 
+/// 背景色を指定する値のある手の操作の id（設定ファイルの `op = "background"`）。白紙スクラップだけで動く。
+pub const BACKGROUND: &str = "background";
+
 /// レシピの手 1 つ（設定ファイルの `steps` の要素）。中身の検査はまだしていない（書いたまま）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -24,6 +27,8 @@ pub enum Step {
     Op(String),
     /// 値のある手。見た目を指定する操作（`APPEARANCE`）と、その値（設定ファイルではインライン表）。
     Appearance(AppearanceStep),
+    /// 値のある手。背景色を指定する操作（`BACKGROUND`）と、その色（設定ファイルではインライン表）。
+    Background(BackgroundStep),
 }
 
 impl Step {
@@ -32,13 +37,14 @@ impl Step {
         match self {
             Step::Op(id) => id,
             Step::Appearance(_) => APPEARANCE,
+            Step::Background(_) => BACKGROUND,
         }
     }
 
-    /// 手に書いた値。値のない手は None。
+    /// 見た目を指定する手に書いた値。ほかの手は None。
     pub fn values(&self) -> Option<&AppearanceStep> {
         match self {
-            Step::Op(_) => None,
+            Step::Op(_) | Step::Background(_) => None,
             Step::Appearance(values) => Some(values),
         }
     }
@@ -58,6 +64,37 @@ pub struct AppearanceStep {
     pub values: AppearanceValues,
     /// 読めなかった項目（書いた順）。どれか 1 つでもあれば、その手はレシピの問題になる。
     pub rejected: Vec<Rejected>,
+}
+
+/// 背景色を指定する手（`{ op = "background", color = "#RRGGBB" }`）。書いたまま（検査は `plan` がする）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackgroundStep {
+    /// 読めた色（`Background` の書き方。設定ファイルの `[annotation] background` と同じ）。書いていないか
+    /// 読めなければ None。
+    pub color: Option<Background>,
+    /// 読めなかった項目（書いた順）。どれか 1 つでもあれば、その手はレシピの問題になる。
+    pub rejected: Vec<Rejected>,
+}
+
+impl BackgroundStep {
+    /// `color` に書いた値を読む。読めなければ色を「書いていない」にして、そのわけを返す。
+    pub fn set_color(&mut self, written: Written) -> Result<(), Rejection> {
+        self.color = None;
+        let Written::Text(s) = written else {
+            return Err(Rejection::BadValue);
+        };
+        self.color = Some(s.parse().map_err(|_| Rejection::BadValue)?);
+        Ok(())
+    }
+}
+
+/// 検査を通った値のある手の値。実行するときに `OpContext::values` で操作へ渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepValues {
+    /// 見た目を指定する手（`APPEARANCE`）。
+    Appearance(AppearanceValues),
+    /// 背景色を指定する手（`BACKGROUND`）。
+    Background(Background),
 }
 
 /// 見た目を指定する手に書いた値。書いた項目だけが Some。キーと値の範囲は設定ファイルの `[scrap]` と同じ。
@@ -238,6 +275,8 @@ pub enum StepKey {
     Op,
     /// 見た目の項目のキー。
     Item(AppearanceItem),
+    /// 背景色を指定する手の色（`color`）。
+    Color,
     /// 知らないキー。
     Unknown(String),
 }
@@ -248,6 +287,7 @@ impl StepKey {
         match self {
             StepKey::Op => "op",
             StepKey::Item(item) => item.key(),
+            StepKey::Color => "color",
             StepKey::Unknown(key) => key,
         }
     }
@@ -271,7 +311,7 @@ pub enum Rejection {
     BadValue,
     /// 知らないキー。
     UnknownKey,
-    /// `op` が `appearance` でない（書いていないときも）。
+    /// `op` が `appearance` でも `background` でもない（書いていないときも）。
     NotAppearance,
 }
 
@@ -280,7 +320,7 @@ pub enum Rejection {
 pub struct PlannedStep {
     pub op: &'static OperationDescriptor,
     /// 手に書いた値。値のない手は None。実行するときに `OpContext::values` で操作へ渡す。
-    pub values: Option<AppearanceValues>,
+    pub values: Option<StepValues>,
 }
 
 /// 検査を通ったレシピ。ショートカットから実行できる。
@@ -312,7 +352,7 @@ pub enum Problem {
     BadValue(String),
     /// 値のある手の知らないキー。
     UnknownKey(String),
-    /// 値のある手の `op` が `appearance` でない（書いていないときも）。
+    /// 値のある手の `op` が `appearance` でも `background` でもない（書いていないときも）。
     NotAppearance,
     /// 値のある手に、項目を 1 つも書いていない。
     NoValues,
@@ -367,9 +407,17 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
         }
         let mut steps = Vec::with_capacity(recipe.steps.len());
         for step in &recipe.steps {
-            let values = step
-                .values()
-                .map(|step| check_appearance(step, &mut problems));
+            let values = match step {
+                Step::Op(_) => None,
+                Step::Appearance(step) => Some(StepValues::Appearance(check_appearance(
+                    step,
+                    &mut problems,
+                ))),
+                Step::Background(step) => Some(StepValues::Background(check_background(
+                    step,
+                    &mut problems,
+                ))),
+            };
             // 値のある手は値を取る操作（`takes_values`）を、値のない手はレシピに入れられる操作を呼ぶ
             let fits = |op: &OperationDescriptor| match values {
                 Some(_) => op.takes_values,
@@ -401,9 +449,9 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
     checked
 }
 
-/// 見た目を指定する手の値を検査し、問題を `problems` に足す。読めた値を返す（問題があっても）。
-fn check_appearance(step: &AppearanceStep, problems: &mut Vec<Problem>) -> AppearanceValues {
-    for r in &step.rejected {
+/// 読めなかった項目を問題にして `problems` に足す。
+fn check_rejected(rejected: &[Rejected], problems: &mut Vec<Problem>) {
+    for r in rejected {
         problems.push(match r.reason {
             Rejection::OutOfRange => Problem::OutOfRange(r.key.as_str().to_owned()),
             Rejection::BadValue => Problem::BadValue(r.key.as_str().to_owned()),
@@ -411,6 +459,22 @@ fn check_appearance(step: &AppearanceStep, problems: &mut Vec<Problem>) -> Appea
             Rejection::NotAppearance => Problem::NotAppearance,
         });
     }
+}
+
+/// 背景色を指定する手を検査し、問題を `problems` に足す。読めた色を返す（読めなければ既定の白。問題がある
+/// ので実行はしない）。
+fn check_background(step: &BackgroundStep, problems: &mut Vec<Problem>) -> Background {
+    check_rejected(&step.rejected, problems);
+    let wrote_color = step.color.is_some() || step.rejected.iter().any(|r| r.key == StepKey::Color);
+    if !wrote_color {
+        problems.push(Problem::NoValues);
+    }
+    step.color.unwrap_or_default()
+}
+
+/// 見た目を指定する手の値を検査し、問題を `problems` に足す。読めた値を返す（問題があっても）。
+fn check_appearance(step: &AppearanceStep, problems: &mut Vec<Problem>) -> AppearanceValues {
+    check_rejected(&step.rejected, problems);
     let values = step.values;
     let wrote_an_item = !values.is_empty() || step.rejected.iter().any(|r| r.key != StepKey::Op);
     if !wrote_an_item {
@@ -622,7 +686,7 @@ mod tests {
     use super::*;
     use crate::geometry::{Point, Size};
     use crate::scrap::ops::{Effect, OPERATIONS, OpContext};
-    use crate::scrap::{Appearance, Border, ScrapModel};
+    use crate::scrap::{Appearance, Background, Border, ScrapModel};
     use crate::settings::{
         self, Keymap, Rgb, Settings, SettingsIssue, SettingsItem, ValidationIssue,
     };
@@ -1279,13 +1343,13 @@ mod tests {
         assert_eq!(ids(&checked.plans[0]), ["appearance", "copy"]);
         assert_eq!(
             steps[0].values,
-            Some(AppearanceValues {
+            Some(StepValues::Appearance(AppearanceValues {
                 opacity: Some(50),
                 border: Some(true),
                 border_color: Some(Rgb(0xFF, 0, 0)),
                 border_width: Some(3),
                 shadow: Some(false),
-            })
+            }))
         );
         assert_eq!(steps[1].values, None);
     }
@@ -1355,6 +1419,106 @@ mod tests {
             (
                 r#"["appearance"]"#,
                 vec![Problem::NotAStep("appearance".into())],
+            ),
+        ] {
+            let checked = checked_steps(steps);
+            assert_eq!(
+                checked.problems,
+                problems.into_iter().map(|p| (0, p)).collect::<Vec<_>>(),
+                "{steps}"
+            );
+            assert!(checked.plans.is_empty(), "{steps}");
+        }
+    }
+
+    fn white_blank() -> ScrapModel {
+        ScrapModel::blank(Point::new(0, 0), Size::new(20, 10), Background::WHITE)
+    }
+
+    #[test]
+    fn a_background_step_becomes_a_plan_with_that_colour() {
+        let checked = checked_steps(r##"[{ op = "background", color = "#1e88e5" }, "copy"]"##);
+        assert_eq!(checked.problems, vec![]);
+        assert_eq!(ids(&checked.plans[0]), ["background", "copy"]);
+        assert_eq!(
+            checked.plans[0].steps[0].values,
+            Some(StepValues::Background(Background::Color(Rgb(
+                0x1E, 0x88, 0xE5
+            ))))
+        );
+    }
+
+    #[test]
+    fn a_background_step_repaints_a_blank_scrap_then_goes_on() {
+        let mut run = run_of_steps(r##"[{ op = "background", color = "#212121" }, "copy"]"##);
+        let mut scrap = white_blank();
+        assert_eq!(
+            step(&mut run, &mut scrap),
+            ("background", vec![Effect::Redraw])
+        );
+        assert_eq!(
+            scrap.background(),
+            Some(Background::Color(Rgb(0x21, 0x21, 0x21)))
+        );
+        run.settle(Outcome::Succeeded);
+        assert_eq!(
+            step(&mut run, &mut scrap),
+            ("copy", vec![Effect::CopyToClipboard])
+        );
+    }
+
+    #[test]
+    fn a_background_step_already_of_that_colour_still_goes_on() {
+        let mut run = run_of_steps(r##"[{ op = "background", color = "#FFFFFF" }, "copy"]"##);
+        let mut scrap = white_blank();
+        assert_eq!(step(&mut run, &mut scrap), ("background", vec![]));
+        run.settle(Outcome::of([]));
+        assert_eq!(
+            step(&mut run, &mut scrap),
+            ("copy", vec![Effect::CopyToClipboard])
+        );
+    }
+
+    #[test]
+    fn a_background_step_stops_the_recipe_on_a_captured_scrap() {
+        let mut run = run_of_steps(r##"[{ op = "background", color = "#000000" }, "copy"]"##);
+        let mut scrap = model();
+        let before = scrap.clone();
+        assert_eq!(
+            run.advance(&mut scrap, &OpContext::default()),
+            Advance::Stopped(Stop::CannotRun("background"))
+        );
+        assert_eq!(scrap, before);
+        assert_eq!(
+            run.advance(&mut scrap, &OpContext::default()),
+            Advance::Stopped(Stop::CannotRun("background"))
+        );
+    }
+
+    #[test]
+    fn mistakes_in_a_background_step_make_the_recipe_an_error() {
+        for (steps, problems) in [
+            (
+                r#"[{ op = "background", color = "white" }]"#,
+                vec![Problem::BadValue("color".into())],
+            ),
+            (
+                r##"[{ op = "background", color = "#FFF" }]"##,
+                vec![Problem::BadValue("color".into())],
+            ),
+            (
+                r#"[{ op = "background", color = 0xFFFFFF }]"#,
+                vec![Problem::BadValue("color".into())],
+            ),
+            (
+                r##"[{ op = "background", color = "#FFFFFF", opacity = 50 }]"##,
+                vec![Problem::UnknownKey("opacity".into())],
+            ),
+            (r#"[{ op = "background" }]"#, vec![Problem::NoValues]),
+            // 値のない手として background は書けない（色がないと実行できない）
+            (
+                r#"["background"]"#,
+                vec![Problem::NotAStep("background".into())],
             ),
         ] {
             let checked = checked_steps(steps);
