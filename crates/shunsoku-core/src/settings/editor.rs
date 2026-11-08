@@ -257,6 +257,16 @@ impl Editor {
         index + 1
     }
 
+    /// 写しの定型領域 `index` の、撮ったものの出し方の欄（保存先・ファイル名テンプレート・保存する・スクラップに
+    /// する）を使えるか。白紙スクラップにする定型領域は撮らず何も保存しないので、使えない。`index` の定型領域が
+    /// なければ false。
+    pub fn region_uses_capture_outputs(&self, index: usize) -> bool {
+        self.draft
+            .regions
+            .get(index)
+            .is_some_and(|region| !region.blank_scrap)
+    }
+
     /// 定型領域 `index` を消す（「削除」）。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を返す。
     pub fn remove_region(&mut self, index: usize) -> Option<usize> {
         self.draft.regions.remove(index);
@@ -1201,6 +1211,22 @@ mod tests {
         assert_eq!(copy.hotkey, None);
         assert!(copy.scrap);
         assert_eq!(copy.loaded_name, None);
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn a_blank_scrap_region_cannot_use_its_save_and_scrap_items_and_copies_the_choice() {
+        let mut editor = Editor::new(with_regions(&["a", "b"]));
+        assert!(editor.region_uses_capture_outputs(0));
+
+        editor.draft_mut().regions[0].blank_scrap = true;
+
+        assert!(!editor.region_uses_capture_outputs(0));
+        assert!(editor.region_uses_capture_outputs(1));
+        assert!(!editor.region_uses_capture_outputs(2));
+        let i = editor.duplicate_region(0, "a のコピー");
+        assert!(!editor.region_uses_capture_outputs(i));
+        // 白紙スクラップにしても、適用は止めない
         assert!(editor.buttons().ok);
     }
 

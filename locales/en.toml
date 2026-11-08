@@ -126,6 +126,7 @@ open_folder = "Open folder"
 template_label = "File name:"
 save = "Save"
 scrap = "Show as a scrap"
+blank_scrap = "Make a blank scrap instead of capturing"
 
 [settings_gui.scrap]
 opacity = "Opacity (%):"
