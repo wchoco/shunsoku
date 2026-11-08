@@ -275,6 +275,9 @@ pub enum Effect {
     ShowZoom,
     /// 「名前を付けて保存」のダイアログを出し、選ばれた場所に保存する。初期フォルダとファイル名は `SaveDefault` と同じ。
     ShowSaveDialog,
+    /// スクラップファイル（`crate::scrap_file`）の保存先のダイアログを出し、選ばれた場所に書く。ほかの保存と違い、
+    /// 表示する画像ではなく元の画像・トリム・書き込みをそのまま書く（`ScrapFile::of`）。
+    ShowScrapFileSaveDialog,
     /// トリムの範囲の選択を始めた（`Mode::Trimming`）。キーとマウスを `ScrapModel::trim_input` に渡し、範囲を描く。
     EnterTrimMode,
     /// 書き込みの編集モードに入った（`Mode::Editing`）。キーとマウスを `ScrapModel::edit_input` に渡す。
@@ -595,6 +598,10 @@ fn save_as(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     vec![Effect::ShowSaveDialog]
 }
 
+fn save_scrap_file(_: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
+    vec![Effect::ShowScrapFileSaveDialog]
+}
+
 fn trim(model: &mut ScrapModel, _: &OpContext) -> Vec<Effect> {
     if model.start_trim() {
         vec![Effect::EnterTrimMode]
@@ -711,6 +718,22 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         checked: None,
         choices: None,
         run: save_as,
+    },
+    OperationDescriptor {
+        id: "save_scrap_file",
+        label_key: "scrap.op.save_scrap_file",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::Output,
+        order: 40,
+        drag_only: false,
+        takes_values: false,
+        in_recipe: InRecipe::Anywhere,
+        in_menu: true,
+        can_execute: not_compact,
+        checked: None,
+        choices: None,
+        run: save_scrap_file,
     },
     OperationDescriptor {
         id: "trim",
@@ -1519,6 +1542,7 @@ mod tests {
             ("copy", Effect::CopyToClipboard),
             ("save_default", Effect::SaveDefault),
             ("save_as", Effect::ShowSaveDialog),
+            ("save_scrap_file", Effect::ShowScrapFileSaveDialog),
         ] {
             let mut model = scrap();
             let effects = execute(op(id), &mut model, &OpContext::default());
@@ -2385,6 +2409,7 @@ reset_appearance = "Ctrl+Shift+D"
                 ("copy", true),
                 ("save_default", false),
                 ("save_as", false),
+                ("save_scrap_file", false),
                 ("trim", false),
                 ("untrim", false),
                 ("annotate", false),
@@ -2515,6 +2540,7 @@ reset_appearance = "Ctrl+Shift+D"
                 item("copy", true, Some("Ctrl+C")),
                 item("save_default", true, Some("Ctrl+S")),
                 item("save_as", true, Some("Ctrl+Shift+S")),
+                item("save_scrap_file", true, None),
                 MenuEntry::Separator,
                 item("trim", true, Some("Ctrl+T")),
                 item("untrim", false, None),
@@ -2943,6 +2969,7 @@ reset_appearance = "Ctrl+Shift+D"
                 "copy",
                 "save_default",
                 "save_as",
+                "save_scrap_file",
                 "trim",
                 "untrim",
                 "annotate",

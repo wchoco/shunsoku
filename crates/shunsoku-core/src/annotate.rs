@@ -348,6 +348,14 @@ impl Change {
 }
 
 impl Annotations {
+    /// `items`（描いた順）を持ち、履歴が空のもの（スクラップファイルから開いたとき）。
+    pub fn from_items(items: Vec<Annotation>) -> Annotations {
+        Annotations {
+            items,
+            ..Annotations::default()
+        }
+    }
+
     /// 描いた順の書き込み。
     pub fn items(&self) -> &[Annotation] {
         &self.items
