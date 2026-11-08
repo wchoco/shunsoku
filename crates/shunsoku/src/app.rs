@@ -1621,6 +1621,17 @@ impl App {
         self.scraps.iter_mut().find(|s| s.window.hwnd() == hwnd)
     }
 
+    /// スクラップ操作に渡す `context` に、設定の既定値（見た目・書き込み・書体）と、編集モードの引き継ぎを入れる。
+    fn op_context(&self, context: OpContext) -> OpContext {
+        OpContext {
+            appearance: Appearance::from(self.settings.scrap),
+            annotation: Style::from(&self.settings.annotation),
+            font: Font::from(&self.settings.annotation),
+            carryover: self.carryover,
+            ..context
+        }
+    }
+
     /// `hwnd` のスクラップと、描くのに要る設定の見た目と描画器を、まとめて借りる。
     fn scrap_to_draw(
         &mut self,
@@ -2442,21 +2453,12 @@ fn perform(
     step: impl FnOnce(&mut ScrapModel, &OpContext) -> Option<(OperationId, Vec<Effect>)>,
 ) -> Option<Performed> {
     let deferred = with_app(|app| {
-        let annotation = Style::from(&app.settings.annotation);
-        let font = Font::from(&app.settings.annotation);
         let crosshair = app.settings.selection.crosshair_color;
-        let carryover = app.carryover;
         let module = app.module;
+        let context = app.op_context(context);
         let (scrap, appearance, renderer) = app.scrap_to_draw(hwnd)?;
         let before = scrap.model.clone();
         let mut deferred = Vec::new();
-        let context = OpContext {
-            appearance,
-            annotation,
-            font,
-            carryover,
-            ..context
-        };
         let (op_id, effects) = step(&mut scrap.model, &context)?;
         let show_zoom = effects.contains(&Effect::ShowZoom);
         if show_zoom {
@@ -2490,7 +2492,7 @@ fn perform(
                         match toolbar_window::ToolbarWindow::create(module, hwnd) {
                             Ok(window) => Some(Toolbar {
                                 window,
-                                colours: toolbar::palette(annotation.color),
+                                colours: toolbar::palette(context.annotation.color),
                                 placed: Default::default(),
                                 drag: Drag::default(),
                             }),
@@ -3312,10 +3314,7 @@ fn finish_selection() {
             .or_else(|| selection.rect());
         // スクラップを前面にしてから範囲選択の画面を閉じる（前面にする権利を失わないように）
         if let Some(rect) = rect {
-            match request.recipe.and_then(capture_recipe_launch) {
-                Some(launch) => create_recipe_blank_scrap(launch, rect),
-                None => create_blank_scrap(rect),
-            }
+            create_blank_scrap(rect, request.recipe);
         }
         drop(overlay);
         end_capture();
@@ -3627,15 +3626,13 @@ fn output(request: CaptureRequest, area: Rect, image: Image) {
         }
     }
     if outputs.scrap {
-        let floated = match recipe.and_then(capture_recipe_launch) {
-            Some(launch) => float_recipe_scrap(
-                launch,
-                ScrapModel::new(area.origin(), image.size()),
-                image.clone(),
-                outputs.focus_scrap,
-            ),
-            None => float_scrap(area.origin(), image.clone(), outputs.focus_scrap),
-        };
+        let floated = float_requested(
+            recipe,
+            ScrapModel::new(area.origin(), image.size()),
+            image.clone(),
+            outputs.focus_scrap,
+            |model, image| float_model(model, image, outputs.focus_scrap),
+        );
         match floated {
             Ok(()) => perf::mark(Mark::ScrapShown),
             Err(reason) if strict => {
@@ -4240,23 +4237,15 @@ fn capture_region(request: CaptureRequest) {
     if region.blank_scrap {
         // 白紙スクラップにする定型領域は撮らず、その範囲の白紙スクラップを浮かべる。何も保存しない
         // （保存先・ファイル名テンプレート・保存する・スクラップにするは見ない）。レシピなら残りの操作を進める
-        let floated = match request.recipe.and_then(capture_recipe_launch) {
-            Some(launch) => blank_model(screen)
-                .and_then(|(model, image)| float_recipe_scrap(launch, model, image, true)),
-            None => float_blank_scrap(screen).map(|_| ()),
-        };
-        match floated {
-            Ok(_) => {
+        match float_blank_scrap(screen, request.recipe) {
+            Ok(()) => {
                 if let Some(to) = request.reply {
                     reply(to, Response::Captured { path: None });
                 }
             }
             Err(reason) => {
                 if request.notify {
-                    notify_user(
-                        notify::Level::Error,
-                        &format!("{}\n{reason}", text("blank_scrap.failed")),
-                    );
+                    notify_blank_scrap_failed(&reason);
                 }
                 reply_failed(request.reply, &reason);
             }
@@ -4388,6 +4377,22 @@ fn float_scrap(at: Point, image: Image, focus: bool) -> std::result::Result<(), 
     float_model(model, image, focus).map(|_| ())
 }
 
+/// 依頼の `recipe`（`CaptureRequest::recipe`）がキャプチャで始まるレシピなら、そのレシピで `model`（元の画像は
+/// `image`）を浮かべて残りの操作を進める（`float_recipe_scrap`）。ほかの依頼は `float` で浮かべる。出せなければ
+/// 理由を返す。
+fn float_requested(
+    recipe: Option<usize>,
+    model: ScrapModel,
+    image: Image,
+    focus: bool,
+    float: impl FnOnce(ScrapModel, Image) -> std::result::Result<HWND, String>,
+) -> std::result::Result<(), String> {
+    match recipe.and_then(capture_recipe_launch) {
+        Some(launch) => float_recipe_scrap(launch, model, image, focus),
+        None => float(model, image).map(|_| ()),
+    }
+}
+
 /// キャプチャで始まるレシピ `launch` で作った、まだ出していない `model`（元の画像は `image`）に、出す前に当てる
 /// 操作（見た目・背景色）を当ててから浮かべ、残りの操作を進める（ADR-0010）。白紙スクラップでも、ここでは編集
 /// モードに入らない（レシピを終えたか止まったときに `drive_recipe` が決める）。出せなければ理由を返す。
@@ -4398,14 +4403,7 @@ fn float_recipe_scrap(
     focus: bool,
 ) -> std::result::Result<(), String> {
     let mut model = model;
-    let context = with_app(|app| OpContext {
-        appearance: Appearance::from(app.settings.scrap),
-        annotation: Style::from(&app.settings.annotation),
-        font: Font::from(&app.settings.annotation),
-        carryover: app.carryover,
-        ..OpContext::default()
-    })
-    .unwrap_or_default();
+    let context = with_app(|app| app.op_context(OpContext::default())).unwrap_or_default();
     let Shown { run, effects } = launch.captured(&mut model, &context);
     let hwnd = float_model(model, image, focus)?;
     if with_app(|app| app.recipe.discard()).flatten().is_some() {
@@ -4445,29 +4443,20 @@ fn float_model(model: ScrapModel, image: Image, focus: bool) -> std::result::Res
     }
 }
 
-/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移す。背景が透明なときだけ
-/// すぐに書き込みの編集モードに入る（core の `ScrapModel::starts_in_edit_mode`）。出せなければ通知する。
-fn create_blank_scrap(rect: Rect) {
-    if let Err(reason) = float_blank_scrap(rect) {
-        notify_user(
-            notify::Level::Error,
-            &format!("{}\n{reason}", text("blank_scrap.failed")),
-        );
+/// 範囲選択の画面で選んだ `rect`（スクリーン座標）に、白紙スクラップを浮かべる（`float_blank_scrap`）。出せなければ
+/// 通知する。
+fn create_blank_scrap(rect: Rect, recipe: Option<usize>) {
+    if let Err(reason) = float_blank_scrap(rect, recipe) {
+        notify_blank_scrap_failed(&reason);
     }
 }
 
-/// 「白紙スクラップを作る」で始まるレシピ `launch` で、`rect`（スクリーン座標）に設定の既定の背景色の白紙
-/// スクラップを作り、出す前に当てる操作を当ててから浮かべて残りの操作を進める（`float_recipe_scrap`）。出せなければ
-/// 通知する。
-fn create_recipe_blank_scrap(launch: Launch, rect: Rect) {
-    let floated =
-        blank_model(rect).and_then(|(model, image)| float_recipe_scrap(launch, model, image, true));
-    if let Err(reason) = floated {
-        notify_user(
-            notify::Level::Error,
-            &format!("{}\n{reason}", text("blank_scrap.failed")),
-        );
-    }
+/// 白紙スクラップを作れなかったこと（わけは `reason`）を通知する。
+fn notify_blank_scrap_failed(reason: &str) {
+    notify_user(
+        notify::Level::Error,
+        &format!("{}\n{reason}", text("blank_scrap.failed")),
+    );
 }
 
 /// `rect`（スクリーン座標）に置く、設定の既定の背景色の白紙スクラップと、その下地。作れなければ理由を返す。
@@ -4490,11 +4479,13 @@ fn blank_model(rect: Rect) -> std::result::Result<(ScrapModel, Image), String> {
     Ok((model, image))
 }
 
-/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移す（`float_new_model`）。
-/// 範囲選択の画面で選んだ範囲と、白紙スクラップにする定型領域で使う。通知はせず、出せなければ理由を返す。
-fn float_blank_scrap(rect: Rect) -> std::result::Result<HWND, String> {
+/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移す。依頼の `recipe` が
+/// 「白紙スクラップを作る」か定型領域キャプチャで始まるレシピなら、そのレシピの残りの操作を進め（`float_requested`）、
+/// ほかは背景が透明なときだけすぐに書き込みの編集モードに入る（`float_new_model`）。範囲選択の画面で選んだ範囲と、
+/// 白紙スクラップにする定型領域で使う。通知はせず、出せなければ理由を返す。
+fn float_blank_scrap(rect: Rect, recipe: Option<usize>) -> std::result::Result<(), String> {
     let (model, image) = blank_model(rect)?;
-    float_new_model(model, image)
+    float_requested(recipe, model, image, true, float_new_model)
 }
 
 /// 作った・開いた `model` のスクラップを浮かべてフォーカスを移す。core の `ScrapModel::starts_in_edit_mode` なら
