@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 use shunsoku_core::autostart;
 use shunsoku_core::keys::{Chord, Key, Modifiers};
 use shunsoku_core::perf::{self, Mark, PerfLog, Summary};
-use windows::Win32::Foundation::{ERROR_BAD_LENGTH, HANDLE, LPARAM, POINT, WPARAM};
+use windows::Win32::Foundation::{ERROR_BAD_LENGTH, HANDLE, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    DISPLAY_DEVICEW, EnumDisplayDevicesW, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MONITORINFOEXW, MonitorFromPoint,
+    DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint,
 };
 use windows::Win32::System::Performance::QueryPerformanceCounter;
 use windows::Win32::System::ProcessStatus::QueryWorkingSet;
@@ -34,14 +34,15 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput, VIRTUAL_KEY,
-    VK_ESCAPE,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EDD_GET_DEVICE_INTERFACE_NAME, FindWindowExW, HWND_MESSAGE, PostMessageW, SetCursorPos,
+    EDD_GET_DEVICE_INTERFACE_NAME, FindWindowExW, GetSystemMetrics, HWND_MESSAGE, PostMessageW,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos,
     WM_CLOSE,
 };
-use windows::core::PCWSTR;
+use windows::core::{BOOL, PCWSTR};
 
 use crate::{Metric, Options};
 
@@ -320,21 +321,29 @@ fn measure_cold_start(options: &Options, workspace: &Workspace) -> Result<ColdSt
     Ok(cold)
 }
 
-/// 書き込みの更新。主モニタと同じ大きさの白紙スクラップ（白・不透明）を、白紙スクラップにする定型領域で 1 枚出し、
-/// 書き込みの編集モード（`E`）でフリーハンド（`6`）を選んで、主モニタの中央を回る 200 歩のドラッグを送る。
-/// 1 歩ごとに描き直しが出るのを待ってから次の歩を送り、ドラッグの間の描き直しの 1 回ずつを値にする。
+/// 書き込みの更新。モニタ（`--monitor`、既定は主モニタ）と同じ大きさの白紙スクラップ（白・不透明）を、白紙スクラップに
+/// する定型領域で 1 枚出し、書き込みの編集モード（`E`）でフリーハンド（`6`）を選んで、そのモニタの中央を回る 200 歩の
+/// ドラッグを送る。1 歩ごとに描き直しが出るのを待ってから次の歩を送り、ドラッグの間の描き直しの 1 回ずつを値にする。
 fn measure_annotate(options: &Options, workspace: &Workspace) -> Result<Vec<f64>> {
     let hotkey: Chord = ANNOTATE_HOTKEY.parse()?;
-    let (monitor, width, height) = primary_monitor()?;
+    let monitor = match &options.monitor {
+        Some(name) => Monitor::named(name)?,
+        None => Monitor::primary()?,
+    };
+    eprintln!(
+        "書き込みの更新: {}（{}×{}）",
+        monitor.device, monitor.width, monitor.height
+    );
     workspace.write_settings(
         options.hotkey,
         &format!(
             "\n[annotation]\nbackground = \"#FFFFFF\"\n\n\
-             [[regions]]\nname = \"perf-annotate\"\nhotkey = \"{hotkey}\"\nmonitor = '{monitor}'\n\
-             x = 0\ny = 0\nwidth = {width}\nheight = {height}\nblank_scrap = true\n"
+             [[regions]]\nname = \"perf-annotate\"\nhotkey = \"{hotkey}\"\nmonitor = '{}'\n\
+             x = 0\ny = 0\nwidth = {}\nheight = {}\nblank_scrap = true\n",
+            monitor.id, monitor.width, monitor.height
         ),
     )?;
-    let result = annotate_once(options, workspace, hotkey, width, height);
+    let result = annotate_once(options, workspace, hotkey, &monitor);
     // ほかの指標が同じ作業フォルダを使うので、設定を戻す
     workspace.write_settings(options.hotkey, "")?;
     result
@@ -344,8 +353,7 @@ fn annotate_once(
     options: &Options,
     workspace: &Workspace,
     hotkey: Chord,
-    width: i32,
-    height: i32,
+    monitor: &Monitor,
 ) -> Result<Vec<f64>> {
     let (mut app, _) = Instance::spawn(options, workspace, 0)?;
     app.wait(Mark::TrayRegistered, 0, START_TIMEOUT)?;
@@ -353,23 +361,6 @@ fn annotate_once(
     send_hotkey(hotkey);
     // 白紙スクラップは区切りを書かないので、出て前面になるのを待つ
     sleep(Duration::from_secs(1));
-    send_key(VK_E);
-    sleep(Duration::from_millis(300));
-    send_key(VK_6);
-    // 道具を選ぶと描き直すので、その終わりで編集モードに入ってフリーハンドを選べたことを確かめる
-    app.wait(Mark::AnnotatePaintEnd, 0, OVERLAY_TIMEOUT)?;
-    sleep(Duration::from_millis(300));
-
-    // 主モニタの中央を回る円。1 歩ずつ別の画素に動かす
-    let (cx, cy) = (width / 2, height / 2);
-    let radius = f64::from(width.min(height) / 4);
-    let at = |step: usize| {
-        let angle = step as f64 / ANNOTATE_STEPS as f64 * std::f64::consts::TAU;
-        (
-            cx + (radius * angle.cos()).round() as i32,
-            cy + (radius * angle.sin()).round() as i32,
-        )
-    };
     let ends = |app: &Instance| {
         app.log()
             .marks
@@ -377,14 +368,36 @@ fn annotate_once(
             .filter(|(m, _)| *m == Mark::AnnotatePaintEnd)
             .count()
     };
-    move_mouse(at(0), width, height);
+    send_key(VK_E);
+    sleep(Duration::from_millis(300));
+    // 編集モードに入ったときの描き直しも区切りを書くので、道具を選ぶ前の数を控える
+    let before_tool = ends(&app);
+    send_key(VK_6);
+    // 道具を選ぶと描き直すので、その終わりで編集モードに入ってフリーハンドを選べたことを確かめる
+    app.wait(Mark::AnnotatePaintEnd, before_tool, OVERLAY_TIMEOUT)?;
+    sleep(Duration::from_millis(300));
+
+    // モニタの中央を回る円。1 歩ずつ別の画素に動かす
+    let (cx, cy) = (
+        monitor.left + monitor.width / 2,
+        monitor.top + monitor.height / 2,
+    );
+    let radius = f64::from(monitor.width.min(monitor.height) / 4);
+    let at = |step: usize| {
+        let angle = step as f64 / ANNOTATE_STEPS as f64 * std::f64::consts::TAU;
+        (
+            cx + (radius * angle.cos()).round() as i32,
+            cy + (radius * angle.sin()).round() as i32,
+        )
+    };
+    move_mouse(at(0));
     sleep(Duration::from_millis(100));
     let started = qpc();
     send(&[mouse_button(MOUSEEVENTF_LEFTDOWN)]);
     let mut painted = ends(&app);
     for step in 1..=ANNOTATE_STEPS {
         progress("書き込みの更新", step - 1, ANNOTATE_STEPS);
-        move_mouse(at(step), width, height);
+        move_mouse(at(step));
         let sent = Instant::now();
         while ends(&app) <= painted && sent.elapsed() < STEP_TIMEOUT {
             sleep(Duration::from_millis(1));
@@ -405,44 +418,111 @@ fn annotate_once(
     Ok(values)
 }
 
-/// 主モニタの識別子（本体の `monitor_list` と同じ、デバイスインターフェースのパス。取れなければ GDI のデバイス名）と、
-/// 幅と高さ（物理ピクセル）。主モニタの左上はスクリーン座標の (0, 0)。
-fn primary_monitor() -> Result<(String, i32, i32)> {
-    // SAFETY: 問い合わせだけ
-    let handle = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
-    let mut info = MONITORINFOEXW {
-        monitorInfo: MONITORINFO {
-            cbSize: size_of::<MONITORINFOEXW>() as u32,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    // SAFETY: cbSize を MONITORINFOEXW の大きさにして渡す
-    if !unsafe { GetMonitorInfoW(handle, &mut info.monitorInfo) }.as_bool() {
-        return Err("主モニタの情報を読めない".into());
-    }
-    let mut dd = DISPLAY_DEVICEW {
-        cb: size_of::<DISPLAY_DEVICEW>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: szDevice は NUL で終わる。dd は呼び出しの間生きている
-    let found = unsafe {
-        EnumDisplayDevicesW(
-            PCWSTR(info.szDevice.as_ptr()),
-            0,
-            &mut dd,
-            EDD_GET_DEVICE_INTERFACE_NAME,
-        )
-    }
-    .as_bool();
-    let id = Some(from_wide(&dd.DeviceID))
-        .filter(|path| found && !path.is_empty())
-        .unwrap_or_else(|| from_wide(&info.szDevice));
-    let rect = info.monitorInfo.rcMonitor;
-    Ok((id, rect.right - rect.left, rect.bottom - rect.top))
+/// 白紙スクラップを出すモニタ。
+///
+/// 識別子の求め方は本体の `monitor_list`（`crates/shunsoku/src/monitor_list.rs`）の写し。ハーネスは本体の crate に
+/// 依存できない（本体は bin で、Win32 層は lib として切り出していない）ので、同じ求め方をここに持つ。本体の求め方を
+/// 変えたら、ここも合わせる（合わないと、定型領域のモニタが見つからず白紙スクラップが出ないので、計測が失敗して分かる）。
+struct Monitor {
+    /// 本体の `monitor_list` と同じ識別子（デバイスインターフェースのパス。取れなければ GDI のデバイス名）。
+    id: String,
+    /// GDI のデバイス名（`\\.\DISPLAY2` など）。
+    device: String,
+    /// 左上（スクリーン座標、物理ピクセル）と幅・高さ（物理ピクセル）。
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
 }
 
-/// NUL で終わる UTF-16 の配列を文字列にする。
+impl Monitor {
+    /// 主モニタ。左上はスクリーン座標の (0, 0)。
+    fn primary() -> Result<Monitor> {
+        // SAFETY: 問い合わせだけ
+        let handle = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+        Monitor::of(handle).ok_or_else(|| "主モニタの情報を読めない".into())
+    }
+
+    /// GDI のデバイス名が `name`（`DISPLAY2` または `\\.\DISPLAY2`。大文字と小文字は区別しない）のモニタ。
+    fn named(name: &str) -> Result<Monitor> {
+        let monitors = Monitor::all();
+        let wanted = name.trim_start_matches(r"\\.\").to_ascii_uppercase();
+        let names: Vec<&str> = monitors.iter().map(|m| m.device.as_str()).collect();
+        let message = format!("モニタ {name} がない（あるのは {}）", names.join("、"));
+        monitors
+            .into_iter()
+            .find(|m| m.device.trim_start_matches(r"\\.\").to_ascii_uppercase() == wanted)
+            .ok_or_else(|| message.into())
+    }
+
+    fn all() -> Vec<Monitor> {
+        unsafe extern "system" fn collect(
+            handle: HMONITOR,
+            _: HDC,
+            _: *mut RECT,
+            data: LPARAM,
+        ) -> BOOL {
+            // SAFETY: data は `all` の handles を指し、列挙の間生きている
+            let handles = unsafe { &mut *(data.0 as *mut Vec<HMONITOR>) };
+            handles.push(handle);
+            true.into()
+        }
+        let mut handles: Vec<HMONITOR> = Vec::new();
+        // SAFETY: handles は列挙の間生きている
+        let _ = unsafe {
+            EnumDisplayMonitors(
+                None,
+                None,
+                Some(collect),
+                LPARAM(&mut handles as *mut _ as isize),
+            )
+        };
+        handles.into_iter().filter_map(Monitor::of).collect()
+    }
+
+    fn of(handle: HMONITOR) -> Option<Monitor> {
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // SAFETY: cbSize を MONITORINFOEXW の大きさにして渡す
+        if !unsafe { GetMonitorInfoW(handle, &mut info.monitorInfo) }.as_bool() {
+            return None;
+        }
+        let mut dd = DISPLAY_DEVICEW {
+            cb: size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: szDevice は NUL で終わる。dd は呼び出しの間生きている
+        let found = unsafe {
+            EnumDisplayDevicesW(
+                PCWSTR(info.szDevice.as_ptr()),
+                0,
+                &mut dd,
+                EDD_GET_DEVICE_INTERFACE_NAME,
+            )
+        }
+        .as_bool();
+        let device = from_wide(&info.szDevice);
+        let id = Some(from_wide(&dd.DeviceID))
+            .filter(|path| found && !path.is_empty())
+            .unwrap_or_else(|| device.clone());
+        let rect = info.monitorInfo.rcMonitor;
+        Some(Monitor {
+            id,
+            device,
+            left: rect.left,
+            top: rect.top,
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
+        })
+    }
+}
+
+/// NUL で終わる UTF-16 の配列を文字列にする。本体の `monitor_list` の写し（理由は `Monitor`）。
 fn from_wide(wide: &[u16]) -> String {
     let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     String::from_utf16_lossy(&wide[..len])
@@ -672,20 +752,29 @@ fn mouse_button(flags: MOUSE_EVENT_FLAGS) -> INPUT {
     }
 }
 
-/// カーソルを主モニタ（幅 `width`、高さ `height`）の `to`（物理ピクセル）へ `SendInput` で動かす。絶対座標は
-/// 主モニタを 0〜65535 にした値で、画素 x は ceil(x × 65536 / 幅) で表す。
-fn move_mouse(to: (i32, i32), width: i32, height: i32) {
-    let normal = |v: i32, size: i32| {
+/// カーソルを `to`（スクリーン座標、物理ピクセル）へ `SendInput` で動かす。絶対座標は仮想スクリーン（全モニタ）を
+/// 0〜65535 にした値で、仮想スクリーンの左端から x 画素目は ceil(x × 65536 / 幅) で表す。
+fn move_mouse(to: (i32, i32)) {
+    // SAFETY: 問い合わせだけ
+    let (left, top, width, height) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let normal = |v: i32, origin: i32, size: i32| {
         let size = i64::from(size);
-        ((i64::from(v) * 65536 + size - 1) / size) as i32
+        ((i64::from(v - origin) * 65536 + size - 1) / size) as i32
     };
     send(&[INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
             mi: MOUSEINPUT {
-                dx: normal(to.0, width),
-                dy: normal(to.1, height),
-                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                dx: normal(to.0, left, width),
+                dy: normal(to.1, top, height),
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 ..Default::default()
             },
         },
@@ -694,12 +783,11 @@ fn move_mouse(to: (i32, i32), width: i32, height: i32) {
 
 /// 左ボタンで `from` から `to` まで（スクリーン座標、物理ピクセル）ドラッグする。
 fn drag(from: (i32, i32), to: (i32, i32)) {
-    let button = mouse_button;
     // SAFETY: 座標を渡すだけ
     unsafe {
         let _ = SetCursorPos(from.0, from.1);
         sleep(Duration::from_millis(50));
-        send(&[button(MOUSEEVENTF_LEFTDOWN)]);
+        send(&[mouse_button(MOUSEEVENTF_LEFTDOWN)]);
         for i in 1..=10 {
             let _ = SetCursorPos(
                 from.0 + (to.0 - from.0) * i / 10,
@@ -707,7 +795,7 @@ fn drag(from: (i32, i32), to: (i32, i32)) {
             );
             sleep(Duration::from_millis(20));
         }
-        send(&[button(MOUSEEVENTF_LEFTUP)]);
+        send(&[mouse_button(MOUSEEVENTF_LEFTUP)]);
     }
 }
 
