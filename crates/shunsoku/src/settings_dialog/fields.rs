@@ -175,6 +175,8 @@ pub enum Action {
     BrowseFolder(Field),
     /// 色を選ばせて `Field` に入れる。
     PickColor(Field),
+    /// 背景色の欄 `Field` を透明にする。
+    Transparent(Field),
     /// 変数のメニューを出し、テンプレートの欄に入れる。
     InsertVariable(TemplateOf),
     /// `Field` の保存先をエクスプローラーで開く。
@@ -225,6 +227,7 @@ impl Fields {
             button.action = match button.action {
                 Action::BrowseFolder(f) => Action::BrowseFolder(f.with_region(index)),
                 Action::PickColor(f) => Action::PickColor(f.with_region(index)),
+                Action::Transparent(f) => Action::Transparent(f.with_region(index)),
                 Action::OpenFolder(f) => Action::OpenFolder(f.with_region(index)),
                 Action::InsertVariable(TemplateOf::Region(_)) => {
                     Action::InsertVariable(TemplateOf::Region(index))
@@ -1097,6 +1100,18 @@ impl PageBuilder<'_> {
             id: pick,
             action: Action::PickColor(field),
         });
+    }
+
+    /// 背景色の欄（`#RRGGBB` か `transparent`）と「選ぶ…」「透明」。
+    pub fn background_field(&mut self, field: Field, x: i16, y: i16) {
+        self.color_field(field, x, y);
+        self.button(
+            Action::Transparent(field),
+            "settings_gui.transparent",
+            x + COLOR_WIDTH + BUTTON_GAP + SIDE_BUTTON + BUTTON_GAP,
+            y,
+            SIDE_BUTTON,
+        );
     }
 
     /// 色の欄と「選ぶ…」を置いて、その ID を返す（`Field` と `Action` の行には入れない）。
