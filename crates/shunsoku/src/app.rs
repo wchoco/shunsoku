@@ -668,11 +668,24 @@ fn paint_scrap_unmarked(
     // 透明な白紙スクラップは、透明な部分も当たり判定に入るよう、見えないほど小さいアルファを敷く
     let see_through = model.is_transparent_blank();
     let hit_alpha = see_through.then(|| appearance.hit_alpha());
-    let caret = painter.paint_scrap(&canvas, image, display, appearance, hit_alpha, overlays)?;
+    let painted = painter.paint_scrap(&canvas, image, display, appearance, hit_alpha, overlays)?;
     *renderer = Some(painter);
-    // レイヤード ウィンドウは中身を写して持つので、canvas は次の描き直しで使ってよい
-    window.present(canvas.dc(), rect, appearance.constant_alpha())?;
-    Ok(caret)
+    let Some(dirty) = painted.dirty else {
+        // 中身は前に出したときのまま
+        window.move_to(rect)?;
+        return Ok(painted.caret);
+    };
+    // レイヤード ウィンドウは中身を写して持つので、canvas は次の描き直しで使ってよい。描き直した範囲だけを写す
+    // （canvas の前の中身は、前に出した中身と同じ）
+    let presents = window.presents();
+    let shown = window.present(canvas.dc(), rect, Some(dirty), appearance.constant_alpha());
+    // 出せなかったとき、出している間にほかの描き先の中身を出したとき（出している間に届いたメッセージで描き直した
+    // とき）は、ウィンドウに見えているものが canvas の中身と同じとは限らないので、次はウィンドウ全体を描く
+    if shown.is_err() || window.presents() != presents.wrapping_add(1) {
+        canvas.forget();
+    }
+    shown?;
+    Ok(painted.caret)
 }
 
 struct Windows {
