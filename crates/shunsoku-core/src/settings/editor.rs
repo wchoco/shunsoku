@@ -2134,11 +2134,7 @@ mod tests {
     fn captures_are_always_offered_first_and_named_in_the_step_list() {
         for ids in [&[][..], &["copy"], &["copy", "close"], &["select_capture"]] {
             let editor = with_steps(ids);
-            assert_eq!(
-                captures(&editor, 0),
-                [Capture::Select, Capture::Region],
-                "{ids:?}"
-            );
+            assert_eq!(captures(&editor, 0), Capture::ALL, "{ids:?}");
             assert_eq!(
                 editor.step_choices(0)[0],
                 StepChoice::Capture(Capture::Select),
@@ -2151,6 +2147,11 @@ mod tests {
         );
         let editor = with_steps(&["select_capture", "copy"]);
         assert_eq!(labels(&editor), ["範囲選択キャプチャ", "コピー"]);
+        let editor = with_steps(&["active_window_capture", "blank_scrap"]);
+        assert_eq!(
+            labels(&editor),
+            ["ウィンドウキャプチャ", "白紙スクラップを作る"]
+        );
     }
 
     #[test]
@@ -2261,7 +2262,7 @@ mod tests {
     #[test]
     fn a_fixed_region_capture_is_added_without_a_region_and_offers_the_regions_in_order() {
         let mut editor = with_regions_read("[]");
-        assert_eq!(captures(&editor, 0), [Capture::Select, Capture::Region]);
+        assert_eq!(captures(&editor, 0).last(), Some(&Capture::Region));
         let added = editor
             .add_step(0, StepChoice::Capture(Capture::Region))
             .unwrap();

@@ -247,6 +247,8 @@ no_such_region = "撮る定型領域が見つかりません（名前を変え�
 # レシピの最初に置けるキャプチャ系の操作（recipe::Capture::label_key）
 [recipe.capture]
 select_capture = "範囲選択キャプチャ"
+active_window_capture = "ウィンドウキャプチャ"
+blank_scrap = "白紙スクラップを作る"
 capture_region = "定型領域キャプチャ"
 
 [hotkey]

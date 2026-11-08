@@ -232,6 +232,8 @@ no_such_region = "The saved region to capture is not found (choose it again if i
 # Capture steps that can start a recipe (recipe::Capture::label_key)
 [recipe.capture]
 select_capture = "Region capture"
+active_window_capture = "Window capture"
+blank_scrap = "Create a blank scrap"
 capture_region = "Saved region capture"
 
 [hotkey]

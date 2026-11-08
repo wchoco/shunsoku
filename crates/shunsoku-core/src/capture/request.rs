@@ -164,7 +164,8 @@ impl CaptureRequest {
     /// キャプチャで始まるレシピ（`Settings::recipes` の `index`）のホットキー: レシピのキャプチャ（`launch`）で撮り、
     /// スクラップを出す。出したスクラップに続きの操作を実行する。
     ///
-    /// - 範囲選択キャプチャ: 範囲選択キャプチャのホットキーと同じく、フォーカスを移す。
+    /// - 範囲選択キャプチャ・ウィンドウキャプチャ・白紙スクラップを作る: それぞれのホットキーと同じく、フォーカスを
+    ///   移す。
     /// - 定型領域キャプチャ: `regions` の中の、選んだ定型領域のホットキーと同じく撮る（保存は定型領域の「保存する」の
     ///   とおり。フォーカスは元のアプリに残す）。ただし「スクラップにする」は見ず、いつもスクラップを出す。定型領域が
     ///   もうなくても名前のまま依頼にする（撮るときに、消えた定型領域として知らせる）。
@@ -176,6 +177,8 @@ impl CaptureRequest {
         use crate::recipe::Capture;
         let request = match launch.capture() {
             Capture::Select => CaptureRequest::scrap(CaptureMethod::Select),
+            Capture::ActiveWindow => CaptureRequest::scrap(CaptureMethod::ActiveWindow),
+            Capture::Blank => CaptureRequest::scrap(CaptureMethod::BlankScrap),
             Capture::Region => {
                 let name = launch.region().unwrap_or_default();
                 match regions.iter().find(|r| r.name == name) {
@@ -398,6 +401,23 @@ mod tests {
                 ..select_capture()
             }
         );
+    }
+
+    #[test]
+    fn window_and_blank_scrap_recipe_hotkeys_take_like_their_own_hotkeys_and_name_the_recipe() {
+        for (steps, source) in [
+            (r#"["active_window_capture"]"#, Source::ActiveWindowHotkey),
+            (r#"["blank_scrap"]"#, Source::BlankScrap),
+        ] {
+            assert_eq!(
+                CaptureRequest::recipe(1, &launch_of(steps, &[]), &[]),
+                CaptureRequest {
+                    recipe: Some(1),
+                    ..CaptureRequest::from_source(source)
+                },
+                "{steps}"
+            );
+        }
     }
 
     #[test]
