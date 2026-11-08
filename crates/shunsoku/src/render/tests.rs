@@ -1,0 +1,167 @@
+//! 描き手（`Renderer`）の使い回しのテスト。1 つの描き手で続けて描いた結果が、毎回新しく作った描き手で描いた結果と
+//! 画素で一致することを確かめる（#165 のシーム 2）。
+
+use super::*;
+
+use shunsoku_core::annotate::Style;
+use shunsoku_core::scrap::Border;
+
+/// 一色の画像。`bgra` はアルファを掛けない BGRA。
+fn solid(size: Size, bgra: [u8; 4]) -> Image {
+    let pixels = bgra.repeat(size.width as usize * size.height as usize);
+    Image::from_bgra(size, pixels).unwrap()
+}
+
+/// 左半分が `left`、右半分が透明な画像（透明な部分のある画像）。
+fn half_transparent(size: Size, left: [u8; 4]) -> Image {
+    let mut pixels = Vec::new();
+    for _ in 0..size.height {
+        for x in 0..size.width {
+            let px = if x < size.width / 2 { left } else { [0; 4] };
+            pixels.extend_from_slice(&px);
+        }
+    }
+    Image::from_bgra(size, pixels).unwrap()
+}
+
+/// 線・矢印・フリーハンド・文字の書き込み。
+fn annotations() -> Vec<Annotation> {
+    let style = |color| Style { color, width: 3 };
+    vec![
+        Annotation {
+            shape: Shape::Line {
+                from: Point::new(2, 2),
+                to: Point::new(30, 20),
+            },
+            style: style(Rgb(0xFF, 0, 0)),
+        },
+        Annotation {
+            shape: Shape::Arrow {
+                from: Point::new(5, 35),
+                to: Point::new(30, 10),
+            },
+            style: style(Rgb(0, 0x80, 0xFF)),
+        },
+        Annotation {
+            shape: Shape::Freehand {
+                points: vec![
+                    Point::new(10, 30),
+                    Point::new(14, 26),
+                    Point::new(20, 31),
+                    Point::new(27, 24),
+                ],
+            },
+            style: style(Rgb(0, 0xC0, 0)),
+        },
+        Annotation {
+            shape: Shape::Text {
+                at: Point::new(4, 8),
+                text: "Ab\nあ".to_owned(),
+                font: Font::default(),
+            },
+            style: style(Rgb(0x20, 0x20, 0x20)),
+        },
+    ]
+}
+
+/// 太い枠と影のある見た目。
+fn framed() -> Appearance {
+    Appearance {
+        border: Border {
+            width: 2,
+            color: 0x30_60_90,
+        },
+        show_border: true,
+        shadow: true,
+        ..Appearance::default()
+    }
+}
+
+/// `image` を書き込みと枠・影を付けて、表示の大きさ `display` で `renderer` で描いた画素。
+fn paint(
+    renderer: &mut Renderer,
+    image: &CachedImage,
+    display: Size,
+    hit_alpha: Option<u8>,
+) -> Image {
+    let appearance = framed();
+    let margin = appearance.margin() as u32;
+    let window = Size::new(display.width + margin * 2, display.height + margin * 2);
+    let canvas = Canvas::new(window).unwrap();
+    let annotations = annotations();
+    let size = image.image().size();
+    let overlays = Overlays {
+        annotations: AnnotationLayer {
+            annotations: &annotations,
+            view: View {
+                left: 0.0,
+                top: 0.0,
+                scale_x: f64::from(display.width) / f64::from(size.width),
+                scale_y: f64::from(display.height) / f64::from(size.height),
+            },
+            selected: &[],
+            selection_range: None,
+            typing: None,
+            scale: 1.0,
+        },
+        label: None,
+        trim: None,
+    };
+    renderer
+        .paint_scrap(&canvas, image, display, &appearance, hit_alpha, overlays)
+        .unwrap();
+    canvas.to_image().unwrap()
+}
+
+#[test]
+fn reused_renderer_paints_the_same_pixels_as_a_new_one() {
+    let small = Size::new(48, 40);
+    let shrunk = Size::new(72, 48);
+    let enlarged = Size::new(80, 112);
+    let hit_alpha = Appearance::default().hit_alpha();
+    // 並び: 同じ画像（同じ作り置きで 2 回）→ 別の画像 → 大きさの違う画像（縮小して描く）→ 透明な部分のある
+    // 画像（拡大して描き、透明な白紙スクラップの下敷きを敷く）
+    let first = CachedImage::new(solid(small, [0x10, 0x80, 0xF0, 0xFF]));
+    let other = CachedImage::new(solid(small, [0xF0, 0x20, 0x40, 0xFF]));
+    let larger = CachedImage::new(solid(Size::new(96, 64), [0x60, 0xD0, 0x30, 0xFF]));
+    let see_through = CachedImage::new(half_transparent(
+        Size::new(40, 56),
+        [0x00, 0x00, 0xFF, 0x80],
+    ));
+    let steps = [
+        (&first, small, None),
+        (&first, small, None),
+        (&other, small, None),
+        (&larger, shrunk, None),
+        (&see_through, enlarged, Some(hit_alpha)),
+    ];
+
+    let mut reused = Renderer::new().unwrap();
+    for (i, (image, display, alpha)) in steps.iter().enumerate() {
+        let got = paint(&mut reused, image, *display, *alpha);
+        let fresh = CachedImage::new(image.image().clone());
+        let want = paint(&mut Renderer::new().unwrap(), &fresh, *display, *alpha);
+        assert!(
+            got == want,
+            "step {i}: the reused renderer drew other pixels"
+        );
+        // 描けていること（画像の右下の隅は書き込みの外）
+        let margin = framed().margin() as u32;
+        let corner = got.pixel(margin + display.width - 2, margin + display.height - 2);
+        let expected = match i {
+            0 | 1 => [0x10, 0x80, 0xF0, 0xFF],
+            2 => [0xF0, 0x20, 0x40, 0xFF],
+            3 => [0x60, 0xD0, 0x30, 0xFF],
+            // 透明な部分には当たり判定の下敷き（黒）だけが残る
+            _ => [0, 0, 0, hit_alpha],
+        };
+        assert_eq!(corner, expected, "step {i}");
+    }
+
+    // 描き手を作り直したあと（`D2DERR_RECREATE_TARGET` で捨てたあとなど）も、同じ画像を新しい描き手で描ける
+    let mut recreated = Renderer::new().unwrap();
+    let got = paint(&mut recreated, &first, small, None);
+    let fresh = CachedImage::new(first.image().clone());
+    let want = paint(&mut Renderer::new().unwrap(), &fresh, small, None);
+    assert!(got == want, "a recreated renderer drew other pixels");
+}
