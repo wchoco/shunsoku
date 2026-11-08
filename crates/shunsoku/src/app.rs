@@ -2939,7 +2939,7 @@ fn save_failed(path: Option<&Path>, reason: &str) {
 /// スクラップを閉じて、閉じる直前の状態のままごみ箱に移す（上限が 0 なら破棄する）。何も書かれていない透明な
 /// 白紙スクラップ（編集モードの途中で閉じたものも）は、ごみ箱に入れずに捨てる。
 fn close_scrap(hwnd: HWND) {
-    remove_scrap(hwnd, true);
+    remove_scrap(hwnd, Removal::Close);
 }
 
 /// 何も書かれていない透明な白紙スクラップを、ごみ箱に入れずに捨てる（`Effect::Discard` と、編集モードを
@@ -2952,12 +2952,22 @@ fn discard_scrap(hwnd: HWND) {
     })
     .unwrap_or(false);
     if discardable {
-        remove_scrap(hwnd, false);
+        remove_scrap(hwnd, Removal::Discard);
     }
 }
 
-/// スクラップを閉じる。`to_trash` で、何も書かれていない透明な白紙スクラップでなければ、ごみ箱に移す。
-fn remove_scrap(hwnd: HWND, to_trash: bool) {
+/// スクラップの片付け方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// 閉じる: ごみ箱に移す。ただし、片付けた（`ScrapModel::settle`）あとで何も書かれていない透明な白紙
+    /// スクラップなら、ごみ箱に入れずに捨てる（描きかけは片付けで書き込みになるので、片付けてから決める）。
+    Close,
+    /// ごみ箱に入れずに捨てる。
+    Discard,
+}
+
+/// スクラップを `removal` のとおりに片付ける。
+fn remove_scrap(hwnd: HWND, removal: Removal) {
     let removed = with_app(|app| {
         // 保存を待っているレシピは、スクラップと一緒に捨てる
         if app.recipe.discard_for(&(hwnd.0 as isize)).is_some() {
@@ -2967,7 +2977,10 @@ fn remove_scrap(hwnd: HWND, to_trash: bool) {
         let mut scrap = app.scraps.remove(index);
         // トリムの範囲を選んでいる途中で閉じたら選ぶ前の状態で、書き込みの編集モードなら抜けてから入れる
         scrap.model.settle();
-        let to_trash = to_trash && !scrap.model.is_empty_transparent_blank();
+        let to_trash = match removal {
+            Removal::Close => !scrap.model.is_empty_transparent_blank(),
+            Removal::Discard => false,
+        };
         let thumbnail = to_trash.then(|| trash_thumbnail(&scrap));
         let Scrap {
             toolbar,
