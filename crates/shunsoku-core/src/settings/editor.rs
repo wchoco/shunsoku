@@ -12,10 +12,13 @@
 //!   `move_region`。「範囲を選び直す」は `set_region_range`。GUI を開いている間にトレイから登録した定型領域は
 //!   `new_registered_region` で名前を決め、書いたら `registered` で base と写しに足す。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
 //! - 「レシピ」タブの一覧の追加・削除は `add_recipe` / `remove_recipe`、名前は `set_recipe_name`。操作の並びは
-//!   `step_choices`（足せる操作と見た目を指定する手）/ `add_step` / `move_step` / `remove_step`。見た目を指定する手の
-//!   欄（`AppearanceItem`）は `appearance` / `set_appearance` で読み書きする（「変えない」は書かない）。ショートカットは
-//!   `set_chord` の `RecipeShortcut`。検査（`recipe::plan`）で引っかかったもの（欄に打った範囲外の値を含む）は `mark` の
-//!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（値のある手は書いた値の要約）。
+//!   `step_choices`（足せる操作と、見た目・背景色を指定する操作）/ `add_step` / `move_step` / `remove_step`。選んでいる操作に
+//!   出すパラメータの欄の種類は `param_fields`（パラメータのない操作は None）。足したら、`add_step` が返す位置の
+//!   操作を選ぶ。見た目を指定する操作の
+//!   欄（`AppearanceItem`）は `appearance` / `set_appearance` で、背景色を指定する操作の色は `background` / `set_background` で読み書きする（「変えない」は書かない）。ショートカットは
+//!   `set_chord` の `RecipeShortcut`、キャプチャで始まるレシピのホットキーは `RecipeHotkey`（どちらの欄を出すかは
+//!   `key_item`。最初の操作がキャプチャ系かどうかが変わったら、両方のキーを消す）。検査（`recipe::plan`）で引っかかったもの（欄に打った範囲外の値を含む）は `mark` の
+//!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（パラメータを添えた操作はパラメータの要約）。
 
 use std::collections::BTreeSet;
 
@@ -23,7 +26,12 @@ use super::{Problem, Region, Settings, SettingsItem, new_region};
 use crate::geometry::Rect;
 use crate::keys::Chord;
 pub use crate::recipe::AppearanceItem;
-use crate::recipe::{self, AppearanceStep, ItemValue, Recipe, Step, StepKey, Written};
+pub use crate::recipe::Capture;
+use crate::recipe::{
+    self, AppearanceStep, BackgroundStep, CaptureRegionStep, ItemValue, Recipe, Step, StepKey,
+    Written,
+};
+use crate::scrap::Background;
 use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationId};
 
 /// 設定 GUI の写し。
@@ -65,15 +73,21 @@ impl Mark {
             Mark::Problem(Problem::DuplicateName) => "settings_gui.mark.duplicate_name",
             Mark::Problem(Problem::NoSteps) => "settings_gui.mark.no_steps",
             Mark::Problem(Problem::NotAStep) => "settings_gui.mark.not_a_step",
-            Mark::Problem(Problem::CloseNotLast) => "settings_gui.mark.close_not_last",
+            Mark::Problem(Problem::LastOnlyNotLast) => "settings_gui.mark.last_only_not_last",
+            Mark::Problem(Problem::FirstOnlyNotFirst) => "settings_gui.mark.first_only_not_first",
+            Mark::Problem(Problem::ShortcutOnCapture) => "settings_gui.mark.shortcut_on_capture",
+            Mark::Problem(Problem::HotkeyWithoutCapture) => {
+                "settings_gui.mark.hotkey_without_capture"
+            }
             Mark::Problem(Problem::OutOfRange) => "settings_gui.mark.out_of_range",
             Mark::Problem(Problem::BadValue) => "settings_gui.mark.bad_value",
             Mark::Problem(Problem::UnknownKey) => "settings_gui.mark.unknown_key",
-            Mark::Problem(Problem::NotAppearance) => "settings_gui.mark.not_appearance",
+            Mark::Problem(Problem::UnknownTableOp) => "settings_gui.mark.not_appearance",
             Mark::Problem(Problem::NoValues) => "settings_gui.mark.no_values",
             Mark::Problem(Problem::BorderOffWithColorOrWidth) => {
                 "settings_gui.mark.border_off_with_color_or_width"
             }
+            Mark::Problem(Problem::NoSuchRegion) => "settings_gui.mark.no_such_region",
         }
     }
 }
@@ -154,10 +168,19 @@ impl Editor {
     }
 
     /// キーの組み合わせの欄 `item` に `chord` を入れる。None は空（割り当てなし）。キーの組み合わせの項目で
-    /// なければ何もしない。
+    /// なければ何もしない。レシピのショートカットかホットキーを入れたら、もう片方（設定 GUI に出ていない欄。
+    /// 設定ファイルに両方を書いたときだけ値がある）を消す。
     pub fn set_chord(&mut self, item: &SettingsItem, chord: Option<Chord>) {
         if let Some(slot) = chord_slot(&mut self.draft, item) {
             *slot = chord;
+        }
+        let other = match *item {
+            SettingsItem::RecipeShortcut(i) => self.draft.recipes.get_mut(i).map(|r| &mut r.hotkey),
+            SettingsItem::RecipeHotkey(i) => self.draft.recipes.get_mut(i).map(|r| &mut r.shortcut),
+            _ => None,
+        };
+        if let Some(other) = other {
+            *other = None;
         }
     }
 
@@ -256,6 +279,16 @@ impl Editor {
         index + 1
     }
 
+    /// 写しの定型領域 `index` の、撮ったものの出し方の欄（保存先・ファイル名テンプレート・保存する・スクラップに
+    /// する）を使えるか。白紙スクラップにする定型領域は撮らず何も保存しないので、使えない。`index` の定型領域が
+    /// なければ false。
+    pub fn region_uses_capture_outputs(&self, index: usize) -> bool {
+        self.draft
+            .regions
+            .get(index)
+            .is_some_and(|region| !region.blank_scrap)
+    }
+
     /// 定型領域 `index` を消す（「削除」）。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を返す。
     pub fn remove_region(&mut self, index: usize) -> Option<usize> {
         self.draft.regions.remove(index);
@@ -306,6 +339,9 @@ impl Editor {
             return None;
         }
         self.draft.recipes.remove(index);
+        // ホットキーは位置で指すので、登録できなかった印は位置がずれたら当たらない
+        self.not_registered
+            .retain(|item| !matches!(item, SettingsItem::RecipeHotkey(_)));
         let len = self.draft.recipes.len();
         (len > 0).then(|| index.min(len - 1))
     }
@@ -317,9 +353,11 @@ impl Editor {
         }
     }
 
-    /// レシピ `index` の「操作を足す」で選べるもの。値のない操作（表の順）と、最後に見た目を指定する手。値のない
-    /// 操作は、レシピに入れられる操作（`recipe::can_be_step`）のうち、`close` で終わるレシピには `close` を出さない
-    /// （`add_step` は `close` の前に足すので、2 つ目の `close` は最後に置けない）。`index` のレシピがなければ空。
+    /// レシピ `index` の「操作を足す」で選べるもの。最初にキャプチャ系（`Capture::ALL` の順）、次にパラメータの
+    /// ない操作（表の順）、最後に見た目を指定する操作と背景色を指定する操作。
+    /// パラメータのない操作は、レシピに入れられる操作（`recipe::can_be_step`）。最後にだけ置ける操作（`close`、
+    /// `annotate`）で終わるレシピには最後にだけ置ける操作を出さない（`add_step` はその前に足すので、2 つ目は最後に
+    /// 置けない）。`index` のレシピがなければ空。
     pub fn step_choices(&self, index: usize) -> Vec<StepChoice> {
         let Some(r) = self.draft.recipes.get(index) else {
             return Vec::new();
@@ -328,19 +366,25 @@ impl Editor {
             .steps
             .last()
             .is_some_and(|s| recipe::is_last_only(s.op_id(), OPERATIONS));
-        OPERATIONS
-            .iter()
-            .filter(|op| recipe::can_be_step(op))
-            .filter(|op| !(ends_with_last_only && op.in_recipe == InRecipe::Last))
-            .map(|op| StepChoice::Op(op.id))
-            .chain(std::iter::once(StepChoice::Appearance))
+        // キャプチャ系は、操作の位置にかかわらず出す（最初以外に足せば `FirstOnlyNotFirst` の印が出る）
+        let captures = Capture::ALL.into_iter().map(StepChoice::Capture);
+        captures
+            .chain(
+                OPERATIONS
+                    .iter()
+                    .filter(|op| recipe::can_be_step(op))
+                    .filter(|op| !(ends_with_last_only && op.in_recipe == InRecipe::Last))
+                    .map(|op| StepChoice::Op(op.id)),
+            )
+            .chain([StepChoice::Appearance, StepChoice::Background])
             .collect()
     }
 
-    /// レシピ `index` に `choice` を足す。見た目を指定する手は、全部の項目が「変えない」（そのままでは
-    /// `NoValues`）。レシピが `close` で終わっていれば、その前に入れる（`close` は最後にだけ置けるため）。入れた
+    /// レシピ `index` に `choice` を足す。見た目を指定する操作は、全部の項目が「変えない」、背景色を指定する操作は
+    /// 色を選んでいない（どちらもそのままでは `NoValues`）。レシピが最後にだけ置ける操作（`close`、`annotate`）で終わっていれば、その前に入れる。入れた
     /// 位置を返す。`index` のレシピがなければ何もせず None。
     pub fn add_step(&mut self, index: usize, choice: impl Into<StepChoice>) -> Option<usize> {
+        let first = self.starts_with_capture(index);
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
         let at = if steps
             .last()
@@ -352,15 +396,52 @@ impl Editor {
         };
         let step = match choice.into() {
             StepChoice::Op(id) => id.into(),
+            StepChoice::Capture(Capture::Region) => {
+                Step::CaptureRegion(CaptureRegionStep::default())
+            }
+            StepChoice::Capture(c) => c.id().into(),
             StepChoice::Appearance => Step::Appearance(AppearanceStep::default()),
+            StepChoice::Background => Step::Background(BackgroundStep::default()),
         };
         steps.insert(at, step);
+        self.first_step_changed(index, first);
         Some(at)
     }
 
-    /// レシピ `index` の手 `step` を隣と入れ替える（「上へ」「下へ」）。端か、手がなければ動かさない。移った
+    /// レシピ `index` の最初の操作がキャプチャ系か。
+    fn starts_with_capture(&self, index: usize) -> bool {
+        self.draft
+            .recipes
+            .get(index)
+            .is_some_and(Recipe::starts_with_capture)
+    }
+
+    /// 操作の並びを変えたあと、最初の操作がキャプチャ系かどうか（変える前は `before`）が変わったら、
+    /// ショートカットとホットキーを消す（欄が入れ替わるため）。
+    fn first_step_changed(&mut self, index: usize, before: bool) {
+        if self.starts_with_capture(index) != before
+            && let Some(r) = self.draft.recipes.get_mut(index)
+        {
+            r.shortcut = None;
+            r.hotkey = None;
+        }
+    }
+
+    /// レシピ `index` のキーの欄（ショートカットの欄の場所に出す欄）。最初の操作がキャプチャ系なら
+    /// `RecipeHotkey`、ほかは `RecipeShortcut`。`index` のレシピがなければ None。
+    pub fn key_item(&self, index: usize) -> Option<SettingsItem> {
+        self.draft.recipes.get(index)?;
+        Some(if self.starts_with_capture(index) {
+            SettingsItem::RecipeHotkey(index)
+        } else {
+            SettingsItem::RecipeShortcut(index)
+        })
+    }
+
+    /// レシピ `index` の操作 `step` を隣と入れ替える（「上へ」「下へ」）。端か、操作がなければ動かさない。移った
     /// 位置を返す。
     pub fn move_step(&mut self, index: usize, step: usize, to: Move) -> usize {
+        let first = self.starts_with_capture(index);
         let Some(r) = self.draft.recipes.get_mut(index) else {
             return step;
         };
@@ -371,33 +452,104 @@ impl Editor {
         match other.filter(|&o| o < r.steps.len() && step < r.steps.len()) {
             Some(other) => {
                 r.steps.swap(step, other);
+                self.first_step_changed(index, first);
                 other
             }
             None => step,
         }
     }
 
-    /// レシピ `index` の手 `step` を消す。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を
-    /// 返す。手がなければ何もせず None。
+    /// レシピ `index` の操作 `step` を消す。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を
+    /// 返す。操作がなければ何もせず None。
     pub fn remove_step(&mut self, index: usize, step: usize) -> Option<usize> {
+        let first = self.starts_with_capture(index);
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
         if step >= steps.len() {
             return None;
         }
         steps.remove(step);
         let len = steps.len();
+        self.first_step_changed(index, first);
         (len > 0).then(|| step.min(len - 1))
     }
 
-    /// レシピ `index` の手 `step` が見た目を指定する手なら、その項目 `item` の欄に出す値。「変えない」は
-    /// `Switch(None)` か空の `Text`。読めなかった値（範囲外など）は書いたまま出す。見た目を指定する手でなければ None。
+    /// レシピ `index` の操作 `step` を選んでいる間に出すパラメータの欄。パラメータの欄のない操作か、操作が
+    /// なければ None（欄を出さない）。
+    pub fn param_fields(&self, index: usize, step: usize) -> Option<ParamFields> {
+        match self.step(index, step)? {
+            Step::Appearance(_) => Some(ParamFields::Appearance),
+            Step::Background(_) => Some(ParamFields::Background),
+            Step::CaptureRegion(_) => Some(ParamFields::Region),
+            Step::Op(_) => None,
+        }
+    }
+
+    /// レシピ `index` の操作 `step` が定型領域キャプチャなら、選べる定型領域の名前（写しの定型領域の順）と、選んで
+    /// いる位置（選んでいないか、名前が読めなければ None）。写しにない名前を選んでいれば、それも末尾に足して選んで
+    /// おく（表示だけ）。定型領域キャプチャでなければ None。
+    pub fn capture_region(&self, index: usize, step: usize) -> Option<RegionChoices> {
+        let Step::CaptureRegion(step) = self.step(index, step)? else {
+            return None;
+        };
+        let mut names: Vec<String> = self.draft.regions.iter().map(|r| r.name.clone()).collect();
+        let selected = step.region.as_ref().map(|chosen| {
+            names.iter().position(|n| n == chosen).unwrap_or_else(|| {
+                names.push(chosen.clone());
+                names.len() - 1
+            })
+        });
+        Some(RegionChoices { names, selected })
+    }
+
+    /// レシピ `index` の操作 `step`。
+    fn step(&self, index: usize, step: usize) -> Option<&Step> {
+        self.draft.recipes.get(index)?.steps.get(step)
+    }
+
+    /// レシピ `index` の操作 `step`（書き換える）。
+    fn step_mut(&mut self, index: usize, step: usize) -> Option<&mut Step> {
+        self.draft.recipes.get_mut(index)?.steps.get_mut(step)
+    }
+
+    /// レシピ `index` の操作 `step`（定型領域キャプチャ）で撮る定型領域を、名前 `name` の定型領域にする。設定
+    /// ファイルから読めなかった名前は消す。定型領域キャプチャでなければ何もしない。
+    pub fn set_capture_region(&mut self, index: usize, step: usize, name: &str) {
+        let Some(Step::CaptureRegion(step)) = self.step_mut(index, step) else {
+            return;
+        };
+        forget_rejected(&mut step.rejected, &StepKey::Region);
+        step.region = Some(name.to_owned());
+    }
+
+    /// レシピ `index` の操作 `step` が背景色を指定する操作なら、その色（選んでいないか、設定ファイルに書いた色が
+    /// 読めなければ None）。背景色を指定する操作でなければ None。
+    pub fn background(&self, index: usize, step: usize) -> Option<Option<Background>> {
+        match self.step(index, step)? {
+            Step::Background(step) => Some(step.color),
+            Step::Op(_) | Step::Appearance(_) | Step::CaptureRegion(_) => None,
+        }
+    }
+
+    /// レシピ `index` の操作 `step`（背景色を指定する操作）の色を `color` にする（「選ぶ…」で選んだ色か、「透明」の
+    /// チェックで `Transparent`。チェックを外したら None で、色を選ぶまで `NoValues`）。設定ファイルから読めなかった
+    /// 色は消す。背景色を指定する操作でなければ何もしない。
+    pub fn set_background(&mut self, index: usize, step: usize, color: Option<Background>) {
+        let Some(Step::Background(step)) = self.step_mut(index, step) else {
+            return;
+        };
+        forget_rejected(&mut step.rejected, &StepKey::Color);
+        step.color = color;
+    }
+
+    /// レシピ `index` の操作 `step` が見た目を指定する操作なら、その項目 `item` の欄に出す値。「変えない」は
+    /// `Switch(None)` か空の `Text`。読めなかった値（範囲外など）は書いたまま出す。見た目を指定する操作でなければ None。
     pub fn appearance(
         &self,
         index: usize,
         step: usize,
         item: AppearanceItem,
     ) -> Option<AppearanceInput> {
-        let Some(Step::Appearance(step)) = self.draft.recipes.get(index)?.steps.get(step) else {
+        let Some(Step::Appearance(step)) = self.step(index, step) else {
             return None;
         };
         let text = match step.values.get(item) {
@@ -419,10 +571,10 @@ impl Editor {
         ))
     }
 
-    /// レシピ `index` の手 `step`（見た目を指定する手）の項目 `item` を、欄の入力 `input` にする。「変えない」
+    /// レシピ `index` の操作 `step`（見た目を指定する操作）の項目 `item` を、欄の入力 `input` にする。「変えない」
     /// （`Switch(None)`、空白だけの `Text`）は書かない。読めない文字（範囲外の数、`#RRGGBB` でない色）は書いたまま
     /// 残し、設定ファイルから読めなかった値と同じくレシピの問題にする（適用できない）。項目を書き直したら、その
-    /// 項目の読めなかった値は消す。見た目を指定する手でないか、欄と違う種類の入力なら何もしない。
+    /// 項目の読めなかった値は消す。見た目を指定する操作でないか、欄と違う種類の入力なら何もしない。
     pub fn set_appearance(
         &mut self,
         index: usize,
@@ -430,18 +582,13 @@ impl Editor {
         item: AppearanceItem,
         input: AppearanceInput,
     ) {
-        let Some(Step::Appearance(step)) = self
-            .draft
-            .recipes
-            .get_mut(index)
-            .and_then(|r| r.steps.get_mut(step))
-        else {
+        let Some(Step::Appearance(step)) = self.step_mut(index, step) else {
             return;
         };
         if item.is_switch() != matches!(input, AppearanceInput::Switch(_)) {
             return;
         }
-        step.rejected.retain(|r| r.key != StepKey::Item(item));
+        forget_rejected(&mut step.rejected, &StepKey::Item(item));
         let written = match &input {
             AppearanceInput::Switch(on) => on.map(Written::Bool),
             AppearanceInput::Text(s) => {
@@ -480,18 +627,39 @@ impl Editor {
     }
 }
 
-/// 「レシピ」タブの手の一覧の行の文言。値のない手は操作の名前（表にない id はそのまま）、値のある手は
+/// 「レシピ」タブの操作の一覧の行の文言。パラメータのない操作は操作の名前（表にない id はそのまま）、パラメータを添えた操作は
 /// 「見た目: 枠 #FF0000 3px」のように、書いた項目を決まった順（透明度、枠、枠の太さ、影）に並べた要約。`text` は文言のキーから
 /// 文言を引く。
 pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> String {
     let values = match step {
         Step::Op(id) => {
+            if let Some(c) = Capture::from_id(id) {
+                return text(c.label_key()).to_owned();
+            }
             return OPERATIONS
                 .iter()
                 .find(|op| op.id == id)
                 .map_or_else(|| id.clone(), |op| text(op.label_key).to_owned());
         }
         Step::Appearance(step) => step.values,
+        Step::CaptureRegion(step) => {
+            let label = text(Capture::Region.label_key());
+            return match &step.region {
+                Some(name) => text("settings_gui.recipes.step.capture_region")
+                    .replace("{capture}", label)
+                    .replace("{region}", name),
+                None => label.to_owned(),
+            };
+        }
+        Step::Background(step) => {
+            return match step.color {
+                Some(Background::Transparent) => text("settings_gui.recipes.step.background")
+                    .replace("{color}", text("scrap.background.transparent")),
+                Some(color) => text("settings_gui.recipes.step.background")
+                    .replace("{color}", &color.to_string()),
+                None => text("scrap.op.background").to_owned(),
+            };
+        }
     };
     let mut items: Vec<String> = Vec::new();
     if let Some(opacity) = values.opacity {
@@ -555,7 +723,7 @@ impl AppearanceItem {
     }
 }
 
-/// 見た目を指定する手の欄の値（`Editor::appearance` / `set_appearance`）。
+/// 見た目を指定する操作の欄の値（`Editor::appearance` / `set_appearance`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppearanceInput {
     /// オン・オフの欄（枠・影）。None は「変えない」。
@@ -574,6 +742,11 @@ pub const SWITCH_CHOICES: [(Option<bool>, &str); 3] = [
 /// 「変えない」の文言のキー。文字の欄では、空のときに薄く出す。
 pub const UNCHANGED_KEY: &str = "settings_gui.recipes.appearance.unchanged";
 
+/// 操作のパラメータ `key` を設定 GUI の欄で書き直すので、設定ファイルから読めなかったその値（`rejected`）を消す。
+fn forget_rejected(rejected: &mut Vec<recipe::Rejected>, key: &StepKey) {
+    rejected.retain(|r| &r.key != key);
+}
+
 /// 読めなかった値（TOML の書き方）を欄に出す文字にする。文字列なら中身、ほかはそのまま。
 fn unquoted(written: &str) -> String {
     match written.parse::<toml_edit::Value>() {
@@ -582,13 +755,38 @@ fn unquoted(written: &str) -> String {
     }
 }
 
+/// レシピのタブで、選んでいる操作に添えて出すパラメータの欄の種類（`Editor::param_fields`）。Win32 層は、
+/// 種類ごとの欄のまとまりを、選んでいる操作の種類のときだけ出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamFields {
+    /// 見た目（透明度・枠・影。`Editor::appearance` / `set_appearance`）。
+    Appearance,
+    /// 背景色（「選ぶ…」と「透明」。`Editor::background` / `set_background`）。
+    Background,
+    /// 定型領域キャプチャの定型領域（ドロップダウン。`Editor::capture_region` / `set_capture_region`）。
+    Region,
+}
+
+/// 定型領域キャプチャの欄のドロップダウン（`Editor::capture_region`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionChoices {
+    /// 定型領域の名前（ドロップダウンの順）。
+    pub names: Vec<String>,
+    /// 選んでいる位置。選んでいなければ None。
+    pub selected: Option<usize>,
+}
+
 /// 「操作を足す」で選べるもの（`Editor::step_choices`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepChoice {
     /// 値のない操作。
     Op(OperationId),
-    /// 見た目を指定する手（値は足してから欄で入れる）。
+    /// 見た目を指定する操作（パラメータは足してから欄で入れる）。
     Appearance,
+    /// 背景色を指定する操作（色は足してから欄で選ぶ）。
+    Background,
+    /// キャプチャ系の操作（ADR-0010。最初にだけ置ける）。
+    Capture(Capture),
 }
 
 impl StepChoice {
@@ -597,6 +795,8 @@ impl StepChoice {
         let id = match self {
             StepChoice::Op(id) => id,
             StepChoice::Appearance => recipe::APPEARANCE,
+            StepChoice::Background => recipe::BACKGROUND,
+            StepChoice::Capture(c) => return Some(c.label_key()),
         };
         OPERATIONS
             .iter()
@@ -645,9 +845,11 @@ fn chord_of(settings: &Settings, item: &SettingsItem) -> Option<Chord> {
         SettingsItem::SelectCaptureHotkey => settings.hotkeys.select_capture,
         SettingsItem::RestoreLastHotkey => settings.hotkeys.restore_last,
         SettingsItem::ActiveWindowCaptureHotkey => settings.hotkeys.active_window_capture,
+        SettingsItem::BlankScrapHotkey => settings.hotkeys.blank_scrap,
         SettingsItem::RegionHotkey(i) => settings.regions.get(*i).and_then(|r| r.hotkey),
         SettingsItem::Shortcut(id) => settings.shortcuts.get(id).copied().flatten(),
         SettingsItem::RecipeShortcut(i) => settings.recipes.get(*i).and_then(|r| r.shortcut),
+        SettingsItem::RecipeHotkey(i) => settings.recipes.get(*i).and_then(|r| r.hotkey),
         SettingsItem::Mouse(_)
         | SettingsItem::RegionName(_)
         | SettingsItem::RecipeName(_)
@@ -666,9 +868,11 @@ fn chord_slot<'a>(
         SettingsItem::ActiveWindowCaptureHotkey => {
             Some(&mut settings.hotkeys.active_window_capture)
         }
+        SettingsItem::BlankScrapHotkey => Some(&mut settings.hotkeys.blank_scrap),
         SettingsItem::RegionHotkey(i) => settings.regions.get_mut(*i).map(|r| &mut r.hotkey),
         SettingsItem::Shortcut(id) => Some(settings.shortcuts.entry(id.clone()).or_default()),
         SettingsItem::RecipeShortcut(i) => settings.recipes.get_mut(*i).map(|r| &mut r.shortcut),
+        SettingsItem::RecipeHotkey(i) => settings.recipes.get_mut(*i).map(|r| &mut r.hotkey),
         SettingsItem::Mouse(_)
         | SettingsItem::RegionName(_)
         | SettingsItem::RecipeName(_)
@@ -909,13 +1113,14 @@ mod tests {
             Mark::Problem(Problem::DuplicateName),
             Mark::Problem(Problem::NoSteps),
             Mark::Problem(Problem::NotAStep),
-            Mark::Problem(Problem::CloseNotLast),
+            Mark::Problem(Problem::LastOnlyNotLast),
             Mark::Problem(Problem::OutOfRange),
             Mark::Problem(Problem::BadValue),
             Mark::Problem(Problem::UnknownKey),
-            Mark::Problem(Problem::NotAppearance),
+            Mark::Problem(Problem::UnknownTableOp),
             Mark::Problem(Problem::NoValues),
             Mark::Problem(Problem::BorderOffWithColorOrWidth),
+            Mark::Problem(Problem::NoSuchRegion),
         ] {
             let key = mark.label_key();
             assert_ne!(catalog.text(key), key, "{mark:?}");
@@ -931,7 +1136,8 @@ mod tests {
             .into_iter()
             .chain(SWITCH_CHOICES.map(|(_, key)| key))
             .chain([UNCHANGED_KEY])
-            .chain(StepChoice::Appearance.label_key());
+            .chain(StepChoice::Appearance.label_key())
+            .chain(StepChoice::Background.label_key());
         for key in keys {
             assert_ne!(catalog.text(key), key);
         }
@@ -1193,6 +1399,22 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_scrap_region_cannot_use_its_save_and_scrap_items_and_copies_the_choice() {
+        let mut editor = Editor::new(with_regions(&["a", "b"]));
+        assert!(editor.region_uses_capture_outputs(0));
+
+        editor.draft_mut().regions[0].blank_scrap = true;
+
+        assert!(!editor.region_uses_capture_outputs(0));
+        assert!(editor.region_uses_capture_outputs(1));
+        assert!(!editor.region_uses_capture_outputs(2));
+        let i = editor.duplicate_region(0, "a のコピー");
+        assert!(!editor.region_uses_capture_outputs(i));
+        // 白紙スクラップにしても、適用は止めない
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
     fn a_removed_region_leaves_the_next_one_selected() {
         let mut editor = Editor::new(with_regions(&["a", "b", "c"]));
 
@@ -1284,16 +1506,15 @@ mod tests {
             .iter()
             .filter_map(|c| match c {
                 StepChoice::Op(id) => Some(*id),
-                StepChoice::Appearance => None,
+                StepChoice::Appearance | StepChoice::Background | StepChoice::Capture(_) => None,
             })
             .collect()
     }
 
     #[test]
-    fn an_appearance_step_is_offered_last_and_starts_with_every_item_unchanged() {
+    fn an_appearance_step_is_offered_once_and_starts_with_every_item_unchanged() {
         let mut editor = with_steps(&["copy", "close"]);
         let choices = editor.step_choices(0);
-        assert_eq!(choices.last(), Some(&StepChoice::Appearance));
         assert_eq!(
             choices
                 .iter()
@@ -1309,7 +1530,7 @@ mod tests {
             editor.draft().recipes[0].steps[1],
             Step::Appearance(recipe::AppearanceStep::default())
         );
-        // 項目のない手のままでは適用できない
+        // 項目を 1 つも書いていない操作のままでは適用できない
         assert_eq!(
             editor.mark(&SettingsItem::RecipeSteps(0)),
             Some(Mark::Problem(Problem::NoValues))
@@ -1322,11 +1543,11 @@ mod tests {
         let mut editor = Editor::new(Settings::default());
         editor.add_recipe("R");
         let ids = choice_ids(&editor, 0);
-        for id in ["copy", "zoom_in", "toggle_compact", "close"] {
+        for id in ["copy", "zoom_in", "toggle_compact", "close", "annotate"] {
             assert!(ids.contains(&id), "{id} in {ids:?}");
         }
-        // モードを切り替える操作、引数を取る操作、ドラッグ専用の操作は出さない
-        for id in ["trim", "annotate", "zoom", "opacity", "move"] {
+        // トリム、引数を取る操作、ドラッグ専用の操作は出さない
+        for id in ["trim", "zoom", "opacity", "move"] {
             assert!(!ids.contains(&id), "{id} in {ids:?}");
         }
     }
@@ -1344,6 +1565,19 @@ mod tests {
         assert_eq!(editor.add_step(1, "copy"), None);
     }
 
+    #[test]
+    fn a_recipe_ending_with_one_last_only_step_is_not_offered_the_other() {
+        // 最後にだけ置ける操作は 1 つまで。足すとその前に入るので、「閉じる」と「書き込み」は一緒に出さない
+        for (last, other) in [("close", "annotate"), ("annotate", "close")] {
+            let mut editor = Editor::new(Settings::default());
+            editor.add_recipe("R");
+            editor.add_step(0, last);
+            let ids = choice_ids(&editor, 0);
+            assert!(!ids.contains(&last) && !ids.contains(&other), "{ids:?}");
+            assert!(ids.contains(&"copy"), "{ids:?}");
+        }
+    }
+
     /// 操作の並びが `ids` のレシピ 1 つを持つ写し（ほかに適用を止める問題はない）。
     fn with_steps(ids: &[&str]) -> Editor {
         let mut settings = Settings::default();
@@ -1352,6 +1586,7 @@ mod tests {
             name: "R".to_owned(),
             steps: ids.iter().map(|&id| id.into()).collect(),
             shortcut: None,
+            hotkey: None,
         });
         Editor::new(settings)
     }
@@ -1372,6 +1607,14 @@ mod tests {
             .iter()
             .map(|s| step_label(s, |key| catalog.text(key)))
             .collect()
+    }
+
+    #[test]
+    fn the_step_list_names_a_transparent_background_in_words() {
+        let editor = with_steps_read(
+            r##"[{ op = "background", color = "transparent" }, { op = "background", color = "#ffffff" }]"##,
+        );
+        assert_eq!(labels(&editor), ["背景色: 透明", "背景色: #FFFFFF"]);
     }
 
     #[test]
@@ -1410,7 +1653,7 @@ mod tests {
             (r#"[{ op = "appearance", width = 3 }]"#, Problem::UnknownKey),
             (
                 r#"[{ op = "copy", shadow = true }]"#,
-                Problem::NotAppearance,
+                Problem::UnknownTableOp,
             ),
             (r#"[{ op = "appearance" }]"#, Problem::NoValues),
             (
@@ -1428,7 +1671,7 @@ mod tests {
         }
     }
 
-    /// レシピ 1 つに、全部の項目が「変えない」の見た目の手を 1 つ足した写し。
+    /// レシピ 1 つに、全部の項目が「変えない」の見た目を指定する操作を 1 つ足した写し。
     fn with_an_appearance_step() -> Editor {
         let mut editor = with_steps(&["copy"]);
         editor.add_step(0, StepChoice::Appearance);
@@ -1456,7 +1699,7 @@ mod tests {
             fields(&editor, 1),
             AppearanceItem::ALL.map(unchanged).to_vec()
         );
-        // 値のない手には欄がない
+        // パラメータのない操作には欄がない
         assert_eq!(fields(&editor, 0), vec![None; 5]);
         assert_eq!(editor.appearance(0, 2, AppearanceItem::Border), None);
     }
@@ -1695,7 +1938,7 @@ mod tests {
         assert_eq!(steps(&editor, 0), ["zoom_in", "close", "copy"]);
         assert_eq!(
             editor.mark(&SettingsItem::RecipeSteps(0)),
-            Some(Mark::Problem(Problem::CloseNotLast))
+            Some(Mark::Problem(Problem::LastOnlyNotLast))
         );
         assert_eq!(editor.move_step(1, 0, Move::Down), 0);
     }
@@ -1738,6 +1981,129 @@ mod tests {
     }
 
     #[test]
+    fn only_operations_with_parameters_show_parameter_fields() {
+        let editor = with_steps_read(
+            r##"["copy", { op = "appearance", opacity = 50 }, { op = "background", color = "#ffffff" }]"##,
+        );
+        assert_eq!(editor.param_fields(0, 0), None);
+        assert_eq!(editor.param_fields(0, 1), Some(ParamFields::Appearance));
+        assert_eq!(editor.param_fields(0, 2), Some(ParamFields::Background));
+        // 選んでいる操作やレシピがない
+        assert_eq!(editor.param_fields(0, 3), None);
+        assert_eq!(editor.param_fields(1, 0), None);
+    }
+
+    #[test]
+    fn an_added_appearance_operation_is_the_one_to_select_and_shows_its_fields() {
+        let mut editor = with_steps(&["copy", "close"]);
+        // `close` の前に入るので、選ぶのは末尾ではなく入った位置
+        let added = editor.add_step(0, StepChoice::Appearance).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(editor.param_fields(0, added), Some(ParamFields::Appearance));
+
+        let added = editor.add_step(0, "copy").unwrap();
+        assert_eq!(editor.param_fields(0, added), None);
+    }
+
+    #[test]
+    fn a_background_operation_is_offered_last_and_an_added_one_is_selected_with_its_fields() {
+        let mut editor = with_steps(&["copy", "close"]);
+        let choices = editor.step_choices(0);
+        assert_eq!(
+            choices[choices.len() - 2..],
+            [StepChoice::Appearance, StepChoice::Background]
+        );
+
+        // `close` の前に入る。色はまだ選んでいない（そのままでは適用できない）
+        let added = editor.add_step(0, StepChoice::Background).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(steps(&editor, 0), ["copy", "background", "close"]);
+        assert_eq!(editor.param_fields(0, added), Some(ParamFields::Background));
+        assert_eq!(editor.background(0, added), Some(None));
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoValues))
+        );
+        assert!(!editor.buttons().ok);
+    }
+
+    #[test]
+    fn a_background_chosen_in_the_fields_is_written_as_a_background_step_and_reads_back_the_same() {
+        let mut editor = with_steps(&["copy"]);
+        editor.add_step(0, StepChoice::Background);
+        editor.add_step(0, StepChoice::Background);
+        // 「選ぶ…」で選んだ色と、「透明」のチェック
+        editor.set_background(
+            0,
+            1,
+            Some(Background::Color(super::super::Rgb(0x1E, 0x88, 0xE5))),
+        );
+        editor.set_background(0, 2, Some(Background::Transparent));
+        assert_eq!(
+            editor.background(0, 1),
+            Some(Some(Background::Color(super::super::Rgb(0x1E, 0x88, 0xE5))))
+        );
+        assert_eq!(editor.background(0, 2), Some(Some(Background::Transparent)));
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().apply);
+
+        let written = super::super::write::rewrite("version = 1\n", editor.draft()).unwrap();
+
+        assert!(
+            written.contains(
+                r##"steps = ["copy", { op = "background", color = "#1E88E5" }, { op = "background", color = "transparent" }]"##
+            ),
+            "{written}"
+        );
+        let (read, issues) = super::super::load(&written);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, editor.draft().recipes);
+        let reopened = Editor::new(read);
+        assert_eq!(
+            reopened.background(0, 2),
+            Some(Some(Background::Transparent))
+        );
+    }
+
+    #[test]
+    fn unchecking_transparent_leaves_the_colour_to_be_chosen() {
+        let mut editor = with_steps_read(r#"[{ op = "background", color = "transparent" }]"#);
+        editor.set_background(0, 0, None);
+        assert_eq!(editor.background(0, 0), Some(None));
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoValues))
+        );
+    }
+
+    #[test]
+    fn choosing_a_background_replaces_a_colour_that_could_not_be_read() {
+        let (settings, _) = super::super::load(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Shift+A\"\n[[recipes]]\nname = \"R\"\nsteps = [{ op = \"background\", color = \"white\" }]\n",
+        );
+        let mut editor = Editor::new(settings);
+        assert_eq!(editor.background(0, 0), Some(None));
+        assert!(editor.mark(&SettingsItem::RecipeSteps(0)).is_some());
+
+        editor.set_background(0, 0, Some(Background::WHITE));
+
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn choosing_a_background_for_another_operation_changes_nothing() {
+        let mut editor = with_steps_read(r#"["copy", { op = "appearance", opacity = 50 }]"#);
+        let before = editor.draft().clone();
+        editor.set_background(0, 0, Some(Background::Transparent));
+        editor.set_background(0, 1, Some(Background::Transparent));
+        editor.set_background(0, 2, Some(Background::Transparent));
+        editor.set_background(1, 0, Some(Background::Transparent));
+        assert_eq!(editor.draft(), &before);
+        assert_eq!(editor.background(0, 1), None);
+    }
+
+    #[test]
     fn recipe_shortcuts_overlapping_an_operation_are_marked_and_block_applying() {
         let mut editor = with_steps(&["copy"]);
         editor.set_chord(&SettingsItem::RecipeShortcut(0), Some(chord("Ctrl+C")));
@@ -1750,5 +2116,232 @@ mod tests {
             Some(Mark::Problem(Problem::Conflict(_)))
         ));
         assert!(!editor.buttons().ok);
+    }
+
+    fn captures(editor: &Editor, index: usize) -> Vec<Capture> {
+        editor
+            .step_choices(index)
+            .iter()
+            .filter_map(|c| match c {
+                StepChoice::Capture(c) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn captures_are_always_offered_first_and_named_in_the_step_list() {
+        for ids in [&[][..], &["copy"], &["copy", "close"], &["select_capture"]] {
+            let editor = with_steps(ids);
+            assert_eq!(captures(&editor, 0), Capture::ALL, "{ids:?}");
+            assert_eq!(
+                editor.step_choices(0)[0],
+                StepChoice::Capture(Capture::Select),
+                "{ids:?}"
+            );
+        }
+        assert_eq!(
+            StepChoice::Capture(Capture::Select).label_key(),
+            Some("recipe.capture.select_capture")
+        );
+        let editor = with_steps(&["select_capture", "copy"]);
+        assert_eq!(labels(&editor), ["範囲選択キャプチャ", "コピー"]);
+        let editor = with_steps(&["active_window_capture", "blank_scrap"]);
+        assert_eq!(
+            labels(&editor),
+            ["ウィンドウキャプチャ", "白紙スクラップを作る"]
+        );
+    }
+
+    #[test]
+    fn a_capture_added_after_the_first_step_is_a_problem_until_it_is_first() {
+        let mut editor = with_steps(&["copy", "close"]);
+        // ほかの操作と同じく、最後にだけ置ける操作の前に入る
+        assert_eq!(
+            editor.add_step(0, StepChoice::Capture(Capture::Select)),
+            Some(1)
+        );
+        assert_eq!(steps(&editor, 0), ["copy", "select_capture", "close"]);
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::FirstOnlyNotFirst))
+        );
+        assert!(!editor.buttons().ok);
+        editor.move_step(0, 1, Move::Up);
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Alt+C")));
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn the_key_field_follows_the_first_step_and_switching_clears_the_key() {
+        let mut editor = with_steps(&["copy"]);
+        assert_eq!(editor.key_item(0), Some(SettingsItem::RecipeShortcut(0)));
+        editor.set_chord(&SettingsItem::RecipeShortcut(0), Some(chord("Ctrl+Q")));
+        editor.add_step(0, StepChoice::Capture(Capture::Select));
+        // 2 つ目に足しただけでは最初の操作は変わらない
+        assert_eq!(editor.key_item(0), Some(SettingsItem::RecipeShortcut(0)));
+        assert_eq!(
+            editor.chord(&SettingsItem::RecipeShortcut(0)),
+            Some(chord("Ctrl+Q"))
+        );
+
+        editor.move_step(0, 1, Move::Up);
+        assert_eq!(editor.key_item(0), Some(SettingsItem::RecipeHotkey(0)));
+        assert_eq!(editor.chord(&SettingsItem::RecipeShortcut(0)), None);
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeHotkey(0)),
+            Some(Mark::Problem(Problem::Unset))
+        );
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Alt+C")));
+        assert_eq!(editor.mark(&SettingsItem::RecipeHotkey(0)), None);
+        assert!(editor.buttons().ok);
+
+        // 並べ替えで最初がキャプチャのままなら、キーは残る
+        editor.add_step(0, "close");
+        editor.move_step(0, 2, Move::Up);
+        assert_eq!(
+            editor.chord(&SettingsItem::RecipeHotkey(0)),
+            Some(chord("Ctrl+Alt+C"))
+        );
+
+        editor.remove_step(0, 0);
+        assert_eq!(editor.key_item(0), Some(SettingsItem::RecipeShortcut(0)));
+        assert_eq!(editor.chord(&SettingsItem::RecipeHotkey(0)), None);
+        assert_eq!(editor.key_item(1), None);
+    }
+
+    #[test]
+    fn a_capture_recipe_hotkey_overlapping_another_hotkey_is_marked() {
+        let mut editor = with_steps(&["select_capture"]);
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Shift+A")));
+        assert!(matches!(
+            editor.mark(&SettingsItem::RecipeHotkey(0)),
+            Some(Mark::Problem(Problem::Conflict(_)))
+        ));
+        assert!(matches!(
+            editor.mark(&SettingsItem::SelectCaptureHotkey),
+            Some(Mark::Problem(Problem::Conflict(_)))
+        ));
+        assert!(!editor.buttons().ok);
+    }
+
+    #[test]
+    fn entering_the_shown_key_clears_the_hidden_one_written_in_the_file() {
+        let (settings, _) = super::super::load(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Shift+A\"\n[[recipes]]\nname = \"R\"\nsteps = [\"select_capture\"]\nshortcut = \"Ctrl+Q\"\nhotkey = \"Ctrl+Alt+C\"\n",
+        );
+        let mut editor = Editor::new(settings);
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeHotkey(0)),
+            Some(Mark::Problem(Problem::ShortcutOnCapture))
+        );
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Alt+C")));
+        assert_eq!(editor.chord(&SettingsItem::RecipeShortcut(0)), None);
+        assert_eq!(editor.mark(&SettingsItem::RecipeHotkey(0)), None);
+        assert!(editor.buttons().ok);
+    }
+
+    /// 定型領域「右」「左」（この順）と、`steps = [...]` のキャプチャで始まるレシピ 1 つを読んだ写し。
+    fn with_regions_read(steps: &str) -> Editor {
+        let region = |name: &str| {
+            format!(
+                "[[regions]]\nname = \"{name}\"\nmonitor = \"m\"\nx = 0\ny = 0\nwidth = 10\nheight = 10\n"
+            )
+        };
+        let (settings, issues) = super::super::load(&format!(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Shift+A\"\n{}{}[[recipes]]\nname = \"R\"\nsteps = {steps}\nhotkey = \"Ctrl+Alt+C\"\n",
+            region("右"),
+            region("左"),
+        ));
+        assert_eq!(issues, vec![], "{steps}");
+        Editor::new(settings)
+    }
+
+    #[test]
+    fn a_fixed_region_capture_is_added_without_a_region_and_offers_the_regions_in_order() {
+        let mut editor = with_regions_read("[]");
+        assert_eq!(captures(&editor, 0).last(), Some(&Capture::Region));
+        let added = editor
+            .add_step(0, StepChoice::Capture(Capture::Region))
+            .unwrap();
+        assert_eq!(steps(&editor, 0), ["capture_region"]);
+        assert_eq!(editor.param_fields(0, added), Some(ParamFields::Region));
+        assert_eq!(
+            editor.capture_region(0, added),
+            Some(RegionChoices {
+                names: vec!["右".to_owned(), "左".to_owned()],
+                selected: None,
+            })
+        );
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoValues))
+        );
+        assert!(!editor.buttons().ok);
+    }
+
+    #[test]
+    fn a_region_chosen_in_the_field_is_written_as_a_fixed_region_capture_and_reads_back_the_same() {
+        let mut editor = with_regions_read("[]");
+        editor.add_step(0, StepChoice::Capture(Capture::Region));
+        editor.add_step(0, "copy");
+        editor.set_capture_region(0, 0, "左");
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Alt+C")));
+        assert_eq!(
+            editor.capture_region(0, 0).map(|c| c.selected),
+            Some(Some(1))
+        );
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().ok);
+        assert_eq!(labels(&editor), ["定型領域キャプチャ: 左", "コピー"]);
+
+        let written = super::super::write::rewrite("version = 1\n", editor.draft()).unwrap();
+
+        assert!(
+            written.contains(r#"steps = [{ op = "capture_region", region = "左" }, "copy"]"#),
+            "{written}"
+        );
+        let (read, issues) = super::super::load(&written);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, editor.draft().recipes);
+    }
+
+    #[test]
+    fn a_fixed_region_capture_of_a_missing_region_shows_that_name_and_is_a_problem_until_another_is_chosen()
+     {
+        let mut editor = with_regions_read(r#"[{ op = "capture_region", region = "中" }]"#);
+        assert_eq!(
+            editor.capture_region(0, 0),
+            Some(RegionChoices {
+                names: vec!["右".to_owned(), "左".to_owned(), "中".to_owned()],
+                selected: Some(2),
+            })
+        );
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoSuchRegion))
+        );
+        assert!(!editor.buttons().ok);
+
+        editor.set_capture_region(0, 0, "右");
+
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().ok);
+        // 定型領域キャプチャでない操作は何も変えない
+        let before = editor.draft().clone();
+        editor.set_capture_region(0, 1, "左");
+        editor.set_capture_region(1, 0, "左");
+        assert_eq!(editor.draft(), &before);
+    }
+
+    #[test]
+    fn a_fixed_region_capture_of_a_region_value_that_could_not_be_read_is_replaced_by_choosing_one()
+    {
+        let mut editor = with_regions_read(r#"[{ op = "capture_region", region = 1 }]"#);
+        assert_eq!(editor.capture_region(0, 0).map(|c| c.selected), Some(None));
+        assert!(editor.mark(&SettingsItem::RecipeSteps(0)).is_some());
+        editor.set_capture_region(0, 0, "左");
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
     }
 }

@@ -9,6 +9,7 @@
 //!   シェルが全画面のウィンドウとみなしてタスクバーを後ろに回し、動かすたびにモニタを覆う・覆わないが
 //!   切り替わってタスクバーがちらつくため。タスクバーは常にスクラップの上に出る。
 //! - drop でウィンドウを壊す。
+//! - 書き込みの編集モードで消しゴムを選んでいる間のカーソル（`set_eraser_cursor`）もここで作る。
 
 use shunsoku_core::geometry::Rect;
 use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND};
@@ -19,6 +20,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, RemovePropW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE,
     SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, WNDCLASSEXW, WNDPROC,
     WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateCursor, GetSystemMetrics, HCURSOR, SM_CXCURSOR, SM_CYCURSOR, SetCursor,
 };
 use windows::core::{PCWSTR, Result, w};
 
@@ -50,6 +54,77 @@ pub fn register_class(module: HINSTANCE, wndproc: WNDPROC) -> Result<()> {
         return Err(windows::core::Error::from_thread());
     }
     Ok(())
+}
+
+thread_local! {
+    /// 消しゴムのカーソル。UI スレッドで最初に使うときに作り、終わるまで持つ（壊さない）。作れなければ None。
+    static ERASER_CURSOR: Option<HCURSOR> = eraser_cursor();
+}
+
+/// カーソルを消しゴムの形（中の空いた正方形）にする。作れなかったら矢印のまま。
+pub fn set_eraser_cursor() {
+    if let Some(cursor) = ERASER_CURSOR.with(|c| *c) {
+        // SAFETY: UI スレッドで呼ぶ
+        unsafe { SetCursor(Some(cursor)) };
+    }
+}
+
+/// 標準の大きさで、黒い縁の内側に白い縁を重ねた正方形のカーソルを作る（どの色の上でも見えるように）。
+/// 真ん中の 1 画素は下の色を反転して、ホットスポットを示す。
+fn eraser_cursor() -> Option<HCURSOR> {
+    // SAFETY: 引数のない問い合わせ
+    let (width, height) = unsafe { (GetSystemMetrics(SM_CXCURSOR), GetSystemMetrics(SM_CYCURSOR)) };
+    let (width, height) = (width.max(16) as usize, height.max(16) as usize);
+    // 1 行は WORD の境まで詰める
+    let stride = width.div_ceil(16) * 2;
+    // AND が 1・XOR が 0 で透明、0・0 で黒、0・1 で白、1・1 で反転
+    let mut and = vec![0xFF_u8; stride * height];
+    let mut xor = vec![0_u8; stride * height];
+    let mut put = |x: usize, y: usize, and_bit: bool, xor_bit: bool| {
+        let (byte, bit) = (y * stride + x / 8, 0x80 >> (x % 8));
+        and[byte] = if and_bit {
+            and[byte] | bit
+        } else {
+            and[byte] & !bit
+        };
+        xor[byte] = if xor_bit {
+            xor[byte] | bit
+        } else {
+            xor[byte] & !bit
+        };
+    };
+    let (cx, cy) = (width / 2, height / 2);
+    let half = width.min(height) / 4;
+    for y in cy - half..=cy + half {
+        for x in cx - half..=cx + half {
+            let ring = (x.abs_diff(cx)).max(y.abs_diff(cy));
+            if ring == half {
+                put(x, y, false, false);
+            } else if ring == half - 1 {
+                put(x, y, false, true);
+            }
+        }
+    }
+    put(cx, cy, true, true);
+    // SAFETY: 2 つの面は width x height の 1 ビットの画素で、呼ぶ間は生きている
+    let cursor = unsafe {
+        CreateCursor(
+            None,
+            cx as i32,
+            cy as i32,
+            width as i32,
+            height as i32,
+            and.as_ptr().cast(),
+            xor.as_ptr().cast(),
+        )
+    };
+    match cursor {
+        Ok(cursor) => Some(cursor),
+        Err(e) => {
+            log::warn!("could not create the eraser cursor: {e}");
+            None
+        }
+    }
 }
 
 /// スクラップのウィンドウ 1 枚。
@@ -88,9 +163,9 @@ impl ScrapWindow {
     }
 
     /// `source`（premultiplied BGRA の DIB を選んだ DC、大きさは `rect` と同じ）の中身を `rect` に出す。
-    /// `opacity` は透明度（%）。
-    pub fn present(&self, source: HDC, rect: Rect, opacity: u8) -> Result<()> {
-        layered::present(self.hwnd, source, rect, opacity)
+    /// `constant_alpha` は全体のアルファ（`Appearance::constant_alpha`）。
+    pub fn present(&self, source: HDC, rect: Rect, constant_alpha: u8) -> Result<()> {
+        layered::present(self.hwnd, source, rect, constant_alpha)
     }
 
     pub fn hwnd(&self) -> HWND {

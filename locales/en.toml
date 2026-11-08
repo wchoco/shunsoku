@@ -7,9 +7,11 @@ tooltip = "shunsoku"
 
 [tray.menu]
 select_capture = "Region capture"
+blank_scrap = "Blank scrap"
 regions = "Saved regions"
 regions_empty = "(None)"
 add_region = "Add saved region…"
+open = "Open…"
 trash = "Trash"
 trash_empty = "(Empty)"
 close_all = "Close all scraps"
@@ -48,6 +50,7 @@ apply = "Apply"
 write_failed = "Could not write the settings file. The changes in Settings are not applied yet."
 browse = "Browse…"
 pick_color = "Pick…"
+transparent = "Transparent"
 chord_none = "None"
 insert_variable = "Insert variable"
 
@@ -57,6 +60,7 @@ title = "This value cannot be used"
 number = "Enter a whole number from {min} to {max}. The field went back to its previous value."
 number_min = "Enter a whole number of {min} or more. The field went back to its previous value."
 color = "Enter a color as #RRGGBB (for example #FF0000). The field went back to its previous value."
+background = "Enter a background as #RRGGBB (for example #FFFFFF) or transparent. The field went back to its previous value."
 folder = "Enter a full folder path (for example C:\\Pictures), or leave it empty for the default. The field went back to its previous value."
 template = "The file name cannot be empty. The field went back to its previous value."
 
@@ -96,6 +100,9 @@ mode_precise = "Precise (adjust, then capture)"
 crosshair = "Show a crosshair when selecting"
 crosshair_color = "Crosshair color:"
 hint = "Select a field and press keys to assign them. Tab moves to the next field."
+blank_scrap = "Blank scrap"
+blank_scrap_hotkey = "Hotkey to create:"
+blank_background = "Background:"
 
 [settings_gui.regions]
 name = "Name"
@@ -123,6 +130,7 @@ open_folder = "Open folder"
 template_label = "File name:"
 save = "Save"
 scrap = "Show as a scrap"
+blank_scrap = "Make a blank scrap instead of capturing"
 
 [settings_gui.scrap]
 opacity = "Opacity (%):"
@@ -158,13 +166,14 @@ shortcut = "Shortcut"
 add = "Add"
 remove = "Remove"
 name_label = "Name:"
-steps_label = "Operations:"
+steps_label = "Steps:"
 add_step = "Add"
 shortcut_label = "Shortcut:"
+hotkey_label = "Hotkey:"
 # Name of a recipe added with "Add" (a number follows)
 default_name = "Recipe"
 
-# Summary of an appearance step in the step list ("Appearance: border #FF0000")
+# Summary of a step with parameters in the step list ("Appearance: border #FF0000")
 [settings_gui.recipes.step]
 appearance = "Appearance: {items}"
 opacity = "opacity {percent}%"
@@ -174,8 +183,11 @@ border_color = "border {color}"
 border_width = "{width}px"
 shadow_on = "shadow"
 shadow_off = "no shadow"
+background = "Background: {color}"
+# Saved region capture ({capture} is the step name, {region} the saved region's name)
+capture_region = "{capture}: {region}"
 
-# Fields of an appearance step (shown below the step list while it is selected)
+# Parameter fields of an appearance step (shown below the step list while it is selected)
 [settings_gui.recipes.appearance]
 border = "Border:"
 border_color = "Color:"
@@ -187,6 +199,14 @@ unchanged = "Keep"
 on = "On"
 off = "Off"
 
+# Parameter fields of a background colour operation (label before "Pick..." and "Transparent")
+[settings_gui.recipes.background]
+color = "Color:"
+
+# Parameter field of a saved region capture (label before the drop-down of the region to capture)
+[settings_gui.recipes.region]
+name = "Saved region:"
+
 [settings_gui.mark]
 unset = "Not set"
 conflict = "Overlaps"
@@ -195,15 +215,31 @@ overlap = "Overlaps a shortcut (the hotkey wins)"
 not_registered = "Could not register (another app may be using it)"
 empty_name = "The name is empty"
 duplicate_name = "The name is used twice"
-no_steps = "No operations"
-not_a_step = "Has an operation that cannot go in a recipe"
-close_not_last = "Close can only be the last operation"
-out_of_range = "An appearance value is out of range (opacity is 10-100, border width is 1-16)"
-bad_value = "An appearance value is written wrong (colors are #RRGGBB, border and shadow are true or false)"
-unknown_key = "An appearance step has an unknown key"
-not_appearance = "Only op = \"appearance\" can be written as a table"
-no_values = "An appearance step has no items"
+no_steps = "No steps"
+not_a_step = "Has a step that cannot go in a recipe"
+last_only_not_last = "Only one of Close and Draw can be in a recipe, and only as the last step"
+first_only_not_first = "Only one capture can be in a recipe, and only as the first step"
+shortcut_on_capture = "A recipe that starts with a capture is called by a hotkey (it cannot have a shortcut)"
+hotkey_without_capture = "A recipe that does not start with a capture is called by a shortcut (it cannot have a hotkey)"
+out_of_range = "An appearance parameter is out of range (opacity is 10-100, border width is 1-16)"
+bad_value = "A parameter is written wrong (colors are #RRGGBB, border and shadow are true or false)"
+unknown_key = "A step has an unknown parameter"
+not_appearance = "Only op = \"appearance\", op = \"background\" and op = \"capture_region\" can be written as a table"
+no_values = "A step written as a table has no parameters"
 border_off_with_color_or_width = "border = false cannot go with a border color or width"
+no_such_region = "The saved region to capture is not found (choose it again if it was renamed or deleted)"
+
+# Recipes
+[recipe]
+# A recipe starting with a capture could not run when its hotkey was pressed, e.g. after a settings change (the recipe name follows)
+cannot_launch = "Could not run the recipe. Check the recipe in the settings: "
+
+# Capture steps that can start a recipe (recipe::Capture::label_key)
+[recipe.capture]
+select_capture = "Region capture"
+active_window_capture = "Window capture"
+blank_scrap = "Create a blank scrap"
+capture_region = "Saved region capture"
 
 [hotkey]
 failed = "Could not register these hotkeys (another app may be using them): "
@@ -213,6 +249,7 @@ unset = "The region capture hotkey is not set. Set it on the Capture tab of Sett
 copy = "Copy"
 save_default = "Save to the default folder"
 save_as = "Save as…"
+save_scrap_file = "Save as scrap file…"
 trim = "Trim"
 untrim = "Undo trim"
 annotate = "Draw"
@@ -237,6 +274,7 @@ opacity_down = "More transparent"
 border = "Border"
 shadow = "Shadow"
 reset_appearance = "Reset appearance to default"
+background = "Background color"
 toggle_compact = "Compact view"
 close = "Close"
 
@@ -257,6 +295,18 @@ black = "Black"
 white = "White"
 red = "Red"
 blue = "Blue"
+
+[scrap.background]
+red = "Red"
+orange = "Orange"
+yellow = "Yellow"
+green = "Green"
+blue = "Blue"
+purple = "Purple"
+black = "Black"
+white = "White"
+transparent = "Transparent"
+other = "Other colors…"
 
 [scrap.shadow]
 on = "On"
@@ -296,6 +346,8 @@ unreadable_monitor = "This monitor's screen cannot be captured as is (for exampl
 cancelled = "The region selection was cancelled."
 timed_out = "The request was dropped because the capture did not finish in time."
 no_active_window = "There is no active window to capture (the desktop and the taskbar are not captured)."
+selecting_open = "Cannot open a scrap file while the region selection screen is open."
+float_failed = "The scrap file was read, but the scrap could not be shown."
 
 [copy]
 failed = "Could not copy to the clipboard."
@@ -308,6 +360,17 @@ saved = "Saved (click to open the folder):"
 failed = "Could not save. The scrap is still there."
 png_filter = "PNG image"
 
+[scrap_file]
+filter = "shunsoku scrap file"
+unreadable = "Could not open the scrap file. The file cannot be read."
+not_scrap_file = "Could not open the scrap file. It is not a scrap file."
+newer_version = "Could not open the scrap file. It was made by a newer version of shunsoku. Update shunsoku."
+bad_record = "Could not open the scrap file. The file is broken (the annotation or trim record)."
+bad_image = "Could not open the scrap file. The file is broken (the image)."
+size_mismatch = "Could not open the scrap file. The file is broken (the image size does not match the record)."
+too_large = "Could not open the scrap file. It is too large."
+out_of_range = "Could not open the scrap file. The file is broken (a value is out of range)."
+
 [template.var]
 name = "{name}  Saved region name"
 date = "{date}  Date (20260307)"
@@ -315,3 +378,8 @@ time = "{time}  Time (090504)"
 datetime = "{datetime:…}  Date and time format (2026-03-07_09-05-04)"
 seq = "{seq}  Sequence number (1, 2, …)"
 seq3 = "{seq:3}  3-digit sequence number (001, 002, …)"
+
+[blank_scrap]
+failed = "Could not create a blank scrap."
+# The background colour of a blank scrap ([annotation] background) could not be read (the line after failed)
+no_background = "Could not read the background colour from the settings. See the log for details."

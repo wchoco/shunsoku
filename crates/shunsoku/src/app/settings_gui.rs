@@ -38,11 +38,12 @@ use std::path::Path;
 use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::monitors;
+use shunsoku_core::scrap::Background;
 use shunsoku_core::settings::editor::{AppearanceInput, AppearanceItem, Editor, Move};
 use shunsoku_core::settings::form::{ClickPlace, FieldEntry, PauseChange};
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::tab_step::{StepFocus, TabStep};
-use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
+use shunsoku_core::settings::{self, Region, Rgb, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -122,9 +123,21 @@ impl SettingsGui {
             .iter()
             .find(|row| row.field == recipes::shortcut_id())?;
         match row.item {
-            SettingsItem::RecipeShortcut(i) => Some(i),
+            SettingsItem::RecipeShortcut(i) | SettingsItem::RecipeHotkey(i) => Some(i),
             _ => None,
         }
+    }
+
+    /// 「レシピ」タブのキーの欄を、結んでいるレシピのいまの最初の操作に合う項目（キャプチャで始まればホットキー、
+    /// ほかはショートカット。ADR-0010）に結び直す。
+    fn rebind_recipe_key(&mut self) {
+        let Some(item) = self
+            .bound_recipe()
+            .and_then(|index| self.editor.key_item(index))
+        else {
+            return;
+        };
+        self.rebind_chord_row(recipes::shortcut_id(), item);
     }
 
     /// 一覧の行で変わるキーの欄（ID `field`）を、設定の項目 `item` に結び直す。
@@ -352,6 +365,7 @@ fn refresh(hwnd: HWND) {
     }
     let snapshot = with_app(|app| {
         app.settings_gui.as_mut().map(|gui| {
+            gui.rebind_recipe_key();
             let pass = gui.fields.begin_fill();
             let fields = gui.fields.clone();
             (
@@ -579,6 +593,11 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
             EN_KILLFOCUS => refresh(hwnd),
             _ => {}
         },
+        _ if id == recipes::region_id() && code == CBN_SELCHANGE => {
+            if !recipes::is_syncing() {
+                set_capture_region(hwnd, recipes::chosen_region(hwnd));
+            }
+        }
         _ if let Some(item) = recipes::appearance_item(id) => match code {
             CBN_SELCHANGE | EN_CHANGE if !recipes::is_syncing() => {
                 set_appearance(hwnd, item, recipes::appearance_input(hwnd, item));
@@ -720,6 +739,9 @@ fn on_button(hwnd: HWND, fields: &Fields, action: Action) {
             if let Some(color) = fields::pick_color(hwnd, current) {
                 set_field(field, Input::Text(color.to_string()));
             }
+        }
+        Action::Transparent(field) => {
+            set_field(field, Input::Text(Background::Transparent.to_string()))
         }
         Action::InsertVariable(of) => insert_variable(hwnd, fields, of),
         Action::OpenFolder(field) => {
@@ -933,7 +955,11 @@ fn on_recipe_selected(hwnd: HWND) {
     let field = recipes::shortcut_id();
     with_app(|app| {
         if let Some(gui) = app.settings_gui.as_mut() {
-            gui.rebind_chord_row(field, SettingsItem::RecipeShortcut(index));
+            let item = gui
+                .editor
+                .key_item(index)
+                .unwrap_or(SettingsItem::RecipeShortcut(index));
+            gui.rebind_chord_row(field, item);
         }
     });
     // 一覧を揃えている途中なら、揃えたあとで出す（`refresh`）
@@ -942,13 +968,13 @@ fn on_recipe_selected(hwnd: HWND) {
     }
 }
 
-/// 「レシピ」タブのボタン。写しを変えて、移った行（レシピか手）を選ぶ。足したレシピは名前の欄にフォーカスを置く。
+/// 「レシピ」タブのボタン。写しを変えて、移った行（レシピか操作）を選ぶ。足したレシピは名前の欄にフォーカスを置く。
 fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
     use recipes::Button;
     let selected = recipes::selected(hwnd);
     let step = recipes::selected_step(hwnd);
     let in_range = |editor: &Editor| selected.filter(|&i| i < editor.draft().recipes.len());
-    // 選んでいるレシピの選んでいる手を `change(editor, レシピ, 手)` で変え、移った手を選ぶ
+    // 選んでいるレシピの選んでいる操作を `change(editor, レシピ, 操作)` で変え、移った操作を選ぶ
     let change_step = |change: fn(&mut Editor, usize, usize) -> Option<usize>| {
         let to = edit(hwnd, |editor| {
             let i = in_range(editor)?;
@@ -990,10 +1016,59 @@ fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
             refresh(hwnd);
         }
         Button::PickColor => pick_appearance_color(hwnd),
+        Button::PickBackground => pick_background_color(hwnd),
+        Button::Transparent => {
+            let color = recipes::transparent_checked(hwnd).then_some(Background::Transparent);
+            set_background(hwnd, color);
+        }
     }
 }
 
-/// 「レシピ」タブで選んでいる見た目の手の項目 `item` を `input` にする。
+/// 「レシピ」タブで選んでいる定型領域キャプチャで撮る定型領域を、名前 `name` の定型領域にする。
+fn set_capture_region(hwnd: HWND, name: Option<String>) {
+    let (Some(i), Some(s), Some(name)) =
+        (recipes::selected(hwnd), recipes::selected_step(hwnd), name)
+    else {
+        return;
+    };
+    edit(hwnd, |editor| editor.set_capture_region(i, s, &name));
+}
+
+/// 「レシピ」タブで選んでいる背景色を指定する操作の色を `color` にする。
+fn set_background(hwnd: HWND, color: Option<Background>) {
+    let (Some(i), Some(s)) = (recipes::selected(hwnd), recipes::selected_step(hwnd)) else {
+        return;
+    };
+    edit(hwnd, |editor| editor.set_background(i, s, color));
+}
+
+/// 「レシピ」タブの背景色の「選ぶ…」: 色の画面を開いて、選んだ色を背景色を指定する操作の色にする。初めの色は
+/// 操作の色、選んでいなければ白紙スクラップの背景色の既定値（透明なら白）。
+fn pick_background_color(hwnd: HWND) {
+    let (Some(i), Some(s)) = (recipes::selected(hwnd), recipes::selected_step(hwnd)) else {
+        return;
+    };
+    let current = with_app(|app| {
+        let editor = &app.settings_gui.as_ref()?.editor;
+        let color = editor
+            .background(i, s)?
+            .unwrap_or(editor.draft().annotation.background);
+        Some(match color {
+            Background::Color(c) => c,
+            Background::Transparent => Rgb(0xFF, 0xFF, 0xFF),
+        })
+    })
+    .flatten();
+    // 色の画面はモーダルで回るので、App を借りたまま開かない
+    let Some(current) = current else {
+        return;
+    };
+    if let Some(color) = fields::pick_color(hwnd, current) {
+        set_background(hwnd, Some(Background::Color(color)));
+    }
+}
+
+/// 「レシピ」タブで選んでいる見た目を指定する操作の項目 `item` を `input` にする。
 fn set_appearance(hwnd: HWND, item: AppearanceItem, input: Option<AppearanceInput>) {
     let (Some(i), Some(s), Some(input)) =
         (recipes::selected(hwnd), recipes::selected_step(hwnd), input)
@@ -1003,7 +1078,7 @@ fn set_appearance(hwnd: HWND, item: AppearanceItem, input: Option<AppearanceInpu
     edit(hwnd, |editor| editor.set_appearance(i, s, item, input));
 }
 
-/// 「レシピ」タブの「選ぶ…」: 色の画面を開いて、選んだ色を見た目の手の枠の色にする。
+/// 「レシピ」タブの「選ぶ…」: 色の画面を開いて、選んだ色を見た目を指定する操作の枠の色にする。
 /// 初めの色は欄の色、欄が空ならスクラップの枠の色。
 fn pick_appearance_color(hwnd: HWND) {
     let (Some(i), Some(s)) = (recipes::selected(hwnd), recipes::selected_step(hwnd)) else {

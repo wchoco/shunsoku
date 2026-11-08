@@ -11,7 +11,7 @@
 //! - キーの組み合わせの欄（ホットキー・ショートカット）は `PageBuilder::chord_field` で置く。欄（`chord_field`）と、
 //!   その横の印の欄を組にして `ChordRow` として返す。呼び出し側は `ChordRow::item` で写しの項目と結ぶ。
 //! - それ以外の欄（チェックボックス・テキスト・数・ドロップダウンと、横の「参照…」などのボタン）は `fields`。
-//!   一般・スクラップ・書き込みのタブは `pages`、定型領域のタブは `regions`、スクラップ操作のタブは `scrap_ops`。
+//!   一般・キャプチャ・スクラップ・書き込みのタブは `pages`、定型領域のタブは `regions`、スクラップ操作のタブは `scrap_ops`。
 //! - キーの組み合わせの欄にフォーカスがあるとき、欄の外（ダイアログの地・ラベル・タブのページの地）をクリックしたら、
 //!   フォーカスをダイアログ本体へ移して、どの部品も選ばれていない状態にする（`blur_on_click`。#118）。ラベルの
 //!   Static はクリックを下に通すので、ページの中のクリックはタブに届く。タブはサブクラス化して見出しの外のクリックを
@@ -117,7 +117,7 @@ const PAGES: &[PageDef] = &[
     PageDef {
         page: Page::Capture,
         label_key: "settings_gui.tab.capture",
-        build: capture_page,
+        build: pages::capture,
     },
     PageDef {
         page: Page::Regions,
@@ -149,61 +149,6 @@ const PAGES: &[PageDef] = &[
 /// ページの左の見出しの幅と、欄の左端。見出しは欄より 2 下げる。
 pub const LABEL_WIDTH: i16 = 100;
 pub const FIELD_X: i16 = LABEL_WIDTH + 5;
-
-/// 「キャプチャ」タブ。
-fn capture_page(b: &mut PageBuilder) {
-    use fields::Field;
-    let hotkeys = [
-        (
-            "settings_gui.capture.select_capture",
-            SettingsItem::SelectCaptureHotkey,
-        ),
-        (
-            "settings_gui.capture.active_window_capture",
-            SettingsItem::ActiveWindowCaptureHotkey,
-        ),
-        (
-            "settings_gui.capture.restore_last",
-            SettingsItem::RestoreLastHotkey,
-        ),
-    ];
-    let mut y = 0;
-    for (key, item) in hotkeys {
-        b.label(key, 0, y + 2, LABEL_WIDTH, 10);
-        b.chord_field(item, FIELD_X, y, 110);
-        y += 34;
-    }
-    b.check(
-        Field::CaptureCursor,
-        "settings_gui.capture.capture_cursor",
-        0,
-        y,
-        PAGE_WIDTH,
-    );
-    y += 16;
-    b.label("settings_gui.capture.mode", 0, y + 2, LABEL_WIDTH, 10);
-    b.choice(Field::SelectionMode, FIELD_X, y, 110, 60);
-    y += 20;
-    b.check(
-        Field::Crosshair,
-        "settings_gui.capture.crosshair",
-        0,
-        y,
-        PAGE_WIDTH,
-    );
-    // タブの下端（ページの y で 193 あたり）に収まるよう、行の間を詰める
-    y += 16;
-    b.label(
-        "settings_gui.capture.crosshair_color",
-        0,
-        y + 2,
-        LABEL_WIDTH,
-        10,
-    );
-    b.color_field(Field::CrosshairColor, FIELD_X, y);
-    y += 18;
-    b.label("settings_gui.capture.hint", 0, y, PAGE_WIDTH, 20);
-}
 
 /// 文言を引く関数（`app::text`）。
 pub type Text = fn(&'static str) -> &'static str;
@@ -560,7 +505,7 @@ pub fn show_page(hwnd: HWND, page: Page) {
             unsafe {
                 let _ = ShowWindow(
                     child,
-                    if shown.contains(&id) {
+                    if shown.contains(&id) && !recipes::is_hidden_param(id) {
                         SW_SHOW
                     } else {
                         SW_HIDE
@@ -709,6 +654,16 @@ impl PageBuilder<'_> {
 
     /// 項目 `item` のキーの組み合わせの欄（幅 `cx`）と、その下の印の欄。
     pub fn chord_field(&mut self, item: SettingsItem, x: i16, y: i16, cx: i16) {
+        self.chord_field_at(item, (x, y, cx), (x, y + 16, PAGE_WIDTH - x, 18));
+    }
+
+    /// 項目 `item` のキーの組み合わせの欄（`field` は x, y, 幅）と、印の欄（`mark` は x, y, 幅, 高さ）。
+    pub fn chord_field_at(
+        &mut self,
+        item: SettingsItem,
+        (x, y, cx): (i16, i16, i16),
+        mark: (i16, i16, i16, i16),
+    ) {
         let field = self.next_id();
         self.template.item(Item {
             class: Class::HotKey,
@@ -718,6 +673,7 @@ impl PageBuilder<'_> {
             ex_style: WS_EX_CLIENTEDGE,
             rect: (PAGE_X + x, PAGE_Y + y, cx, 14),
         });
+        let (mark_x, mark_y, mark_cx, mark_cy) = mark;
         let mark = self.next_id();
         self.template.item(Item {
             class: Class::Static,
@@ -725,7 +681,7 @@ impl PageBuilder<'_> {
             id: mark,
             style: STATIC_TEXT,
             ex_style: WINDOW_EX_STYLE(0),
-            rect: (PAGE_X + x, PAGE_Y + y + 16, PAGE_WIDTH - x, 18),
+            rect: (PAGE_X + mark_x, PAGE_Y + mark_y, mark_cx, mark_cy),
         });
         self.rows.push(ChordRow { item, field, mark });
     }

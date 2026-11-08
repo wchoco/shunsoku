@@ -20,6 +20,7 @@ pub mod perf;
 pub mod protocol;
 pub mod recipe;
 pub mod scrap;
+pub mod scrap_file;
 pub mod selection;
 pub mod settings;
 pub mod template;

@@ -6,7 +6,8 @@
 //! - 画素（非圧縮の BGRA）は `%TEMP%\shunsoku\<プロセス ID>\` に裏のスレッドで書き、書き終えたらメモリから
 //!   捨てる（常駐時のメモリを増やさないため）。書き終えるまでと、書けなかったときはメモリに持つ。
 //!   書き終えたら `PostMessageW(window, message)` で UI スレッドを起こし、`app` が `on_written` を呼ぶ。
-//! - 退避する画素は `Stash` 1 つずつ。いまは元の画像（`Entry::image`）だけ。
+//! - 退避する画素は `Stash` 1 つずつ。いまは元の画像（`Entry::image`）だけ。白紙スクラップは画素を退避せず、
+//!   戻すときに背景色から作り直す（`ScrapModel::blank_image`）。
 //! - 一覧に付けるサムネイル（`Entry::thumbnail`、閉じたときの見た目を縮めたもの）は小さいのでメモリに持ち、
 //!   一覧を出すたびに一時ファイルを読まない。項目と一緒に捨てる。
 //! - ごみ箱から消えたもの（上限で捨てた・戻した）の一時ファイルは消す。drop（終了時）でフォルダごと消す。
@@ -61,16 +62,23 @@ pub struct Listed<'a> {
 struct Entry {
     model: ScrapModel,
     closed_at: LocalTime,
-    image: Stash,
+    /// 元の画像の画素。白紙スクラップなら None（`ScrapModel::blank_image` で作り直す）。
+    image: Option<Stash>,
     thumbnail: Image,
 }
 
 impl Entry {
     /// 画素を読み戻して、閉じる直前のスクラップにする。一時ファイルは消す。
     fn take(self) -> std::io::Result<Trashed> {
+        let image = match self.image {
+            Some(stash) => stash.take()?,
+            None => self.model.blank_image().ok_or_else(|| {
+                std::io::Error::other("the trashed scrap has neither pixels nor a background")
+            })?,
+        };
         Ok(Trashed {
             model: self.model,
-            image: self.image.take()?,
+            image,
         })
     }
 }
@@ -175,10 +183,12 @@ impl TrashStore {
         thumbnail: Image,
         closed_at: LocalTime,
     ) {
+        // 白紙スクラップの画素は背景色から作り直せるので、預からない
+        let image = (!model.is_blank()).then(|| Stash::new(image));
         let entry = Entry {
             model,
             closed_at,
-            image: Stash::new(image),
+            image,
             thumbnail,
         };
         let pushed = self.trash.push(entry);
@@ -194,10 +204,9 @@ impl TrashStore {
             return;
         };
         let path = folder.path.join(format!("{}.bgra", self.next_file));
-        let Some(entry) = self.trash.get_mut(id) else {
+        let Some(stash) = self.trash.get_mut(id).and_then(|e| e.image.as_mut()) else {
             return;
         };
-        let stash = &mut entry.image;
         self.next_file += 1;
         let Some(image) = stash.memory.clone() else {
             return;
@@ -243,7 +252,7 @@ impl TrashStore {
             let stash = self
                 .trash
                 .get_mut(written.id)
-                .map(|entry| &mut entry.image)
+                .and_then(|entry| entry.image.as_mut())
                 .filter(|s| s.file.as_deref() == Some(written.path.as_path()));
             match (stash, written.result) {
                 (Some(stash), Ok(())) => {
@@ -407,7 +416,9 @@ impl Drop for TrashStore {
 
 /// 捨てたスクラップの一時ファイルを消す。
 fn discard(entry: &mut Entry) {
-    entry.image.discard();
+    if let Some(stash) = &mut entry.image {
+        stash.discard();
+    }
 }
 
 /// 画素を `path` に新しいファイルとして書く（裏のスレッドで呼ぶ）。失敗したら作りかけのファイルを消す。

@@ -23,7 +23,67 @@ use crate::annotate::{
 };
 use crate::geometry::{Point, Rect, Size};
 use crate::image::Image;
-use crate::settings::{DpiScaling, ScrapAppearance};
+use crate::settings::{DpiScaling, Rgb, ScrapAppearance};
+
+/// 白紙スクラップの背景色。背景色は見た目ではなく中身なので、「見た目を既定に戻す」では戻らない。
+/// 設定ファイルとレシピでは `#RRGGBB` か `transparent` で書く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Background {
+    /// 不透明な一色。
+    Color(Rgb),
+    /// 透明（下地の画素のアルファが 0）。表示では透けて見えるが、透明な部分もつかめる（Win32 層が
+    /// 当たり判定のために見えないほど小さいアルファを載せる）。保存画像はアルファ 0 の PNG になる。
+    Transparent,
+}
+
+impl Background {
+    /// 白（設定の既定値）。
+    pub const WHITE: Background = Background::Color(Rgb(0xFF, 0xFF, 0xFF));
+
+    /// 設定ファイルとレシピでの透明の書き方。
+    const TRANSPARENT: &str = "transparent";
+
+    /// 下地の 1 画素の BGRA（premultiply しない）。
+    fn bgra(self) -> [u8; 4] {
+        match self {
+            Background::Color(Rgb(r, g, b)) => [b, g, r, 0xFF],
+            Background::Transparent => [0, 0, 0, 0],
+        }
+    }
+}
+
+impl Default for Background {
+    fn default() -> Background {
+        Background::WHITE
+    }
+}
+
+/// `#RRGGBB`（大文字）か `transparent`。
+impl std::fmt::Display for Background {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Background::Color(c) => c.fmt(f),
+            Background::Transparent => f.write_str(Background::TRANSPARENT),
+        }
+    }
+}
+
+/// `#RRGGBB`（大文字と小文字を問わない）でも `transparent`（小文字だけ）でもない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotBackground;
+
+impl std::str::FromStr for Background {
+    type Err = NotBackground;
+
+    fn from_str(s: &str) -> Result<Background, NotBackground> {
+        if s == Background::TRANSPARENT {
+            return Ok(Background::Transparent);
+        }
+        s.parse::<Rgb>()
+            .map(Background::Color)
+            .map_err(|_| NotBackground)
+    }
+}
 
 /// 書き込みの当たり判定の、線の外の広さ（96 DPI での画面の画素。モニタの DPI で換算する）。
 const HIT_SLOP: u32 = 4;
@@ -188,6 +248,8 @@ pub struct ScrapModel {
     trimmed: Option<Rect>,
     /// 書き込み。元の画像（トリム前）の画素の座標で持つ。
     annotations: Annotations,
+    /// 白紙スクラップなら背景色。画像を持つスクラップは None。
+    background: Option<Background>,
 }
 
 impl ScrapModel {
@@ -203,7 +265,83 @@ impl ScrapModel {
             compact: None,
             trimmed: None,
             annotations: Annotations::default(),
+            background: None,
         }
+    }
+
+    /// 中身（白紙スクラップなら背景色 `background`、トリムの範囲 `trimmed` と書き込み `annotations`）を戻した
+    /// スクラップ（スクラップファイルから開いたとき）。`position` は表示する画像の左上。倍率は 100%、見た目の
+    /// 個別値はなし。`trimmed` は `image_size` の中の空でない範囲であること（`scrap_file` が確かめる）。
+    pub fn restored(
+        position: Point,
+        image_size: Size,
+        background: Option<Background>,
+        trimmed: Option<Rect>,
+        annotations: Annotations,
+    ) -> ScrapModel {
+        ScrapModel {
+            background,
+            trimmed,
+            annotations,
+            ..ScrapModel::new(position, image_size)
+        }
+    }
+
+    /// 白紙スクラップ。`position` に `size` の大きさで、`background` の一色を下地にする。
+    pub fn blank(position: Point, size: Size, background: Background) -> ScrapModel {
+        ScrapModel {
+            background: Some(background),
+            ..ScrapModel::new(position, size)
+        }
+    }
+
+    /// 白紙スクラップの背景色。画像を持つスクラップなら None。
+    pub fn background(&self) -> Option<Background> {
+        self.background
+    }
+
+    /// 白紙スクラップの背景色を `background` にする。下地の画素は持たないので、表示する側は `blank_image` で
+    /// 作り直す（ごみ箱から戻すときも、この背景色で塗り直す）。画像を持つスクラップか、同じ背景色なら何もせず
+    /// false。
+    pub fn set_background(&mut self, background: Background) -> bool {
+        match &mut self.background {
+            Some(now) if *now != background => {
+                *now = background;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 白紙スクラップか（画像を持たず、背景色の一色を下地にする）。
+    pub fn is_blank(&self) -> bool {
+        self.background.is_some()
+    }
+
+    /// 背景が透明な白紙スクラップか。透明な部分も当たり判定に入れ、コピーではアルファを残す。
+    pub fn is_transparent_blank(&self) -> bool {
+        self.background == Some(Background::Transparent)
+    }
+
+    /// 何も書かれていない透明な白紙スクラップか。画面では見えずにつかめるだけなので、書き込みの編集モードを
+    /// 抜けたら（どの抜け方でも）ごみ箱に入れずに捨てる。
+    pub fn is_empty_transparent_blank(&self) -> bool {
+        self.is_transparent_blank() && self.annotations.is_empty()
+    }
+
+    /// 浮かべたらすぐ書き込みの編集モードに入るか。白紙スクラップを作ったとき（ホットキー・トレイ・レシピの
+    /// どの作り方でも）と、スクラップファイルを開いたときに、この規則で決める。入るのは何も書かれていない透明な
+    /// 白紙だけ（見えずにつかめるだけの物にしないため。何も書かずに抜けると捨てる）。不透明な白紙はそのまま浮かぶ。
+    pub fn starts_in_edit_mode(&self) -> bool {
+        self.is_empty_transparent_blank()
+    }
+
+    /// 白紙スクラップの元の画像に当たる下地（大きさが `image_size` の、背景色の一色）。画素は持たずに背景色から
+    /// 作るので、ごみ箱は白紙スクラップの画素を退避しない。画像を持つスクラップなら None。
+    pub fn blank_image(&self) -> Option<Image> {
+        let bgra = self.background?.bgra();
+        let count = self.image_size.width as usize * self.image_size.height as usize;
+        Image::from_bgra(self.image_size, bgra.repeat(count))
     }
 
     /// コンパクト表示に畳んでいるか。
@@ -219,6 +357,7 @@ impl ScrapModel {
     /// `before` と描く中身が同じか（位置のほかは変わっていない）。同じならウィンドウを動かすだけでよい。
     pub fn same_content(&self, before: &ScrapModel) -> bool {
         self.image_size == before.image_size
+            && self.background == before.background
             && self.image_rect().size() == before.image_rect().size()
             && self.display_size() == before.display_size()
             && self.mode == before.mode
@@ -703,9 +842,20 @@ impl ScrapModel {
     }
 
     /// 編集モードで選んでいる書き込み。選択の印を描くのに使う。
-    pub fn selected_annotation(&self) -> Option<&Annotation> {
-        let index = self.edit_state()?.selected()?;
-        self.annotations.items().get(index)
+    pub fn selected_annotations(&self) -> Vec<&Annotation> {
+        let Some(state) = self.edit_state() else {
+            return vec![];
+        };
+        state
+            .selected()
+            .iter()
+            .filter_map(|&i| self.annotations.items().get(i))
+            .collect()
+    }
+
+    /// 編集モードで範囲で選んでいる間の範囲（元の画像の画素）。範囲を描くのに使う。
+    pub fn selection_range(&self) -> Option<Rect> {
+        self.edit_state()?.marquee()
     }
 
     /// 書き込み（描き終えたもの）。
@@ -909,7 +1059,7 @@ pub struct AppearanceOverrides {
     /// 枠の太さ（物理ピクセル）。枠の有無とは別に持つので、枠を隠したり色を変えたりしても残る。
     /// 物理ピクセルのまま持つのは、全体の既定値 `Border::width`（設定の `[scrap] border_width`）をそのまま
     /// 差し替える値だから。既定値が DPI で換算しない物理ピクセルなので、上書きだけを 96 DPI の値にすると、同じ数を
-    /// 書いても `[scrap]` と手とで太さが違って見える。96 DPI の値にするなら既定値と一緒に変える。
+    /// 書いても `[scrap]` とレシピのパラメータとで太さが違って見える。96 DPI の値にするなら既定値と一緒に変える。
     pub border_width: Option<u32>,
     /// 影の有無。
     pub shadow: Option<bool>,
@@ -971,6 +1121,19 @@ impl Default for Appearance {
 }
 
 impl Appearance {
+    /// レイヤード ウィンドウの全体のアルファ（`SourceConstantAlpha`、0〜255）。透明度（%）から換算する。
+    pub fn constant_alpha(&self) -> u8 {
+        (u32::from(self.opacity.min(100)) * 255 / 100) as u8
+    }
+
+    /// 透明な白紙スクラップの透明な部分に載せる、当たり判定のためのアルファ（premultiplied の画素の A）。
+    /// レイヤード ウィンドウはアルファが 0 の画素のクリックを下のウィンドウに通すので、全体のアルファ
+    /// （`constant_alpha`）を掛けても 0 に落ちない最小の値にする（見た目は透明と変わらない）。
+    pub fn hit_alpha(&self) -> u8 {
+        let constant = u32::from(self.constant_alpha()).max(1);
+        255u32.div_ceil(constant).min(255) as u8
+    }
+
     /// 出す枠。枠を出さないなら None。
     pub fn shown_border(&self) -> Option<Border> {
         self.show_border.then_some(self.border)
@@ -1084,6 +1247,129 @@ mod tests {
         let scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
         assert_eq!(scrap.mode, Mode::Normal);
         assert_eq!(scrap.image_rect(), Rect::new(-100, 50, 200, 250));
+    }
+
+    #[test]
+    fn a_blank_scrap_has_the_chosen_size_and_is_painted_with_its_background() {
+        let white = Background::Color(Rgb(0xFF, 0xFF, 0xFF));
+        let scrap = ScrapModel::blank(Point::new(10, 20), Size::new(3, 2), white);
+        assert_eq!(scrap.image_rect(), Rect::new(10, 20, 13, 22));
+        assert_eq!(scrap.background(), Some(white));
+        let image = scrap.blank_image().unwrap();
+        assert_eq!(image.size(), Size::new(3, 2));
+        assert_eq!(image.pixel(0, 0), [0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(image.pixel(2, 1), [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn a_blank_scrap_paints_its_background_in_bgra() {
+        let colour = Background::Color(Rgb(0x10, 0x20, 0x30));
+        let scrap = ScrapModel::blank(Point::default(), Size::new(1, 1), colour);
+        assert_eq!(
+            scrap.blank_image().unwrap().pixel(0, 0),
+            [0x30, 0x20, 0x10, 0xFF]
+        );
+    }
+
+    #[test]
+    fn a_transparent_blank_scrap_is_painted_with_zero_alpha() {
+        let scrap = ScrapModel::blank(Point::default(), Size::new(2, 1), Background::Transparent);
+        let image = scrap.blank_image().unwrap();
+        assert_eq!(image.pixel(0, 0), [0, 0, 0, 0]);
+        assert_eq!(image.pixel(1, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_background_is_written_as_rrggbb_or_transparent_and_read_back() {
+        assert_eq!(Background::Transparent.to_string(), "transparent");
+        assert_eq!(
+            "transparent".parse::<Background>(),
+            Ok(Background::Transparent)
+        );
+        assert_eq!(
+            "#10a0ff".parse::<Background>(),
+            Ok(Background::Color(Rgb(0x10, 0xA0, 0xFF)))
+        );
+        assert_eq!(
+            Background::Color(Rgb(0x10, 0xA0, 0xFF)).to_string(),
+            "#10A0FF"
+        );
+        for wrong in ["Transparent", "clear", "none", ""] {
+            assert_eq!(wrong.parse::<Background>(), Err(NotBackground), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn a_blank_scrap_is_transparent_only_with_the_transparent_background() {
+        let size = Size::new(4, 4);
+        let transparent = ScrapModel::blank(Point::default(), size, Background::Transparent);
+        let white = ScrapModel::blank(Point::default(), size, Background::WHITE);
+        let captured = ScrapModel::new(Point::default(), size);
+        assert!(transparent.is_blank() && transparent.is_transparent_blank());
+        assert!(white.is_blank() && !white.is_transparent_blank());
+        assert!(!captured.is_blank() && !captured.is_transparent_blank());
+    }
+
+    #[test]
+    fn only_a_transparent_blank_scrap_with_nothing_written_is_empty() {
+        let size = Size::new(4, 4);
+        let transparent = ScrapModel::blank(Point::default(), size, Background::Transparent);
+        assert!(transparent.is_empty_transparent_blank());
+        assert!(
+            !ScrapModel::blank(Point::default(), size, Background::WHITE)
+                .is_empty_transparent_blank()
+        );
+        assert!(!ScrapModel::new(Point::default(), size).is_empty_transparent_blank());
+        let mut written = transparent.clone();
+        written.start_editing(Style::default());
+        written.edit_input(EditInput::Press(Point::new(0, 0)));
+        written.edit_input(EditInput::Move {
+            at: Point::new(3, 3),
+            shift: false,
+        });
+        written.edit_input(EditInput::Leave);
+        assert_eq!(written.annotations().items().len(), 1);
+        assert!(!written.is_empty_transparent_blank());
+    }
+
+    #[test]
+    fn only_a_transparent_blank_scrap_with_nothing_written_starts_in_edit_mode() {
+        let size = Size::new(4, 4);
+        let transparent = ScrapModel::blank(Point::default(), size, Background::Transparent);
+        assert!(transparent.starts_in_edit_mode());
+        assert!(
+            !ScrapModel::blank(Point::default(), size, Background::WHITE).starts_in_edit_mode()
+        );
+        let dark = Background::Color(Rgb(0x21, 0x21, 0x21));
+        assert!(!ScrapModel::blank(Point::default(), size, dark).starts_in_edit_mode());
+        assert!(!ScrapModel::new(Point::default(), size).starts_in_edit_mode());
+        let mut written = transparent.clone();
+        written.start_editing(Style::default());
+        written.edit_input(EditInput::Press(Point::new(0, 0)));
+        written.edit_input(EditInput::Move {
+            at: Point::new(3, 3),
+            shift: false,
+        });
+        written.edit_input(EditInput::Leave);
+        assert!(!written.starts_in_edit_mode());
+    }
+
+    #[test]
+    fn a_captured_scrap_has_no_background_of_its_own() {
+        let scrap = ScrapModel::new(Point::default(), Size::new(3, 2));
+        assert_eq!(scrap.background(), None);
+        assert_eq!(scrap.blank_image(), None);
+    }
+
+    #[test]
+    fn the_hit_alpha_survives_the_window_opacity_and_stays_out_of_sight() {
+        let at = |opacity| Appearance {
+            opacity,
+            ..Appearance::default()
+        };
+        assert_eq!(at(100).hit_alpha(), 1);
+        assert_eq!(at(50).hit_alpha(), 3);
+        assert_eq!(at(10).hit_alpha(), 11);
     }
 
     #[test]
@@ -2243,7 +2529,7 @@ mod tests {
             scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x56))));
             scrap.edit_input(EditInput::Press(at(50, 57)));
             scrap.edit_input(EditInput::Release);
-            assert_eq!(scrap.selected_annotation().is_some(), hit, "{dpi} dpi");
+            assert_eq!(!scrap.selected_annotations().is_empty(), hit, "{dpi} dpi");
         }
     }
 
@@ -2264,18 +2550,18 @@ mod tests {
         scrap.edit_input(EditInput::Release);
         scrap.edit_input(EditInput::Leave);
         assert!(!scrap.is_editing());
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
 
         scrap.start_editing(Style::default());
         scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x56))));
         // 画面で 6px 離れた所（元の画像では 12 画素）は当たらない
         scrap.edit_input(EditInput::Press(at(50, 56)));
         scrap.edit_input(EditInput::Release);
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
         // 画面で 4px 離れた所（元の画像では 8 画素）は、太さの半分を超えても当たる（当たりの広さは画面の画素で決める）
         scrap.edit_input(EditInput::Press(at(50, 54)));
         scrap.edit_input(EditInput::Release);
-        let selected = scrap.selected_annotation().cloned();
+        let selected = scrap.selected_annotations().first().copied().cloned();
         assert_eq!(selected.as_ref(), scrap.annotations().items().first());
         // 矢印キーは元の画像の画素で動かす
         scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x28))));
@@ -2292,7 +2578,7 @@ mod tests {
         assert_eq!(scrap.edit_state().map(|s| s.style.color), Some(black));
         scrap.edit_input(EditInput::Delete);
         assert!(scrap.annotations().is_empty());
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
     }
 
     #[test]
@@ -2538,16 +2824,16 @@ mod tests {
         select_tool(&mut scrap);
         // 画像の外のクリックは右の縁の画素 (99, 30) になる。外の矩形の左の辺から 5 画素で当たりの内だが、選ばない
         click_at(&mut scrap, Point::new(100 + 300, 50 + 30));
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
         // 縁にまたがるものは、見えている部分のクリックで選べる
         click_at(&mut scrap, Point::new(100 + 90, 50 + 60));
-        assert_eq!(scrap.selected_annotation(), Some(&all[1]));
+        assert_eq!(scrap.selected_annotations(), [&all[1]]);
         scrap.edit_input(EditInput::Leave);
         assert!(scrap.untrim());
         assert_eq!(scrap.annotations_to_draw(), all);
         select_tool(&mut scrap);
         click_at(&mut scrap, Point::new(100 + 104, 50 + 30));
-        assert_eq!(scrap.selected_annotation(), Some(&all[2]));
+        assert_eq!(scrap.selected_annotations(), [&all[2]]);
     }
 
     #[test]
@@ -2556,12 +2842,12 @@ mod tests {
         let inside = scrap.annotations().items()[0].clone();
         select_tool(&mut scrap);
         click_at(&mut scrap, Point::new(100 + 25, 50 + 10));
-        assert_eq!(scrap.selected_annotation(), Some(&inside));
+        assert_eq!(scrap.selected_annotations(), [&inside]);
         let shift_right = EditInput::Key(Chord::plain(Key::known(0x27)).shift());
         // 左の辺の外側（太さの半分）が 8 なので、10 画素ずつ 10 回で範囲 (0, 0)〜(100, 100) の外に出る
         for _ in 0..9 {
             scrap.edit_input(shift_right.clone());
-            assert!(scrap.selected_annotation().is_some());
+            assert!(!scrap.selected_annotations().is_empty());
         }
         assert_eq!(
             scrap.edit_input(shift_right.clone()),
@@ -2570,7 +2856,7 @@ mod tests {
         assert_eq!(scrap.annotations().items().len(), 3);
         assert_eq!(scrap.annotations_to_draw().len(), 1);
         // 隠れたものは選択から外れ、矢印キーも Delete も効かない
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
         assert_eq!(scrap.edit_input(shift_right), vec![]);
         assert_eq!(scrap.edit_input(EditInput::Delete), vec![]);
         // 元に戻すで範囲の中に戻る

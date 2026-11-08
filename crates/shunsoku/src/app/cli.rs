@@ -4,9 +4,12 @@
 //!   `submit` に渡す（`on_pipe_requests`）。範囲選択の画面を開いている間に届いたものは失敗として返す。
 //! - CLI が待つのをやめた（切った・待ちきれなかった）依頼は取りやめる（`abandon_unwaited_capture`）。
 //! - `capture rect` は範囲選択の画面を出さずに撮る（`capture_rect`）。出力はどの撮り方とも同じ `output`。
+//! - `open` はトレイの「開く…」と同じ `open_scrap_path` で開き、すぐ応答する（`open_for_cli`）。通知は出さない
+//!   （わけは CLI の終了コードと標準エラーで伝える）。
 //! - 応答は `REPLIER`（`pipe_server::Replier`）から返す。App を借りられないときにも返せるよう、App の外に置く。
 
 use super::*;
+use crate::pipe_server::PipeRequest;
 
 /// CLI の依頼に応答する口（`pipe_server`）。App を借りられないときにも応答できるよう、App の外に置く。
 pub(super) static REPLIER: OnceLock<pipe_server::Replier> = OnceLock::new();
@@ -38,6 +41,20 @@ pub(super) fn on_pipe_requests(message_window: HWND) {
         let Some((request, selecting)) = next else {
             return;
         };
+        let request = match request {
+            PipeRequest::Capture(request) => request,
+            PipeRequest::Open { path, reply } => {
+                if !cli_waiting(reply) {
+                    log::info!("CLI request {} is no longer waited for; dropped", reply.0);
+                } else if selecting {
+                    log::info!("CLI open while the overlay is open; rejected");
+                    reply_failed(Some(reply), text("cli.selecting_open"));
+                } else {
+                    open_for_cli(&path, reply);
+                }
+                continue;
+            }
+        };
         if let Some(to) = request.reply
             && !cli_waiting(to)
         {
@@ -52,6 +69,24 @@ pub(super) fn on_pipe_requests(message_window: HWND) {
             submit(request);
         }
     }
+}
+
+/// `open`: スクラップファイルを開いて浮かべ、結果を CLI に返す。読めない・正しくない・新しい版は、それぞれの
+/// 終了コード（`ErrorKind::from(LoadErrorKind)`）で、読めたが出せなければ `ErrorKind::ShowFailed` で返す。
+fn open_for_cli(path: &Path, to: ReplyTo) {
+    log::info!("open requested from the CLI: {}", path.display());
+    let response = match open_scrap_path(path) {
+        Ok(()) => Response::Opened,
+        Err(OpenFailure::Load(e)) => Response::Failed {
+            kind: ErrorKind::from(e.kind()),
+            message: format!("{} {}", text(e.message_key()), path.display()),
+        },
+        Err(OpenFailure::Float(reason)) => Response::Failed {
+            kind: ErrorKind::ShowFailed,
+            message: format!("{} {reason}", text("cli.float_failed")),
+        },
+    };
+    reply(to, response);
 }
 
 /// 進めている依頼の CLI が待つのをやめていたら（切った・待ちきれなかった）、依頼を取りやめる。

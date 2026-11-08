@@ -17,11 +17,13 @@ use super::{
     ANNOTATION_FONT_SIZE_RANGE, ANNOTATION_WIDTH_RANGE, AnnotationDefaults, BORDER_WIDTH_RANGE,
     DEFAULT_REGION_FILE_NAME_TEMPLATE, DpiScaling, General, HotkeyAction, Hotkeys, LogLevel,
     OPACITY_RANGE, Reader, Region, ScrapAppearance, SelectionScreen, Settings, TRASH_LIMIT_RANGE,
-    VERSION, dpi_scaling, in_range, language, log_level, non_empty_str, optional_chord,
+    VERSION, background, dpi_scaling, in_range, language, log_level, non_empty_str, optional_chord,
     optional_gesture, read_regions_at, recipe_steps, region_number, rgb, save_dir, selection_mode,
 };
 use crate::i18n::Language;
-use crate::recipe::{APPEARANCE, AppearanceItem, ItemValue, Recipe, Step, StepKey};
+use crate::recipe::{
+    APPEARANCE, AppearanceItem, BACKGROUND, Capture, ItemValue, Recipe, Step, StepKey,
+};
 use crate::selection::Mode;
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
@@ -276,6 +278,14 @@ fn write_annotation(t: &mut dyn TableLike, a: &AnnotationDefaults) {
     put(t, "font", non_empty_str, Some(d.font), &a.font, |s| {
         Some(s.as_str().into())
     });
+    put(
+        t,
+        "background",
+        background,
+        Some(d.background),
+        &a.background,
+        |b| Some(b.to_string().into()),
+    );
 }
 
 fn write_selection(t: &mut dyn TableLike, s: &SelectionScreen) {
@@ -459,7 +469,7 @@ fn write_recipes(root: &mut Table, recipes: &[Recipe]) {
     tables.extend(out);
 }
 
-/// レシピ 1 つ。ショートカットがなければ項目を消す。
+/// レシピ 1 つ。ショートカットかホットキーがなければ、その項目を消す。
 fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
     put(
         t,
@@ -480,15 +490,36 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
         &r.shortcut,
         |c| c.map(|c| c.to_string().into()),
     );
+    put(t, "hotkey", optional_chord, Some(None), &r.hotkey, |c| {
+        c.map(|c| c.to_string().into())
+    });
 }
 
-/// レシピの手 1 つ。値のない手は操作の id の文字列、値のある手は `op` と書いた項目のキーを持つインライン表
+/// レシピの操作 1 つ。パラメータのない操作は操作の id の文字列、パラメータを添えた操作は `op` と書いた項目のキーを持つインライン表
 /// （`op` のあと、項目は `AppearanceItem::ALL` の順）。読めなかった項目は、その後ろに書いたまま書く（`op` を
-/// 読めなかったなら、その `op` で書く）。
+/// 読めなかったなら、その `op` で書く）。背景色を指定する操作は `op` と `color`、定型領域キャプチャは `op` と `region`。
 fn step_value(step: &Step) -> Value {
     let step = match step {
         Step::Op(id) => return id.as_str().into(),
         Step::Appearance(step) => step,
+        Step::Background(step) => {
+            let mut table = toml_edit::InlineTable::new();
+            table.insert(StepKey::Op.as_str(), BACKGROUND.into());
+            if let Some(color) = step.color {
+                table.insert(StepKey::Color.as_str(), color.to_string().into());
+            }
+            insert_rejected(&mut table, &step.rejected);
+            return Value::InlineTable(table);
+        }
+        Step::CaptureRegion(step) => {
+            let mut table = toml_edit::InlineTable::new();
+            table.insert(StepKey::Op.as_str(), Capture::Region.id().into());
+            if let Some(region) = &step.region {
+                table.insert(StepKey::Region.as_str(), region.as_str().into());
+            }
+            insert_rejected(&mut table, &step.rejected);
+            return Value::InlineTable(table);
+        }
     };
     let mut table = toml_edit::InlineTable::new();
     table.insert(StepKey::Op.as_str(), APPEARANCE.into());
@@ -501,12 +532,17 @@ fn step_value(step: &Step) -> Value {
         };
         table.insert(item.key(), value);
     }
-    for r in &step.rejected {
+    insert_rejected(&mut table, &step.rejected);
+    Value::InlineTable(table)
+}
+
+/// パラメータを添えた操作の読めなかった項目を、書いたまま `table` に足す。
+fn insert_rejected(table: &mut toml_edit::InlineTable, rejected: &[crate::recipe::Rejected]) {
+    for r in rejected {
         if let Some(value) = r.value.as_deref().and_then(|v| v.parse::<Value>().ok()) {
             table.insert(r.key.as_str(), value);
         }
     }
-    Value::InlineTable(table)
 }
 
 /// 定型領域 1 つ。名前・モニタ・範囲は既定値がないので、読めなければ常に書く。
@@ -561,6 +597,14 @@ fn write_region(t: &mut dyn TableLike, r: &Region) {
     put(t, "scrap", Item::as_bool, Some(false), &r.scrap, |&v| {
         Some(v.into())
     });
+    put(
+        t,
+        "blank_scrap",
+        Item::as_bool,
+        Some(false),
+        &r.blank_scrap,
+        |&v| Some(v.into()),
+    );
 }
 
 /// 表 `name` の中を `f` で書く。表がなければ（表でない値なら置き換えて）、何か書いたときだけ文書の末尾に足す。
@@ -650,6 +694,7 @@ mod tests {
     use super::*;
     use crate::geometry::Rect;
     use crate::keys::Chord;
+    use crate::scrap::Background;
     use crate::scrap::ops::MouseGesture;
     use crate::settings::{Rgb, load};
 
@@ -885,6 +930,7 @@ paste = "Ctrl+V"
             file_name_template: DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned(),
             save: true,
             scrap: false,
+            blank_scrap: false,
             loaded_name: None,
         }
     }
@@ -906,6 +952,19 @@ paste = "Ctrl+V"
         assert_eq!(issues, vec![]);
         assert_eq!(read.regions, vec![added]);
         assert!(out.starts_with(src), "{out}");
+    }
+
+    #[test]
+    fn a_region_turned_into_a_blank_scrap_writes_only_that_and_back() {
+        let out = written(TWO_REGIONS, |s| s.regions[1].blank_scrap = true);
+        assert_eq!(
+            out,
+            TWO_REGIONS.replace("height = 20\n", "height = 20\nblank_scrap = true\n")
+        );
+        assert!(load(&out).0.regions[1].blank_scrap);
+
+        let back = written(&out, |s| s.regions[1].blank_scrap = false);
+        assert!(!load(&back).0.regions[1].blank_scrap);
     }
 
     /// 手で書いた定型領域 2 つと、その後ろの表。
@@ -1147,6 +1206,36 @@ font = "Meiryo"     # 書体
     }
 
     #[test]
+    fn the_blank_scrap_background_and_hotkey_are_written_and_read_back() {
+        let out = written("version = 1\n", |s| {
+            s.annotation.background = Background::Color(Rgb(0x12, 0x34, 0x56));
+            s.hotkeys.blank_scrap = Some("Ctrl+Alt+N".parse().unwrap());
+        });
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            read.annotation.background,
+            Background::Color(Rgb(0x12, 0x34, 0x56))
+        );
+        assert_eq!(
+            read.hotkeys.blank_scrap,
+            Some("Ctrl+Alt+N".parse().unwrap())
+        );
+        assert!(out.contains("background = \"#123456\""), "{out}");
+    }
+
+    #[test]
+    fn a_transparent_blank_scrap_background_is_written_and_read_back() {
+        let out = written("version = 1\n", |s| {
+            s.annotation.background = Background::Transparent;
+        });
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.annotation.background, Background::Transparent);
+        assert!(out.contains("background = \"transparent\""), "{out}");
+    }
+
+    #[test]
     fn a_missing_version_is_written() {
         let out = written("[scrap]\nshadow = false\n", |_| {});
         assert_eq!(load(&out).1, vec![]);
@@ -1156,6 +1245,7 @@ font = "Meiryo"     # 書体
             name: name.to_owned(),
             steps: steps.iter().map(|&s| s.into()).collect(),
             shortcut: shortcut.and_then(chord),
+            hotkey: None,
         }
     }
 
@@ -1170,6 +1260,22 @@ font = "Meiryo"     # 書体
         assert_eq!(issues, vec![]);
         assert_eq!(read.recipes, wanted);
         assert!(!out.contains("shortcut = \"\""), "{out}");
+        assert!(!out.contains("hotkey"), "{out}");
+    }
+
+    #[test]
+    fn a_recipe_hotkey_is_written_and_reads_back_the_same() {
+        let mut r = recipe("撮ってコピー", &["select_capture", "copy"], None);
+        r.hotkey = chord("Ctrl+Alt+C");
+        let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
+        assert!(out.contains("hotkey = \"Ctrl+Alt+C\""), "{out}");
+        assert!(!out.contains("shortcut"), "{out}");
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, vec![r]);
+        // ホットキーを消したら項目も消す
+        let cleared = written(&out, |s| s.recipes[0].hotkey = None);
+        assert!(!cleared.contains("hotkey"), "{cleared}");
     }
     const RECIPES: &str = r#"version = 1
 
@@ -1222,6 +1328,33 @@ steps = ["shadow"]
         let (read, issues) = load(&out);
         assert_eq!(issues, vec![]);
         assert_eq!(read.recipes, vec![r]);
+    }
+
+    #[test]
+    fn a_background_step_reads_back_the_same_and_keeps_a_wrong_colour_as_written() {
+        let mut r = recipe("黒い白紙でコピー", &[], None);
+        r.steps = vec![
+            Step::Background(crate::recipe::BackgroundStep {
+                color: Some(crate::scrap::Background::Color(Rgb(0x21, 0x21, 0x21))),
+                rejected: vec![],
+            }),
+            "copy".into(),
+        ];
+        let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
+        assert!(
+            out.contains(r##"steps = [{ op = "background", color = "#212121" }, "copy"]"##),
+            "{out}"
+        );
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, vec![r]);
+
+        let wrong = "version = 1\n[[recipes]]\nname = \"a\"\nsteps = [{ op = \"background\", color = \"white\" }]\n";
+        let out = written(wrong, |s| s.recipes[0].steps.push("copy".into()));
+        assert!(
+            out.contains(r#"steps = [{ op = "background", color = "white" }, "copy"]"#),
+            "{out}"
+        );
     }
 
     const RECIPES_WITH_VALUES: &str = r##"version = 1

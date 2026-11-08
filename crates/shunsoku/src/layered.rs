@@ -9,8 +9,8 @@ use windows::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};
 use windows::core::Result;
 
 /// レイヤード ウィンドウ `hwnd` に、`source`（premultiplied BGRA の DIB を選んだ DC、大きさは `rect` と同じ）の
-/// 中身を `rect` で出す。`opacity` は透明度（%）。
-pub fn present(hwnd: HWND, source: HDC, rect: Rect, opacity: u8) -> Result<()> {
+/// 中身を `rect` で出す。`constant_alpha` は全体のアルファ（`Appearance::constant_alpha`）。
+pub fn present(hwnd: HWND, source: HDC, rect: Rect, constant_alpha: u8) -> Result<()> {
     let position = POINT {
         x: rect.left,
         y: rect.top,
@@ -23,7 +23,7 @@ pub fn present(hwnd: HWND, source: HDC, rect: Rect, opacity: u8) -> Result<()> {
     let blend = BLENDFUNCTION {
         BlendOp: AC_SRC_OVER as u8,
         BlendFlags: 0,
-        SourceConstantAlpha: (u32::from(opacity.min(100)) * 255 / 100) as u8,
+        SourceConstantAlpha: constant_alpha,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
     // SAFETY: 呼び元のスレッドのウィンドウ。引数はこの関数の中で生きている

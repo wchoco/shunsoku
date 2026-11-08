@@ -103,6 +103,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         select_capture,
         restore_last,
         active_window_capture,
+        blank_scrap,
     } = hotkeys;
     let ScrapAppearance {
         opacity,
@@ -119,6 +120,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         width: annotation_width,
         font_size,
         font,
+        background,
     } = annotation;
     let SelectionScreen {
         mode,
@@ -163,6 +165,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         active_window_capture,
         hotkeys.active_window_capture
     );
+    value!("hotkeys.blank_scrap", blank_scrap, hotkeys.blank_scrap);
     value!("scrap.opacity", opacity, scrap.opacity);
     value!("scrap.border", border_visible, scrap.border.visible);
     value!("scrap.border_width", border_width, scrap.border.width);
@@ -172,6 +175,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
     value!("annotation.width", annotation_width, annotation.width);
     value!("annotation.font_size", font_size, annotation.font_size);
     value!("annotation.font", font, annotation.font);
+    value!("annotation.background", background, annotation.background);
     value!("selection.mode", mode, selection.mode);
     value!("selection.crosshair", crosshair, selection.crosshair);
     value!(
@@ -350,6 +354,7 @@ fn merge_region(
         file_name_template,
         save,
         scrap,
+        blank_scrap,
         loaded_name: _,
     } = ours;
     let mut m = |key: &'static str, (changed, both): (bool, bool)| {
@@ -375,6 +380,10 @@ fn merge_region(
     );
     m("save", take(&base.save, save, &mut out.save));
     m("scrap", take(&base.scrap, scrap, &mut out.scrap));
+    m(
+        "blank_scrap",
+        take(&base.blank_scrap, blank_scrap, &mut out.blank_scrap),
+    );
 }
 
 /// 1 つの項目を突き合わせる。`out` は theirs の値で、GUI で変えていれば GUI の値にする。
@@ -544,6 +553,24 @@ mod tests {
     }
 
     #[test]
+    fn a_region_turned_into_a_blank_scrap_in_the_gui_keeps_the_other_items_changed_outside() {
+        let base = regions(&["a", "b"]);
+        let mut ours = base.clone();
+        ours.regions[0].blank_scrap = true;
+        ours.regions[1].blank_scrap = true;
+        let mut theirs = base.clone();
+        theirs.regions[1].blank_scrap = false;
+        theirs.regions[0].save = false;
+        theirs.regions[0].scrap = true;
+
+        let merged = merge(&base, &ours, &theirs);
+        assert_eq!(merged.conflicts, vec![]);
+        assert!(merged.settings.regions[0].blank_scrap);
+        assert!(merged.settings.regions[0].scrap);
+        assert!(merged.settings.regions[1].blank_scrap);
+    }
+
+    #[test]
     fn the_same_region_item_changed_on_both_sides_conflicts_and_the_gui_value_wins() {
         let base = regions(&["a", "b"]);
         let mut ours = base.clone();
@@ -658,6 +685,9 @@ mod tests {
             ("hotkeys.active_window_capture", |s| {
                 s.hotkeys.active_window_capture = Some("Ctrl+Shift+W".parse().unwrap())
             }),
+            ("hotkeys.blank_scrap", |s| {
+                s.hotkeys.blank_scrap = Some("Ctrl+Shift+N".parse().unwrap())
+            }),
             ("shortcuts.copy", |s| {
                 s.shortcuts.insert("copy".into(), None);
             }),
@@ -675,6 +705,9 @@ mod tests {
             ("annotation.width", |s| s.annotation.width = 9),
             ("annotation.font_size", |s| s.annotation.font_size = 30),
             ("annotation.font", |s| s.annotation.font = "Meiryo".into()),
+            ("annotation.background", |s| {
+                s.annotation.background = crate::scrap::Background::Color(Rgb(1, 2, 3))
+            }),
             ("selection.mode", |s| s.selection.mode = Mode::Precise),
             ("selection.crosshair", |s| s.selection.crosshair = true),
             ("selection.crosshair_color", |s| {
@@ -696,6 +729,7 @@ mod tests {
                     file_name_template: "t".into(),
                     save: true,
                     scrap: false,
+                    blank_scrap: false,
                     loaded_name: None,
                 }]
             }),

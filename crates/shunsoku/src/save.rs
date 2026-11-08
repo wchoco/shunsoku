@@ -6,6 +6,7 @@
 //! - PNG の書き出しと書き込み（`write_png`）は裏のスレッドで行う。書き込みは新しいファイルとしてだけ作り
 //!   （`create_new`）、名前を決めたあとに同じ名前のファイルができていても上書きしない。ただし「名前を付けて保存」
 //!   （`ask_path`）で選ばれた場所は、ダイアログで上書きを確かめてあるので上書きする（`Overwrite::Allow`）。
+//! - スクラップファイル（`write_scrap_file`）も同じく裏のスレッドで書き出して書き込む。
 
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
@@ -13,15 +14,17 @@ use std::path::{Path, PathBuf};
 
 use shunsoku_core::APP_NAME;
 use shunsoku_core::image::Image;
+use shunsoku_core::scrap_file::{self, ScrapFile};
 use shunsoku_core::template::{self, LocalTime};
 use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Shell::Common::{COMDLG_FILTERSPEC, ITEMIDLIST};
 use windows::Win32::UI::Shell::{
-    FOLDERID_Pictures, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PICKFOLDERS,
-    FOS_STRICTFILETYPES, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, ILFree,
-    IShellItem, KF_FLAG_DEFAULT, SEE_MASK_CLASSNAME, SEE_MASK_IDLIST, SHCreateItemFromParsingName,
+    FILEOPENDIALOGOPTIONS, FOLDERID_Pictures, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
+    FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FOS_STRICTFILETYPES, FileOpenDialog,
+    FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, ILFree, IShellItem,
+    KF_FLAG_DEFAULT, SEE_MASK_CLASSNAME, SEE_MASK_IDLIST, SHCreateItemFromParsingName,
     SHELLEXECUTEINFOW, SHGetKnownFolderPath, SHParseDisplayName, SIGDN_FILESYSPATH,
     ShellExecuteExW,
 };
@@ -30,6 +33,33 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 /// 保存画像の拡張子。形式は PNG だけ。
 const EXTENSION: &str = "png";
+
+/// ダイアログで選ばせるファイルの種類。
+#[derive(Debug, Clone, Copy)]
+pub struct FileType<'a> {
+    /// ダイアログに出す種類の名前（「PNG 画像」など）。
+    pub name: &'a str,
+    /// 拡張子（点なし）。
+    pub extension: &'a str,
+}
+
+impl FileType<'_> {
+    /// 保存画像（PNG）。
+    pub fn png(name: &str) -> FileType<'_> {
+        FileType {
+            name,
+            extension: EXTENSION,
+        }
+    }
+
+    /// スクラップファイル。
+    pub fn scrap_file(name: &str) -> FileType<'_> {
+        FileType {
+            name,
+            extension: scrap_file::EXTENSION,
+        }
+    }
+}
 
 /// 全体の保存先の既定値: ピクチャ フォルダ（Known Folder）の下の `shunsoku`。
 pub fn default_dir() -> windows::core::Result<PathBuf> {
@@ -92,68 +122,104 @@ pub fn destination(
 ///
 /// 初期フォルダは `path` のフォルダ（まだなければ、あるうちで最も近い親）、ファイル名は `path` のファイル名にする
 /// （どちらも既定の保存と同じものを渡す）。
-/// 形式は PNG だけ。既にあるファイルを選んだら、ダイアログが上書きを確かめる。モーダルなので `App` を借りずに
-/// 呼ぶ。UI スレッドで COM を初期化してから呼ぶ。
+/// 形式は `file_type` だけ（`path` の拡張子は呼ぶ側が合わせる）。既にあるファイルを選んだら、ダイアログが上書きを
+/// 確かめる。モーダルなので `App` を借りずに呼ぶ。UI スレッドで COM を初期化してから呼ぶ。
 pub fn ask_path(
     owner: HWND,
     path: &Path,
-    filter_name: &str,
+    file_type: FileType,
 ) -> windows::core::Result<Option<PathBuf>> {
-    let folder = path
-        .ancestors()
-        .skip(1)
-        .find(|dir| dir.is_dir())
-        .map(HSTRING::from);
     let file_name = path.file_name().map(HSTRING::from).unwrap_or_default();
-    let filter_name = HSTRING::from(filter_name);
-    let filters = [COMDLG_FILTERSPEC {
-        pszName: PCWSTR(filter_name.as_ptr()),
-        pszSpec: w!("*.png"),
-    }];
-    // SAFETY: 渡す文字列はどれも呼び出しの間生きている。返った文字列は CoTaskMemFree で返す
-    unsafe {
+    let extension = HSTRING::from(file_type.extension);
+    // SAFETY: 渡す文字列はどれも呼び出しの間生きている
+    let dialog: IFileSaveDialog = unsafe {
         let dialog: IFileSaveDialog =
             CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
-        dialog.SetFileTypes(&filters)?;
-        dialog.SetDefaultExtension(w!("png"))?;
-        let options = dialog.GetOptions()?;
-        dialog.SetOptions(
-            options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_STRICTFILETYPES,
-        )?;
-        if let Some(folder) = &folder {
-            let item: IShellItem = SHCreateItemFromParsingName(folder, None)?;
-            dialog.SetFolder(&item)?;
-        }
-        dialog.SetFileName(&file_name)?;
-        match dialog.Show(Some(owner)) {
-            Ok(()) => {}
-            Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let chosen = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
-        let text = chosen.to_string();
-        CoTaskMemFree(Some(chosen.0 as *const _));
-        Ok(Some(PathBuf::from(text?)))
-    }
+        dialog.SetDefaultExtension(&extension)?;
+        dialog
+    };
+    set_file_type(&dialog, file_type)?;
+    add_options(
+        &dialog,
+        FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_STRICTFILETYPES,
+    )?;
+    set_folder(&dialog, path.ancestors().skip(1).find(|dir| dir.is_dir()))?;
+    // SAFETY: 渡す文字列は呼び出しの間生きている
+    unsafe { dialog.SetFileName(&file_name)? };
+    show(&dialog, owner)
+}
+
+/// 開くファイルを選ぶダイアログを出し、選ばれたパスを返す。キャンセルされたら None。種類は `file_type` だけを
+/// 出す。`initial` があればそのフォルダから開く。モーダルなので `App` を借りずに、UI スレッドで COM を初期化して
+/// から呼ぶ。
+pub fn ask_open_path(
+    owner: HWND,
+    initial: Option<&Path>,
+    file_type: FileType,
+) -> windows::core::Result<Option<PathBuf>> {
+    let dialog = open_dialog()?;
+    set_file_type(&dialog, file_type)?;
+    add_options(
+        &dialog,
+        FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST,
+    )?;
+    set_folder(
+        &dialog,
+        initial.and_then(|path| path.ancestors().find(|dir| dir.is_dir())),
+    )?;
+    show(&dialog, owner)
 }
 
 /// フォルダを選ぶダイアログを出し、選ばれたフォルダを返す。`initial` があればそこ（なければその上のあるフォルダ）
 /// から開く。キャンセルされたら None。
 pub fn ask_folder(owner: HWND, initial: &Path) -> windows::core::Result<Option<PathBuf>> {
-    let folder = initial
-        .ancestors()
-        .find(|dir| dir.is_dir())
-        .map(HSTRING::from);
-    // SAFETY: 渡す文字列はどれも呼び出しの間生きている。返った文字列は CoTaskMemFree で返す
+    let dialog = open_dialog()?;
+    add_options(&dialog, FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)?;
+    set_folder(&dialog, initial.ancestors().find(|dir| dir.is_dir()))?;
+    show(&dialog, owner)
+}
+
+/// 開くダイアログを作る。
+fn open_dialog() -> windows::core::Result<IFileOpenDialog> {
+    // SAFETY: 引数を持たない COM の生成
+    unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+}
+
+/// ダイアログの種類を `file_type` だけにする（名前と `*.<拡張子>`）。
+fn set_file_type(dialog: &IFileDialog, file_type: FileType) -> windows::core::Result<()> {
+    let name = HSTRING::from(file_type.name);
+    let spec = HSTRING::from(format!("*.{}", file_type.extension));
+    let filters = [COMDLG_FILTERSPEC {
+        pszName: PCWSTR(name.as_ptr()),
+        pszSpec: PCWSTR(spec.as_ptr()),
+    }];
+    // SAFETY: 渡す文字列は呼び出しの間生きている（ダイアログが写し取る）
+    unsafe { dialog.SetFileTypes(&filters) }
+}
+
+/// ダイアログの今のオプションに `options` を足す。
+fn add_options(dialog: &IFileDialog, options: FILEOPENDIALOGOPTIONS) -> windows::core::Result<()> {
+    // SAFETY: ダイアログは生きている
+    unsafe { dialog.SetOptions(dialog.GetOptions()? | options) }
+}
+
+/// ダイアログを `folder` から開くようにする。None なら何もしない（ダイアログの既定のまま）。
+fn set_folder(dialog: &IFileDialog, folder: Option<&Path>) -> windows::core::Result<()> {
+    let Some(folder) = folder else {
+        return Ok(());
+    };
+    let folder = HSTRING::from(folder);
+    // SAFETY: 渡す文字列は呼び出しの間生きている
     unsafe {
-        let dialog: IFileOpenDialog =
-            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
-        let options = dialog.GetOptions()?;
-        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)?;
-        if let Some(folder) = &folder {
-            let item: IShellItem = SHCreateItemFromParsingName(folder, None)?;
-            dialog.SetFolder(&item)?;
-        }
+        let item: IShellItem = SHCreateItemFromParsingName(&folder, None)?;
+        dialog.SetFolder(&item)
+    }
+}
+
+/// ダイアログをモーダルで出し、選ばれたパスを返す。キャンセルされたら None。
+fn show(dialog: &IFileDialog, owner: HWND) -> windows::core::Result<Option<PathBuf>> {
+    // SAFETY: 返った文字列は CoTaskMemFree で返す
+    unsafe {
         match dialog.Show(Some(owner)) {
             Ok(()) => {}
             Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => return Ok(None),
@@ -178,6 +244,25 @@ pub enum Overwrite {
 /// 画像を PNG にして `path` に書く（裏のスレッドで呼ぶ）。フォルダがなければ作る。失敗したら作りかけのファイルを
 /// 消す。
 pub fn write_png(path: &Path, image: &Image, overwrite: Overwrite) -> std::io::Result<()> {
+    write_with(path, overwrite, |out| {
+        image.write_png(out).map_err(std::io::Error::other)
+    })
+}
+
+/// スクラップファイルを書き出して `path` に書く（裏のスレッドで呼ぶ）。保存先はダイアログで上書きを確かめてあるので
+/// 上書きする。フォルダがなければ作り、失敗したら作りかけのファイルを消す。
+pub fn write_scrap_file(path: &Path, file: &ScrapFile) -> std::io::Result<()> {
+    // 書き出しに失敗したら、ファイルを作らない
+    let bytes = scrap_file::encode(file).map_err(std::io::Error::other)?;
+    write_with(path, Overwrite::Allow, |out| out.write_all(&bytes))
+}
+
+/// `path` を開いて `write` で書く。フォルダがなければ作る。失敗したら作りかけのファイルを消す。
+fn write_with(
+    path: &Path,
+    overwrite: Overwrite,
+    write: impl FnOnce(&mut BufWriter<std::fs::File>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -189,10 +274,7 @@ pub fn write_png(path: &Path, image: &Image, overwrite: Overwrite) -> std::io::R
     };
     let file = options.open(path)?;
     let mut out = BufWriter::new(file);
-    let written = image
-        .write_png(&mut out)
-        .map_err(std::io::Error::other)
-        .and_then(|()| out.flush());
+    let written = write(&mut out).and_then(|()| out.flush());
     if written.is_err() {
         drop(out);
         let _ = std::fs::remove_file(path);

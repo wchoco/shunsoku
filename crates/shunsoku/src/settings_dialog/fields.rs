@@ -20,6 +20,7 @@ use std::rc::Rc;
 use shunsoku_core::annotate::toolbar::{FONT_SIZES, WIDTHS};
 use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
+use shunsoku_core::scrap::Background;
 use shunsoku_core::selection::Mode;
 use shunsoku_core::settings::editor::{Editor, choices};
 use shunsoku_core::settings::form::{FillPass, RegionDetail, read_number};
@@ -91,6 +92,8 @@ pub enum Field {
     AnnotationFontSize,
     /// `[annotation] font`。
     AnnotationFont,
+    /// `[annotation] background`（新しく作る白紙スクラップの背景色）。
+    BlankBackground,
     /// 定型領域 i（`Settings::regions` の位置）の項目。
     Region(usize, RegionKey),
 }
@@ -110,6 +113,9 @@ pub enum RegionKey {
     Save,
     /// 撮ったらスクラップとして表示する。
     Scrap,
+    /// 撮らずに、範囲の位置と大きさで白紙スクラップを作る。入れると保存先・ファイル名テンプレート・保存する・
+    /// スクラップとして表示するの欄が使えなくなる（`Editor::region_uses_capture_outputs`）。
+    BlankScrap,
 }
 
 impl Field {
@@ -172,6 +178,8 @@ pub enum Action {
     BrowseFolder(Field),
     /// 色を選ばせて `Field` に入れる。
     PickColor(Field),
+    /// 背景色の欄 `Field` を透明にする。
+    Transparent(Field),
     /// 変数のメニューを出し、テンプレートの欄に入れる。
     InsertVariable(TemplateOf),
     /// `Field` の保存先をエクスプローラーで開く。
@@ -222,6 +230,7 @@ impl Fields {
             button.action = match button.action {
                 Action::BrowseFolder(f) => Action::BrowseFolder(f.with_region(index)),
                 Action::PickColor(f) => Action::PickColor(f.with_region(index)),
+                Action::Transparent(f) => Action::Transparent(f.with_region(index)),
                 Action::OpenFolder(f) => Action::OpenFolder(f.with_region(index)),
                 Action::InsertVariable(TemplateOf::Region(_)) => {
                     Action::InsertVariable(TemplateOf::Region(index))
@@ -250,11 +259,14 @@ fn kind(field: Field) -> Kind {
         | Field::Crosshair
         | Field::Border
         | Field::Shadow
-        | Field::Region(_, RegionKey::Save | RegionKey::Scrap) => Kind::Check,
+        | Field::Region(_, RegionKey::Save | RegionKey::Scrap | RegionKey::BlankScrap) => {
+            Kind::Check
+        }
         Field::SaveDir
         | Field::Template(_)
         | Field::BorderColor
         | Field::AnnotationColor
+        | Field::BlankBackground
         | Field::CrosshairColor
         | Field::Region(_, RegionKey::Name | RegionKey::SaveDir) => Kind::Text { preview: None },
         Field::Opacity
@@ -348,6 +360,7 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
         Field::Region(i, key) => region_shown(d.regions.get(i), key),
         Field::BorderColor => Shown::Text(d.scrap.border.color.to_string()),
         Field::AnnotationColor => Shown::Text(d.annotation.color.to_string()),
+        Field::BlankBackground => Shown::Text(d.annotation.background.to_string()),
         Field::CrosshairColor => Shown::Text(d.selection.crosshair_color.to_string()),
         Field::Opacity => Shown::Text(d.scrap.opacity.to_string()),
         Field::BorderWidth => Shown::Text(d.scrap.border.width.to_string()),
@@ -395,7 +408,7 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
 fn region_shown(region: Option<&Region>, key: RegionKey) -> Shown {
     let Some(r) = region else {
         return match key {
-            RegionKey::Save | RegionKey::Scrap => Shown::Check(false),
+            RegionKey::Save | RegionKey::Scrap | RegionKey::BlankScrap => Shown::Check(false),
             _ => Shown::Text(String::new()),
         };
     };
@@ -413,6 +426,7 @@ fn region_shown(region: Option<&Region>, key: RegionKey) -> Shown {
         ),
         RegionKey::Save => Shown::Check(r.save),
         RegionKey::Scrap => Shown::Check(r.scrap),
+        RegionKey::BlankScrap => Shown::Check(r.blank_scrap),
     }
 }
 
@@ -456,6 +470,11 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
         (Field::AnnotationColor, Input::Text(s)) => {
             if let Ok(c) = s.trim().parse::<Rgb>() {
                 draft.annotation.color = c;
+            }
+        }
+        (Field::BlankBackground, Input::Text(s)) => {
+            if let Ok(b) = s.trim().parse::<Background>() {
+                draft.annotation.background = b;
             }
         }
         (Field::CrosshairColor, Input::Text(s)) => {
@@ -529,6 +548,7 @@ fn set_region(region: &mut Region, key: RegionKey, input: Input) {
         }
         (RegionKey::Save, Input::Check(v)) if v || region.scrap => region.save = v,
         (RegionKey::Scrap, Input::Check(v)) if v || region.save => region.scrap = v,
+        (RegionKey::BlankScrap, Input::Check(v)) => region.blank_scrap = v,
         _ => {}
     }
 }
@@ -538,6 +558,11 @@ pub fn color_of(settings: &Settings, field: Field) -> Option<Rgb> {
     match field {
         Field::BorderColor => Some(settings.scrap.border.color),
         Field::AnnotationColor => Some(settings.annotation.color),
+        // 透明なら、色の選択ダイアログは白から始める（欄には `transparent` とも書ける）
+        Field::BlankBackground => match settings.annotation.background {
+            Background::Color(c) => Some(c),
+            Background::Transparent => Some(Rgb(0xFF, 0xFF, 0xFF)),
+        },
         Field::CrosshairColor => Some(settings.selection.crosshair_color),
         _ => None,
     }
@@ -584,6 +609,8 @@ pub enum Rejected {
     Number { min: u32, max: u32 },
     /// `#RRGGBB`。
     Color,
+    /// `#RRGGBB` か `transparent`（白紙の背景色）。
+    Background,
     /// 絶対パスのフォルダ（空なら既定）。
     Folder,
     /// 空でないテンプレート。
@@ -602,6 +629,7 @@ impl Rejected {
                 .replace("{min}", &min.to_string())
                 .replace("{max}", &max.to_string()),
             Rejected::Color => text("settings_gui.invalid.color").to_owned(),
+            Rejected::Background => text("settings_gui.invalid.background").to_owned(),
             Rejected::Folder => text("settings_gui.invalid.folder").to_owned(),
             Rejected::Template => text("settings_gui.invalid.template").to_owned(),
         }
@@ -628,6 +656,11 @@ pub fn rejected(field: Field, s: &str) -> Option<Rejected> {
         Field::BorderColor | Field::AnnotationColor | Field::CrosshairColor => {
             s.trim().parse::<Rgb>().is_err().then_some(Rejected::Color)
         }
+        Field::BlankBackground => s
+            .trim()
+            .parse::<Background>()
+            .is_err()
+            .then_some(Rejected::Background),
         _ => None,
     }
 }
@@ -1074,6 +1107,18 @@ impl PageBuilder<'_> {
             id: pick,
             action: Action::PickColor(field),
         });
+    }
+
+    /// 背景色の欄（`#RRGGBB` か `transparent`）と「選ぶ…」「透明」。
+    pub fn background_field(&mut self, field: Field, x: i16, y: i16) {
+        self.color_field(field, x, y);
+        self.button(
+            Action::Transparent(field),
+            "settings_gui.transparent",
+            x + COLOR_WIDTH + BUTTON_GAP + SIDE_BUTTON + BUTTON_GAP,
+            y,
+            SIDE_BUTTON,
+        );
     }
 
     /// 色の欄と「選ぶ…」を置いて、その ID を返す（`Field` と `Action` の行には入れない）。

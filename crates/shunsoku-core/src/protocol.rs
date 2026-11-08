@@ -1,12 +1,13 @@
 //! `shunsoku-cli` と常駐本体の間の、名前付きパイプでの依頼と応答の形式（ADR-0003）。
 
-use crate::cli_args::{Capture, Output, Save, Target, check_capture};
+use crate::cli_args::{Capture, Open, Output, Save, Target, check_capture, check_open};
 use crate::geometry::Rect;
 use crate::monitors::Monitor;
+use crate::scrap_file::LoadErrorKind;
 use std::time::Duration;
 
 /// プロトコルのバージョン。形式を変えたら上げる。互換性は保たず、違えば断る。
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// 1 通の依頼・応答の大きさの上限（バイト）。これより大きいものは読まずに断る。
 pub const MAX_MESSAGE: usize = 64 * 1024;
@@ -31,6 +32,10 @@ pub fn reply_timeout(capture: &Capture) -> Duration {
     }
 }
 
+/// 常駐本体が `open` の依頼の応答を待つ時間の上限（届いてから）。ユーザーは待たないが、`delay` を待っている
+/// キャプチャの依頼の後ろに並ぶことがあるので、その分（`cli_args::MAX_DELAY`）も見込む。
+pub const OPEN_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// CLI が応答を待つ時間の上限（依頼を書いてから）。常駐本体が取りやめて返す応答を受け取れるよう、
 /// `reply_timeout` より少し長く待つ。過ぎたら常駐本体が応答しないものとして終わる。
 pub fn client_timeout(request: &Request) -> Duration {
@@ -38,6 +43,7 @@ pub fn client_timeout(request: &Request) -> Duration {
     const MARGIN: Duration = Duration::from_secs(10);
     match request {
         Request::Capture(capture) => reply_timeout(capture) + MARGIN,
+        Request::Open(_) => OPEN_REPLY_TIMEOUT + MARGIN,
         Request::Monitors => MARGIN,
     }
 }
@@ -47,6 +53,7 @@ pub fn client_timeout(request: &Request) -> Duration {
 pub enum Request {
     Capture(Capture),
     Monitors,
+    Open(Open),
 }
 
 /// 読めなかった理由。
@@ -66,6 +73,10 @@ pub fn encode_request(request: &Request) -> String {
     let mut w = Writer::new();
     match request {
         Request::Monitors => w.field("command", "monitors"),
+        Request::Open(open) => {
+            w.field("command", "open");
+            w.field("path", &open.path);
+        }
         Request::Capture(capture) => {
             w.field("command", "capture");
             match &capture.target {
@@ -108,6 +119,13 @@ pub fn decode_request(text: &str) -> Result<Request, DecodeError> {
     let mut r = Reader::new(text)?;
     let request = match r.take("command")? {
         "monitors" => Request::Monitors,
+        "open" => {
+            let open = Open {
+                path: r.take("path")?.to_owned(),
+            };
+            check_open(&open).map_err(|e| DecodeError::Malformed(e.0))?;
+            Request::Open(open)
+        }
         "capture" => {
             let target = match r.take("target")? {
                 "rect" => {
@@ -153,6 +171,8 @@ pub enum Response {
     Captured { path: Option<String> },
     /// モニタの一覧（並びは常駐本体が集めた順。番号は `monitors::numbered` で振る）。
     Monitors(Vec<Monitor>),
+    /// スクラップファイルを開いて浮かべた。
+    Opened,
     /// 失敗した。
     Failed { kind: ErrorKind, message: String },
 }
@@ -160,7 +180,8 @@ pub enum Response {
 /// 失敗の種類。終了コードを決める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// 撮れなかった（範囲選択の画面を開いている、モニタがない、保存できない、裏のスレッドのパニック など）。終了コード 1。
+    /// 撮れなかった（範囲選択の画面を開いている、モニタがない、保存できない、裏のスレッドのパニック など）。
+    /// 終了コード 1。
     CaptureFailed,
     /// 引数の誤り。終了コード 2。
     InvalidArguments,
@@ -168,44 +189,72 @@ pub enum ErrorKind {
     Unavailable,
     /// ユーザーが取り消した。終了コード 4。
     Cancelled,
+    /// 開くスクラップファイルを読めない（ない、権限がない など）。終了コード 5。
+    FileUnreadable,
+    /// 開くファイルがスクラップファイルとして正しくない（壊れている、スクラップファイルでない）。終了コード 6。
+    FileMalformed,
+    /// 開くスクラップファイルが新しい版の shunsoku で作られた。終了コード 7。
+    FileNewerVersion,
+    /// スクラップファイルは読めたが、スクラップを出せなかった（ウィンドウを作れない など）。終了コード 8。
+    ShowFailed,
+}
+
+impl From<LoadErrorKind> for ErrorKind {
+    fn from(kind: LoadErrorKind) -> ErrorKind {
+        match kind {
+            LoadErrorKind::Unreadable => ErrorKind::FileUnreadable,
+            LoadErrorKind::Malformed => ErrorKind::FileMalformed,
+            LoadErrorKind::NewerVersion => ErrorKind::FileNewerVersion,
+        }
+    }
 }
 
 impl ErrorKind {
-    pub fn exit_code(self) -> i32 {
+    /// すべての種類（応答の名前から引くときに使う）。
+    const ALL: [ErrorKind; 8] = [
+        ErrorKind::CaptureFailed,
+        ErrorKind::InvalidArguments,
+        ErrorKind::Unavailable,
+        ErrorKind::Cancelled,
+        ErrorKind::FileUnreadable,
+        ErrorKind::FileMalformed,
+        ErrorKind::FileNewerVersion,
+        ErrorKind::ShowFailed,
+    ];
+
+    /// 応答に書く名前と、CLI の終了コード。種類ごとの決まりはここにだけ書く。
+    fn entry(self) -> (&'static str, i32) {
         match self {
-            ErrorKind::CaptureFailed => 1,
-            ErrorKind::InvalidArguments => 2,
-            ErrorKind::Unavailable => 3,
-            ErrorKind::Cancelled => 4,
+            ErrorKind::CaptureFailed => ("capture-failed", 1),
+            ErrorKind::InvalidArguments => ("invalid-arguments", 2),
+            ErrorKind::Unavailable => ("unavailable", 3),
+            ErrorKind::Cancelled => ("cancelled", 4),
+            ErrorKind::FileUnreadable => ("file-unreadable", 5),
+            ErrorKind::FileMalformed => ("file-malformed", 6),
+            ErrorKind::FileNewerVersion => ("file-newer-version", 7),
+            ErrorKind::ShowFailed => ("show-failed", 8),
         }
+    }
+
+    pub fn exit_code(self) -> i32 {
+        self.entry().1
     }
 
     fn name(self) -> &'static str {
-        match self {
-            ErrorKind::CaptureFailed => "capture-failed",
-            ErrorKind::InvalidArguments => "invalid-arguments",
-            ErrorKind::Unavailable => "unavailable",
-            ErrorKind::Cancelled => "cancelled",
-        }
+        self.entry().0
     }
 
     fn from_name(name: &str) -> Option<ErrorKind> {
-        [
-            ErrorKind::CaptureFailed,
-            ErrorKind::InvalidArguments,
-            ErrorKind::Unavailable,
-            ErrorKind::Cancelled,
-        ]
-        .into_iter()
-        .find(|kind| kind.name() == name)
+        ErrorKind::ALL.into_iter().find(|kind| kind.name() == name)
     }
 }
 
 impl Response {
-    /// CLI の終了コード（0 成功 / 1 キャプチャの失敗 / 2 引数の誤り / 3 依頼できない・バージョン違い / 4 取り消し）。
+    /// CLI の終了コード（0 成功 / 1 キャプチャの失敗 / 2 引数の誤り / 3 依頼できない・バージョン違い / 4 取り消し
+    /// / 5〜7 スクラップファイルを開けない / 8 開いたスクラップを出せない。`ErrorKind::exit_code`）。
     pub fn exit_code(&self) -> i32 {
         match self {
-            Response::Captured { .. } | Response::Monitors(_) => 0,
+            Response::Captured { .. } | Response::Monitors(_) | Response::Opened => 0,
             Response::Failed { kind, .. } => kind.exit_code(),
         }
     }
@@ -248,6 +297,7 @@ pub fn encode_response(response: &Response) -> String {
                 w.field("primary", flag(m.primary));
             }
         }
+        Response::Opened => w.field("status", "opened"),
         Response::Failed { kind, message } => {
             w.field("status", "failed");
             w.field("kind", kind.name());
@@ -282,6 +332,7 @@ pub fn decode_response(text: &str) -> Result<Response, DecodeError> {
             }
             Response::Monitors(monitors)
         }
+        "opened" => Response::Opened,
         "failed" => {
             let kind = r.take("kind")?;
             let kind =
@@ -720,5 +771,86 @@ mod tests {
         assert_eq!(failed(ErrorKind::InvalidArguments).exit_code(), 2);
         assert_eq!(failed(ErrorKind::Unavailable).exit_code(), 3);
         assert_eq!(failed(ErrorKind::Cancelled).exit_code(), 4);
+    }
+
+    fn open(path: &str) -> Request {
+        Request::Open(Open {
+            path: path.to_owned(),
+        })
+    }
+
+    #[test]
+    fn an_open_request_survives_a_round_trip() {
+        let request = open("C:\\スクラップ\\a\nb\\メモ.shunsoku");
+        assert_eq!(decode_request(&encode_request(&request)), Ok(request));
+    }
+
+    #[test]
+    fn an_open_request_the_cli_would_not_have_sent_is_refused() {
+        for path in [
+            "a.shunsoku",
+            r"\\.\pipe\a.shunsoku",
+            r"\\localhost\pipe\a.shunsoku",
+            r"C:\a.png",
+        ] {
+            assert!(
+                matches!(
+                    decode_request(&encode_request(&open(path))),
+                    Err(DecodeError::Malformed(_))
+                ),
+                "{path} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn opened_and_open_failures_survive_a_round_trip() {
+        let failed = |kind| Response::Failed {
+            kind,
+            message: "開けません: C:\\a.shunsoku".to_owned(),
+        };
+        for response in [
+            Response::Opened,
+            failed(ErrorKind::FileUnreadable),
+            failed(ErrorKind::FileMalformed),
+            failed(ErrorKind::FileNewerVersion),
+            failed(ErrorKind::ShowFailed),
+        ] {
+            let wire = encode_response(&response);
+            assert_eq!(decode_response(&wire), Ok(response));
+        }
+    }
+
+    #[test]
+    fn each_reason_an_open_fails_has_its_own_exit_code() {
+        let code = |kind: LoadErrorKind| ErrorKind::from(kind).exit_code();
+        assert_eq!(Response::Opened.exit_code(), 0);
+        assert_eq!(code(LoadErrorKind::Unreadable), 5);
+        assert_eq!(code(LoadErrorKind::Malformed), 6);
+        assert_eq!(code(LoadErrorKind::NewerVersion), 7);
+        assert_eq!(ErrorKind::ShowFailed.exit_code(), 8);
+    }
+
+    #[test]
+    fn every_error_kind_has_its_own_name_and_exit_code() {
+        let names: std::collections::HashSet<_> =
+            ErrorKind::ALL.iter().map(|kind| kind.name()).collect();
+        let codes: std::collections::HashSet<_> =
+            ErrorKind::ALL.iter().map(|kind| kind.exit_code()).collect();
+        assert_eq!(names.len(), ErrorKind::ALL.len());
+        assert_eq!(codes.len(), ErrorKind::ALL.len());
+        assert!(!codes.contains(&0));
+        for kind in ErrorKind::ALL {
+            assert_eq!(ErrorKind::from_name(kind.name()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn the_cli_waits_for_an_open_a_little_longer_than_the_resident_gives_up() {
+        assert_eq!(OPEN_REPLY_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(
+            client_timeout(&open(r"C:\a.shunsoku")),
+            Duration::from_secs(130)
+        );
     }
 }

@@ -32,6 +32,7 @@
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
 //! restore_last = "Ctrl+Alt+Z"                  # 最後に閉じたものを復元。既定は空で、必須ではない
 //! active_window_capture = "Ctrl+Shift+W"       # アクティブウィンドウのキャプチャ。既定は空で、必須ではない
+//! blank_scrap = "Ctrl+Shift+N"                 # 白紙スクラップを作る。既定は空で、必須ではない
 //!
 //! [shortcuts]                                  # スクラップ操作の id ごとの上書き。"" は割り当てなし
 //! copy = "Ctrl+Shift+C"
@@ -52,6 +53,8 @@
 //! width = 3                                    # 1〜64（画像の画素）
 //! font_size = 16                               # 文字の大きさ。1〜256（画像の画素）
 //! font = "Yu Gothic UI"                        # 文字の書体。入っていなければ代わりの書体で描く
+//! background = "#FFFFFF"                       # 新しく作る白紙スクラップの背景色（"transparent" で透明）。
+//!                                              #   透明なときだけ、作るとすぐ書き込みの編集モードに入る
 //!
 //! [selection]                                  # 範囲選択の画面
 //! mode = "normal"                              # 開いたときのモード: normal / precise
@@ -69,6 +72,9 @@
 //! file_name_template = "{name}_{date}-{time}"
 //! save = true                                  # save と scrap の両方 false は save を true に戻す
 //! scrap = false
+//! blank_scrap = false                          # true なら画面を撮らず、範囲の位置と大きさで白紙スクラップを
+//!                                              #   作る（背景色は [annotation] background）。何も保存せず、
+//!                                              #   save_dir / file_name_template / save / scrap は無視する
 //! ```
 
 use std::collections::BTreeMap;
@@ -80,8 +86,10 @@ use crate::geometry::Rect;
 use crate::i18n::Language;
 use crate::keys::Chord;
 use crate::recipe::{
-    self, AppearanceItem, AppearanceStep, Recipe, Rejected, Rejection, Step, StepKey, Written,
+    self, AppearanceItem, AppearanceStep, BackgroundStep, Capture, CaptureRegionStep, Recipe,
+    Rejected, Rejection, Step, StepKey, Written,
 };
+use crate::scrap::Background;
 use crate::scrap::ops::{
     MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, ShortcutOwner, Shortcuts,
 };
@@ -93,6 +101,7 @@ pub mod form;
 mod location;
 pub mod merge;
 pub mod tab_step;
+pub mod tabs;
 pub mod unset;
 mod write;
 mod write_failure;
@@ -176,6 +185,9 @@ pub struct Region {
     pub save: bool,
     /// 撮ったらスクラップとして表示する。`save` と両方 false にはならない（読み込みで `save` を true に戻す）。
     pub scrap: bool,
+    /// 画面を撮らずに、範囲の位置と大きさで白紙スクラップを作る（背景色は `[annotation] background`）。
+    /// 真なら保存先・ファイル名テンプレート・`save`・`scrap` は使わない（何も保存しない）。
+    pub blank_scrap: bool,
     /// ファイルで付いている名前（読み込んだ・書いたときの `name`）。ファイルにまだない定型領域は None。
     /// 書き戻し（`write`）と 3-way マージは、これで定型領域とファイルの `[[regions]]` の要素を結び付ける
     /// （名前を変えても、手で書いたコメントは元の要素ごと残る）。
@@ -193,6 +205,7 @@ impl PartialEq for Region {
             file_name_template,
             save,
             scrap,
+            blank_scrap,
             loaded_name: _,
         } = self;
         *name == other.name
@@ -203,6 +216,7 @@ impl PartialEq for Region {
             && *file_name_template == other.file_name_template
             && *save == other.save
             && *scrap == other.scrap
+            && *blank_scrap == other.blank_scrap
     }
 }
 
@@ -224,6 +238,7 @@ pub fn new_region(settings: &Settings, base: &str, monitor: &str, rect: Rect) ->
         file_name_template: settings.general.file_name_template.clone(),
         save: true,
         scrap: false,
+        blank_scrap: false,
         loaded_name: None,
     }
 }
@@ -274,25 +289,31 @@ pub enum HotkeyAction {
     RestoreLast,
     /// アクティブウィンドウのキャプチャ。任意（空でも通知しない）。
     ActiveWindowCapture,
+    /// 白紙スクラップを作る（範囲選択の画面で位置と大きさを選ぶ）。任意（空でも通知しない）。
+    BlankScrap,
     /// 定型領域キャプチャ。`Settings::regions` の中の位置。`[[regions]]` の `hotkey` に書く。
     Region(usize),
+    /// キャプチャで始まるレシピ（ADR-0010）。`Settings::recipes` の中の位置。`[[recipes]]` の `hotkey` に書く。
+    Recipe(usize),
 }
 
 impl HotkeyAction {
     /// `[hotkeys]` に書くもののすべて（定型領域は除く）。
-    pub const ALL: [HotkeyAction; 3] = [
+    pub const ALL: [HotkeyAction; 4] = [
         HotkeyAction::SelectCapture,
         HotkeyAction::RestoreLast,
         HotkeyAction::ActiveWindowCapture,
+        HotkeyAction::BlankScrap,
     ];
 
-    /// `[hotkeys]` の中のキー（定型領域では `[[regions]]` の中のキー）。
+    /// `[hotkeys]` の中のキー（定型領域では `[[regions]]`、レシピでは `[[recipes]]` の中のキー）。
     pub fn key(self) -> &'static str {
         match self {
             HotkeyAction::SelectCapture => "select_capture",
             HotkeyAction::RestoreLast => "restore_last",
             HotkeyAction::ActiveWindowCapture => "active_window_capture",
-            HotkeyAction::Region(_) => "hotkey",
+            HotkeyAction::BlankScrap => "blank_scrap",
+            HotkeyAction::Region(_) | HotkeyAction::Recipe(_) => "hotkey",
         }
     }
 }
@@ -303,6 +324,7 @@ pub struct Hotkeys {
     pub select_capture: Option<Chord>,
     pub restore_last: Option<Chord>,
     pub active_window_capture: Option<Chord>,
+    pub blank_scrap: Option<Chord>,
 }
 
 impl Hotkeys {
@@ -312,7 +334,8 @@ impl Hotkeys {
             HotkeyAction::SelectCapture => self.select_capture,
             HotkeyAction::RestoreLast => self.restore_last,
             HotkeyAction::ActiveWindowCapture => self.active_window_capture,
-            HotkeyAction::Region(_) => None,
+            HotkeyAction::BlankScrap => self.blank_scrap,
+            HotkeyAction::Region(_) | HotkeyAction::Recipe(_) => None,
         }
     }
 
@@ -330,7 +353,8 @@ impl Hotkeys {
             HotkeyAction::SelectCapture => Some(&mut self.select_capture),
             HotkeyAction::RestoreLast => Some(&mut self.restore_last),
             HotkeyAction::ActiveWindowCapture => Some(&mut self.active_window_capture),
-            HotkeyAction::Region(_) => None,
+            HotkeyAction::BlankScrap => Some(&mut self.blank_scrap),
+            HotkeyAction::Region(_) | HotkeyAction::Recipe(_) => None,
         }
     }
 }
@@ -396,6 +420,9 @@ pub struct AnnotationDefaults {
     pub font_size: u32,
     /// 文字の書体の名前。入っていない書体でも誤りにはせず、描くときに DirectWrite が代わりの書体で描く。
     pub font: String,
+    /// 新しく作る白紙スクラップの背景色。作ったあとの白紙スクラップは、作ったときの色を持つ。透明なときだけ、
+    /// 作るとすぐ書き込みの編集モードに入る（`ScrapModel::starts_in_edit_mode`）。
+    pub background: Background,
 }
 
 impl Default for AnnotationDefaults {
@@ -406,6 +433,7 @@ impl Default for AnnotationDefaults {
             width: 3,
             font_size: 16,
             font: "Yu Gothic UI".to_owned(),
+            background: Background::WHITE,
         }
     }
 }
@@ -427,6 +455,11 @@ impl Rgb {
     pub fn to_rrggbb(self) -> u32 {
         let Rgb(r, g, b) = self;
         u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+    }
+
+    /// `0xRRGGBB` の数から（上の 8 ビットは見ない）。
+    pub fn from_rrggbb(rrggbb: u32) -> Rgb {
+        Rgb((rrggbb >> 16) as u8, (rrggbb >> 8) as u8, rrggbb as u8)
     }
 }
 
@@ -577,6 +610,8 @@ pub enum SettingsItem {
     RestoreLastHotkey,
     /// `[hotkeys] active_window_capture`。
     ActiveWindowCaptureHotkey,
+    /// `[hotkeys] blank_scrap`。
+    BlankScrapHotkey,
     /// `[shortcuts]` のスクラップ操作の id。
     Shortcut(String),
     /// `[mouse]` のスクラップ操作の id。
@@ -591,6 +626,8 @@ pub enum SettingsItem {
     RecipeSteps(usize),
     /// レシピのショートカット。`Settings::recipes` の中の位置。
     RecipeShortcut(usize),
+    /// レシピのホットキー（キャプチャで始まるレシピ）。`Settings::recipes` の中の位置。
+    RecipeHotkey(usize),
 }
 
 impl From<HotkeyAction> for SettingsItem {
@@ -599,7 +636,9 @@ impl From<HotkeyAction> for SettingsItem {
             HotkeyAction::SelectCapture => SettingsItem::SelectCaptureHotkey,
             HotkeyAction::RestoreLast => SettingsItem::RestoreLastHotkey,
             HotkeyAction::ActiveWindowCapture => SettingsItem::ActiveWindowCaptureHotkey,
+            HotkeyAction::BlankScrap => SettingsItem::BlankScrapHotkey,
             HotkeyAction::Region(i) => SettingsItem::RegionHotkey(i),
+            HotkeyAction::Recipe(i) => SettingsItem::RecipeHotkey(i),
         }
     }
 }
@@ -613,6 +652,7 @@ impl std::fmt::Display for SettingsItem {
             SettingsItem::SelectCaptureHotkey => f.write_str("hotkeys.select_capture"),
             SettingsItem::RestoreLastHotkey => f.write_str("hotkeys.restore_last"),
             SettingsItem::ActiveWindowCaptureHotkey => f.write_str("hotkeys.active_window_capture"),
+            SettingsItem::BlankScrapHotkey => f.write_str("hotkeys.blank_scrap"),
             SettingsItem::Shortcut(id) => write!(f, "shortcuts.{id}"),
             SettingsItem::Mouse(id) => write!(f, "mouse.{id}"),
             SettingsItem::RegionHotkey(i) => write!(f, "regions[{}].hotkey", i + 1),
@@ -620,6 +660,7 @@ impl std::fmt::Display for SettingsItem {
             SettingsItem::RecipeName(i) => write!(f, "recipes[{}].name", i + 1),
             SettingsItem::RecipeSteps(i) => write!(f, "recipes[{}].steps", i + 1),
             SettingsItem::RecipeShortcut(i) => write!(f, "recipes[{}].shortcut", i + 1),
+            SettingsItem::RecipeHotkey(i) => write!(f, "recipes[{}].hotkey", i + 1),
         }
     }
 }
@@ -635,7 +676,7 @@ impl std::fmt::Debug for SettingsItem {
 /// 設定 GUI で適用する前に見つける問題の中身（`validate`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Problem {
-    /// 必須の項目が空（範囲選択キャプチャのホットキー）。
+    /// 必須の項目が空（範囲選択キャプチャのホットキー、キャプチャで始まるレシピのホットキー）。
     Unset,
     /// 同じ範囲（ホットキー同士、ショートカット同士）で重なったキーの組み合わせ。
     Conflict(Chord),
@@ -651,20 +692,28 @@ pub enum Problem {
     NoSteps,
     /// レシピに入れられない操作がある。
     NotAStep,
-    /// レシピの `close` が最後以外にある。
-    CloseNotLast,
-    /// レシピの値のある手の値が範囲外。
+    /// レシピの最後にだけ置ける操作（`close`、`annotate`）が最後以外にある。
+    LastOnlyNotLast,
+    /// レシピの最初にだけ置ける操作（キャプチャ系）が最初以外にある。
+    FirstOnlyNotFirst,
+    /// キャプチャで始まるレシピにショートカットがある。
+    ShortcutOnCapture,
+    /// キャプチャで始まらないレシピにホットキーがある。
+    HotkeyWithoutCapture,
+    /// レシピの操作に添えたパラメータが範囲外。
     OutOfRange,
-    /// レシピの値のある手の値の型か書式の誤り。
+    /// レシピの操作に添えたパラメータの型か書式の誤り。
     BadValue,
-    /// レシピの値のある手の知らないキー。
+    /// レシピのパラメータを添えた操作の知らないキー。
     UnknownKey,
-    /// レシピの値のある手の `op` が `appearance` でない。
-    NotAppearance,
-    /// レシピの値のある手に項目がない。
+    /// レシピのパラメータを添えた操作の `op` が表で書ける操作（`appearance`、`background`、`capture_region`）でない。
+    UnknownTableOp,
+    /// レシピのパラメータを添えた操作に項目がない。
     NoValues,
-    /// レシピの値のある手に `border = false` と枠の色か太さを一緒に書いた。
+    /// レシピのパラメータを添えた操作に `border = false` と枠の色か太さを一緒に書いた。
     BorderOffWithColorOrWidth,
+    /// レシピの定型領域キャプチャの定型領域がない。
+    NoSuchRegion,
 }
 
 impl Problem {
@@ -747,26 +796,34 @@ pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
             problem,
         });
     }
-    let mut recipe_issues: Vec<ValidationIssue> = recipe::plan(&settings.recipes, OPERATIONS)
-        .problems
-        .iter()
-        .map(|(i, problem)| ValidationIssue {
-            item: recipe_problem_item(*i, problem),
-            problem: match problem {
-                recipe::Problem::EmptyName => Problem::EmptyName,
-                recipe::Problem::DuplicateName => Problem::DuplicateName,
-                recipe::Problem::NoSteps => Problem::NoSteps,
-                recipe::Problem::NotAStep(_) => Problem::NotAStep,
-                recipe::Problem::CloseNotLast => Problem::CloseNotLast,
-                recipe::Problem::OutOfRange(_) => Problem::OutOfRange,
-                recipe::Problem::BadValue(_) => Problem::BadValue,
-                recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
-                recipe::Problem::NotAppearance => Problem::NotAppearance,
-                recipe::Problem::NoValues => Problem::NoValues,
-                recipe::Problem::BorderOffWithColorOrWidth => Problem::BorderOffWithColorOrWidth,
-            },
-        })
-        .collect();
+    let mut recipe_issues: Vec<ValidationIssue> =
+        recipe::plan(&settings.recipes, OPERATIONS, &settings.regions)
+            .problems
+            .iter()
+            .map(|(i, problem)| ValidationIssue {
+                item: recipe_problem_item(*i, problem),
+                problem: match problem {
+                    recipe::Problem::EmptyName => Problem::EmptyName,
+                    recipe::Problem::DuplicateName => Problem::DuplicateName,
+                    recipe::Problem::NoSteps => Problem::NoSteps,
+                    recipe::Problem::NotAStep(_) => Problem::NotAStep,
+                    recipe::Problem::LastOnlyNotLast => Problem::LastOnlyNotLast,
+                    recipe::Problem::FirstOnlyNotFirst => Problem::FirstOnlyNotFirst,
+                    recipe::Problem::ShortcutOnCapture => Problem::ShortcutOnCapture,
+                    recipe::Problem::NoHotkey => Problem::Unset,
+                    recipe::Problem::HotkeyWithoutCapture => Problem::HotkeyWithoutCapture,
+                    recipe::Problem::OutOfRange(_) => Problem::OutOfRange,
+                    recipe::Problem::BadValue(_) => Problem::BadValue,
+                    recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
+                    recipe::Problem::UnknownTableOp => Problem::UnknownTableOp,
+                    recipe::Problem::NoValues => Problem::NoValues,
+                    recipe::Problem::BorderOffWithColorOrWidth => {
+                        Problem::BorderOffWithColorOrWidth
+                    }
+                    recipe::Problem::NoSuchRegion(_) => Problem::NoSuchRegion,
+                },
+            })
+            .collect();
     // 入れられない操作がいくつあっても、欄には 1 つだけ出す
     recipe_issues.dedup();
     issues.extend(recipe_issues);
@@ -800,13 +857,19 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
         .iter()
         .enumerate()
         .filter_map(|(i, region)| Some((region.hotkey?, HotkeyAction::Region(i))));
+    let recipes = recipe::plan(&settings.recipes, ops, &settings.regions);
+    // 問題のないキャプチャで始まるレシピのホットキー（問題のあるレシピはショートカットと同じく付けない）
+    let recipe_hotkeys = recipes
+        .plans
+        .iter()
+        .filter_map(|plan| Some((plan.hotkey?, HotkeyAction::Recipe(plan.index))));
     let hotkeys = assign(
         HotkeyAction::ALL
             .into_iter()
             .filter_map(|action| Some((settings.hotkeys.get(action)?, action)))
-            .chain(region_hotkeys),
+            .chain(region_hotkeys)
+            .chain(recipe_hotkeys),
     );
-    let recipes = recipe::plan(&settings.recipes, ops);
     let shortcuts = Shortcuts::with_recipes(ops, &settings.shortcuts, &recipes.plans);
     let shortcut_item = |owner: ShortcutOwner| match owner {
         ShortcutOwner::Operation(id) => SettingsItem::Shortcut(id.to_owned()),
@@ -882,10 +945,11 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
 
 /// レシピの問題が載る欄。
 fn recipe_problem_item(index: usize, problem: &recipe::Problem) -> SettingsItem {
-    if problem.is_about_name() {
-        SettingsItem::RecipeName(index)
-    } else {
-        SettingsItem::RecipeSteps(index)
+    match problem.field() {
+        recipe::Field::Name => SettingsItem::RecipeName(index),
+        recipe::Field::Steps => SettingsItem::RecipeSteps(index),
+        recipe::Field::Shortcut => SettingsItem::RecipeShortcut(index),
+        recipe::Field::Hotkey => SettingsItem::RecipeHotkey(index),
     }
 }
 
@@ -924,7 +988,9 @@ impl SettingsChanges {
 /// `old` から `new` への変化。
 pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
     SettingsChanges {
-        hotkeys: old.hotkeys != new.hotkeys || region_hotkeys(old) != region_hotkeys(new),
+        hotkeys: old.hotkeys != new.hotkeys
+            || region_hotkeys(old) != region_hotkeys(new)
+            || recipe_hotkeys(old) != recipe_hotkeys(new),
         shortcuts: old.shortcuts != new.shortcuts || old.recipes != new.recipes,
         mouse: old.mouse != new.mouse,
         save: old.general.save_dir != new.general.save_dir
@@ -936,6 +1002,16 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
         log_level: old.log_level != new.log_level,
         language: old.general.language != new.general.language,
     }
+}
+
+/// 登録するレシピのホットキー（問題のないキャプチャで始まるレシピの位置とホットキー）。`HotkeyAction::Recipe`
+/// は位置で持つので、位置とホットキーの対応が変わったら登録し直す。
+fn recipe_hotkeys(settings: &Settings) -> Vec<(usize, Chord)> {
+    recipe::plan(&settings.recipes, OPERATIONS, &settings.regions)
+        .plans
+        .iter()
+        .filter_map(|plan| Some((plan.index, plan.hotkey?)))
+        .collect()
 }
 
 /// 定型領域のホットキーを位置の順に並べたもの。`HotkeyAction::Region` は位置で持つので、位置とホットキーの
@@ -1061,6 +1137,9 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     if let Some(font) = r.value(annotation, "annotation", "font", non_empty_str) {
         s.annotation.font = font;
     }
+    if let Some(background) = r.value(annotation, "annotation", "background", background) {
+        s.annotation.background = background;
+    }
 
     let selection = r.table(root, "selection");
     if let Some(mode) = r.value(selection, "selection", "mode", selection_mode) {
@@ -1116,8 +1195,14 @@ fn read_regions_at(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(us
             .unwrap_or_else(|| DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned());
         let mut save = r.value(t, &path, "save", Item::as_bool).unwrap_or(true);
         let scrap = r.value(t, &path, "scrap", Item::as_bool).unwrap_or(false);
+        let blank_scrap = r
+            .value(t, &path, "blank_scrap", Item::as_bool)
+            .unwrap_or(false);
         if !save && !scrap {
-            r.invalid(format!("{path}.save"));
+            // 白紙スクラップにする定型領域は保存もスクラップも使わないので、問題にせずに戻すだけ
+            if !blank_scrap {
+                r.invalid(format!("{path}.save"));
+            }
             save = true;
         }
         let (Some(name), Some(monitor), Some(rect)) = (name, monitor, rect) else {
@@ -1139,13 +1224,14 @@ fn read_regions_at(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(us
                 file_name_template,
                 save,
                 scrap,
+                blank_scrap,
             },
         ));
     }
     regions
 }
 
-/// `[[recipes]]` を読む。名前か操作の並びが読めないレシピは捨てる。ショートカットが読めなければ割り当てなしにする。
+/// `[[recipes]]` を読む。名前か操作の並びが読めないレシピは捨てる。ショートカットかホットキーが読めなければ割り当てなしにする。
 /// 項目名は `recipes[N].key`（N は 1 から）。空の名前・空の並び・入れられない操作などの中身の問題は、ここでは
 /// 見ない（`recipe::plan` が見る。設定 GUI で直せるように、書いたまま残す）。
 fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
@@ -1164,6 +1250,9 @@ fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
         let shortcut = r
             .value(Some(table), &path, "shortcut", optional_chord)
             .flatten();
+        let hotkey = r
+            .value(Some(table), &path, "hotkey", optional_chord)
+            .flatten();
         let (Some(name), Some(steps)) = (name, steps) else {
             continue;
         };
@@ -1171,25 +1260,37 @@ fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
             name,
             steps,
             shortcut,
+            hotkey,
         });
     }
     recipes
 }
 
-/// レシピの手の並び。値のない手（操作の id の文字列）と、値のある手（インライン表）の配列。ほかの値があれば
-/// None。表の中身の誤りは `AppearanceStep::rejected` に残す（`recipe::plan` が問題にする）。
+/// レシピの操作の並び。パラメータのない操作（操作の id の文字列）と、パラメータを添えた操作（インライン表）の配列。ほかの値があれば
+/// None。表の中身の誤りは `AppearanceStep::rejected` / `BackgroundStep::rejected` に残す（`recipe::plan` が
+/// 問題にする）。`op = "background"` の表は背景色を指定する操作、ほかは見た目を指定する操作として読む。
 fn recipe_steps(item: &Item) -> Option<Vec<Step>> {
     item.as_array()?
         .iter()
         .map(|v| match v {
             toml_edit::Value::String(_) => v.as_str().map(Step::from),
+            toml_edit::Value::InlineTable(t)
+                if t.get("op").and_then(|v| v.as_str()) == Some(recipe::BACKGROUND) =>
+            {
+                Some(Step::Background(background_step(t)))
+            }
+            toml_edit::Value::InlineTable(t)
+                if t.get("op").and_then(|v| v.as_str()) == Some(Capture::Region.id()) =>
+            {
+                Some(Step::CaptureRegion(capture_region_step(t)))
+            }
             toml_edit::Value::InlineTable(t) => Some(Step::Appearance(appearance_step(t))),
             _ => None,
         })
         .collect()
 }
 
-/// 値のある手（`{ op = "appearance", ... }`）。項目のキーと値の範囲は `[scrap]` と同じ（`AppearanceValues::set`）。
+/// 見た目を指定する操作（`{ op = "appearance", ... }`）。項目のキーと値の範囲は `[scrap]` と同じ（`AppearanceValues::set`）。
 fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
     let mut step = AppearanceStep::default();
     let mut wrote_op = false;
@@ -1197,7 +1298,7 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
         let (key, reason) = if key == "op" {
             wrote_op = true;
             let other = value.as_str() != Some(recipe::APPEARANCE);
-            (StepKey::Op, other.then_some(Rejection::NotAppearance))
+            (StepKey::Op, other.then_some(Rejection::UnknownTableOp))
         } else {
             match AppearanceItem::from_key(key) {
                 Some(item) => (
@@ -1224,8 +1325,61 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
         step.rejected.push(Rejected {
             key: StepKey::Op,
             value: None,
-            reason: Rejection::NotAppearance,
+            reason: Rejection::UnknownTableOp,
         });
+    }
+    step
+}
+
+/// 定型領域キャプチャ（`{ op = "capture_region", region = "<名前>" }`）。名前は文字列で書く。定型領域があるかは
+/// `recipe::plan` が見る。
+fn capture_region_step(table: &toml_edit::InlineTable) -> CaptureRegionStep {
+    let mut step = CaptureRegionStep::default();
+    for (key, value) in table.iter() {
+        let (key, reason) = match key {
+            "op" => continue,
+            "region" => match value.as_str() {
+                Some(name) => {
+                    step.region = Some(name.to_owned());
+                    continue;
+                }
+                None => (StepKey::Region, Rejection::BadValue),
+            },
+            _ => (StepKey::Unknown(key.to_owned()), Rejection::UnknownKey),
+        };
+        let mut written = value.clone();
+        written.decor_mut().clear();
+        step.rejected.push(Rejected {
+            key,
+            value: Some(written.to_string()),
+            reason,
+        });
+    }
+    step
+}
+
+/// 背景色を指定する操作（`{ op = "background", color = "#RRGGBB" | "transparent" }`）。色の書き方は
+/// `[annotation] background` と同じ（`Background` の `FromStr`）。
+fn background_step(table: &toml_edit::InlineTable) -> BackgroundStep {
+    let mut step = BackgroundStep::default();
+    for (key, value) in table.iter() {
+        let (key, reason) = match key {
+            "op" => continue,
+            "color" => (StepKey::Color, step.set_color(written(value)).err()),
+            _ => (
+                StepKey::Unknown(key.to_owned()),
+                Some(Rejection::UnknownKey),
+            ),
+        };
+        if let Some(reason) = reason {
+            let mut written = value.clone();
+            written.decor_mut().clear();
+            step.rejected.push(Rejected {
+                key,
+                value: Some(written.to_string()),
+                reason,
+            });
+        }
     }
     step
 }
@@ -1383,6 +1537,10 @@ fn in_range<T: TryFrom<i64> + PartialOrd>(
 
 /// `#RRGGBB`。
 fn rgb(item: &Item) -> Option<Rgb> {
+    item.as_str()?.parse().ok()
+}
+
+fn background(item: &Item) -> Option<Background> {
     item.as_str()?.parse().ok()
 }
 
@@ -1551,6 +1709,7 @@ shadow = false
                     select_capture: Some(chord("Win+Shift+PrintScreen")),
                     restore_last: Some(chord("Ctrl+Alt+Z")),
                     active_window_capture: None,
+                    blank_scrap: None,
                 },
                 shortcuts: BTreeMap::from([
                     ("close".to_owned(), None),
@@ -2083,6 +2242,7 @@ a = 1
             select_capture: Some(chord("Ctrl+Alt+S")),
             restore_last: None,
             active_window_capture: None,
+            blank_scrap: None,
         };
         let assigned = hotkeys.assign();
         assert_eq!(
@@ -2111,6 +2271,58 @@ a = 1
             settings.hotkeys.assign().bound,
             BTreeMap::from([(chord("Ctrl+Alt+Z"), HotkeyAction::RestoreLast)])
         );
+    }
+
+    #[test]
+    fn blank_scrap_hotkey_is_unset_by_default_and_read_and_assigned() {
+        let (settings, issues) = load("version = 1\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.hotkeys.get(HotkeyAction::BlankScrap), None);
+        let (settings, issues) = load("version = 1\n[hotkeys]\nblank_scrap = \"Ctrl+Alt+N\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.hotkeys.get(HotkeyAction::BlankScrap),
+            Some(chord("Ctrl+Alt+N"))
+        );
+        assert_eq!(
+            settings.hotkeys.assign().bound,
+            BTreeMap::from([(chord("Ctrl+Alt+N"), HotkeyAction::BlankScrap)])
+        );
+        let (_, issues) = load("version = 1\n[hotkeys]\nblank_scrap = \"Ctrl+Nope\"\n");
+        assert_eq!(issues, vec![invalid("hotkeys.blank_scrap")]);
+    }
+
+    #[test]
+    fn the_blank_scrap_background_defaults_to_white_and_reads_a_colour() {
+        let (settings, _) = load("version = 1\n");
+        assert_eq!(
+            settings.annotation.background,
+            Background::Color(Rgb(0xFF, 0xFF, 0xFF))
+        );
+        let (settings, issues) = load("version = 1\n[annotation]\nbackground = \"#fff8e1\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.annotation.background,
+            Background::Color(Rgb(0xFF, 0xF8, 0xE1))
+        );
+    }
+
+    #[test]
+    fn the_blank_scrap_background_can_be_transparent() {
+        let (settings, issues) = load("version = 1\n[annotation]\nbackground = \"transparent\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.annotation.background, Background::Transparent);
+    }
+
+    #[test]
+    fn an_invalid_blank_scrap_background_falls_back_to_white_and_is_named() {
+        for value in ["\"white\"", "\"#FFF\"", "1", "\"\""] {
+            let (settings, issues) = load(&format!(
+                "version = 1\n[annotation]\nbackground = {value}\n"
+            ));
+            assert_eq!(issues, vec![invalid("annotation.background")], "{value}");
+            assert_eq!(settings.annotation.background, Background::WHITE, "{value}");
+        }
     }
 
     #[test]
@@ -2196,6 +2408,7 @@ height = 1
                     file_name_template: "dash_{seq:3}".to_owned(),
                     save: false,
                     scrap: true,
+                    blank_scrap: false,
                     loaded_name: None,
                 },
                 Region {
@@ -2207,6 +2420,7 @@ height = 1
                     file_name_template: "{name}_{date}-{time}".to_owned(),
                     save: true,
                     scrap: false,
+                    blank_scrap: false,
                     loaded_name: None,
                 },
             ]
@@ -2245,6 +2459,31 @@ height = 1
         assert_eq!(issues, vec![invalid("regions[1].save")]);
         assert!(settings.regions[0].save);
         assert!(!settings.regions[0].scrap);
+    }
+
+    #[test]
+    fn a_region_becomes_a_blank_scrap_only_when_it_says_so() {
+        let src = format!(
+            "version = 1\n{}{}{}",
+            region_src("a", ""),
+            region_src("b", "blank_scrap = true"),
+            region_src("c", "blank_scrap = 1")
+        );
+        let (settings, issues) = load(&src);
+        assert_eq!(issues, vec![invalid("regions[3].blank_scrap")]);
+        let blank: Vec<bool> = settings.regions.iter().map(|r| r.blank_scrap).collect();
+        assert_eq!(blank, [false, true, false]);
+    }
+
+    #[test]
+    fn a_blank_scrap_region_ignores_that_it_neither_saves_nor_shows_a_scrap() {
+        let src = format!(
+            "version = 1\n{}",
+            region_src("a", "blank_scrap = true\nsave = false\nscrap = false")
+        );
+        let (settings, issues) = load(&src);
+        assert_eq!(issues, vec![]);
+        assert!(settings.regions[0].blank_scrap);
     }
 
     #[test]
@@ -2362,6 +2601,109 @@ width = 0
         assert!(diff(&old, &new).hotkeys);
         let mut renamed = old.clone();
         renamed.regions[0].name = "b".to_owned();
+        assert!(!diff(&old, &renamed).hotkeys);
+    }
+
+    fn capture_recipe_src(name: &str, hotkey: &str) -> String {
+        format!(
+            "[[recipes]]\nname = \"{name}\"\nsteps = [\"select_capture\", \"copy\"]\nhotkey = \"{hotkey}\"\n"
+        )
+    }
+
+    #[test]
+    fn a_recipe_hotkey_is_read_and_assigned_with_the_other_hotkeys() {
+        let src = format!(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Alt+S\"\n{}{}{}{}",
+            region_src("a", "hotkey = \"Ctrl+Alt+1\""),
+            capture_recipe_src("撮ってコピー", "Ctrl+Alt+C"),
+            capture_recipe_src("領域と同じ", "Ctrl+Alt+1"),
+            capture_recipe_src("範囲選択と同じ", "Ctrl+Alt+S"),
+        );
+        let (settings, issues) = load(&src);
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.recipes[0].hotkey, Some(chord("Ctrl+Alt+C")));
+        assert_eq!(settings.recipes[0].shortcut, None);
+        let keymap = keymap(&settings, OPERATIONS);
+        assert_eq!(
+            keymap.hotkeys.bound,
+            BTreeMap::from([(chord("Ctrl+Alt+C"), HotkeyAction::Recipe(0))])
+        );
+        assert_eq!(
+            keymap.issues,
+            vec![
+                SettingsIssue::Conflict {
+                    chord: chord("Ctrl+Alt+1"),
+                    items: vec![SettingsItem::RegionHotkey(0), SettingsItem::RecipeHotkey(1)],
+                },
+                SettingsIssue::Conflict {
+                    chord: chord("Ctrl+Alt+S"),
+                    items: vec![
+                        SettingsItem::SelectCaptureHotkey,
+                        SettingsItem::RecipeHotkey(2)
+                    ],
+                },
+            ]
+        );
+        // スクラップのショートカットとの重なりは、ほかのホットキーと同じく警告だけ
+        let overlap = format!("version = 1\n{}", capture_recipe_src("r", "Ctrl+C"));
+        let keymap = keymap_of(&overlap);
+        assert_eq!(
+            keymap.hotkeys.bound,
+            BTreeMap::from([(chord("Ctrl+C"), HotkeyAction::Recipe(0))])
+        );
+        assert_eq!(
+            keymap.issues,
+            vec![SettingsIssue::Overlap {
+                chord: chord("Ctrl+C"),
+                hotkey: SettingsItem::RecipeHotkey(0),
+                shortcut: SettingsItem::Shortcut("copy".to_owned()),
+            }]
+        );
+        assert_eq!(
+            SettingsItem::RecipeHotkey(0).to_string(),
+            "recipes[1].hotkey"
+        );
+    }
+
+    #[test]
+    fn a_recipe_hotkey_that_does_not_fit_its_steps_is_a_problem_on_the_shown_key() {
+        let src = "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Alt+S\"\n\
+            [[recipes]]\nname = \"a\"\nsteps = [\"select_capture\"]\nshortcut = \"Ctrl+Q\"\nhotkey = \"Ctrl+Alt+A\"\n\
+            [[recipes]]\nname = \"b\"\nsteps = [\"select_capture\"]\n\
+            [[recipes]]\nname = \"c\"\nsteps = [\"copy\"]\nhotkey = \"Ctrl+Alt+C\"\n\
+            [[recipes]]\nname = \"d\"\nsteps = [\"copy\", \"select_capture\"]\n";
+        let (settings, _) = load(src);
+        let keymap = keymap(&settings, OPERATIONS);
+        assert_eq!(
+            keymap.hotkeys.bound.values().collect::<Vec<_>>(),
+            [&HotkeyAction::SelectCapture]
+        );
+        let issue = |item, problem| ValidationIssue { item, problem };
+        assert_eq!(
+            validate(&settings),
+            vec![
+                issue(SettingsItem::RecipeHotkey(0), Problem::ShortcutOnCapture),
+                issue(SettingsItem::RecipeHotkey(1), Problem::Unset),
+                issue(
+                    SettingsItem::RecipeShortcut(2),
+                    Problem::HotkeyWithoutCapture
+                ),
+                issue(SettingsItem::RecipeSteps(3), Problem::FirstOnlyNotFirst),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_tells_that_hotkeys_changed_when_a_recipe_hotkey_changed() {
+        let (old, _) = load(&format!(
+            "version = 1\n{}",
+            capture_recipe_src("a", "Ctrl+Alt+C")
+        ));
+        let mut new = old.clone();
+        new.recipes[0].hotkey = Some(chord("Ctrl+Alt+D"));
+        assert!(diff(&old, &new).hotkeys);
+        let mut renamed = old.clone();
+        renamed.recipes[0].name = "b".to_owned();
         assert!(!diff(&old, &renamed).hotkeys);
     }
 
@@ -2600,12 +2942,28 @@ width = 0
         assert_eq!(names(&settings), vec!["ダッシュボード"]);
         assert_eq!(settings.regions[0].rect, Rect::new(0, 0, 800, 600));
         assert_eq!(
-            settings.recipes,
-            vec![Recipe {
-                name: "コピーして閉じる".to_owned(),
-                steps: vec!["copy".into(), "close".into()],
-                shortcut: Some("Ctrl+Q".parse().unwrap()),
-            }]
+            settings.recipes[..2],
+            vec![
+                Recipe {
+                    name: "コピーして閉じる".to_owned(),
+                    steps: vec!["copy".into(), "close".into()],
+                    shortcut: Some("Ctrl+Q".parse().unwrap()),
+                    hotkey: None,
+                },
+                Recipe {
+                    name: "戻して書き込む".to_owned(),
+                    steps: vec!["zoom_actual".into(), "annotate".into()],
+                    shortcut: Some("Ctrl+E".parse().unwrap()),
+                    hotkey: None,
+                },
+            ]
+        );
+        let capture = &settings.recipes[2];
+        assert_eq!(capture.steps[0], "select_capture".into());
+        assert_eq!(capture.hotkey, Some("Ctrl+Shift+F1".parse().unwrap()));
+        assert_eq!(
+            recipe::plan(&settings.recipes, OPERATIONS, &settings.regions).problems,
+            vec![]
         );
     }
 
@@ -2619,6 +2977,7 @@ width = 0
             file_name_template: DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned(),
             save: true,
             scrap: false,
+            blank_scrap: false,
             loaded_name: None,
         };
         Settings {
@@ -2662,6 +3021,7 @@ width = 0
                 file_name_template: "cap_{seq:3}".to_owned(),
                 save: true,
                 scrap: false,
+                blank_scrap: false,
                 loaded_name: None,
             }
         );
