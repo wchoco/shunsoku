@@ -43,7 +43,7 @@ use shunsoku_core::settings::editor::{AppearanceInput, AppearanceItem, Editor, M
 use shunsoku_core::settings::form::{ClickPlace, FieldEntry, PauseChange};
 use shunsoku_core::settings::merge::{Field, merge};
 use shunsoku_core::settings::tab_step::{StepFocus, TabStep};
-use shunsoku_core::settings::{self, Region, Settings, SettingsItem, unset};
+use shunsoku_core::settings::{self, Region, Rgb, Settings, SettingsItem, unset};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -994,6 +994,45 @@ fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
             refresh(hwnd);
         }
         Button::PickColor => pick_appearance_color(hwnd),
+        Button::PickBackground => pick_background_color(hwnd),
+        Button::Transparent => {
+            let color = recipes::transparent_checked(hwnd).then_some(Background::Transparent);
+            set_background(hwnd, color);
+        }
+    }
+}
+
+/// 「レシピ」タブで選んでいる背景色を指定する操作の色を `color` にする。
+fn set_background(hwnd: HWND, color: Option<Background>) {
+    let (Some(i), Some(s)) = (recipes::selected(hwnd), recipes::selected_step(hwnd)) else {
+        return;
+    };
+    edit(hwnd, |editor| editor.set_background(i, s, color));
+}
+
+/// 「レシピ」タブの背景色の「選ぶ…」: 色の画面を開いて、選んだ色を背景色を指定する操作の色にする。初めの色は
+/// 操作の色、選んでいなければ白紙スクラップの背景色の既定値（透明なら白）。
+fn pick_background_color(hwnd: HWND) {
+    let (Some(i), Some(s)) = (recipes::selected(hwnd), recipes::selected_step(hwnd)) else {
+        return;
+    };
+    let current = with_app(|app| {
+        let editor = &app.settings_gui.as_ref()?.editor;
+        let color = editor
+            .background(i, s)?
+            .unwrap_or(editor.draft().annotation.background);
+        Some(match color {
+            Background::Color(c) => c,
+            Background::Transparent => Rgb(0xFF, 0xFF, 0xFF),
+        })
+    })
+    .flatten();
+    // 色の画面はモーダルで回るので、App を借りたまま開かない
+    let Some(current) = current else {
+        return;
+    };
+    if let Some(color) = fields::pick_color(hwnd, current) {
+        set_background(hwnd, Some(Background::Color(color)));
     }
 }
 

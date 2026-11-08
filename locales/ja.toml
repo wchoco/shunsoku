@@ -210,6 +210,10 @@ unchanged = "変えない"
 on = "あり"
 off = "なし"
 
+# 背景色を指定する操作のパラメータの欄（「選ぶ…」と「透明」のチェックの前の見出し）
+[settings_gui.recipes.background]
+color = "色:"
+
 # 欄の横の印
 [settings_gui.mark]
 unset = "未設定"
