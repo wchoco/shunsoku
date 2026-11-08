@@ -25,8 +25,9 @@
 //! - コピーと保存の画像は、`render_image` で画像と書き込みを画像の大きさに描いてから作る（表示と同じ描き方に
 //!   するため。ADR-0006）。
 
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::ffi::c_void;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use shunsoku_core::annotate::toolbar::{Button, Layout, ToolSlot};
@@ -224,14 +225,22 @@ impl Canvas {
     /// 使い回す描き先 `slot` を大きさ `size` で返す。同じ大きさのものがあればそのまま（中身は描くときに
     /// `Renderer` が消す）、なければ前のものを返してから作り直す。作れなければ `slot` は空になる。
     ///
+    /// `slot` がほかの描き直しに借りられていれば（出している間に届いたメッセージで描き直したとき）、使い捨ての
+    /// 描き先を作って返す（`slot` には触れない）。
+    ///
     /// `UpdateLayeredWindow` は中身を写し取るので、出し終えた描き先は次の描き直しで使ってよい。
-    pub fn reuse(slot: &mut Option<Canvas>, size: Size) -> Result<&Canvas> {
-        if slot.as_ref().is_some_and(|canvas| canvas.size == size) {
-            return Ok(slot.as_ref().expect("checked above"));
+    pub fn reuse(slot: &RefCell<Option<Canvas>>, size: Size) -> Result<CanvasLease<'_>> {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return Ok(CanvasLease::Once(Canvas::new(size)?));
+        };
+        if slot.as_ref().is_none_or(|canvas| canvas.size != size) {
+            // 大きな DIB を 2 枚同時に持たないよう、先に返す
+            *slot = None;
+            *slot = Some(Canvas::new(size)?);
         }
-        // 大きな DIB を 2 枚同時に持たないよう、先に返す
-        *slot = None;
-        Ok(slot.insert(Canvas::new(size)?))
+        Ok(CanvasLease::Reused(RefMut::map(slot, |slot| {
+            slot.as_mut().expect("filled above")
+        })))
     }
 
     /// DIB を選んだメモリ DC（`UpdateLayeredWindow` の描き元）。
@@ -266,6 +275,23 @@ impl Drop for Canvas {
             SelectObject(self.dc, self.old);
             let _ = DeleteObject(self.bitmap.into());
             let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
+/// `Canvas::reuse` が返す描き先。使い回すもの（借りている間はほかの描き直しに使わせない）か、使い捨てのもの。
+pub enum CanvasLease<'a> {
+    Reused(RefMut<'a, Canvas>),
+    Once(Canvas),
+}
+
+impl Deref for CanvasLease<'_> {
+    type Target = Canvas;
+
+    fn deref(&self) -> &Canvas {
+        match self {
+            CanvasLease::Reused(canvas) => canvas,
+            CanvasLease::Once(canvas) => canvas,
         }
     }
 }

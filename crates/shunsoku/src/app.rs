@@ -580,8 +580,8 @@ fn paint_scrap(
 ) -> Result<Option<Rect>> {
     let rect = model.window_rect(appearance);
     let appearance = &model.appearance(appearance);
-    let mut slot = window.canvas();
-    let canvas = render::Canvas::reuse(&mut slot, rect.size())?;
+    // 出している間に届いたメッセージで描き直すと描き先は借りられているので、そのときは使い捨ての描き先に描く
+    let canvas = render::Canvas::reuse(window.canvas(), rect.size())?;
     let mut painter = match renderer.take() {
         Some(painter) => painter,
         None => render::Renderer::new()?,
@@ -643,7 +643,7 @@ fn paint_scrap(
     // 透明な白紙スクラップは、透明な部分も当たり判定に入るよう、見えないほど小さいアルファを敷く
     let see_through = model.is_transparent_blank();
     let hit_alpha = see_through.then(|| appearance.hit_alpha());
-    let caret = painter.paint_scrap(canvas, image, display, appearance, hit_alpha, overlays)?;
+    let caret = painter.paint_scrap(&canvas, image, display, appearance, hit_alpha, overlays)?;
     *renderer = Some(painter);
     // レイヤード ウィンドウは中身を写して持つので、canvas は次の描き直しで使ってよい
     window.present(canvas.dc(), rect, appearance.constant_alpha())?;
