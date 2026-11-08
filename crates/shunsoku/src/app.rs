@@ -2434,7 +2434,7 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
         // 選択の印もキャレットも描かない
         scale: 1.0,
     };
-    match render::render_image(scrap.shown(), layer) {
+    match render::render_image(scrap.shown_cached(), layer) {
         Ok(image) => job(image),
         Err(e) => Deferred::RenderFailed {
             failed_key,
@@ -3052,7 +3052,7 @@ fn trash_thumbnail(scrap: &Scrap) -> Image {
         typing: None,
         scale: 1.0,
     };
-    match render::render_image(scrap.shown(), layer) {
+    match render::render_image(scrap.shown_cached(), layer) {
         Ok(image) => image.thumbnail(side),
         Err(e) => {
             log::warn!("could not draw the annotations for the trash thumbnail: {e}");

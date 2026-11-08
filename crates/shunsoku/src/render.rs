@@ -526,7 +526,7 @@ impl Renderer {
             }
             match (magnified, &dwrite) {
                 (Some((m, scale)), Some(dwrite)) => {
-                    draw_trim_magnifier(target, dwrite, &image.image, window, m, scale)
+                    draw_trim_magnifier(target, dwrite, image.image(), window, m, scale)
                 }
                 _ => Ok(()),
             }
@@ -561,15 +561,16 @@ impl Renderer {
     }
 
     /// 画像と書き込みを画像の大きさの `canvas` に描く（コピーや保存で、表示と同じ描き方を使うため）。
+    /// 画像のビットマップは作り置きにしない（使い捨ての描き手で描くので）。
     pub fn paint_image(
         &self,
         canvas: &Canvas,
-        image: &Image,
+        image: &CachedImage,
         annotations: AnnotationLayer,
     ) -> Result<()> {
-        let rect = Rect::from_origin_size(Point::default(), image.size());
+        let rect = Rect::from_origin_size(Point::default(), image.image().size());
         self.paint(canvas, |target| {
-            draw_image(target, image, rect)?;
+            image.draw(target, rect, None)?;
             draw_annotations(target, annotations, rect).map(|_| ())
         })
     }
@@ -602,26 +603,17 @@ impl Renderer {
 }
 
 /// コピーと保存の画像を作る: 画像と書き込みを画像の画素の大きさに、表示と同じ描き方で描く。
-pub fn render_image(image: &Image, annotations: AnnotationLayer) -> Result<Image> {
-    if image.width() == 0 || image.height() == 0 {
-        return Ok(image.clone());
+pub fn render_image(image: &CachedImage, annotations: AnnotationLayer) -> Result<Image> {
+    let size = image.image().size();
+    // 大きさ 0 の描き先は作れない
+    if size.width == 0 || size.height == 0 {
+        return Ok(image.image().clone());
     }
-    let canvas = Canvas::new(image.size())?;
+    let canvas = Canvas::new(size)?;
     Renderer::new()?.paint_image(&canvas, image, annotations)?;
     canvas
         .to_image()
         .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED))
-}
-
-/// 画像を `dest` に伸び縮みさせて描く。縮めるときだけ線形補間にする。
-fn draw_image(target: &ID2D1RenderTarget, image: &Image, dest: Rect) -> Result<()> {
-    let size = image.size();
-    if size.width == 0 || size.height == 0 {
-        return Ok(());
-    }
-    let bitmap = create_bitmap(target, image)?;
-    draw_bitmap(target, &bitmap, size, dest);
-    Ok(())
 }
 
 /// 大きさ `size` の画像のビットマップを `dest` に伸び縮みさせて描く。縮めるときだけ線形補間にする。
