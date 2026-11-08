@@ -12,7 +12,9 @@
 //!   `move_region`。「範囲を選び直す」は `set_region_range`。GUI を開いている間にトレイから登録した定型領域は
 //!   `new_registered_region` で名前を決め、書いたら `registered` で base と写しに足す。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
 //! - 「レシピ」タブの一覧の追加・削除は `add_recipe` / `remove_recipe`、名前は `set_recipe_name`。操作の並びは
-//!   `step_choices`（足せる操作と見た目を指定する手）/ `add_step` / `move_step` / `remove_step`。見た目を指定する手の
+//!   `step_choices`（足せる操作と見た目を指定する手）/ `add_step` / `move_step` / `remove_step`。選んでいる操作に
+//!   出すパラメータの欄の種類は `param_fields`（パラメータのない操作は None）。足したら、`add_step` が返す位置の
+//!   操作を選ぶ。見た目を指定する手の
 //!   欄（`AppearanceItem`）は `appearance` / `set_appearance` で読み書きする（「変えない」は書かない）。ショートカットは
 //!   `set_chord` の `RecipeShortcut`。検査（`recipe::plan`）で引っかかったもの（欄に打った範囲外の値を含む）は `mark` の
 //!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（値のある手は書いた値の要約）。
@@ -390,6 +392,15 @@ impl Editor {
         (len > 0).then(|| step.min(len - 1))
     }
 
+    /// レシピ `index` の操作 `step` を選んでいる間に出すパラメータの欄。パラメータの欄のない操作か、操作が
+    /// なければ None（欄を出さない）。
+    pub fn param_fields(&self, index: usize, step: usize) -> Option<ParamFields> {
+        match self.draft.recipes.get(index)?.steps.get(step)? {
+            Step::Appearance(_) => Some(ParamFields::Appearance),
+            Step::Op(_) | Step::Background(_) => None,
+        }
+    }
+
     /// レシピ `index` の手 `step` が見た目を指定する手なら、その項目 `item` の欄に出す値。「変えない」は
     /// `Switch(None)` か空の `Text`。読めなかった値（範囲外など）は書いたまま出す。見た目を指定する手でなければ None。
     pub fn appearance(
@@ -590,6 +601,14 @@ fn unquoted(written: &str) -> String {
         Ok(toml_edit::Value::String(s)) => s.value().clone(),
         _ => written.to_owned(),
     }
+}
+
+/// レシピのタブで、選んでいる操作に添えて出すパラメータの欄の種類（`Editor::param_fields`）。Win32 層は、
+/// 種類ごとの欄のまとまりを、選んでいる操作の種類のときだけ出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamFields {
+    /// 見た目（透明度・枠・影。`Editor::appearance` / `set_appearance`）。
+    Appearance,
 }
 
 /// 「操作を足す」で選べるもの（`Editor::step_choices`）。
@@ -1755,6 +1774,32 @@ mod tests {
         editor.set_recipe_name(1, "閉じる");
         assert_eq!(editor.mark(&SettingsItem::RecipeName(1)), None);
         assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn only_the_appearance_operation_shows_parameter_fields() {
+        let editor = with_steps_read(
+            r##"["copy", { op = "appearance", opacity = 50 }, { op = "background", color = "#ffffff" }]"##,
+        );
+        assert_eq!(editor.param_fields(0, 0), None);
+        assert_eq!(editor.param_fields(0, 1), Some(ParamFields::Appearance));
+        // 背景色の欄はまだない（#158）
+        assert_eq!(editor.param_fields(0, 2), None);
+        // 選んでいる操作やレシピがない
+        assert_eq!(editor.param_fields(0, 3), None);
+        assert_eq!(editor.param_fields(1, 0), None);
+    }
+
+    #[test]
+    fn an_added_appearance_operation_is_the_one_to_select_and_shows_its_fields() {
+        let mut editor = with_steps(&["copy", "close"]);
+        // `close` の前に入るので、選ぶのは末尾ではなく入った位置
+        let added = editor.add_step(0, StepChoice::Appearance).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(editor.param_fields(0, added), Some(ParamFields::Appearance));
+
+        let added = editor.add_step(0, "copy").unwrap();
+        assert_eq!(editor.param_fields(0, added), None);
     }
 
     #[test]
