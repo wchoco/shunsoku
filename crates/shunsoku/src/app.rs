@@ -104,7 +104,7 @@ use shunsoku_core::monitors::{self, LocateError};
 use shunsoku_core::notice::Notices;
 use shunsoku_core::perf::Mark;
 use shunsoku_core::protocol::{ErrorKind, Response};
-use shunsoku_core::recipe::{Advance, Outcome, Parked, PlannedStep, Run};
+use shunsoku_core::recipe::{Advance, Outcome, Parked, PlannedStep, Run, StepValues};
 use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseBindings, MouseGesture, OpContext,
     OperationDescriptor, OperationId, Shortcuts,
@@ -2573,7 +2573,7 @@ fn perform(
     })
 }
 
-/// `Effect::ShowBackgroundDialog`: 色の選択ダイアログを出し、選ばれた色を `background` の選択肢として
+/// `Effect::ShowBackgroundDialog`: 色の選択ダイアログを出し、選ばれた色を `background` の値として
 /// 実行する。モーダルなので App を借りずに呼ぶ。取り消したら何もしない。
 fn pick_background(hwnd: HWND, current: Rgb) -> Outcome {
     let Some(color) = crate::settings_dialog::fields::pick_color(hwnd, current) else {
@@ -2584,7 +2584,7 @@ fn pick_background(hwnd: HWND, current: Rgb) -> Outcome {
         return Outcome::Failed;
     };
     let context = OpContext {
-        choice: Some(color.to_rrggbb() as i32),
+        values: Some(StepValues::Background(Background::Color(color))),
         ..OpContext::default()
     };
     perform(hwnd, context, |model, context| {
