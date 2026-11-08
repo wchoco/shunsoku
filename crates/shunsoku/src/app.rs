@@ -110,7 +110,7 @@ use shunsoku_core::scrap::ops::{
     OperationDescriptor, OperationId, Shortcuts,
 };
 use shunsoku_core::scrap::{
-    Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
+    Appearance, Background, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
 use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
 use shunsoku_core::settings::form::HotkeyPause;
@@ -474,9 +474,14 @@ impl Scrap {
         self.shown.as_ref().unwrap_or(&self.image)
     }
 
-    /// トリムの範囲が `before` から変わっていたら、表示する画像を切り出し直す。
+    /// トリムの範囲が `before` から変わっていたら、表示する画像を切り出し直す。白紙スクラップの背景が
+    /// 変わっていたら、画像をその背景で塗り直してから切り出し直す。
     fn sync_shown(&mut self, before: &ScrapModel) {
-        if self.model.trim_rect() != before.trim_rect() {
+        let repainted = self.model.background() != before.background();
+        if repainted && let Some(image) = self.model.blank_image() {
+            self.image = image;
+        }
+        if repainted || self.model.trim_rect() != before.trim_rect() {
             self.shown = shown_image(&self.model, &self.image);
         }
     }
@@ -2349,6 +2354,8 @@ enum Deferred {
         reason: String,
     },
     Close,
+    /// 「その他の色…」: 今の背景の色から色の選択ダイアログを出す。
+    PickBackground(Rgb),
 }
 
 /// コピーや保存の画像（書き込みを描いたもの）を表示と同じ描き方で作り、`job` の `Deferred` にする。作れなければ
@@ -2473,6 +2480,13 @@ fn perform(
                 Effect::ShowSaveDialog => {
                     deferred.push(render_for(scrap, Deferred::SaveAs, "save.failed"));
                 }
+                Effect::ShowBackgroundDialog => {
+                    let current = match scrap.model.background() {
+                        Some(Background::Color(color)) => color,
+                        _ => Rgb(0xFF, 0xFF, 0xFF),
+                    };
+                    deferred.push(Deferred::PickBackground(current));
+                }
             }
         }
         Some(deferred)
@@ -2507,12 +2521,33 @@ fn perform(
                 close_scrap(hwnd);
                 Outcome::Succeeded
             }
+            Deferred::PickBackground(current) => pick_background(hwnd, current),
         })
         .collect();
     Some(Performed {
         outcome: Outcome::of(outcomes),
         saving,
     })
+}
+
+/// `Effect::ShowBackgroundDialog`: 色の選択ダイアログを出し、選ばれた色を `background` の選択肢として
+/// 実行する。モーダルなので App を借りずに呼ぶ。取り消したら何もしない。
+fn pick_background(hwnd: HWND, current: Rgb) -> Outcome {
+    let Some(color) = crate::settings_dialog::fields::pick_color(hwnd, current) else {
+        log::info!("background colour cancelled");
+        return Outcome::Cancelled;
+    };
+    let Some(op) = ops::find("background") else {
+        return Outcome::Failed;
+    };
+    let context = OpContext {
+        choice: Some(color.to_rrggbb() as i32),
+        ..OpContext::default()
+    };
+    perform(hwnd, context, |model, context| {
+        Some((op.id, ops::execute(op, model, context)))
+    })
+    .map_or(Outcome::Failed, |performed| performed.outcome)
 }
 
 /// `Effect::CopyToClipboard`: 画像をクリップボードに置く。失敗したらエラーの通知を出し、失敗を返す。

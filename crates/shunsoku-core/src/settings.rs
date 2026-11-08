@@ -82,7 +82,8 @@ use crate::geometry::Rect;
 use crate::i18n::Language;
 use crate::keys::Chord;
 use crate::recipe::{
-    self, AppearanceItem, AppearanceStep, Recipe, Rejected, Rejection, Step, StepKey, Written,
+    self, AppearanceItem, AppearanceStep, BackgroundStep, Recipe, Rejected, Rejection, Step,
+    StepKey, Written,
 };
 use crate::scrap::Background;
 use crate::scrap::ops::{
@@ -440,6 +441,11 @@ impl Rgb {
     pub fn to_rrggbb(self) -> u32 {
         let Rgb(r, g, b) = self;
         u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+    }
+
+    /// `0xRRGGBB` の数から（上の 8 ビットは見ない）。
+    pub fn from_rrggbb(rrggbb: u32) -> Rgb {
+        Rgb((rrggbb >> 16) as u8, (rrggbb >> 8) as u8, rrggbb as u8)
     }
 }
 
@@ -1197,12 +1203,18 @@ fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
 }
 
 /// レシピの手の並び。値のない手（操作の id の文字列）と、値のある手（インライン表）の配列。ほかの値があれば
-/// None。表の中身の誤りは `AppearanceStep::rejected` に残す（`recipe::plan` が問題にする）。
+/// None。表の中身の誤りは `AppearanceStep::rejected` / `BackgroundStep::rejected` に残す（`recipe::plan` が
+/// 問題にする）。`op = "background"` の表は背景色を指定する手、ほかは見た目を指定する手として読む。
 fn recipe_steps(item: &Item) -> Option<Vec<Step>> {
     item.as_array()?
         .iter()
         .map(|v| match v {
             toml_edit::Value::String(_) => v.as_str().map(Step::from),
+            toml_edit::Value::InlineTable(t)
+                if t.get("op").and_then(|v| v.as_str()) == Some(recipe::BACKGROUND) =>
+            {
+                Some(Step::Background(background_step(t)))
+            }
             toml_edit::Value::InlineTable(t) => Some(Step::Appearance(appearance_step(t))),
             _ => None,
         })
@@ -1246,6 +1258,32 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
             value: None,
             reason: Rejection::NotAppearance,
         });
+    }
+    step
+}
+
+/// 背景色を指定する値のある手（`{ op = "background", color = "#RRGGBB" }`）。色の書き方は
+/// `[annotation] background` と同じ（`Background` の `FromStr`）。
+fn background_step(table: &toml_edit::InlineTable) -> BackgroundStep {
+    let mut step = BackgroundStep::default();
+    for (key, value) in table.iter() {
+        let (key, reason) = match key {
+            "op" => continue,
+            "color" => (StepKey::Color, step.set_color(written(value)).err()),
+            _ => (
+                StepKey::Unknown(key.to_owned()),
+                Some(Rejection::UnknownKey),
+            ),
+        };
+        if let Some(reason) = reason {
+            let mut written = value.clone();
+            written.decor_mut().clear();
+            step.rejected.push(Rejected {
+                key,
+                value: Some(written.to_string()),
+                reason,
+            });
+        }
     }
     step
 }

@@ -177,6 +177,7 @@ border_color = "border {color}"
 border_width = "{width}px"
 shadow_on = "shadow"
 shadow_off = "no shadow"
+background = "Background: {color}"
 
 # Fields of an appearance step (shown below the step list while it is selected)
 [settings_gui.recipes.appearance]
@@ -202,10 +203,10 @@ no_steps = "No operations"
 not_a_step = "Has an operation that cannot go in a recipe"
 close_not_last = "Close can only be the last operation"
 out_of_range = "An appearance value is out of range (opacity is 10-100, border width is 1-16)"
-bad_value = "An appearance value is written wrong (colors are #RRGGBB, border and shadow are true or false)"
-unknown_key = "An appearance step has an unknown key"
-not_appearance = "Only op = \"appearance\" can be written as a table"
-no_values = "An appearance step has no items"
+bad_value = "A value is written wrong (colors are #RRGGBB, border and shadow are true or false)"
+unknown_key = "A step with values has an unknown key"
+not_appearance = "Only op = \"appearance\" and op = \"background\" can be written as a table"
+no_values = "A step with values has no items"
 border_off_with_color_or_width = "border = false cannot go with a border color or width"
 
 [hotkey]
@@ -240,6 +241,7 @@ opacity_down = "More transparent"
 border = "Border"
 shadow = "Shadow"
 reset_appearance = "Reset appearance to default"
+background = "Background color"
 toggle_compact = "Compact view"
 close = "Close"
 
@@ -260,6 +262,17 @@ black = "Black"
 white = "White"
 red = "Red"
 blue = "Blue"
+
+[scrap.background]
+red = "Red"
+orange = "Orange"
+yellow = "Yellow"
+green = "Green"
+blue = "Blue"
+purple = "Purple"
+black = "Black"
+white = "White"
+other = "Other colors…"
 
 [scrap.shadow]
 on = "On"

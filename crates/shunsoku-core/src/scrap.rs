@@ -271,6 +271,19 @@ impl ScrapModel {
         self.background
     }
 
+    /// 白紙スクラップの背景色を `background` にする。下地の画素は持たないので、表示する側は `blank_image` で
+    /// 作り直す（ごみ箱から戻すときも、この背景色で塗り直す）。画像を持つスクラップか、同じ背景色なら何もせず
+    /// false。
+    pub fn set_background(&mut self, background: Background) -> bool {
+        match &mut self.background {
+            Some(now) if *now != background => {
+                *now = background;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 白紙スクラップの元の画像に当たる下地（大きさが `image_size` の、背景色の一色）。画素は持たずに背景色から
     /// 作るので、ごみ箱は白紙スクラップの画素を退避しない。画像を持つスクラップなら None。
     pub fn blank_image(&self) -> Option<Image> {

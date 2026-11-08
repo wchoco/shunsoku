@@ -191,6 +191,7 @@ border_color = "枠 {color}"
 border_width = "{width}px"
 shadow_on = "影"
 shadow_off = "影なし"
+background = "背景色: {color}"
 
 # 見た目を指定する手の欄（手の一覧で選んでいる間、一覧の下に出す）
 [settings_gui.recipes.appearance]
@@ -217,10 +218,10 @@ no_steps = "操作がありません"
 not_a_step = "レシピに入れられない操作があります"
 close_not_last = "閉じるは最後にだけ置けます"
 out_of_range = "見た目の値が範囲外です（透明度は 10〜100、枠の太さは 1〜16）"
-bad_value = "見た目の値の書き方が違います（色は #RRGGBB、枠と影は true か false）"
-unknown_key = "見た目の手に知らないキーがあります"
-not_appearance = "表で書ける手は op = \"appearance\" だけです"
-no_values = "見た目の手に項目がありません"
+bad_value = "値の書き方が違います（色は #RRGGBB、枠と影は true か false）"
+unknown_key = "値のある手に知らないキーがあります"
+not_appearance = "表で書ける手は op = \"appearance\" と op = \"background\" だけです"
+no_values = "値のある手に項目がありません"
 border_off_with_color_or_width = "border = false と枠の色・太さは一緒に書けません"
 
 [hotkey]
@@ -256,6 +257,7 @@ opacity_down = "薄くする"
 border = "枠"
 shadow = "影"
 reset_appearance = "見た目を既定に戻す"
+background = "背景色"
 toggle_compact = "コンパクト表示"
 close = "閉じる"
 
@@ -280,6 +282,18 @@ red = "赤"
 blue = "青"
 
 # 影の一覧（scrap::ops の shadow の選択肢）
+# 背景色の一覧（scrap::ops の background の選択肢。白紙スクラップだけ）
+[scrap.background]
+red = "赤"
+orange = "橙"
+yellow = "黄"
+green = "緑"
+blue = "青"
+purple = "紫"
+black = "黒"
+white = "白"
+other = "その他の色…"
+
 [scrap.shadow]
 on = "あり"
 off = "なし"

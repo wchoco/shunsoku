@@ -21,7 +21,7 @@ use super::{
     optional_gesture, read_regions_at, recipe_steps, region_number, rgb, save_dir, selection_mode,
 };
 use crate::i18n::Language;
-use crate::recipe::{APPEARANCE, AppearanceItem, ItemValue, Recipe, Step, StepKey};
+use crate::recipe::{APPEARANCE, AppearanceItem, BACKGROUND, ItemValue, Recipe, Step, StepKey};
 use crate::selection::Mode;
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
@@ -492,11 +492,20 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
 
 /// レシピの手 1 つ。値のない手は操作の id の文字列、値のある手は `op` と書いた項目のキーを持つインライン表
 /// （`op` のあと、項目は `AppearanceItem::ALL` の順）。読めなかった項目は、その後ろに書いたまま書く（`op` を
-/// 読めなかったなら、その `op` で書く）。
+/// 読めなかったなら、その `op` で書く）。背景色を指定する手は `op` と `color`。
 fn step_value(step: &Step) -> Value {
     let step = match step {
         Step::Op(id) => return id.as_str().into(),
         Step::Appearance(step) => step,
+        Step::Background(step) => {
+            let mut table = toml_edit::InlineTable::new();
+            table.insert(StepKey::Op.as_str(), BACKGROUND.into());
+            if let Some(color) = step.color {
+                table.insert(StepKey::Color.as_str(), color.to_string().into());
+            }
+            insert_rejected(&mut table, &step.rejected);
+            return Value::InlineTable(table);
+        }
     };
     let mut table = toml_edit::InlineTable::new();
     table.insert(StepKey::Op.as_str(), APPEARANCE.into());
@@ -509,12 +518,17 @@ fn step_value(step: &Step) -> Value {
         };
         table.insert(item.key(), value);
     }
-    for r in &step.rejected {
+    insert_rejected(&mut table, &step.rejected);
+    Value::InlineTable(table)
+}
+
+/// 値のある手の読めなかった項目を、書いたまま `table` に足す。
+fn insert_rejected(table: &mut toml_edit::InlineTable, rejected: &[crate::recipe::Rejected]) {
+    for r in rejected {
         if let Some(value) = r.value.as_deref().and_then(|v| v.parse::<Value>().ok()) {
             table.insert(r.key.as_str(), value);
         }
     }
-    Value::InlineTable(table)
 }
 
 /// 定型領域 1 つ。名前・モニタ・範囲は既定値がないので、読めなければ常に書く。
@@ -1250,6 +1264,33 @@ steps = ["shadow"]
         let (read, issues) = load(&out);
         assert_eq!(issues, vec![]);
         assert_eq!(read.recipes, vec![r]);
+    }
+
+    #[test]
+    fn a_background_step_reads_back_the_same_and_keeps_a_wrong_colour_as_written() {
+        let mut r = recipe("黒い白紙でコピー", &[], None);
+        r.steps = vec![
+            Step::Background(crate::recipe::BackgroundStep {
+                color: Some(crate::scrap::Background::Color(Rgb(0x21, 0x21, 0x21))),
+                rejected: vec![],
+            }),
+            "copy".into(),
+        ];
+        let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
+        assert!(
+            out.contains(r##"steps = [{ op = "background", color = "#212121" }, "copy"]"##),
+            "{out}"
+        );
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, vec![r]);
+
+        let wrong = "version = 1\n[[recipes]]\nname = \"a\"\nsteps = [{ op = \"background\", color = \"white\" }]\n";
+        let out = written(wrong, |s| s.recipes[0].steps.push("copy".into()));
+        assert!(
+            out.contains(r#"steps = [{ op = "background", color = "white" }, "copy"]"#),
+            "{out}"
+        );
     }
 
     const RECIPES_WITH_VALUES: &str = r##"version = 1
