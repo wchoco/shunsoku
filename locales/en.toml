@@ -59,6 +59,7 @@ title = "This value cannot be used"
 number = "Enter a whole number from {min} to {max}. The field went back to its previous value."
 number_min = "Enter a whole number of {min} or more. The field went back to its previous value."
 color = "Enter a color as #RRGGBB (for example #FF0000). The field went back to its previous value."
+background = "Enter a background as #RRGGBB (for example #FFFFFF) or transparent. The field went back to its previous value."
 folder = "Enter a full folder path (for example C:\\Pictures), or leave it empty for the default. The field went back to its previous value."
 template = "The file name cannot be empty. The field went back to its previous value."
 
@@ -274,6 +275,7 @@ blue = "Blue"
 purple = "Purple"
 black = "Black"
 white = "White"
+transparent = "Transparent"
 other = "Other colors…"
 
 [scrap.shadow]

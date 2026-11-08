@@ -53,7 +53,7 @@
 //! width = 3                                    # 1〜64（画像の画素）
 //! font_size = 16                               # 文字の大きさ。1〜256（画像の画素）
 //! font = "Yu Gothic UI"                        # 文字の書体。入っていなければ代わりの書体で描く
-//! background = "#FFFFFF"                       # 新しく作る白紙スクラップの背景色
+//! background = "#FFFFFF"                       # 新しく作る白紙スクラップの背景色（"transparent" で透明）
 //!
 //! [selection]                                  # 範囲選択の画面
 //! mode = "normal"                              # 開いたときのモード: normal / precise
@@ -1262,7 +1262,7 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
     step
 }
 
-/// 背景色を指定する値のある手（`{ op = "background", color = "#RRGGBB" }`）。色の書き方は
+/// 背景色を指定する値のある手（`{ op = "background", color = "#RRGGBB" | "transparent" }`）。色の書き方は
 /// `[annotation] background` と同じ（`Background` の `FromStr`）。
 fn background_step(table: &toml_edit::InlineTable) -> BackgroundStep {
     let mut step = BackgroundStep::default();
@@ -2209,6 +2209,13 @@ a = 1
             settings.annotation.background,
             Background::Color(Rgb(0xFF, 0xF8, 0xE1))
         );
+    }
+
+    #[test]
+    fn the_blank_scrap_background_can_be_transparent() {
+        let (settings, issues) = load("version = 1\n[annotation]\nbackground = \"transparent\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.annotation.background, Background::Transparent);
     }
 
     #[test]

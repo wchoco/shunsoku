@@ -1189,6 +1189,17 @@ font = "Meiryo"     # 書体
     }
 
     #[test]
+    fn a_transparent_blank_scrap_background_is_written_and_read_back() {
+        let out = written("version = 1\n", |s| {
+            s.annotation.background = Background::Transparent;
+        });
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.annotation.background, Background::Transparent);
+        assert!(out.contains("background = \"transparent\""), "{out}");
+    }
+
+    #[test]
     fn a_missing_version_is_written() {
         let out = written("[scrap]\nshadow = false\n", |_| {});
         assert_eq!(load(&out).1, vec![]);

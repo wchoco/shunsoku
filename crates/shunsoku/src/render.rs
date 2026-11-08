@@ -15,6 +15,8 @@
 //!   見積もり（`annotate::LINE_HEIGHT`）に揃えて描く。打っている文字（`TypingLayer`）は、IME で変換中の文字に
 //!   下線を引いてつなげ、キャレットを描く（その矩形を IME の窓の位置に使う）。
 //! - 透明度はここでは掛けない（レイヤード ウィンドウの `SourceConstantAlpha` で掛ける）。
+//! - 透明な白紙スクラップは、画像の下に当たり判定のための見えないほど小さいアルファ（`Appearance::hit_alpha`）を
+//!   敷く。コピーと保存の画像（`render_image`）には敷かないので、透明な部分はアルファ 0 のまま。
 //! - 書き込みの編集モードのツールバー（`toolbar_window`）も、ここで `paint_toolbar` で描く。並びは core の
 //!   `annotate::toolbar::Layout`。アイコンは Direct2D の線と図形で描く（字形のフォントに頼らない）。
 //! - コピーと保存の画像は、`render_image` で画像と書き込みを画像の大きさに描いてから作る（表示と同じ描き方に
@@ -283,12 +285,15 @@ impl Renderer {
     /// スクラップのウィンドウの中身を描く。`canvas` はウィンドウの大きさ（`ScrapModel::window_rect`）で、
     /// 画像は余白（`Appearance::margin`）の内側に `display`（`ScrapModel::display_size`）の大きさで置く。
     /// 画像の上に `overlays` を重ねる。文字を打っていれば、キャレットの矩形（ウィンドウの中の座標）を返す。
+    /// `hit_alpha` があれば（透明な白紙スクラップ）、画像の下にそのアルファの黒を敷き、透明な部分のクリックが
+    /// 下のウィンドウに抜けないようにする（`Appearance::hit_alpha`）。
     pub fn paint_scrap(
         &mut self,
         canvas: &Canvas,
         image: &Image,
         display: Size,
         appearance: &Appearance,
+        hit_alpha: Option<u8>,
         overlays: Overlays,
     ) -> Result<Option<Rect>> {
         let Overlays {
@@ -334,6 +339,14 @@ impl Renderer {
                         }
                         edge = outer;
                     }
+                }
+            }
+            if let Some(alpha) = hit_alpha {
+                // SAFETY: BeginDraw と EndDraw の間で呼ぶ
+                unsafe {
+                    let brush =
+                        target.CreateSolidColorBrush(&rgb(0, f32::from(alpha) / 255.0), None)?;
+                    target.FillRectangle(&to_rect_f(image_rect), &brush);
                 }
             }
             draw_image(target, image, image_rect)?;

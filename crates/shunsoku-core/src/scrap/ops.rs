@@ -294,6 +294,9 @@ pub enum Effect {
     LeaveEditMode,
     /// 背景色の「その他の色…」: 色の選択ダイアログを出し、選ばれた色を `background` の選択肢として実行する。
     ShowBackgroundDialog,
+    /// スクラップを閉じて、ごみ箱に入れずに捨てる（何も書かれていない透明な白紙スクラップが編集モードを
+    /// 抜けたとき。`ScrapModel::is_empty_transparent_blank`）。
+    Discard,
 }
 
 const ESC: Chord = Chord::plain(Key::known(0x1B));
@@ -609,16 +612,18 @@ const BACKGROUND_LABELS: [&str; 8] = [
 /// 背景色の一覧の「その他の色…」の値。色の値（`0xRRGGBB`）は 0 以上なので重ならない。
 pub const OTHER_BACKGROUND: i32 = -1;
 
+/// 背景色の一覧の「透明」の値。
+pub const TRANSPARENT_BACKGROUND: i32 = -2;
+
 /// 白紙スクラップで、畳んでいなければ実行できる。
 fn blank_and_not_compact(model: &ScrapModel) -> bool {
     not_compact(model) && model.background().is_some()
 }
 
-/// 背景色の一覧: ツールバーと同じ 8 色（`PALETTE`）と「その他の色…」。並びにない色なら「その他の色…」に
-/// チェックを付ける。
+/// 背景色の一覧: ツールバーと同じ 8 色（`PALETTE`）、「透明」と「その他の色…」。並びにない色なら
+/// 「その他の色…」にチェックを付ける。
 fn background_choices(model: &ScrapModel, _: &Appearance) -> Vec<Choice> {
     let now = model.background();
-    let listed = PALETTE.map(|c| Some(Background::Color(c)));
     let colours = PALETTE
         .iter()
         .zip(BACKGROUND_LABELS)
@@ -627,12 +632,17 @@ fn background_choices(model: &ScrapModel, _: &Appearance) -> Vec<Choice> {
             value: colour.to_rrggbb() as i32,
             checked: now == Some(Background::Color(colour)),
         });
+    let transparent = Choice {
+        label: ChoiceLabel::Key("scrap.background.transparent"),
+        value: TRANSPARENT_BACKGROUND,
+        checked: now == Some(Background::Transparent),
+    };
     let other = Choice {
         label: ChoiceLabel::Key("scrap.background.other"),
         value: OTHER_BACKGROUND,
-        checked: now.is_some() && !listed.contains(&now),
+        checked: matches!(now, Some(Background::Color(c)) if !PALETTE.contains(&c)),
     };
-    colours.chain(std::iter::once(other)).collect()
+    colours.chain([transparent, other]).collect()
 }
 
 /// 背景色を、レシピの手の値か、一覧から選んだ色にする。「その他の色…」なら色の選択ダイアログを出す。
@@ -641,13 +651,28 @@ fn background_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     let background = match (context.values, context.choice) {
         (Some(StepValues::Background(background)), _) => background,
         (_, Some(OTHER_BACKGROUND)) => return vec![Effect::ShowBackgroundDialog],
+        (_, Some(TRANSPARENT_BACKGROUND)) => Background::Transparent,
         (_, Some(choice)) => match u32::try_from(choice) {
             Ok(rrggbb) => Background::Color(Rgb::from_rrggbb(rrggbb)),
             Err(_) => return Vec::new(),
         },
         _ => return Vec::new(),
     };
-    redrawn(model.set_background(background))
+    if !model.set_background(background) {
+        return Vec::new();
+    }
+    // 何も書かれていない白紙を透明にしたら、見えずにつかめるだけの物にしないよう、書き込みに入る（何も書かずに
+    // 抜けると捨てる）
+    if model.is_empty_transparent_blank()
+        && model.start_editing_with(
+            context
+                .carryover
+                .start_with(context.annotation, context.font.clone()),
+        )
+    {
+        return vec![Effect::Redraw, Effect::EnterEditMode];
+    }
+    vec![Effect::Redraw]
 }
 
 /// コンパクト表示に畳む、または広げる。畳む基準点は拡大縮小と同じ（マウスならカーソル、ほかは中心）。
@@ -685,11 +710,16 @@ fn editing(model: &ScrapModel) -> bool {
     model.is_editing()
 }
 
-/// 書き込みの編集モードに入る。入っていれば抜ける（描きかけは書き込みにする）。
+/// 書き込みの編集モードに入る。入っていれば抜ける（描きかけは書き込みにする）。抜けたら、何も書かれていない
+/// 透明な白紙スクラップは捨てる。
 fn annotate(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     if model.is_editing() {
         model.edit_input(EditInput::Leave);
-        vec![Effect::LeaveEditMode]
+        if model.is_empty_transparent_blank() {
+            vec![Effect::LeaveEditMode, Effect::Discard]
+        } else {
+            vec![Effect::LeaveEditMode]
+        }
     } else if model.start_editing_with(
         context
             .carryover
@@ -3171,7 +3201,7 @@ reset_appearance = "Ctrl+Shift+D"
             values,
             [
                 0xE5_39_35, 0xFB_8C_00, 0xFD_D8_35, 0x43_A0_47, 0x1E_88_E5, 0x8E_24_AA, 0x21_21_21,
-                0xFF_FF_FF, -1
+                0xFF_FF_FF, -2, -1
             ]
         );
         let checked: Vec<i32> = submenu
@@ -3215,6 +3245,130 @@ reset_appearance = "Ctrl+Shift+D"
         assert_eq!(
             execute(op("background"), &mut model, &choose(0x1E_88_E5)),
             vec![]
+        );
+    }
+
+    #[test]
+    fn choosing_transparent_makes_the_blank_scrap_see_through_and_checks_it() {
+        let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
+        let submenu = background_menu(&model).unwrap();
+        let transparent = submenu.choices.iter().find(|c| c.value == -2).unwrap();
+        assert_eq!(
+            transparent.label,
+            ChoiceLabel::Key("scrap.background.transparent")
+        );
+        assert!(!transparent.checked);
+        execute(op("background"), &mut model, &choose(-2));
+        assert_eq!(model.background(), Some(Background::Transparent));
+        assert_eq!(model.blank_image().unwrap().pixel(0, 0), [0, 0, 0, 0]);
+        let checked: Vec<i32> = background_menu(&model)
+            .unwrap()
+            .choices
+            .iter()
+            .filter(|c| c.checked)
+            .map(|c| c.value)
+            .collect();
+        assert_eq!(checked, [-2]);
+    }
+
+    /// 編集モードに入って四角を 1 つ描いて抜ける。
+    fn draw_a_rect(model: &mut ScrapModel) {
+        execute(op("annotate"), model, &editing_context());
+        model.edit_input(EditInput::Press(Point::new(2, 2)));
+        model.edit_input(EditInput::Move {
+            at: Point::new(12, 12),
+            shift: false,
+        });
+        model.edit_input(EditInput::Release);
+        execute(op("annotate"), model, &editing_context());
+        assert_eq!(model.annotations().items().len(), 1);
+    }
+
+    #[test]
+    fn making_an_empty_blank_scrap_transparent_enters_the_edit_mode() {
+        let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
+        let context = OpContext {
+            choice: Some(-2),
+            ..editing_context()
+        };
+        assert_eq!(
+            execute(op("background"), &mut model, &context),
+            vec![Effect::Redraw, Effect::EnterEditMode]
+        );
+        assert_eq!(
+            model.edit_state().map(|s| s.style),
+            Some(editing_context().annotation)
+        );
+    }
+
+    #[test]
+    fn making_a_written_blank_scrap_transparent_stays_out_of_the_edit_mode() {
+        let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
+        draw_a_rect(&mut model);
+        assert_eq!(
+            execute(op("background"), &mut model, &choose(-2)),
+            vec![Effect::Redraw]
+        );
+        assert!(!model.is_editing());
+    }
+
+    #[test]
+    fn making_an_empty_blank_scrap_a_colour_stays_out_of_the_edit_mode() {
+        let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
+        assert_eq!(
+            execute(op("background"), &mut model, &choose(0x21_21_21)),
+            vec![Effect::Redraw]
+        );
+        assert!(!model.is_editing());
+    }
+
+    #[test]
+    fn leaving_the_edit_mode_discards_an_empty_transparent_blank_scrap() {
+        let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
+        execute(op("background"), &mut model, &choose(-2));
+        assert!(model.is_editing());
+        assert_eq!(
+            execute(op("annotate"), &mut model, &editing_context()),
+            vec![Effect::LeaveEditMode, Effect::Discard]
+        );
+    }
+
+    #[test]
+    fn leaving_the_edit_mode_after_erasing_everything_discards_a_transparent_blank_scrap() {
+        let mut model =
+            ScrapModel::blank(Point::new(0, 0), Size::new(40, 30), Background::Transparent);
+        draw_a_rect(&mut model);
+        execute(op("annotate"), &mut model, &editing_context());
+        model.edit_input(EditInput::Key(Chord::plain(Key::known(0x41)).ctrl()));
+        model.edit_input(EditInput::Delete);
+        assert!(model.annotations().is_empty());
+        assert_eq!(
+            execute(op("annotate"), &mut model, &editing_context()),
+            vec![Effect::LeaveEditMode, Effect::Discard]
+        );
+    }
+
+    #[test]
+    fn leaving_the_edit_mode_keeps_a_written_or_coloured_blank_scrap() {
+        let mut written =
+            ScrapModel::blank(Point::new(0, 0), Size::new(40, 30), Background::Transparent);
+        draw_a_rect(&mut written);
+        execute(op("annotate"), &mut written, &editing_context());
+        assert_eq!(
+            execute(op("annotate"), &mut written, &editing_context()),
+            vec![Effect::LeaveEditMode]
+        );
+        let mut coloured = blank(Rgb(0xFF, 0xFF, 0xFF));
+        execute(op("annotate"), &mut coloured, &editing_context());
+        assert_eq!(
+            execute(op("annotate"), &mut coloured, &editing_context()),
+            vec![Effect::LeaveEditMode]
+        );
+        let mut captured = scrap();
+        execute(op("annotate"), &mut captured, &editing_context());
+        assert_eq!(
+            execute(op("annotate"), &mut captured, &editing_context()),
+            vec![Effect::LeaveEditMode]
         );
     }
 

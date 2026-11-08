@@ -66,6 +66,7 @@ title = "この値は使えません"
 number = "{min} から {max} までの整数を入れてください。欄は元の値に戻しました。"
 number_min = "{min} 以上の整数を入れてください。欄は元の値に戻しました。"
 color = "色は #RRGGBB（例: #FF0000）で入れてください。欄は元の値に戻しました。"
+background = "背景色は #RRGGBB（例: #FFFFFF）か transparent（透明）で入れてください。欄は元の値に戻しました。"
 folder = "フォルダはドライブから書いてください（例: C:\\Pictures）。空にすると既定になります。欄は元の値に戻しました。"
 template = "ファイル名は空にできません。欄は元の値に戻しました。"
 
@@ -294,6 +295,7 @@ blue = "青"
 purple = "紫"
 black = "黒"
 white = "白"
+transparent = "透明"
 other = "その他の色…"
 
 [scrap.shadow]

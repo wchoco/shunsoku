@@ -163,9 +163,9 @@ impl ScrapWindow {
     }
 
     /// `source`（premultiplied BGRA の DIB を選んだ DC、大きさは `rect` と同じ）の中身を `rect` に出す。
-    /// `opacity` は透明度（%）。
-    pub fn present(&self, source: HDC, rect: Rect, opacity: u8) -> Result<()> {
-        layered::present(self.hwnd, source, rect, opacity)
+    /// `constant_alpha` は全体のアルファ（`Appearance::constant_alpha`）。
+    pub fn present(&self, source: HDC, rect: Rect, constant_alpha: u8) -> Result<()> {
+        layered::present(self.hwnd, source, rect, constant_alpha)
     }
 
     pub fn hwnd(&self) -> HWND {

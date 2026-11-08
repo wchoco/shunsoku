@@ -26,21 +26,28 @@ use crate::image::Image;
 use crate::settings::{DpiScaling, Rgb, ScrapAppearance};
 
 /// 白紙スクラップの背景色。背景色は見た目ではなく中身なので、「見た目を既定に戻す」では戻らない。
-/// 設定ファイルでは `#RRGGBB` で書く。
+/// 設定ファイルとレシピでは `#RRGGBB` か `transparent` で書く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Background {
     /// 不透明な一色。
     Color(Rgb),
+    /// 透明（下地の画素のアルファが 0）。表示では透けて見えるが、透明な部分もつかめる（Win32 層が
+    /// 当たり判定のために見えないほど小さいアルファを載せる）。保存画像はアルファ 0 の PNG になる。
+    Transparent,
 }
 
 impl Background {
     /// 白（設定の既定値）。
     pub const WHITE: Background = Background::Color(Rgb(0xFF, 0xFF, 0xFF));
 
+    /// 設定ファイルとレシピでの透明の書き方。
+    const TRANSPARENT: &str = "transparent";
+
     /// 下地の 1 画素の BGRA（premultiply しない）。
     fn bgra(self) -> [u8; 4] {
         match self {
             Background::Color(Rgb(r, g, b)) => [b, g, r, 0xFF],
+            Background::Transparent => [0, 0, 0, 0],
         }
     }
 }
@@ -51,16 +58,17 @@ impl Default for Background {
     }
 }
 
-/// `#RRGGBB`（大文字）。
+/// `#RRGGBB`（大文字）か `transparent`。
 impl std::fmt::Display for Background {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Background::Color(c) => c.fmt(f),
+            Background::Transparent => f.write_str(Background::TRANSPARENT),
         }
     }
 }
 
-/// `#RRGGBB`（大文字と小文字を問わない）でない。
+/// `#RRGGBB`（大文字と小文字を問わない）でも `transparent`（小文字だけ）でもない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotBackground;
 
@@ -68,6 +76,9 @@ impl std::str::FromStr for Background {
     type Err = NotBackground;
 
     fn from_str(s: &str) -> Result<Background, NotBackground> {
+        if s == Background::TRANSPARENT {
+            return Ok(Background::Transparent);
+        }
         s.parse::<Rgb>()
             .map(Background::Color)
             .map_err(|_| NotBackground)
@@ -298,6 +309,12 @@ impl ScrapModel {
             }
             _ => false,
         }
+    }
+
+    /// 何も書かれていない透明な白紙スクラップか。画面では見えずにつかめるだけなので、書き込みの編集モードを
+    /// 抜けたら（どの抜け方でも）ごみ箱に入れずに捨てる。
+    pub fn is_empty_transparent_blank(&self) -> bool {
+        self.background == Some(Background::Transparent) && self.annotations.is_empty()
     }
 
     /// 白紙スクラップの元の画像に当たる下地（大きさが `image_size` の、背景色の一色）。画素は持たずに背景色から
@@ -1085,6 +1102,19 @@ impl Default for Appearance {
 }
 
 impl Appearance {
+    /// レイヤード ウィンドウの全体のアルファ（`SourceConstantAlpha`、0〜255）。透明度（%）から換算する。
+    pub fn constant_alpha(&self) -> u8 {
+        (u32::from(self.opacity.min(100)) * 255 / 100) as u8
+    }
+
+    /// 透明な白紙スクラップの透明な部分に載せる、当たり判定のためのアルファ（premultiplied の画素の A）。
+    /// レイヤード ウィンドウはアルファが 0 の画素のクリックを下のウィンドウに通すので、全体のアルファ
+    /// （`constant_alpha`）を掛けても 0 に落ちない最小の値にする（見た目は透明と変わらない）。
+    pub fn hit_alpha(&self) -> u8 {
+        let constant = u32::from(self.constant_alpha()).max(1);
+        255u32.div_ceil(constant).min(255) as u8
+    }
+
     /// 出す枠。枠を出さないなら None。
     pub fn shown_border(&self) -> Option<Border> {
         self.show_border.then_some(self.border)
@@ -1223,10 +1253,71 @@ mod tests {
     }
 
     #[test]
+    fn a_transparent_blank_scrap_is_painted_with_zero_alpha() {
+        let scrap = ScrapModel::blank(Point::default(), Size::new(2, 1), Background::Transparent);
+        let image = scrap.blank_image().unwrap();
+        assert_eq!(image.pixel(0, 0), [0, 0, 0, 0]);
+        assert_eq!(image.pixel(1, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_background_is_written_as_rrggbb_or_transparent_and_read_back() {
+        assert_eq!(Background::Transparent.to_string(), "transparent");
+        assert_eq!(
+            "transparent".parse::<Background>(),
+            Ok(Background::Transparent)
+        );
+        assert_eq!(
+            "#10a0ff".parse::<Background>(),
+            Ok(Background::Color(Rgb(0x10, 0xA0, 0xFF)))
+        );
+        assert_eq!(
+            Background::Color(Rgb(0x10, 0xA0, 0xFF)).to_string(),
+            "#10A0FF"
+        );
+        for wrong in ["Transparent", "clear", "none", ""] {
+            assert_eq!(wrong.parse::<Background>(), Err(NotBackground), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn only_a_transparent_blank_scrap_with_nothing_written_is_empty() {
+        let size = Size::new(4, 4);
+        let transparent = ScrapModel::blank(Point::default(), size, Background::Transparent);
+        assert!(transparent.is_empty_transparent_blank());
+        assert!(
+            !ScrapModel::blank(Point::default(), size, Background::WHITE)
+                .is_empty_transparent_blank()
+        );
+        assert!(!ScrapModel::new(Point::default(), size).is_empty_transparent_blank());
+        let mut written = transparent.clone();
+        written.start_editing(Style::default());
+        written.edit_input(EditInput::Press(Point::new(0, 0)));
+        written.edit_input(EditInput::Move {
+            at: Point::new(3, 3),
+            shift: false,
+        });
+        written.edit_input(EditInput::Leave);
+        assert_eq!(written.annotations().items().len(), 1);
+        assert!(!written.is_empty_transparent_blank());
+    }
+
+    #[test]
     fn a_captured_scrap_has_no_background_of_its_own() {
         let scrap = ScrapModel::new(Point::default(), Size::new(3, 2));
         assert_eq!(scrap.background(), None);
         assert_eq!(scrap.blank_image(), None);
+    }
+
+    #[test]
+    fn the_hit_alpha_survives_the_window_opacity_and_stays_out_of_sight() {
+        let at = |opacity| Appearance {
+            opacity,
+            ..Appearance::default()
+        };
+        assert_eq!(at(100).hit_alpha(), 1);
+        assert_eq!(at(50).hit_alpha(), 3);
+        assert_eq!(at(10).hit_alpha(), 11);
     }
 
     #[test]

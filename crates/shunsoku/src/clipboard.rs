@@ -5,19 +5,22 @@
 //!   ペイントなどにも貼れる。
 //! - アルファは premultiply しない。M1 の画像のアルファは 0（モニタの隙間）か 255 だけなので、どちらで
 //!   読まれても同じ色になる。
+//! - 透明な部分のある画像（透明な白紙スクラップ）は `copy_with_alpha` で置く。アルファつきの `PNG`（登録された
+//!   形式）と、白の上に描いて不透明にした `CF_DIBV5` の両方を置く。透明に対応したアプリは `PNG` を、対応しない
+//!   アプリは `CF_DIBV5`（と Windows が作る `CF_DIB` / `CF_BITMAP`）を読む。
 //! - ほかのプロセスがクリップボードを開いていると開けないので、少し待って何度か試す。
 
 use std::time::Duration;
 
 use shunsoku_core::image::Image;
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Foundation::{E_FAIL, GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{BI_BITFIELDS, BITMAPV5HEADER};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_DIBV5;
-use windows::core::Result;
+use windows::core::{Result, w};
 
 /// クリップボードを開く試行の回数と間隔。
 const OPEN_TRIES: u32 = 5;
@@ -30,7 +33,30 @@ const LCS_SRGB: u32 = 0x7352_4742;
 pub fn copy(owner: HWND, image: &Image) -> Result<()> {
     let dib = dibv5(image);
     open(owner)?;
-    let result = put(&dib);
+    // SAFETY: クリップボードは開いている
+    let result = unsafe { EmptyClipboard() }.and_then(|()| put(u32::from(CF_DIBV5.0), &dib));
+    // SAFETY: 開いたクリップボードを閉じる
+    let closed = unsafe { CloseClipboard() };
+    result.and(closed)
+}
+
+/// 透明な部分のある画像をクリップボードに置く: アルファつきの `PNG` と、白の上に描いた `CF_DIBV5`。
+pub fn copy_with_alpha(owner: HWND, image: &Image) -> Result<()> {
+    let png = image
+        .to_png()
+        .map_err(|e| windows::core::Error::new(E_FAIL, e.to_string()))?;
+    let dib = dibv5(&image.on_white());
+    // SAFETY: 引数は定数の文字列
+    let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
+    if png_format == 0 {
+        return Err(windows::core::Error::from_thread());
+    }
+    open(owner)?;
+    // 貼る側は置いた順に好みの形式を探すので、透明を保てる PNG を先に置く
+    // SAFETY: クリップボードは開いている
+    let result = unsafe { EmptyClipboard() }
+        .and_then(|()| put(png_format, &png))
+        .and_then(|()| put(u32::from(CF_DIBV5.0), &dib));
     // SAFETY: 開いたクリップボードを閉じる
     let closed = unsafe { CloseClipboard() };
     result.and(closed)
@@ -51,21 +77,20 @@ fn open(owner: HWND) -> Result<()> {
     }
 }
 
-/// 開いたクリップボードを空にして `CF_DIBV5` を置く。
-fn put(dib: &[u8]) -> Result<()> {
+/// 開いたクリップボードに、形式 `format` で `data` を置く。
+fn put(format: u32, data: &[u8]) -> Result<()> {
     // SAFETY: クリップボードは開いている。メモリは置けたらシステムのものになり、置けなければここで返す
     unsafe {
-        EmptyClipboard()?;
-        let memory: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, dib.len())?;
+        let memory: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, data.len())?;
         let target = GlobalLock(memory).cast::<u8>();
         if target.is_null() {
             let error = windows::core::Error::from_thread();
             let _ = GlobalFree(Some(memory));
             return Err(error);
         }
-        std::ptr::copy_nonoverlapping(dib.as_ptr(), target, dib.len());
+        std::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
         let _ = GlobalUnlock(memory);
-        if let Err(e) = SetClipboardData(u32::from(CF_DIBV5.0), Some(HANDLE(memory.0))) {
+        if let Err(e) = SetClipboardData(format, Some(HANDLE(memory.0))) {
             let _ = GlobalFree(Some(memory));
             return Err(e);
         }
