@@ -220,6 +220,19 @@ impl Canvas {
         }
     }
 
+    /// 使い回す描き先 `slot` を大きさ `size` で返す。同じ大きさのものがあればそのまま（中身は描くときに
+    /// `Renderer` が消す）、なければ前のものを返してから作り直す。作れなければ `slot` は空になる。
+    ///
+    /// `UpdateLayeredWindow` は中身を写し取るので、出し終えた描き先は次の描き直しで使ってよい。
+    pub fn reuse(slot: &mut Option<Canvas>, size: Size) -> Result<&Canvas> {
+        if slot.as_ref().is_some_and(|canvas| canvas.size == size) {
+            return Ok(slot.as_ref().expect("checked above"));
+        }
+        // 大きな DIB を 2 枚同時に持たないよう、先に返す
+        *slot = None;
+        Ok(slot.insert(Canvas::new(size)?))
+    }
+
     /// DIB を選んだメモリ DC（`UpdateLayeredWindow` の描き元）。
     pub fn dc(&self) -> HDC {
         self.dc
