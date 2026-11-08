@@ -11,7 +11,7 @@
 2. 必要なら、同じリリースの `.sha256` のファイルと照らして、zip が壊れていないことを確かめます（PowerShell）。
 
    ```powershell
-   Get-FileHash .\shunsoku-v0.2.0-x64.zip -Algorithm SHA256
+   Get-FileHash .\shunsoku-v0.3.0-x64.zip -Algorithm SHA256
    ```
 
 3. 好きなフォルダに展開し、`shunsoku.exe` を起動します。トレイに常駐します。インストーラはなく、VC++ ランタイムも要りません。
