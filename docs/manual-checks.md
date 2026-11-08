@@ -15,7 +15,7 @@
 - エージェントが確かめるときは、`tools/win-driver` を通して操作し、[docs/agents/manual-check.md](agents/manual-check.md) の決まり（安全、結果の書き方、判定の仕方）に従う。
 - 確かめる exe: リリースの workflow が作った zip を展開したもの（M5-18、M5-19）。
 - 番号は `<マイルストーン>-<spec の番号>`。マイルストーンの後に足した spec やチケットの項目は、足した先のマイルストーンの表の後ろに続きの番号で足す。手順と期待する結果は、各 spec の表のまま写した。後のマイルストーンで振る舞いが変わった項目は、表の後の「置き換わった項目」に書いた。そちらを優先する。
-- 出典: M1 [#32](https://github.com/wchoco/shunsoku/issues/32)、M2 [#33](https://github.com/wchoco/shunsoku/issues/33)、M3 [#34](https://github.com/wchoco/shunsoku/issues/34)、M4 [#35](https://github.com/wchoco/shunsoku/issues/35)（M4-16 は [#122](https://github.com/wchoco/shunsoku/issues/122)、M4-17〜M4-45 は書き込みの拡張の spec [#143](https://github.com/wchoco/shunsoku/issues/143) のチケット #144〜#151、#159、#157、#156、#155、#158、#160。M4-23 は #154 で、M4-24 は #155 で直した）、M5 [#36](https://github.com/wchoco/shunsoku/issues/36)。
+- 出典: M1 [#32](https://github.com/wchoco/shunsoku/issues/32)、M2 [#33](https://github.com/wchoco/shunsoku/issues/33)、M3 [#34](https://github.com/wchoco/shunsoku/issues/34)、M4 [#35](https://github.com/wchoco/shunsoku/issues/35)（M4-16 は [#122](https://github.com/wchoco/shunsoku/issues/122)、M4-17〜M4-47 は書き込みの拡張の spec [#143](https://github.com/wchoco/shunsoku/issues/143) のチケット #144〜#151、#159、#157、#156、#155、#158、#160、#161。M4-23 は #154 で、M4-24 は #155 で直した）、M5 [#36](https://github.com/wchoco/shunsoku/issues/36)。
 
 マイルストーンを足したら、その spec の表をここに写す。
 
@@ -154,6 +154,8 @@
 | M4-43 | 設定 GUI のレシピのタブで「追加」の一覧から「背景色」を選んで足す。「選ぶ…」で色を選ぶ。もう 1 つ足して「透明」にチェックを入れ、外し、また入れる。後ろに `copy` を置いてショートカットを付けて適用し、設定 GUI を開き直す。白紙スクラップと普通のスクラップでショートカットを押す | 足した背景色の操作が選ばれ、ショートカットの下に「色:」「選ぶ…」「透明」が出る（見た目の欄は出ない）。色を選ぶ前とチェックを外したあとは「パラメータを 1 つも書いていない操作があります」が出て適用できない。「透明」にチェックがある間は「選ぶ…」が灰色で押せない。操作の一覧の文言が「背景色: #RRGGBB」「背景色: 透明」になり、設定ファイルに `{ op = "background", color = "#RRGGBB" }` と `{ op = "background", color = "transparent" }` で入る。開き直しても同じ色とチェックが出る。白紙は塗り直されてコピーされ、普通のスクラップではレシピがそこで止まる（コピーされない） | 値 | 両方 |
 | M4-44 | レシピ `steps = ["select_capture", { op = "appearance", border_color = "#FF0000", border_width = 3 }, "copy"]` に `hotkey` を付けて押し、範囲を選んで撮る。もう一度押し、ハイライトのウィンドウをクリックして撮る。もう一度押して Esc で取り消す | 範囲選択の画面が開き、撮ると赤の 3px の枠のスクラップが出て（既定の見た目で 1 度出てから変わらない）、画像がクリップボードに入る。ウィンドウをクリックしても同じく続く。Esc では何も作られず、通知も出ない | 目視 | 両方 |
 | M4-45 | 設定 GUI のレシピのタブで、ショートカットを入れたレシピの「追加」から「範囲選択キャプチャ」を足し、「上へ」で最初に動かす。ホットキーを入れて適用し、また 2 つめに動かす。範囲選択キャプチャのホットキーと同じキーを入れる | 「追加」の一覧の先頭に「範囲選択キャプチャ」が出る。2 つめ以降にある間は並びの下に「キャプチャは 1 つだけを最初に置けます」が出て適用できない。最初に動かすと見出しが「ホットキー:」に変わり、入れていたショートカットが消える。戻すと「ショートカット:」に戻り、ホットキーが消える。同じキーでは両方に印が付き、適用できない | 値 | 両方 |
+| M4-46 | レシピ `steps = ["active_window_capture", { op = "appearance", border_color = "#FF0000", border_width = 3 }, "copy"]` に `hotkey` を付け、メモ帳を前面にして押す。デスクトップを前面にして押す | メモ帳のウィンドウが撮られ、赤の 3px の枠のスクラップが出て（既定の見た目で 1 度出てから変わらない）、画像がクリップボードに入る。デスクトップでは何も作られず、通知も出ない | 目視 | 両方 |
+| M4-47 | `[annotation] background = "#FFFFFF"` で、レシピ `steps = ["blank_scrap", { op = "background", color = "transparent" }, "copy", "zoom_in"]` に `hotkey` を付けて押し、範囲を選ぶ。`"copy"` を `"save_as"` に替えて押し、保存のダイアログで取り消す。背景色の操作を消して押す。もう一度押して Esc で取り消す | 範囲選択の画面が開き、選んだ位置と大きさで透明な白紙スクラップが出る（白で 1 度出てから変わらない）。コピーと拡大の間は編集モードに入らず、拡大し終えてから編集モードに入る。取り消しで止まったときも編集モードに入る。背景色の操作がなければ白のまま浮かび、編集モードに入らない。Esc では何も作られず、通知も出ない | 目視 | 両方 |
 
 ## M5
 
