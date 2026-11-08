@@ -174,19 +174,16 @@ impl CaptureRequest {
         launch: &crate::recipe::Launch,
         regions: &[Region],
     ) -> CaptureRequest {
-        use crate::recipe::Capture;
+        use crate::recipe::PlannedCapture;
         let request = match launch.capture() {
-            Capture::Select => CaptureRequest::scrap(CaptureMethod::Select),
-            Capture::ActiveWindow => CaptureRequest::scrap(CaptureMethod::ActiveWindow),
-            Capture::Blank => CaptureRequest::scrap(CaptureMethod::BlankScrap),
-            Capture::Region => {
-                let name = launch.region().unwrap_or_default();
-                match regions.iter().find(|r| r.name == name) {
-                    Some(region) => CaptureRequest::region(region),
-                    None => CaptureRequest::scrap(CaptureMethod::Region(RegionId(name.to_owned()))),
-                }
-                .with_scrap()
+            PlannedCapture::Select => CaptureRequest::scrap(CaptureMethod::Select),
+            PlannedCapture::ActiveWindow => CaptureRequest::scrap(CaptureMethod::ActiveWindow),
+            PlannedCapture::Blank => CaptureRequest::scrap(CaptureMethod::BlankScrap),
+            PlannedCapture::Region(name) => match regions.iter().find(|r| &r.name == name) {
+                Some(region) => CaptureRequest::region(region),
+                None => CaptureRequest::scrap(CaptureMethod::Region(RegionId(name.to_owned()))),
             }
+            .with_scrap(),
         };
         CaptureRequest {
             recipe: Some(index),
