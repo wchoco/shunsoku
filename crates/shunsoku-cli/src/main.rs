@@ -2,7 +2,8 @@
 //!
 //! - 標準出力には結果（保存した絶対パス、モニタの一覧）だけを出し、エラーは標準エラーに出す。
 //! - 終了コード: 0 成功 / 1 キャプチャの失敗 / 2 引数の誤り / 3 常駐本体に依頼できない（起動を待ちきれない、
-//!   バージョンが合わない）/ 4 ユーザーが取り消した。
+//!   バージョンが合わない）/ 4 ユーザーが取り消した / `open` で 5 ファイルを読めない・6 スクラップファイルとして
+//!   正しくない・7 新しい版のファイル。
 //! - 常駐本体が動いていなければ、この exe と同じフォルダの `shunsoku.exe` を起動し、パイプができるまで待つ。
 //!   起動した常駐本体はそのまま常駐を続ける。
 
@@ -41,16 +42,24 @@ fn run() -> i32 {
         Ok(Command::Capture(mut capture)) => {
             // 常駐本体は作業フォルダが違うので、--out の相対パスはここで絶対パスにする
             if let cli_args::Save::To(path) = &mut capture.output.save {
-                let absolute = std::path::absolute(&*path)
-                    .ok()
-                    .and_then(|absolute| absolute.into_os_string().into_string().ok());
-                let Some(absolute) = absolute else {
+                let Some(absolute) = absolute(path) else {
                     error(&format!("--out のパスを絶対パスにできません: {path}"));
                     return EXIT_ARGS;
                 };
                 *path = absolute;
             }
             Request::Capture(capture)
+        }
+        Ok(Command::Open(mut open)) => {
+            let Some(absolute) = absolute(&open.path) else {
+                error(&format!(
+                    "開くファイルのパスを絶対パスにできません: {}",
+                    open.path
+                ));
+                return EXIT_ARGS;
+            };
+            open.path = absolute;
+            Request::Open(open)
         }
         Ok(Command::Monitors) => Request::Monitors,
         Err(e) => {
@@ -78,7 +87,7 @@ fn run() -> i32 {
     };
     match &response {
         Response::Captured { path: Some(path) } => println!("{path}"),
-        Response::Captured { path: None } => {}
+        Response::Captured { path: None } | Response::Opened => {}
         // CLI の文言は日本語だけ（英語 UI の対象外）
         Response::Monitors(list) => print!(
             "{}",
@@ -90,6 +99,13 @@ fn run() -> i32 {
         Response::Failed { message, .. } => error(message),
     }
     response.exit_code()
+}
+
+/// 作業フォルダからの絶対パス（常駐本体は作業フォルダが違う）。文字として表せなければ None。
+fn absolute(path: &str) -> Option<String> {
+    std::path::absolute(path)
+        .ok()
+        .and_then(|absolute| absolute.into_os_string().into_string().ok())
 }
 
 fn error(message: &str) {

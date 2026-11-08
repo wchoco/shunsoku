@@ -301,6 +301,8 @@ unreadable_monitor = "This monitor's screen cannot be captured as is (for exampl
 cancelled = "The region selection was cancelled."
 timed_out = "The request was dropped because the capture did not finish in time."
 no_active_window = "There is no active window to capture (the desktop and the taskbar are not captured)."
+selecting_open = "Cannot open a scrap file while the region selection screen is open."
+float_failed = "The scrap file was read, but the scrap could not be shown."
 
 [copy]
 failed = "Could not copy to the clipboard."
