@@ -86,8 +86,8 @@ use crate::geometry::Rect;
 use crate::i18n::Language;
 use crate::keys::Chord;
 use crate::recipe::{
-    self, AppearanceItem, AppearanceStep, BackgroundStep, Recipe, Rejected, Rejection, Step,
-    StepKey, Written,
+    self, AppearanceItem, AppearanceStep, BackgroundStep, Capture, CaptureRegionStep, Recipe,
+    Rejected, Rejection, Step, StepKey, Written,
 };
 use crate::scrap::Background;
 use crate::scrap::ops::{
@@ -712,6 +712,8 @@ pub enum Problem {
     NoValues,
     /// レシピのパラメータを添えた操作に `border = false` と枠の色か太さを一緒に書いた。
     BorderOffWithColorOrWidth,
+    /// レシピの定型領域キャプチャの定型領域がない。
+    NoSuchRegion,
 }
 
 impl Problem {
@@ -794,30 +796,34 @@ pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
             problem,
         });
     }
-    let mut recipe_issues: Vec<ValidationIssue> = recipe::plan(&settings.recipes, OPERATIONS)
-        .problems
-        .iter()
-        .map(|(i, problem)| ValidationIssue {
-            item: recipe_problem_item(*i, problem),
-            problem: match problem {
-                recipe::Problem::EmptyName => Problem::EmptyName,
-                recipe::Problem::DuplicateName => Problem::DuplicateName,
-                recipe::Problem::NoSteps => Problem::NoSteps,
-                recipe::Problem::NotAStep(_) => Problem::NotAStep,
-                recipe::Problem::LastOnlyNotLast => Problem::LastOnlyNotLast,
-                recipe::Problem::FirstOnlyNotFirst => Problem::FirstOnlyNotFirst,
-                recipe::Problem::ShortcutOnCapture => Problem::ShortcutOnCapture,
-                recipe::Problem::NoHotkey => Problem::Unset,
-                recipe::Problem::HotkeyWithoutCapture => Problem::HotkeyWithoutCapture,
-                recipe::Problem::OutOfRange(_) => Problem::OutOfRange,
-                recipe::Problem::BadValue(_) => Problem::BadValue,
-                recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
-                recipe::Problem::NotAppearance => Problem::NotAppearance,
-                recipe::Problem::NoValues => Problem::NoValues,
-                recipe::Problem::BorderOffWithColorOrWidth => Problem::BorderOffWithColorOrWidth,
-            },
-        })
-        .collect();
+    let mut recipe_issues: Vec<ValidationIssue> =
+        recipe::plan(&settings.recipes, OPERATIONS, &settings.regions)
+            .problems
+            .iter()
+            .map(|(i, problem)| ValidationIssue {
+                item: recipe_problem_item(*i, problem),
+                problem: match problem {
+                    recipe::Problem::EmptyName => Problem::EmptyName,
+                    recipe::Problem::DuplicateName => Problem::DuplicateName,
+                    recipe::Problem::NoSteps => Problem::NoSteps,
+                    recipe::Problem::NotAStep(_) => Problem::NotAStep,
+                    recipe::Problem::LastOnlyNotLast => Problem::LastOnlyNotLast,
+                    recipe::Problem::FirstOnlyNotFirst => Problem::FirstOnlyNotFirst,
+                    recipe::Problem::ShortcutOnCapture => Problem::ShortcutOnCapture,
+                    recipe::Problem::NoHotkey => Problem::Unset,
+                    recipe::Problem::HotkeyWithoutCapture => Problem::HotkeyWithoutCapture,
+                    recipe::Problem::OutOfRange(_) => Problem::OutOfRange,
+                    recipe::Problem::BadValue(_) => Problem::BadValue,
+                    recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
+                    recipe::Problem::NotAppearance => Problem::NotAppearance,
+                    recipe::Problem::NoValues => Problem::NoValues,
+                    recipe::Problem::BorderOffWithColorOrWidth => {
+                        Problem::BorderOffWithColorOrWidth
+                    }
+                    recipe::Problem::NoSuchRegion(_) => Problem::NoSuchRegion,
+                },
+            })
+            .collect();
     // 入れられない操作がいくつあっても、欄には 1 つだけ出す
     recipe_issues.dedup();
     issues.extend(recipe_issues);
@@ -851,7 +857,7 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
         .iter()
         .enumerate()
         .filter_map(|(i, region)| Some((region.hotkey?, HotkeyAction::Region(i))));
-    let recipes = recipe::plan(&settings.recipes, ops);
+    let recipes = recipe::plan(&settings.recipes, ops, &settings.regions);
     // 問題のないキャプチャで始まるレシピのホットキー（問題のあるレシピはショートカットと同じく付けない）
     let recipe_hotkeys = recipes
         .plans
@@ -1001,7 +1007,7 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
 /// 登録するレシピのホットキー（問題のないキャプチャで始まるレシピの位置とホットキー）。`HotkeyAction::Recipe`
 /// は位置で持つので、位置とホットキーの対応が変わったら登録し直す。
 fn recipe_hotkeys(settings: &Settings) -> Vec<(usize, Chord)> {
-    recipe::plan(&settings.recipes, OPERATIONS)
+    recipe::plan(&settings.recipes, OPERATIONS, &settings.regions)
         .plans
         .iter()
         .filter_map(|plan| Some((plan.index, plan.hotkey?)))
@@ -1273,6 +1279,11 @@ fn recipe_steps(item: &Item) -> Option<Vec<Step>> {
             {
                 Some(Step::Background(background_step(t)))
             }
+            toml_edit::Value::InlineTable(t)
+                if t.get("op").and_then(|v| v.as_str()) == Some(Capture::Region.id()) =>
+            {
+                Some(Step::CaptureRegion(capture_region_step(t)))
+            }
             toml_edit::Value::InlineTable(t) => Some(Step::Appearance(appearance_step(t))),
             _ => None,
         })
@@ -1315,6 +1326,33 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
             key: StepKey::Op,
             value: None,
             reason: Rejection::NotAppearance,
+        });
+    }
+    step
+}
+
+/// 定型領域キャプチャ（`{ op = "capture_region", region = "<名前>" }`）。名前は文字列で書く。定型領域があるかは
+/// `recipe::plan` が見る。
+fn capture_region_step(table: &toml_edit::InlineTable) -> CaptureRegionStep {
+    let mut step = CaptureRegionStep::default();
+    for (key, value) in table.iter() {
+        let (key, reason) = match key {
+            "op" => continue,
+            "region" => match value.as_str() {
+                Some(name) => {
+                    step.region = Some(name.to_owned());
+                    continue;
+                }
+                None => (StepKey::Region, Rejection::BadValue),
+            },
+            _ => (StepKey::Unknown(key.to_owned()), Rejection::UnknownKey),
+        };
+        let mut written = value.clone();
+        written.decor_mut().clear();
+        step.rejected.push(Rejected {
+            key,
+            value: Some(written.to_string()),
+            reason,
         });
     }
     step
@@ -2923,7 +2961,10 @@ width = 0
         let capture = &settings.recipes[2];
         assert_eq!(capture.steps[0], "select_capture".into());
         assert_eq!(capture.hotkey, Some("Ctrl+Shift+F1".parse().unwrap()));
-        assert_eq!(recipe::plan(&settings.recipes, OPERATIONS).problems, vec![]);
+        assert_eq!(
+            recipe::plan(&settings.recipes, OPERATIONS, &settings.regions).problems,
+            vec![]
+        );
     }
 
     fn named(names: &[&str]) -> Settings {

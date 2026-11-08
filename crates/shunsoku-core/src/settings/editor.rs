@@ -28,7 +28,8 @@ use crate::keys::Chord;
 pub use crate::recipe::AppearanceItem;
 pub use crate::recipe::Capture;
 use crate::recipe::{
-    self, AppearanceStep, BackgroundStep, ItemValue, Recipe, Step, StepKey, Written,
+    self, AppearanceStep, BackgroundStep, CaptureRegionStep, ItemValue, Recipe, Step, StepKey,
+    Written,
 };
 use crate::scrap::Background;
 use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationId};
@@ -86,6 +87,7 @@ impl Mark {
             Mark::Problem(Problem::BorderOffWithColorOrWidth) => {
                 "settings_gui.mark.border_off_with_color_or_width"
             }
+            Mark::Problem(Problem::NoSuchRegion) => "settings_gui.mark.no_such_region",
         }
     }
 }
@@ -394,6 +396,9 @@ impl Editor {
         };
         let step = match choice.into() {
             StepChoice::Op(id) => id.into(),
+            StepChoice::Capture(Capture::Region) => {
+                Step::CaptureRegion(CaptureRegionStep::default())
+            }
             StepChoice::Capture(c) => c.id().into(),
             StepChoice::Appearance => Step::Appearance(AppearanceStep::default()),
             StepChoice::Background => Step::Background(BackgroundStep::default()),
@@ -475,8 +480,41 @@ impl Editor {
         match self.draft.recipes.get(index)?.steps.get(step)? {
             Step::Appearance(_) => Some(ParamFields::Appearance),
             Step::Background(_) => Some(ParamFields::Background),
+            Step::CaptureRegion(_) => Some(ParamFields::Region),
             Step::Op(_) => None,
         }
+    }
+
+    /// レシピ `index` の操作 `step` が定型領域キャプチャなら、選べる定型領域の名前（写しの定型領域の順）と、選んで
+    /// いる位置（選んでいないか、名前が読めなければ None）。写しにない名前を選んでいれば、それも末尾に足して選んで
+    /// おく（表示だけ）。定型領域キャプチャでなければ None。
+    pub fn capture_region(&self, index: usize, step: usize) -> Option<RegionChoices> {
+        let Step::CaptureRegion(step) = self.draft.recipes.get(index)?.steps.get(step)? else {
+            return None;
+        };
+        let mut names: Vec<String> = self.draft.regions.iter().map(|r| r.name.clone()).collect();
+        let selected = step.region.as_ref().map(|chosen| {
+            names.iter().position(|n| n == chosen).unwrap_or_else(|| {
+                names.push(chosen.clone());
+                names.len() - 1
+            })
+        });
+        Some(RegionChoices { names, selected })
+    }
+
+    /// レシピ `index` の操作 `step`（定型領域キャプチャ）で撮る定型領域を、名前 `name` の定型領域にする。設定
+    /// ファイルから読めなかった名前は消す。定型領域キャプチャでなければ何もしない。
+    pub fn set_capture_region(&mut self, index: usize, step: usize, name: &str) {
+        let Some(Step::CaptureRegion(step)) = self
+            .draft
+            .recipes
+            .get_mut(index)
+            .and_then(|r| r.steps.get_mut(step))
+        else {
+            return;
+        };
+        step.rejected.retain(|r| r.key != StepKey::Region);
+        step.region = Some(name.to_owned());
     }
 
     /// レシピ `index` の操作 `step` が背景色を指定する操作なら、その色（選んでいないか、設定ファイルに書いた色が
@@ -484,7 +522,7 @@ impl Editor {
     pub fn background(&self, index: usize, step: usize) -> Option<Option<Background>> {
         match self.draft.recipes.get(index)?.steps.get(step)? {
             Step::Background(step) => Some(step.color),
-            Step::Op(_) | Step::Appearance(_) => None,
+            Step::Op(_) | Step::Appearance(_) | Step::CaptureRegion(_) => None,
         }
     }
 
@@ -610,6 +648,15 @@ pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> S
                 .map_or_else(|| id.clone(), |op| text(op.label_key).to_owned());
         }
         Step::Appearance(step) => step.values,
+        Step::CaptureRegion(step) => {
+            let label = text(Capture::Region.label_key());
+            return match &step.region {
+                Some(name) => text("settings_gui.recipes.step.capture_region")
+                    .replace("{capture}", label)
+                    .replace("{region}", name),
+                None => label.to_owned(),
+            };
+        }
         Step::Background(step) => {
             return match step.color {
                 Some(Background::Transparent) => text("settings_gui.recipes.step.background")
@@ -717,6 +764,17 @@ pub enum ParamFields {
     Appearance,
     /// 背景色（「選ぶ…」と「透明」。`Editor::background` / `set_background`）。
     Background,
+    /// 定型領域キャプチャの定型領域（ドロップダウン。`Editor::capture_region` / `set_capture_region`）。
+    Region,
+}
+
+/// 定型領域キャプチャの欄のドロップダウン（`Editor::capture_region`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionChoices {
+    /// 定型領域の名前（ドロップダウンの順）。
+    pub names: Vec<String>,
+    /// 選んでいる位置。選んでいなければ None。
+    pub selected: Option<usize>,
 }
 
 /// 「操作を足す」で選べるもの（`Editor::step_choices`）。
@@ -1063,6 +1121,7 @@ mod tests {
             Mark::Problem(Problem::NotAppearance),
             Mark::Problem(Problem::NoValues),
             Mark::Problem(Problem::BorderOffWithColorOrWidth),
+            Mark::Problem(Problem::NoSuchRegion),
         ] {
             let key = mark.label_key();
             assert_ne!(catalog.text(key), key, "{mark:?}");
@@ -2182,5 +2241,108 @@ mod tests {
         assert_eq!(editor.chord(&SettingsItem::RecipeShortcut(0)), None);
         assert_eq!(editor.mark(&SettingsItem::RecipeHotkey(0)), None);
         assert!(editor.buttons().ok);
+    }
+
+    /// 定型領域「右」「左」（この順）と、`steps = [...]` のキャプチャで始まるレシピ 1 つを読んだ写し。
+    fn with_regions_read(steps: &str) -> Editor {
+        let region = |name: &str| {
+            format!(
+                "[[regions]]\nname = \"{name}\"\nmonitor = \"m\"\nx = 0\ny = 0\nwidth = 10\nheight = 10\n"
+            )
+        };
+        let (settings, issues) = super::super::load(&format!(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Shift+A\"\n{}{}[[recipes]]\nname = \"R\"\nsteps = {steps}\nhotkey = \"Ctrl+Alt+C\"\n",
+            region("右"),
+            region("左"),
+        ));
+        assert_eq!(issues, vec![], "{steps}");
+        Editor::new(settings)
+    }
+
+    #[test]
+    fn a_fixed_region_capture_is_added_without_a_region_and_offers_the_regions_in_order() {
+        let mut editor = with_regions_read("[]");
+        assert_eq!(captures(&editor, 0).last(), Some(&Capture::Region));
+        let added = editor
+            .add_step(0, StepChoice::Capture(Capture::Region))
+            .unwrap();
+        assert_eq!(steps(&editor, 0), ["capture_region"]);
+        assert_eq!(editor.param_fields(0, added), Some(ParamFields::Region));
+        assert_eq!(
+            editor.capture_region(0, added),
+            Some(RegionChoices {
+                names: vec!["右".to_owned(), "左".to_owned()],
+                selected: None,
+            })
+        );
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoValues))
+        );
+        assert!(!editor.buttons().ok);
+    }
+
+    #[test]
+    fn a_region_chosen_in_the_field_is_written_as_a_fixed_region_capture_and_reads_back_the_same() {
+        let mut editor = with_regions_read("[]");
+        editor.add_step(0, StepChoice::Capture(Capture::Region));
+        editor.add_step(0, "copy");
+        editor.set_capture_region(0, 0, "左");
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Alt+C")));
+        assert_eq!(
+            editor.capture_region(0, 0).map(|c| c.selected),
+            Some(Some(1))
+        );
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().ok);
+        assert_eq!(labels(&editor), ["定型領域キャプチャ: 左", "コピー"]);
+
+        let written = super::super::write::rewrite("version = 1\n", editor.draft()).unwrap();
+
+        assert!(
+            written.contains(r#"steps = [{ op = "capture_region", region = "左" }, "copy"]"#),
+            "{written}"
+        );
+        let (read, issues) = super::super::load(&written);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, editor.draft().recipes);
+    }
+
+    #[test]
+    fn a_fixed_region_capture_of_a_missing_region_shows_that_name_and_is_a_problem_until_another_is_chosen()
+     {
+        let mut editor = with_regions_read(r#"[{ op = "capture_region", region = "中" }]"#);
+        assert_eq!(
+            editor.capture_region(0, 0),
+            Some(RegionChoices {
+                names: vec!["右".to_owned(), "左".to_owned(), "中".to_owned()],
+                selected: Some(2),
+            })
+        );
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoSuchRegion))
+        );
+        assert!(!editor.buttons().ok);
+
+        editor.set_capture_region(0, 0, "右");
+
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().ok);
+        // 定型領域キャプチャでない操作は何も変えない
+        let before = editor.draft().clone();
+        editor.set_capture_region(0, 1, "左");
+        editor.set_capture_region(1, 0, "左");
+        assert_eq!(editor.draft(), &before);
+    }
+
+    #[test]
+    fn a_fixed_region_capture_of_a_region_value_that_could_not_be_read_is_replaced_by_choosing_one()
+    {
+        let mut editor = with_regions_read(r#"[{ op = "capture_region", region = 1 }]"#);
+        assert_eq!(editor.capture_region(0, 0).map(|c| c.selected), Some(None));
+        assert!(editor.mark(&SettingsItem::RecipeSteps(0)).is_some());
+        editor.set_capture_region(0, 0, "左");
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
     }
 }

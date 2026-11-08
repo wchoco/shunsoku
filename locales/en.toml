@@ -184,6 +184,8 @@ border_width = "{width}px"
 shadow_on = "shadow"
 shadow_off = "no shadow"
 background = "Background: {color}"
+# Saved region capture ({capture} is the step name, {region} the saved region's name)
+capture_region = "{capture}: {region}"
 
 # Parameter fields of an appearance step (shown below the step list while it is selected)
 [settings_gui.recipes.appearance]
@@ -200,6 +202,10 @@ off = "Off"
 # Parameter fields of a background colour operation (label before "Pick..." and "Transparent")
 [settings_gui.recipes.background]
 color = "Color:"
+
+# Parameter field of a saved region capture (label before the drop-down of the region to capture)
+[settings_gui.recipes.region]
+name = "Saved region:"
 
 [settings_gui.mark]
 unset = "Not set"
@@ -218,15 +224,17 @@ hotkey_without_capture = "A recipe that does not start with a capture is called 
 out_of_range = "An appearance parameter is out of range (opacity is 10-100, border width is 1-16)"
 bad_value = "A parameter is written wrong (colors are #RRGGBB, border and shadow are true or false)"
 unknown_key = "A step has an unknown parameter"
-not_appearance = "Only op = \"appearance\" and op = \"background\" can be written as a table"
+not_appearance = "Only op = \"appearance\", op = \"background\" and op = \"capture_region\" can be written as a table"
 no_values = "A step written as a table has no parameters"
 border_off_with_color_or_width = "border = false cannot go with a border color or width"
+no_such_region = "The saved region to capture is not found (choose it again if it was renamed or deleted)"
 
 # Capture steps that can start a recipe (recipe::Capture::label_key)
 [recipe.capture]
 select_capture = "Region capture"
 active_window_capture = "Window capture"
 blank_scrap = "Create a blank scrap"
+capture_region = "Saved region capture"
 
 [hotkey]
 failed = "Could not register these hotkeys (another app may be using them): "

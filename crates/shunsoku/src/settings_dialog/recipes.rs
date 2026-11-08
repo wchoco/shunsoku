@@ -18,6 +18,9 @@
 //! - 背景色のパラメータの欄は「選ぶ…」（色の選択ダイアログ）と「透明」のチェック（#158）。透明なら「選ぶ…」を
 //!   使えなくする。値の出し入れは `Editor::background` / `set_background` で、呼び出し側が `Button::PickBackground`
 //!   / `Button::Transparent`（`transparent_checked`）で受ける。チェックを外すと色は選んでいない状態に戻る。
+//! - 定型領域キャプチャのパラメータの欄は、撮る定型領域を選ぶドロップダウン（#162）。選べるのは写しの定型領域の
+//!   名前（`Editor::capture_region`）で、呼び出し側が `region_id` の選び直しを `chosen_region` で受けて
+//!   `Editor::set_capture_region` で写しに入れる。
 //! - ショートカットは全体のホットキーと同じ入力欄（`chord_field`）で、`ChordRow` の 1 つ。行を選び直したら、
 //!   呼び出し側が `ChordRow::item` をその行の `Editor::key_item`（キャプチャで始まるレシピは
 //!   `SettingsItem::RecipeHotkey`、ほかは `RecipeShortcut`。ADR-0010）に差し替える（`shortcut_id`）。見出しも
@@ -32,8 +35,8 @@ use std::cell::{Cell, RefCell};
 use shunsoku_core::scrap::Background;
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::{
-    AppearanceInput, AppearanceItem, Editor, ParamFields, SWITCH_CHOICES, StepChoice,
-    UNCHANGED_KEY, step_label,
+    AppearanceInput, AppearanceItem, Editor, ParamFields, RegionChoices, SWITCH_CHOICES,
+    StepChoice, UNCHANGED_KEY, step_label,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
@@ -93,13 +96,18 @@ const BACKGROUND_FIRST: i32 = APPEARANCE_END;
 const PICK_BACKGROUND: i32 = 31;
 const TRANSPARENT: i32 = 32;
 const BACKGROUND_END: i32 = 33;
+/// 定型領域キャプチャのパラメータの欄（見出しと、定型領域を選ぶドロップダウン）。
+const REGION_FIRST: i32 = BACKGROUND_END;
+const REGION: i32 = 34;
+const REGION_END: i32 = 35;
 /// パラメータの欄の種類と、そのまとまり（ページの帯の位置の範囲）。選んでいる操作の種類のまとまりだけを出す。
-const PARAM_FIELDS: [(ParamFields, i32, i32); 2] = [
+const PARAM_FIELDS: [(ParamFields, i32, i32); 3] = [
     (ParamFields::Appearance, APPEARANCE_FIRST, APPEARANCE_END),
     (ParamFields::Background, BACKGROUND_FIRST, BACKGROUND_END),
+    (ParamFields::Region, REGION_FIRST, REGION_END),
 ];
 /// ページの帯の、最後のコントロールの次。
-const PAGE_END: i32 = BACKGROUND_END;
+const PAGE_END: i32 = REGION_END;
 /// 見た目を指定する操作の項目と、その欄。
 const APPEARANCE_FIELDS: [(AppearanceItem, i32); 5] = [
     (AppearanceItem::Border, BORDER),
@@ -316,6 +324,17 @@ pub(super) fn build(b: &mut PageBuilder) {
         12,
     );
     let background_end = b.next_id;
+    // 定型領域キャプチャ: 撮る定型領域を選ぶドロップダウン（高さは開いたときの一覧の高さ）
+    let region_first = b.next_id;
+    b.label(
+        "settings_gui.recipes.region.name",
+        DETAIL_X,
+        PARAMS_Y + 2,
+        LABEL_WIDTH,
+        10,
+    );
+    let region = b.choice_control(FIELD_X, PARAMS_Y, STEPS_WIDTH, 120);
+    let region_end = b.next_id;
 
     let offsets = |ids: &[i32]| ids.iter().map(|id| id - first).collect::<Vec<_>>();
     debug_assert_eq!(offsets(&[list]), [LIST]);
@@ -374,6 +393,10 @@ pub(super) fn build(b: &mut PageBuilder) {
             TRANSPARENT,
             BACKGROUND_END
         ]
+    );
+    debug_assert_eq!(
+        offsets(&[region_first, region, region_end]),
+        [REGION_FIRST, REGION, REGION_END]
     );
     debug_assert_eq!(b.next_id - first, PAGE_END);
 }
@@ -502,6 +525,20 @@ pub fn transparent_checked(hwnd: HWND) -> bool {
     })
 }
 
+/// 定型領域キャプチャの、定型領域を選ぶドロップダウンの ID。
+pub fn region_id() -> i32 {
+    id(REGION)
+}
+
+/// 定型領域キャプチャのドロップダウンで選んでいる定型領域の名前。
+pub fn chosen_region(hwnd: HWND) -> Option<String> {
+    let combo = item(hwnd, region_id())?;
+    // SAFETY: 自分のダイアログのドロップダウンへのメッセージ
+    let index = unsafe { SendMessageW(combo, CB_GETCURSEL, None, None) }.0;
+    let index = usize::try_from(index).ok()?;
+    REGIONS_SHOWN.with_borrow(|names| names.get(index).cloned())
+}
+
 /// 名前の欄の今の文字。
 pub fn name_text(hwnd: HWND) -> Option<String> {
     item(hwnd, name_id()).map(window_text)
@@ -516,6 +553,8 @@ thread_local! {
     static STEPS_SHOWN: RefCell<(Option<usize>, Vec<String>)> = const { RefCell::new((None, Vec::new())) };
     /// 出しているパラメータの欄の種類。
     static PARAMS_SHOWN: Cell<Option<ParamFields>> = const { Cell::new(None) };
+    /// 定型領域キャプチャのドロップダウンに出している定型領域の名前（`chosen_region`）。
+    static REGIONS_SHOWN: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// 一覧の行や名前の欄を揃えている途中か（届いた通知では写しを変えない）。
@@ -689,6 +728,12 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
             .zip(step)
             .and_then(|(i, s)| editor.background(i, s)),
     );
+    fill_region(
+        hwnd,
+        selected
+            .zip(step)
+            .and_then(|(i, s)| editor.capture_region(i, s)),
+    );
     show_params(hwnd, params);
 
     for offset in DETAIL_FIRST..DETAIL_END {
@@ -832,6 +877,39 @@ fn fill_background(hwnd: HWND, color: Option<Option<Background>>) {
         }
     }
     enable(hwnd, id(PICK_BACKGROUND), color.is_some() && !transparent);
+}
+
+/// 定型領域キャプチャの欄に、選べる定型領域と選んでいるもの `choices`（定型領域キャプチャでなければ None）を
+/// 出す。名前が変わったときだけ入れ直す。選んでいなければ何も選ばない。
+fn fill_region(hwnd: HWND, choices: Option<RegionChoices>) {
+    let Some(combo) = item(hwnd, region_id()) else {
+        return;
+    };
+    let RegionChoices { names, selected } = choices.unwrap_or(RegionChoices {
+        names: Vec::new(),
+        selected: None,
+    });
+    // SAFETY: 自分のダイアログのドロップダウンへのメッセージ。文字列は呼び出しの間生きている
+    unsafe {
+        if REGIONS_SHOWN.with_borrow(|shown| *shown != names)
+            || usize::try_from(SendMessageW(combo, CB_GETCOUNT, None, None).0) != Ok(names.len())
+        {
+            SendMessageW(combo, CB_RESETCONTENT, None, None);
+            for name in &names {
+                let label = to_wide(name);
+                SendMessageW(
+                    combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(label.as_ptr() as isize)),
+                );
+            }
+            REGIONS_SHOWN.set(names);
+        }
+        // 選んでいなければ何も選ばない（-1）
+        let index = selected.map_or(-1, |i| i as isize);
+        SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index as usize)), None);
+    }
 }
 
 /// 足せるもの `choice` の文言（ドロップダウンに出す）。表にない id はそのまま。

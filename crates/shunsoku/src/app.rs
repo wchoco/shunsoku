@@ -3437,24 +3437,34 @@ fn request_capture(source: Source) {
 }
 
 /// キャプチャで始まるレシピ（`index` は `Settings::recipes` の添字）を始める（ADR-0010）。キャプチャを依頼し、
-/// 撮れたら `output` がスクラップを出してから残りの操作を進める。
+/// 撮れたら `output` がスクラップを出してから残りの操作を進める。定型領域キャプチャは `capture_region` が撮り、
+/// 白紙スクラップにする定型領域なら、そこで白紙スクラップを出して残りの操作を進める。
 fn request_capture_recipe(index: usize) {
     let Some(launch) = capture_recipe_launch(index) else {
         log::warn!("recipe {index} does not start with a capture");
         return;
     };
     log::info!("capture recipe {index} requested from hotkey");
-    submit(CaptureRequest::recipe(index, launch.capture()));
+    let Some(request) =
+        with_app(|app| CaptureRequest::recipe(index, &launch, &app.settings.regions))
+    else {
+        return;
+    };
+    submit(request);
 }
 
 /// いまの設定での、`index` 番目のレシピの実行。キャプチャで始まる、問題のないレシピでなければ None。
 fn capture_recipe_launch(index: usize) -> Option<Launch> {
     with_app(|app| {
-        recipe::plan(&app.settings.recipes, ops::OPERATIONS)
-            .plans
-            .iter()
-            .find(|plan| plan.index == index)
-            .and_then(Launch::of)
+        recipe::plan(
+            &app.settings.recipes,
+            ops::OPERATIONS,
+            &app.settings.regions,
+        )
+        .plans
+        .iter()
+        .find(|plan| plan.index == index)
+        .and_then(Launch::of)
     })
     .flatten()
 }
@@ -4214,8 +4224,13 @@ fn capture_region(request: CaptureRequest) {
     let screen = located.screen;
     if region.blank_scrap {
         // 白紙スクラップにする定型領域は撮らず、その範囲の白紙スクラップを浮かべる。何も保存しない
-        // （保存先・ファイル名テンプレート・保存する・スクラップにするは見ない）
-        match float_blank_scrap(screen) {
+        // （保存先・ファイル名テンプレート・保存する・スクラップにするは見ない）。レシピなら残りの操作を進める
+        let floated = match request.recipe.and_then(capture_recipe_launch) {
+            Some(launch) => blank_model(screen)
+                .and_then(|(model, image)| float_recipe_scrap(launch, model, image, true)),
+            None => float_blank_scrap(screen).map(|_| ()),
+        };
+        match floated {
             Ok(_) => {
                 if let Some(to) = request.reply {
                     reply(to, Response::Captured { path: None });

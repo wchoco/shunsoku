@@ -593,6 +593,11 @@ fn on_command(hwnd: HWND, id: i32, code: u32, control: HWND) {
             EN_KILLFOCUS => refresh(hwnd),
             _ => {}
         },
+        _ if id == recipes::region_id() && code == CBN_SELCHANGE => {
+            if !recipes::is_syncing() {
+                set_capture_region(hwnd, recipes::chosen_region(hwnd));
+            }
+        }
         _ if let Some(item) = recipes::appearance_item(id) => match code {
             CBN_SELCHANGE | EN_CHANGE if !recipes::is_syncing() => {
                 set_appearance(hwnd, item, recipes::appearance_input(hwnd, item));
@@ -1017,6 +1022,16 @@ fn on_recipe_button(hwnd: HWND, button: recipes::Button) {
             set_background(hwnd, color);
         }
     }
+}
+
+/// 「レシピ」タブで選んでいる定型領域キャプチャで撮る定型領域を、名前 `name` の定型領域にする。
+fn set_capture_region(hwnd: HWND, name: Option<String>) {
+    let (Some(i), Some(s), Some(name)) =
+        (recipes::selected(hwnd), recipes::selected_step(hwnd), name)
+    else {
+        return;
+    };
+    edit(hwnd, |editor| editor.set_capture_region(i, s, &name));
 }
 
 /// 「レシピ」タブで選んでいる背景色を指定する操作の色を `color` にする。

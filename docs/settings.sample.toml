@@ -256,12 +256,18 @@ crosshair_color = "#FFFFFF"
 #             最初にだけ、キャプチャ系の操作を 1 つ置けます: select_capture（範囲選択キャプチャ）、
 #             active_window_capture（ウィンドウキャプチャ。いまアクティブなウィンドウを撮る）、
 #             blank_scrap（白紙スクラップを作る。範囲選択の画面で位置と大きさを選び、背景色は
-#             [annotation] background）。キャプチャで始まるレシピは、できたスクラップに続きの操作を実行します。
+#             [annotation] background）、capture_region（定型領域キャプチャ。後述）。キャプチャで始まる
+#             レシピは、できたスクラップに続きの操作を実行します。
 #             キャプチャのすぐ後ろに続く見た目（appearance）と背景色（background）は、スクラップを出す前に
 #             当てます。範囲選択を Esc で取り消すと、何もしません。
 #             レシピの途中では、透明な白紙スクラップでも書き込みの編集モードに入りません。レシピを最後まで
 #             実行したか途中で止まったときに、何も書かれていない透明な白紙スクラップが残っていれば、そこで
-#             編集モードに入ります
+#             編集モードに入ります。
+#             定型領域キャプチャは { op = "capture_region", region = "<名前>" } と書き、[[regions]] の
+#             name の定型領域を撮ります。保存はその定型領域の save に従い、scrap は見ずに必ずスクラップを
+#             出します（フォーカスは移しません）。blank_scrap の定型領域なら、白紙スクラップを作って続きの
+#             操作を実行します。名前の定型領域がないレシピは問題のあるレシピになります。撮る時点で
+#             定型領域が撮れなければ、定型領域のホットキーと同じ通知を出して止まります
 #   shortcut  実行するショートカット。書き方は [shortcuts] と同じ。省略か "" で未設定
 #             （操作のショートカット（既定のものを含む）やほかのレシピと同じキーにすると、どれにも付かず、
 #             通知で知らせます）。キャプチャで始まるレシピには書けません（hotkey に書きます）
@@ -293,3 +299,9 @@ crosshair_color = "#FFFFFF"
 # name = "赤枠のメモ"
 # steps = ["blank_scrap", { op = "background", color = "transparent" }, { op = "appearance", border_color = "#FF0000" }, "annotate"]
 # hotkey = "Ctrl+Shift+F2"
+#
+# 例（上の定型領域「ダッシュボード」を撮って、枠を赤の 3px にしたスクラップを出し、コピーする）:
+# [[recipes]]
+# name = "ダッシュボードを撮ってコピー"
+# steps = [{ op = "capture_region", region = "ダッシュボード" }, { op = "appearance", border_color = "#FF0000", border_width = 3 }, "copy"]
+# hotkey = "Ctrl+Shift+F3"

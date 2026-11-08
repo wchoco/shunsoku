@@ -161,19 +161,44 @@ impl CaptureRequest {
         }
     }
 
-    /// キャプチャで始まるレシピ（`Settings::recipes` の `index`）のホットキー: レシピのキャプチャ `capture` で撮り、
-    /// スクラップを出してフォーカスを移す（範囲選択キャプチャのホットキーと同じ）。出したスクラップに続きの操作を
-    /// 実行する。
-    pub fn recipe(index: usize, capture: crate::recipe::Capture) -> CaptureRequest {
-        let method = match capture {
-            crate::recipe::Capture::Select => CaptureMethod::Select,
-            crate::recipe::Capture::ActiveWindow => CaptureMethod::ActiveWindow,
-            crate::recipe::Capture::Blank => CaptureMethod::BlankScrap,
+    /// キャプチャで始まるレシピ（`Settings::recipes` の `index`）のホットキー: レシピのキャプチャ（`launch`）で撮り、
+    /// スクラップを出す。出したスクラップに続きの操作を実行する。
+    ///
+    /// - 範囲選択キャプチャ・ウィンドウキャプチャ・白紙スクラップを作る: それぞれのホットキーと同じく、フォーカスを
+    ///   移す。
+    /// - 定型領域キャプチャ: `regions` の中の、選んだ定型領域のホットキーと同じく撮る（保存は定型領域の「保存する」の
+    ///   とおり。フォーカスは元のアプリに残す）。ただし「スクラップにする」は見ず、いつもスクラップを出す。定型領域が
+    ///   もうなくても名前のまま依頼にする（撮るときに、消えた定型領域として知らせる）。
+    pub fn recipe(
+        index: usize,
+        launch: &crate::recipe::Launch,
+        regions: &[Region],
+    ) -> CaptureRequest {
+        use crate::recipe::Capture;
+        let request = match launch.capture() {
+            Capture::Select => CaptureRequest::scrap(CaptureMethod::Select),
+            Capture::ActiveWindow => CaptureRequest::scrap(CaptureMethod::ActiveWindow),
+            Capture::Blank => CaptureRequest::scrap(CaptureMethod::BlankScrap),
+            Capture::Region => {
+                let name = launch.region().unwrap_or_default();
+                match regions.iter().find(|r| r.name == name) {
+                    Some(region) => CaptureRequest::region(region),
+                    None => CaptureRequest::scrap(CaptureMethod::Region(RegionId(name.to_owned()))),
+                }
+                .with_scrap()
+            }
         };
         CaptureRequest {
             recipe: Some(index),
-            ..CaptureRequest::scrap(method)
+            ..request
         }
+    }
+
+    /// いつもスクラップを出す（フォーカスは変えない）。
+    fn with_scrap(mut self) -> CaptureRequest {
+        self.outputs.scrap = true;
+        self.outputs.focus_scrap = false;
+        self
     }
 
     /// 範囲選択の画面でハイライトから選んだウィンドウを撮る依頼。出力・通知・保存の失敗の扱いは
@@ -355,10 +380,22 @@ mod tests {
         }
     }
 
+    /// 定型領域 `regions` と、`steps = [...]` のキャプチャで始まるレシピ 1 つの `Launch`。
+    fn launch_of(steps: &str, regions: &[Region]) -> crate::recipe::Launch {
+        let (settings, issues) = crate::settings::load(&format!(
+            "version = 1\n[[recipes]]\nname = \"r\"\nsteps = {steps}\nhotkey = \"Ctrl+Alt+C\"\n"
+        ));
+        assert_eq!(issues, vec![], "{steps}");
+        let checked =
+            crate::recipe::plan(&settings.recipes, crate::scrap::ops::OPERATIONS, regions);
+        assert_eq!(checked.problems, vec![], "{steps}");
+        crate::recipe::Launch::of(&checked.plans[0]).expect("starts with a capture")
+    }
+
     #[test]
     fn a_capture_recipe_hotkey_selects_like_the_select_capture_hotkey_and_names_the_recipe() {
         assert_eq!(
-            CaptureRequest::recipe(2, crate::recipe::Capture::Select),
+            CaptureRequest::recipe(2, &launch_of(r#"["select_capture"]"#, &[]), &[]),
             CaptureRequest {
                 recipe: Some(2),
                 ..select_capture()
@@ -368,22 +405,56 @@ mod tests {
 
     #[test]
     fn window_and_blank_scrap_recipe_hotkeys_take_like_their_own_hotkeys_and_name_the_recipe() {
-        for (capture, source) in [
-            (
-                crate::recipe::Capture::ActiveWindow,
-                Source::ActiveWindowHotkey,
-            ),
-            (crate::recipe::Capture::Blank, Source::BlankScrap),
+        for (steps, source) in [
+            (r#"["active_window_capture"]"#, Source::ActiveWindowHotkey),
+            (r#"["blank_scrap"]"#, Source::BlankScrap),
         ] {
             assert_eq!(
-                CaptureRequest::recipe(1, capture),
+                CaptureRequest::recipe(1, &launch_of(steps, &[]), &[]),
                 CaptureRequest {
                     recipe: Some(1),
                     ..CaptureRequest::from_source(source)
                 },
-                "{capture:?}"
+                "{steps}"
             );
         }
+    }
+
+    #[test]
+    fn a_fixed_region_recipe_captures_the_region_saving_as_it_says_and_always_shows_a_scrap() {
+        let regions = [region(true, false)];
+        let launch = launch_of(r#"[{ op = "capture_region", region = "dash" }]"#, &regions);
+        assert_eq!(
+            CaptureRequest::recipe(3, &launch, &regions),
+            CaptureRequest {
+                outputs: Outputs {
+                    save: Some(region_save_target()),
+                    scrap: true,
+                    copy: false,
+                    focus_scrap: false,
+                },
+                recipe: Some(3),
+                ..CaptureRequest::region(&regions[0])
+            }
+        );
+        // 保存しない定型領域は保存しない
+        let regions = [region(false, true)];
+        assert_eq!(
+            CaptureRequest::recipe(3, &launch, &regions).outputs.save,
+            None
+        );
+    }
+
+    #[test]
+    fn a_fixed_region_recipe_of_a_region_gone_since_still_names_it_to_be_reported() {
+        let regions = [region(true, false)];
+        let launch = launch_of(r#"[{ op = "capture_region", region = "dash" }]"#, &regions);
+        let request = CaptureRequest::recipe(3, &launch, &[]);
+        assert_eq!(
+            request.method,
+            CaptureMethod::Region(RegionId("dash".to_owned()))
+        );
+        assert_eq!(request.region_to_capture(&[]), None);
     }
 
     #[test]

@@ -21,7 +21,9 @@ use super::{
     optional_gesture, read_regions_at, recipe_steps, region_number, rgb, save_dir, selection_mode,
 };
 use crate::i18n::Language;
-use crate::recipe::{APPEARANCE, AppearanceItem, BACKGROUND, ItemValue, Recipe, Step, StepKey};
+use crate::recipe::{
+    APPEARANCE, AppearanceItem, BACKGROUND, Capture, ItemValue, Recipe, Step, StepKey,
+};
 use crate::selection::Mode;
 
 /// `settings` を `doc` に書く。変わった項目だけを書き換える。
@@ -495,7 +497,7 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
 
 /// レシピの操作 1 つ。パラメータのない操作は操作の id の文字列、パラメータを添えた操作は `op` と書いた項目のキーを持つインライン表
 /// （`op` のあと、項目は `AppearanceItem::ALL` の順）。読めなかった項目は、その後ろに書いたまま書く（`op` を
-/// 読めなかったなら、その `op` で書く）。背景色を指定する操作は `op` と `color`。
+/// 読めなかったなら、その `op` で書く）。背景色を指定する操作は `op` と `color`、定型領域キャプチャは `op` と `region`。
 fn step_value(step: &Step) -> Value {
     let step = match step {
         Step::Op(id) => return id.as_str().into(),
@@ -505,6 +507,15 @@ fn step_value(step: &Step) -> Value {
             table.insert(StepKey::Op.as_str(), BACKGROUND.into());
             if let Some(color) = step.color {
                 table.insert(StepKey::Color.as_str(), color.to_string().into());
+            }
+            insert_rejected(&mut table, &step.rejected);
+            return Value::InlineTable(table);
+        }
+        Step::CaptureRegion(step) => {
+            let mut table = toml_edit::InlineTable::new();
+            table.insert(StepKey::Op.as_str(), Capture::Region.id().into());
+            if let Some(region) = &step.region {
+                table.insert(StepKey::Region.as_str(), region.as_str().into());
             }
             insert_rejected(&mut table, &step.rejected);
             return Value::InlineTable(table);
