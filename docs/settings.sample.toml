@@ -256,7 +256,12 @@ crosshair_color = "#FFFFFF"
 #             最初にだけ、キャプチャ系の操作 select_capture（範囲選択キャプチャ）を 1 つ置けます。キャプチャで
 #             始まるレシピは、撮ってできたスクラップに続きの操作を実行します。キャプチャのすぐ後ろに続く
 #             見た目（appearance）と背景色（background）は、スクラップを出す前に当てます。
-#             範囲選択を Esc で取り消すと、何もしません
+#             範囲選択を Esc で取り消すと、何もしません。
+#             定型領域キャプチャは { op = "capture_region", region = "<名前>" } と書き、[[regions]] の
+#             name の定型領域を撮ります。保存はその定型領域の save に従い、scrap は見ずに必ずスクラップを
+#             出します（フォーカスは移しません）。blank_scrap の定型領域なら、白紙スクラップを作って続きの
+#             操作を実行します。名前の定型領域がないレシピは問題のあるレシピになります。撮る時点で
+#             定型領域が撮れなければ、定型領域のホットキーと同じ通知を出して止まります
 #   shortcut  実行するショートカット。書き方は [shortcuts] と同じ。省略か "" で未設定
 #             （操作のショートカット（既定のものを含む）やほかのレシピと同じキーにすると、どれにも付かず、
 #             通知で知らせます）。キャプチャで始まるレシピには書けません（hotkey に書きます）
@@ -282,3 +287,9 @@ crosshair_color = "#FFFFFF"
 # name = "撮って赤枠でコピー"
 # steps = ["select_capture", { op = "appearance", border_color = "#FF0000", border_width = 3 }, "copy"]
 # hotkey = "Ctrl+Shift+F1"
+#
+# 例（定型領域「左上」を撮って、枠を赤の 3px にしたスクラップを出し、コピーする）:
+# [[recipes]]
+# name = "左上を撮ってコピー"
+# steps = [{ op = "capture_region", region = "左上" }, { op = "appearance", border_color = "#FF0000", border_width = 3 }, "copy"]
+# hotkey = "Ctrl+Shift+F2"

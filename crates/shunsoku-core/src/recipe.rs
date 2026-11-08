@@ -3,7 +3,7 @@
 use crate::keys::Chord;
 use crate::scrap::ops::{Effect, InRecipe, OpContext, OperationDescriptor, OperationId};
 use crate::scrap::{Background, ScrapModel};
-use crate::settings::{BORDER_WIDTH_RANGE, OPACITY_RANGE, Rgb};
+use crate::settings::{BORDER_WIDTH_RANGE, OPACITY_RANGE, Region, Rgb};
 
 /// 設定ファイルの `[[recipes]]` の 1 つ。中身の検査はまだしていない（書いたまま）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -23,16 +23,19 @@ pub struct Recipe {
 pub enum Capture {
     /// 範囲選択キャプチャ。範囲選択の画面で選んだ範囲か、クリックしたウィンドウを撮る。
     Select,
+    /// 定型領域キャプチャ。パラメータで選んだ定型領域（`[[regions]]`）を撮る（`Step::CaptureRegion`）。
+    Region,
 }
 
 impl Capture {
     /// キャプチャ系の操作のすべて（「追加」の一覧の順）。
-    pub const ALL: [Capture; 1] = [Capture::Select];
+    pub const ALL: [Capture; 2] = [Capture::Select, Capture::Region];
 
     /// レシピの `steps` に書く id。
     pub fn id(self) -> &'static str {
         match self {
             Capture::Select => "select_capture",
+            Capture::Region => "capture_region",
         }
     }
 
@@ -45,6 +48,7 @@ impl Capture {
     pub fn label_key(self) -> &'static str {
         match self {
             Capture::Select => "recipe.capture.select_capture",
+            Capture::Region => "recipe.capture.capture_region",
         }
     }
 }
@@ -69,6 +73,9 @@ pub enum Step {
     Appearance(AppearanceStep),
     /// パラメータを添えた操作。背景色を指定する操作（`BACKGROUND`）と、その色（設定ファイルではインライン表）。
     Background(BackgroundStep),
+    /// パラメータを添えた操作。定型領域キャプチャ（`Capture::Region`）と、撮る定型領域の名前（設定ファイルでは
+    /// インライン表）。
+    CaptureRegion(CaptureRegionStep),
 }
 
 impl Step {
@@ -78,13 +85,14 @@ impl Step {
             Step::Op(id) => id,
             Step::Appearance(_) => APPEARANCE,
             Step::Background(_) => BACKGROUND,
+            Step::CaptureRegion(_) => Capture::Region.id(),
         }
     }
 
     /// 見た目を指定する操作に添えたパラメータ。ほかの操作は None。
     pub fn values(&self) -> Option<&AppearanceStep> {
         match self {
-            Step::Op(_) | Step::Background(_) => None,
+            Step::Op(_) | Step::Background(_) | Step::CaptureRegion(_) => None,
             Step::Appearance(values) => Some(values),
         }
     }
@@ -126,6 +134,16 @@ impl BackgroundStep {
         self.color = Some(s.parse().map_err(|_| Rejection::BadValue)?);
         Ok(())
     }
+}
+
+/// 定型領域キャプチャ（`{ op = "capture_region", region = "<名前>" }`）。書いたまま（定型領域があるかの検査は
+/// `plan` がする）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CaptureRegionStep {
+    /// 撮る定型領域の名前（`Region::name`）。書いていないか読めなければ None。
+    pub region: Option<String>,
+    /// 読めなかった項目（書いた順）。どれか 1 つでもあれば、その操作はレシピの問題になる。
+    pub rejected: Vec<Rejected>,
 }
 
 /// 検査を通った操作に添えたパラメータ。実行するときに `OpContext::values` で操作へ渡す。
@@ -317,6 +335,8 @@ pub enum StepKey {
     Item(AppearanceItem),
     /// 背景色を指定する操作の色（`color`）。
     Color,
+    /// 定型領域キャプチャの定型領域の名前（`region`）。
+    Region,
     /// 知らないキー。
     Unknown(String),
 }
@@ -328,6 +348,7 @@ impl StepKey {
             StepKey::Op => "op",
             StepKey::Item(item) => item.key(),
             StepKey::Color => "color",
+            StepKey::Region => "region",
             StepKey::Unknown(key) => key,
         }
     }
@@ -371,6 +392,8 @@ pub struct Plan {
     pub name: String,
     /// 最初に置いたキャプチャ系の操作。キャプチャで始まらないレシピは None。
     pub capture: Option<Capture>,
+    /// 定型領域キャプチャで撮る定型領域の名前（`Region::name`）。ほかのレシピは None。
+    pub region: Option<String>,
     /// スクラップ操作の並び（キャプチャ系の操作を除く）。
     pub steps: Vec<PlannedStep>,
     pub shortcut: Option<Chord>,
@@ -411,6 +434,8 @@ pub enum Problem {
     NoValues,
     /// パラメータを添えた操作に、`border = false` と枠の色か太さを一緒に書いた。
     BorderOffWithColorOrWidth,
+    /// 定型領域キャプチャの定型領域が `[[regions]]` にない。書いた名前。
+    NoSuchRegion(String),
 }
 
 /// レシピの欄（問題が載る場所）。
@@ -456,8 +481,12 @@ pub fn is_last_only(id: &str, ops: &[OperationDescriptor]) -> bool {
 }
 
 /// レシピを検査し、`ops`（ふつうは `scrap::ops::OPERATIONS`）の行に結び付ける。同じ操作を 2 回以上入れるのは
-/// 認める。
-pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked {
+/// 認める。定型領域キャプチャの定型領域は `regions`（`Settings::regions`）から探す。
+pub fn plan(
+    recipes: &[Recipe],
+    ops: &'static [OperationDescriptor],
+    regions: &[Region],
+) -> Checked {
     let mut checked = Checked::default();
     for (index, recipe) in recipes.iter().enumerate() {
         let mut problems = Vec::new();
@@ -475,12 +504,16 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
         }
         let mut steps = Vec::with_capacity(recipe.steps.len());
         let mut capture = None;
+        let mut region = None;
         for (position, step) in recipe.steps.iter().enumerate() {
-            if let Step::Op(id) = step
-                && let Some(c) = Capture::from_id(id)
+            if let Some(c) = Capture::from_id(step.op_id())
+                && matches!(step, Step::Op(_) | Step::CaptureRegion(_))
             {
                 if position == 0 {
                     capture = Some(c);
+                    if c == Capture::Region {
+                        region = check_capture_region(step, regions, &mut problems);
+                    }
                 } else if !problems.contains(&Problem::FirstOnlyNotFirst) {
                     problems.push(Problem::FirstOnlyNotFirst);
                 }
@@ -496,6 +529,8 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
                     step,
                     &mut problems,
                 ))),
+                // キャプチャ系の操作は上で除いている
+                Step::CaptureRegion(_) => None,
             };
             // パラメータを添えた操作は値を取る操作（`takes_values`）を、パラメータのない操作はレシピに入れられる操作を呼ぶ
             let fits = |op: &OperationDescriptor| match values {
@@ -532,6 +567,7 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
                 index,
                 name: recipe.name.clone(),
                 capture,
+                region,
                 steps,
                 shortcut: recipe.shortcut,
                 hotkey: recipe.hotkey,
@@ -555,6 +591,29 @@ fn check_rejected(rejected: &[Rejected], problems: &mut Vec<Problem>) {
             Rejection::NotAppearance => Problem::NotAppearance,
         });
     }
+}
+
+/// 定型領域キャプチャ（`step`）を検査し、問題を `problems` に足す。撮る定型領域の名前を返す（問題があっても、
+/// 読めていれば）。パラメータのない書き方（`"capture_region"`）は、定型領域を選んでいないのと同じ。
+fn check_capture_region(
+    step: &Step,
+    regions: &[Region],
+    problems: &mut Vec<Problem>,
+) -> Option<String> {
+    let Step::CaptureRegion(step) = step else {
+        problems.push(Problem::NoValues);
+        return None;
+    };
+    check_rejected(&step.rejected, problems);
+    match &step.region {
+        Some(name) if !regions.iter().any(|r| &r.name == name) => {
+            problems.push(Problem::NoSuchRegion(name.clone()));
+        }
+        Some(_) => {}
+        None if step.rejected.iter().any(|r| r.key == StepKey::Region) => {}
+        None => problems.push(Problem::NoValues),
+    }
+    step.region.clone()
 }
 
 /// 背景色を指定する操作を検査し、問題を `problems` に足す。読めた色を返す（読めなければ既定の白。問題がある
@@ -736,6 +795,8 @@ impl Run {
 #[derive(Debug, Clone)]
 pub struct Launch {
     capture: Capture,
+    /// 定型領域キャプチャで撮る定型領域の名前。
+    region: Option<String>,
     /// キャプチャの直後に続く、見た目（`APPEARANCE`）と背景色（`BACKGROUND`）の操作。
     before_show: Vec<PlannedStep>,
     /// 残りの操作（出す前に当てる操作のあと、最初のほかの操作から先）。
@@ -765,6 +826,7 @@ impl Launch {
         let (before_show, rest) = plan.steps.split_at(split);
         Some(Launch {
             capture,
+            region: plan.region.clone(),
             before_show: before_show.to_vec(),
             rest: rest.to_vec(),
         })
@@ -773,6 +835,11 @@ impl Launch {
     /// 最初に行うキャプチャ。
     pub fn capture(&self) -> Capture {
         self.capture
+    }
+
+    /// 定型領域キャプチャで撮る定型領域の名前（`Region::name`）。ほかのキャプチャは None。
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
     }
 
     /// キャプチャでできた、まだ出していない `model` に、出す前に当てる操作を並べた順に当てる。今は実行できない操作
@@ -896,6 +963,7 @@ mod tests {
                 recipe("二度", &["copy", "zoom_in", "copy"]),
             ],
             OPERATIONS,
+            &[],
         );
         assert_eq!(checked.problems, vec![]);
         assert_eq!(checked.plans.len(), 2);
@@ -916,6 +984,7 @@ mod tests {
                     recipe("r", &["copy", step]),
                 ],
                 OPERATIONS,
+                &[],
             );
             assert_eq!(
                 checked.problems,
@@ -938,6 +1007,7 @@ mod tests {
                 recipe("名前を付けて保存して閉じる", &["save_as", "close"]),
             ],
             OPERATIONS,
+            &[],
         );
         assert_eq!(checked.problems, vec![]);
         assert_eq!(ids(&checked.plans[0]), ["save_default", "close"]);
@@ -953,6 +1023,7 @@ mod tests {
                 recipe("c", &["close"]),
             ],
             OPERATIONS,
+            &[],
         );
         assert_eq!(
             checked.problems,
@@ -975,6 +1046,7 @@ mod tests {
                 recipe("e", &["copy", "annotate"]),
             ],
             OPERATIONS,
+            &[],
         );
         assert_eq!(
             checked.problems,
@@ -1008,6 +1080,7 @@ mod tests {
                 capture_recipe("b", &["select_capture", "select_capture"], "Ctrl+Alt+E"),
             ],
             OPERATIONS,
+            &[],
         );
         assert_eq!(
             checked.problems,
@@ -1035,7 +1108,11 @@ mod tests {
         };
         let no_hotkey = recipe("b", &["select_capture", "copy"]);
         let hotkey_on_scrap_recipe = capture_recipe("c", &["copy"], "Ctrl+Alt+D");
-        let checked = plan(&[with_both, no_hotkey, hotkey_on_scrap_recipe], OPERATIONS);
+        let checked = plan(
+            &[with_both, no_hotkey, hotkey_on_scrap_recipe],
+            OPERATIONS,
+            &[],
+        );
         assert_eq!(
             checked.problems,
             vec![
@@ -1060,6 +1137,7 @@ mod tests {
                 recipe("", &[]),
             ],
             OPERATIONS,
+            &[],
         );
         assert_eq!(
             checked.problems,
@@ -1230,7 +1308,7 @@ mod tests {
     }
 
     fn run_of(steps: &[&str]) -> Run {
-        let checked = plan(&[recipe("r", steps)], OPERATIONS);
+        let checked = plan(&[recipe("r", steps)], OPERATIONS, &[]);
         assert_eq!(checked.problems, vec![]);
         Run::new(checked.plans[0].steps.clone())
     }
@@ -1571,6 +1649,7 @@ mod tests {
                 recipe("コピーして戻す", &["copy", "reset_appearance"]),
             ],
             OPERATIONS,
+            &[],
         );
         assert_eq!(checked.problems, vec![]);
         assert_eq!(checked.plans.len(), 2);
@@ -1601,7 +1680,7 @@ mod tests {
             "version = 1\n[[recipes]]\nname = \"r\"\nsteps = {steps}\n"
         ));
         assert_eq!(issues, vec![], "{steps}");
-        plan(&settings.recipes, OPERATIONS)
+        plan(&settings.recipes, OPERATIONS, &[])
     }
 
     #[test]
@@ -1758,7 +1837,7 @@ mod tests {
             "version = 1\n[[recipes]]\nname = \"r\"\nsteps = {steps}\nhotkey = \"Ctrl+Alt+C\"\n"
         ));
         assert_eq!(issues, vec![], "{steps}");
-        let checked = plan(&settings.recipes, OPERATIONS);
+        let checked = plan(&settings.recipes, OPERATIONS, &[]);
         assert_eq!(checked.problems, vec![], "{steps}");
         Launch::of(&checked.plans[0]).expect("starts with a capture")
     }
@@ -2018,6 +2097,86 @@ shortcut = "Ctrl+Nope"
                 shortcut: None,
                 hotkey: None,
             }]
+        );
+    }
+
+    /// 定型領域「左上」と、`steps = [...]` のキャプチャで始まるレシピ 1 つを読む。
+    fn with_a_region(steps: &str) -> Settings {
+        let (settings, issues) = settings::load(&format!(
+            "version = 1\n[[regions]]\nname = \"左上\"\nmonitor = \"m\"\nx = 0\ny = 0\nwidth = 10\nheight = 10\n\
+             [[recipes]]\nname = \"r\"\nsteps = {steps}\nhotkey = \"Ctrl+Alt+C\"\n"
+        ));
+        assert_eq!(issues, vec![], "{steps}");
+        settings
+    }
+
+    fn checked_with_a_region(steps: &str) -> Checked {
+        let settings = with_a_region(steps);
+        plan(&settings.recipes, OPERATIONS, &settings.regions)
+    }
+
+    #[test]
+    fn a_fixed_region_capture_names_the_region_it_captures() {
+        let checked =
+            checked_with_a_region(r#"[{ op = "capture_region", region = "左上" }, "copy"]"#);
+        assert_eq!(checked.problems, vec![]);
+        let launch = Launch::of(&checked.plans[0]).expect("starts with a capture");
+        assert_eq!(launch.capture(), Capture::Region);
+        assert_eq!(launch.region(), Some("左上"));
+        assert_eq!(ids(&checked.plans[0]), ["copy"]);
+        // ほかのキャプチャは定型領域を選ばない
+        let select = checked_with_a_region(r#"["select_capture"]"#);
+        assert_eq!(Launch::of(&select.plans[0]).unwrap().region(), None);
+    }
+
+    #[test]
+    fn a_fixed_region_capture_of_a_missing_or_unnamed_region_makes_the_recipe_an_error() {
+        for (steps, problem) in [
+            (
+                r#"[{ op = "capture_region", region = "右下" }]"#,
+                Problem::NoSuchRegion("右下".into()),
+            ),
+            (r#"[{ op = "capture_region" }]"#, Problem::NoValues),
+            (r#"["capture_region"]"#, Problem::NoValues),
+            (
+                r#"[{ op = "capture_region", region = 1 }]"#,
+                Problem::BadValue("region".into()),
+            ),
+            (
+                r##"[{ op = "capture_region", region = "左上", color = "#000000" }]"##,
+                Problem::UnknownKey("color".into()),
+            ),
+            (
+                r#"[{ op = "capture_region", region = "左上" }, { op = "capture_region", region = "左上" }]"#,
+                Problem::FirstOnlyNotFirst,
+            ),
+        ] {
+            let checked = checked_with_a_region(steps);
+            assert_eq!(checked.problems, vec![(0, problem)], "{steps}");
+            assert!(checked.plans.is_empty(), "{steps}");
+        }
+    }
+
+    #[test]
+    fn a_fixed_region_capture_of_a_missing_region_blocks_apply() {
+        let settings = with_a_region(r#"[{ op = "capture_region", region = "右下" }]"#);
+        assert!(settings::validate(&settings).contains(&issue(
+            SettingsItem::RecipeSteps(0),
+            settings::Problem::NoSuchRegion
+        )));
+    }
+
+    #[test]
+    fn a_fixed_region_capture_is_written_back_as_it_was_read() {
+        let settings = with_a_region(
+            r#"[{ op = "capture_region", region = "左上" }, { op = "capture_region", region = "左上", size = 1 }]"#,
+        );
+        let written = settings::rewrite("version = 1\n", &settings).unwrap();
+        let (again, _) = settings::load(&written);
+        assert_eq!(again.recipes, settings.recipes, "{written}");
+        assert!(
+            written.contains(r#"{ op = "capture_region", region = "左上" }"#),
+            "{written}"
         );
     }
 }

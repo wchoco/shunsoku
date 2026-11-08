@@ -3416,24 +3416,34 @@ fn request_capture(source: Source) {
 }
 
 /// キャプチャで始まるレシピ（`index` は `Settings::recipes` の添字）を始める（ADR-0010）。キャプチャを依頼し、
-/// 撮れたら `output` がスクラップを出してから残りの操作を進める。
+/// 撮れたら `output` がスクラップを出してから残りの操作を進める。定型領域キャプチャは `capture_region` が撮り、
+/// 白紙スクラップにする定型領域なら、そこで白紙スクラップを出して残りの操作を進める。
 fn request_capture_recipe(index: usize) {
     let Some(launch) = capture_recipe_launch(index) else {
         log::warn!("recipe {index} does not start with a capture");
         return;
     };
     log::info!("capture recipe {index} requested from hotkey");
-    submit(CaptureRequest::recipe(index, launch.capture()));
+    let Some(request) =
+        with_app(|app| CaptureRequest::recipe(index, &launch, &app.settings.regions))
+    else {
+        return;
+    };
+    submit(request);
 }
 
 /// いまの設定での、`index` 番目のレシピの実行。キャプチャで始まる、問題のないレシピでなければ None。
 fn capture_recipe_launch(index: usize) -> Option<Launch> {
     with_app(|app| {
-        recipe::plan(&app.settings.recipes, ops::OPERATIONS)
-            .plans
-            .iter()
-            .find(|plan| plan.index == index)
-            .and_then(Launch::of)
+        recipe::plan(
+            &app.settings.recipes,
+            ops::OPERATIONS,
+            &app.settings.regions,
+        )
+        .plans
+        .iter()
+        .find(|plan| plan.index == index)
+        .and_then(Launch::of)
     })
     .flatten()
 }
@@ -4190,8 +4200,12 @@ fn capture_region(request: CaptureRequest) {
     let screen = located.screen;
     if region.blank_scrap {
         // 白紙スクラップにする定型領域は撮らず、その範囲の白紙スクラップを浮かべる。何も保存しない
-        // （保存先・ファイル名テンプレート・保存する・スクラップにするは見ない）
-        match float_blank_scrap(screen) {
+        // （保存先・ファイル名テンプレート・保存する・スクラップにするは見ない）。レシピなら残りの操作を進める
+        let floated = match request.recipe.and_then(capture_recipe_launch) {
+            Some(launch) => float_blank_recipe_scrap(launch, screen),
+            None => float_blank_scrap(screen).map(|_| ()),
+        };
+        match floated {
             Ok(_) => {
                 if let Some(to) = request.reply {
                     reply(to, Response::Captured { path: None });
@@ -4342,7 +4356,36 @@ fn float_recipe_scrap(
     image: Image,
     focus: bool,
 ) -> std::result::Result<(), String> {
-    let mut model = ScrapModel::new(at, image.size());
+    let model = ScrapModel::new(at, image.size());
+    float_recipe_model(launch, model, Some(image), focus)
+}
+
+/// 定型領域キャプチャで始まるレシピ `launch` の、白紙スクラップにする定型領域（`rect` はスクリーン座標）: 設定の
+/// 既定の背景色の白紙スクラップに、出す前に当てる操作を当ててから浮かべてフォーカスを移し、残りの操作を進める。
+/// 透明でもすぐには書き込みの編集モードに入らない（レシピの途中なので）。出せなければ理由を返す。
+fn float_blank_recipe_scrap(launch: Launch, rect: Rect) -> std::result::Result<(), String> {
+    let Some(background) = with_app(|app| app.settings.annotation.background) else {
+        return Err(text("job.panicked").to_owned());
+    };
+    let model = ScrapModel::blank(rect.origin(), rect.size(), background);
+    log::info!(
+        "blank scrap {}x{} at ({}, {}) for a recipe",
+        rect.width(),
+        rect.height(),
+        rect.left,
+        rect.top
+    );
+    float_recipe_model(launch, model, None, true)
+}
+
+/// まだ出していない `model`（元の画像は `image`。白紙スクラップなら None で、出す前に当てる操作のあとの背景色で
+/// 作る）に、レシピ `launch` の出す前に当てる操作を当ててから浮かべ、残りの操作を進める。出せなければ理由を返す。
+fn float_recipe_model(
+    launch: Launch,
+    mut model: ScrapModel,
+    image: Option<Image>,
+    focus: bool,
+) -> std::result::Result<(), String> {
     let context = with_app(|app| OpContext {
         appearance: Appearance::from(app.settings.scrap),
         annotation: Style::from(&app.settings.annotation),
@@ -4352,6 +4395,10 @@ fn float_recipe_scrap(
     })
     .unwrap_or_default();
     let Shown { run, effects } = launch.captured(&mut model, &context);
+    let Some(image) = image.or_else(|| model.blank_image()) else {
+        log::error!("could not paint the blank scrap of {:?}", model.image_size);
+        return Err(text("job.panicked").to_owned());
+    };
     let hwnd = float_model(model, image, focus)?;
     if with_app(|app| app.recipe.discard()).flatten().is_some() {
         log::info!("the recipe waiting for a save was discarded");

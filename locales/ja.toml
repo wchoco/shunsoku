@@ -198,6 +198,8 @@ border_width = "{width}px"
 shadow_on = "影"
 shadow_off = "影なし"
 background = "背景色: {color}"
+# 定型領域キャプチャ（{capture} は操作の名前、{region} は定型領域の名前）
+capture_region = "{capture}: {region}"
 
 # 見た目を指定する操作のパラメータの欄（操作の一覧で選んでいる間、一覧の下に出す）
 [settings_gui.recipes.appearance]
@@ -214,6 +216,10 @@ off = "なし"
 # 背景色を指定する操作のパラメータの欄（「選ぶ…」と「透明」のチェックの前の見出し）
 [settings_gui.recipes.background]
 color = "色:"
+
+# 定型領域キャプチャのパラメータの欄（撮る定型領域を選ぶドロップダウンの前の見出し）
+[settings_gui.recipes.region]
+name = "定型領域:"
 
 # 欄の横の印
 [settings_gui.mark]
@@ -233,13 +239,15 @@ hotkey_without_capture = "キャプチャで始まらないレシピはショー
 out_of_range = "見た目のパラメータが範囲外です（透明度は 10〜100、枠の太さは 1〜16）"
 bad_value = "パラメータの書き方が違います（色は #RRGGBB、枠と影は true か false）"
 unknown_key = "パラメータに知らないキーがあります"
-not_appearance = "表で書ける操作は op = \"appearance\" と op = \"background\" だけです"
+not_appearance = "表で書ける操作は op = \"appearance\"、op = \"background\"、op = \"capture_region\" だけです"
 no_values = "パラメータを 1 つも書いていない操作があります"
 border_off_with_color_or_width = "border = false と枠の色・太さは一緒に書けません"
+no_such_region = "撮る定型領域が見つかりません（名前を変えたか消した定型領域は、選び直してください）"
 
 # レシピの最初に置けるキャプチャ系の操作（recipe::Capture::label_key）
 [recipe.capture]
 select_capture = "範囲選択キャプチャ"
+capture_region = "定型領域キャプチャ"
 
 [hotkey]
 failed = "次のホットキーを登録できませんでした（他のアプリが使っている可能性があります）: "
