@@ -4394,7 +4394,8 @@ fn float_requested(
 }
 
 /// キャプチャで始まるレシピ `launch` で作った、まだ出していない `model`（元の画像は `image`）に、出す前に当てる
-/// 操作（見た目・背景色）を当ててから浮かべ、残りの操作を進める（ADR-0010）。白紙スクラップでも、ここでは編集
+/// 操作（見た目・背景色）を当ててから浮かべ、残りの操作を進める（ADR-0010）。背景色が変わった白紙スクラップは、
+/// 下地をその背景色で塗り直してから浮かべる。白紙スクラップでも、ここでは編集
 /// モードに入らない（レシピを終えたか止まったときに `drive_recipe` が決める）。出せなければ理由を返す。
 fn float_recipe_scrap(
     launch: Launch,
@@ -4404,7 +4405,13 @@ fn float_recipe_scrap(
 ) -> std::result::Result<(), String> {
     let mut model = model;
     let context = with_app(|app| app.op_context(OpContext::default())).unwrap_or_default();
+    let before = model.background();
     let Shown { run, effects } = launch.captured(&mut model, &context);
+    // 出す前の操作で白紙スクラップの背景色が変わったら、下地をその背景色で塗り直す（`ScrapWindow::sync_shown` と同じ）
+    let image = match model.blank_image() {
+        Some(repainted) if model.background() != before => repainted,
+        _ => image,
+    };
     let hwnd = float_model(model, image, focus)?;
     if with_app(|app| app.recipe.discard()).flatten().is_some() {
         log::info!("the recipe waiting for a save was discarded");
