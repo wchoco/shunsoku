@@ -26,6 +26,8 @@ pub enum Source {
     ActiveWindowHotkey,
     /// トレイのメニューの「定型領域を追加…」。
     AddRegion,
+    /// 白紙スクラップのホットキーと、トレイのメニューの「白紙スクラップ」。
+    BlankScrap,
 }
 
 /// どう撮るか。
@@ -55,6 +57,8 @@ pub enum CaptureMethod {
     ReselectRegion(usize),
     /// 設定 GUI の「試しに撮る」。写しの定型領域の値（未適用でもよい）で撮る。
     TrialRegion(Box<Region>),
+    /// 白紙スクラップを作る。範囲選択の画面で範囲かウィンドウを選び、その位置と大きさだけを使う（画素は使わない）。
+    BlankScrap,
 }
 
 impl CaptureMethod {
@@ -141,6 +145,7 @@ impl CaptureRequest {
         match source {
             Source::Hotkey | Source::TrayMenu => CaptureRequest::scrap(CaptureMethod::Select),
             Source::ActiveWindowHotkey => CaptureRequest::scrap(CaptureMethod::ActiveWindow),
+            Source::BlankScrap => CaptureRequest::scrap(CaptureMethod::BlankScrap),
             Source::AddRegion => CaptureRequest {
                 outputs: Outputs {
                     save: None,
@@ -350,6 +355,19 @@ mod tests {
                 ..select_capture()
             }
         );
+    }
+
+    #[test]
+    fn a_blank_scrap_opens_the_overlay_to_choose_where_and_shows_a_focused_scrap() {
+        let request = CaptureRequest::from_source(Source::BlankScrap);
+        assert_eq!(
+            request,
+            CaptureRequest {
+                method: CaptureMethod::BlankScrap,
+                ..select_capture()
+            }
+        );
+        assert!(!request.method.registers_region());
     }
 
     #[test]

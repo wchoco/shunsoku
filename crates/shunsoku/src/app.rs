@@ -210,6 +210,7 @@ const CMD_HIDE_ALL: u32 = 4;
 const CMD_SHOW_ALL: u32 = 5;
 const CMD_ADD_REGION: u32 = 6;
 const CMD_SETTINGS: u32 = 7;
+const CMD_BLANK_SCRAP: u32 = 8;
 /// ごみ箱の一覧の項目の番号は、これに一覧の添字を足したもの。
 const CMD_TRASH_FIRST: u32 = 100;
 /// 「定型領域」の項目の番号は、これに `Settings::regions` の添字を足したもの。
@@ -1213,30 +1214,49 @@ fn on_tray(owner: HWND, event: tray::Event) {
                 )
             })
             .unwrap_or_default();
-            let hide_or_show = if any_hidden {
-                menu::Entry::item(CMD_SHOW_ALL, text("tray.menu.show_all"), true)
-            } else {
-                menu::Entry::item(CMD_HIDE_ALL, text("tray.menu.hide_all"), any_scrap)
-            };
-            let items = [
-                menu::Entry::item(CMD_SELECT_CAPTURE, text("tray.menu.select_capture"), true),
-                menu::Entry::Submenu {
-                    label: text("tray.menu.regions").into(),
-                    enabled: true,
-                    items: region_entries,
-                },
-                menu::Entry::item(CMD_ADD_REGION, text("tray.menu.add_region"), true),
-                menu::Entry::Submenu {
-                    label: text("tray.menu.trash").into(),
-                    enabled: true,
-                    items: trash_entries,
-                },
-                menu::Entry::item(CMD_CLOSE_ALL, text("tray.menu.close_all"), any_scrap),
-                hide_or_show,
-                menu::Entry::Separator,
-                menu::Entry::item(CMD_SETTINGS, text("tray.menu.settings"), true),
-                menu::Entry::item(CMD_EXIT, text("tray.menu.exit"), true),
-            ];
+            use shunsoku_core::tray::MenuItem;
+            let (mut region_entries, mut trash_entries) =
+                (Some(region_entries), Some(trash_entries));
+            let items: Vec<menu::Entry> = shunsoku_core::tray::menu(any_hidden)
+                .into_iter()
+                .map(|item| match item {
+                    MenuItem::SelectCapture => menu::Entry::item(
+                        CMD_SELECT_CAPTURE,
+                        text("tray.menu.select_capture"),
+                        true,
+                    ),
+                    MenuItem::BlankScrap => {
+                        menu::Entry::item(CMD_BLANK_SCRAP, text("tray.menu.blank_scrap"), true)
+                    }
+                    MenuItem::Regions => menu::Entry::Submenu {
+                        label: text("tray.menu.regions").into(),
+                        enabled: true,
+                        items: region_entries.take().unwrap_or_default(),
+                    },
+                    MenuItem::AddRegion => {
+                        menu::Entry::item(CMD_ADD_REGION, text("tray.menu.add_region"), true)
+                    }
+                    MenuItem::Trash => menu::Entry::Submenu {
+                        label: text("tray.menu.trash").into(),
+                        enabled: true,
+                        items: trash_entries.take().unwrap_or_default(),
+                    },
+                    MenuItem::CloseAll => {
+                        menu::Entry::item(CMD_CLOSE_ALL, text("tray.menu.close_all"), any_scrap)
+                    }
+                    MenuItem::HideAll => {
+                        menu::Entry::item(CMD_HIDE_ALL, text("tray.menu.hide_all"), any_scrap)
+                    }
+                    MenuItem::ShowAll => {
+                        menu::Entry::item(CMD_SHOW_ALL, text("tray.menu.show_all"), true)
+                    }
+                    MenuItem::Separator => menu::Entry::Separator,
+                    MenuItem::Settings => {
+                        menu::Entry::item(CMD_SETTINGS, text("tray.menu.settings"), true)
+                    }
+                    MenuItem::Exit => menu::Entry::item(CMD_EXIT, text("tray.menu.exit"), true),
+                })
+                .collect();
             // モーダルなので App を借りずに呼ぶ
             let Some(command) = menu::show(owner, &items, x, y) else {
                 return;
@@ -1276,6 +1296,10 @@ fn on_command(command: u32) {
         CMD_ADD_REGION => {
             chosen_from_menu();
             request_capture(Source::AddRegion);
+        }
+        CMD_BLANK_SCRAP => {
+            chosen_from_menu();
+            request_capture(Source::BlankScrap);
         }
         CMD_CLOSE_ALL => close_all_scraps(),
         CMD_HIDE_ALL => set_scraps_visible(false),
@@ -3023,6 +3047,21 @@ fn finish_selection() {
         }
         return;
     }
+    if request.method == CaptureMethod::BlankScrap {
+        // 白紙スクラップは選んだ範囲（ウィンドウならその矩形）の位置と大きさだけを使い、画素は使わない
+        let rect = selection
+            .chosen_window()
+            .map(|chosen| chosen.rect)
+            .or_else(|| selection.rect());
+        // スクラップを前面にしてから範囲選択の画面を閉じる（前面にする権利を失わないように）
+        if let Some(rect) = rect {
+            create_blank_scrap(rect);
+        }
+        drop(overlay);
+        end_capture();
+        log::info!("overlay closed");
+        return;
+    }
     if let Some(chosen) = selection.chosen_window() {
         // ハイライトから選んだウィンドウは、範囲選択の画面を閉じてから WGC で撮る
         log::info!("window chosen on the overlay");
@@ -3215,7 +3254,8 @@ fn take_capture() {
         Some(
             request::CaptureMethod::Select
             | request::CaptureMethod::RegisterRegion
-            | request::CaptureMethod::ReselectRegion(_),
+            | request::CaptureMethod::ReselectRegion(_)
+            | request::CaptureMethod::BlankScrap,
         ) => open_overlay(),
         Some(request::CaptureMethod::ActiveWindow) => capture_active_window(),
         Some(request::CaptureMethod::Window(target)) => {
@@ -3600,6 +3640,7 @@ fn on_hotkey(wparam: WPARAM) {
         Some(settings::HotkeyAction::ActiveWindowCapture) => {
             request_capture(Source::ActiveWindowHotkey)
         }
+        Some(settings::HotkeyAction::BlankScrap) => request_capture(Source::BlankScrap),
         None => log::warn!("unknown hotkey id {}", wparam.0),
     }
 }
@@ -3992,23 +4033,63 @@ fn resolve_save_target(
 
 /// 画像をスクラップとして `at`（スクリーン座標）に等倍で浮かべ、`App::scraps` に入れる。出せなければ理由を返す。
 fn float_scrap(at: Point, image: Image, focus: bool) -> std::result::Result<(), String> {
+    let model = ScrapModel::new(at, image.size());
+    float_model(model, image, focus).map(|_| ())
+}
+
+/// `model` のスクラップ（元の画像は `image`）を浮かべ、`App::scraps` に入れる。出したウィンドウを返す。
+/// 出せなければ理由を返す。
+fn float_model(model: ScrapModel, image: Image, focus: bool) -> std::result::Result<HWND, String> {
     let Some((module, appearance)) =
         with_app(|app| (app.module, Appearance::from(app.settings.scrap)))
     else {
         return Err(text("job.panicked").to_owned());
     };
     // ウィンドウを作るとメッセージが届くので、App を借りずに作る
-    let model = ScrapModel::new(at, image.size());
     match open_scrap(module, model, image, &appearance, focus) {
         Ok(scrap) => {
+            let hwnd = scrap.window.hwnd();
             if with_app(|app| app.scraps.push(scrap)).is_none() {
                 log::warn!("could not keep the scrap");
             }
-            Ok(())
+            Ok(hwnd)
         }
         Err(e) => {
             log::error!("could not open a scrap: {e}");
             Err(e.to_string())
+        }
+    }
+}
+
+/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移し、すぐに書き込みの
+/// 編集モードに入る。出せなければ通知する。
+fn create_blank_scrap(rect: Rect) {
+    let Some(background) = with_app(|app| app.settings.annotation.background) else {
+        return;
+    };
+    let model = ScrapModel::blank(rect.origin(), rect.size(), background);
+    let Some(image) = model.blank_image() else {
+        log::error!("could not paint the blank scrap of {:?}", rect.size());
+        return;
+    };
+    log::info!(
+        "blank scrap {}x{} at ({}, {})",
+        rect.width(),
+        rect.height(),
+        rect.left,
+        rect.top
+    );
+    match float_model(model, image, true) {
+        Ok(hwnd) => {
+            if let Some(op) = ops::find("annotate") {
+                run_scrap_operation(hwnd, op, OpContext::default());
+            }
+        }
+        Err(reason) => {
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{reason}", text("blank_scrap.failed")),
+            );
         }
     }
 }

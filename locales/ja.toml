@@ -7,6 +7,7 @@ tooltip = "shunsoku"
 
 [tray.menu]
 select_capture = "範囲選択キャプチャ"
+blank_scrap = "白紙スクラップ"
 regions = "定型領域"
 regions_empty = "（なし）"
 add_region = "定型領域を追加…"
@@ -155,6 +156,8 @@ width = "太さ:"
 font_size = "文字サイズ:"
 font = "書体:"
 hint = "これから書き込むときの既定値です。書き込み済みのものは変わりません。"
+blank_scrap = "白紙スクラップ:"
+blank_background = "白紙の背景色:"
 
 [settings_gui.scrap_ops]
 operation = "操作"
@@ -345,3 +348,6 @@ time = "{time}  時刻（090504）"
 datetime = "{datetime:…}  日時の書式（2026-03-07_09-05-04）"
 seq = "{seq}  連番（1, 2, …）"
 seq3 = "{seq:3}  3 桁の連番（001, 002, …）"
+
+[blank_scrap]
+failed = "白紙スクラップを作れませんでした。"

@@ -645,6 +645,7 @@ fn chord_of(settings: &Settings, item: &SettingsItem) -> Option<Chord> {
         SettingsItem::SelectCaptureHotkey => settings.hotkeys.select_capture,
         SettingsItem::RestoreLastHotkey => settings.hotkeys.restore_last,
         SettingsItem::ActiveWindowCaptureHotkey => settings.hotkeys.active_window_capture,
+        SettingsItem::BlankScrapHotkey => settings.hotkeys.blank_scrap,
         SettingsItem::RegionHotkey(i) => settings.regions.get(*i).and_then(|r| r.hotkey),
         SettingsItem::Shortcut(id) => settings.shortcuts.get(id).copied().flatten(),
         SettingsItem::RecipeShortcut(i) => settings.recipes.get(*i).and_then(|r| r.shortcut),
@@ -666,6 +667,7 @@ fn chord_slot<'a>(
         SettingsItem::ActiveWindowCaptureHotkey => {
             Some(&mut settings.hotkeys.active_window_capture)
         }
+        SettingsItem::BlankScrapHotkey => Some(&mut settings.hotkeys.blank_scrap),
         SettingsItem::RegionHotkey(i) => settings.regions.get_mut(*i).map(|r| &mut r.hotkey),
         SettingsItem::Shortcut(id) => Some(settings.shortcuts.entry(id.clone()).or_default()),
         SettingsItem::RecipeShortcut(i) => settings.recipes.get_mut(*i).map(|r| &mut r.shortcut),

@@ -20,6 +20,7 @@ use std::rc::Rc;
 use shunsoku_core::annotate::toolbar::{FONT_SIZES, WIDTHS};
 use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::Language;
+use shunsoku_core::scrap::Background;
 use shunsoku_core::selection::Mode;
 use shunsoku_core::settings::editor::{Editor, choices};
 use shunsoku_core::settings::form::{FillPass, RegionDetail, read_number};
@@ -91,6 +92,8 @@ pub enum Field {
     AnnotationFontSize,
     /// `[annotation] font`。
     AnnotationFont,
+    /// `[annotation] background`（新しく作る白紙スクラップの背景色）。
+    BlankBackground,
     /// 定型領域 i（`Settings::regions` の位置）の項目。
     Region(usize, RegionKey),
 }
@@ -255,6 +258,7 @@ fn kind(field: Field) -> Kind {
         | Field::Template(_)
         | Field::BorderColor
         | Field::AnnotationColor
+        | Field::BlankBackground
         | Field::CrosshairColor
         | Field::Region(_, RegionKey::Name | RegionKey::SaveDir) => Kind::Text { preview: None },
         Field::Opacity
@@ -348,6 +352,7 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
         Field::Region(i, key) => region_shown(d.regions.get(i), key),
         Field::BorderColor => Shown::Text(d.scrap.border.color.to_string()),
         Field::AnnotationColor => Shown::Text(d.annotation.color.to_string()),
+        Field::BlankBackground => Shown::Text(d.annotation.background.to_string()),
         Field::CrosshairColor => Shown::Text(d.selection.crosshair_color.to_string()),
         Field::Opacity => Shown::Text(d.scrap.opacity.to_string()),
         Field::BorderWidth => Shown::Text(d.scrap.border.width.to_string()),
@@ -458,6 +463,11 @@ pub fn set(field: Field, draft: &mut Settings, input: Input) {
                 draft.annotation.color = c;
             }
         }
+        (Field::BlankBackground, Input::Text(s)) => {
+            if let Ok(b) = s.trim().parse::<Background>() {
+                draft.annotation.background = b;
+            }
+        }
         (Field::CrosshairColor, Input::Text(s)) => {
             if let Ok(c) = s.trim().parse::<Rgb>() {
                 draft.selection.crosshair_color = c;
@@ -538,6 +548,9 @@ pub fn color_of(settings: &Settings, field: Field) -> Option<Rgb> {
     match field {
         Field::BorderColor => Some(settings.scrap.border.color),
         Field::AnnotationColor => Some(settings.annotation.color),
+        Field::BlankBackground => match settings.annotation.background {
+            Background::Color(c) => Some(c),
+        },
         Field::CrosshairColor => Some(settings.selection.crosshair_color),
         _ => None,
     }
@@ -628,6 +641,11 @@ pub fn rejected(field: Field, s: &str) -> Option<Rejected> {
         Field::BorderColor | Field::AnnotationColor | Field::CrosshairColor => {
             s.trim().parse::<Rgb>().is_err().then_some(Rejected::Color)
         }
+        Field::BlankBackground => s
+            .trim()
+            .parse::<Background>()
+            .is_err()
+            .then_some(Rejected::Color),
         _ => None,
     }
 }

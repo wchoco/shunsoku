@@ -32,6 +32,7 @@
 //! select_capture = "Ctrl+Shift+A"              # 既定は空（未設定）。"" も未設定
 //! restore_last = "Ctrl+Alt+Z"                  # 最後に閉じたものを復元。既定は空で、必須ではない
 //! active_window_capture = "Ctrl+Shift+W"       # アクティブウィンドウのキャプチャ。既定は空で、必須ではない
+//! blank_scrap = "Ctrl+Shift+N"                 # 白紙スクラップを作る。既定は空で、必須ではない
 //!
 //! [shortcuts]                                  # スクラップ操作の id ごとの上書き。"" は割り当てなし
 //! copy = "Ctrl+Shift+C"
@@ -52,6 +53,7 @@
 //! width = 3                                    # 1〜64（画像の画素）
 //! font_size = 16                               # 文字の大きさ。1〜256（画像の画素）
 //! font = "Yu Gothic UI"                        # 文字の書体。入っていなければ代わりの書体で描く
+//! background = "#FFFFFF"                       # 新しく作る白紙スクラップの背景色
 //!
 //! [selection]                                  # 範囲選択の画面
 //! mode = "normal"                              # 開いたときのモード: normal / precise
@@ -82,6 +84,7 @@ use crate::keys::Chord;
 use crate::recipe::{
     self, AppearanceItem, AppearanceStep, Recipe, Rejected, Rejection, Step, StepKey, Written,
 };
+use crate::scrap::Background;
 use crate::scrap::ops::{
     MouseBindings, MouseGesture, OPERATIONS, OperationDescriptor, ShortcutOwner, Shortcuts,
 };
@@ -274,16 +277,19 @@ pub enum HotkeyAction {
     RestoreLast,
     /// アクティブウィンドウのキャプチャ。任意（空でも通知しない）。
     ActiveWindowCapture,
+    /// 白紙スクラップを作る（範囲選択の画面で位置と大きさを選ぶ）。任意（空でも通知しない）。
+    BlankScrap,
     /// 定型領域キャプチャ。`Settings::regions` の中の位置。`[[regions]]` の `hotkey` に書く。
     Region(usize),
 }
 
 impl HotkeyAction {
     /// `[hotkeys]` に書くもののすべて（定型領域は除く）。
-    pub const ALL: [HotkeyAction; 3] = [
+    pub const ALL: [HotkeyAction; 4] = [
         HotkeyAction::SelectCapture,
         HotkeyAction::RestoreLast,
         HotkeyAction::ActiveWindowCapture,
+        HotkeyAction::BlankScrap,
     ];
 
     /// `[hotkeys]` の中のキー（定型領域では `[[regions]]` の中のキー）。
@@ -292,6 +298,7 @@ impl HotkeyAction {
             HotkeyAction::SelectCapture => "select_capture",
             HotkeyAction::RestoreLast => "restore_last",
             HotkeyAction::ActiveWindowCapture => "active_window_capture",
+            HotkeyAction::BlankScrap => "blank_scrap",
             HotkeyAction::Region(_) => "hotkey",
         }
     }
@@ -303,6 +310,7 @@ pub struct Hotkeys {
     pub select_capture: Option<Chord>,
     pub restore_last: Option<Chord>,
     pub active_window_capture: Option<Chord>,
+    pub blank_scrap: Option<Chord>,
 }
 
 impl Hotkeys {
@@ -312,6 +320,7 @@ impl Hotkeys {
             HotkeyAction::SelectCapture => self.select_capture,
             HotkeyAction::RestoreLast => self.restore_last,
             HotkeyAction::ActiveWindowCapture => self.active_window_capture,
+            HotkeyAction::BlankScrap => self.blank_scrap,
             HotkeyAction::Region(_) => None,
         }
     }
@@ -330,6 +339,7 @@ impl Hotkeys {
             HotkeyAction::SelectCapture => Some(&mut self.select_capture),
             HotkeyAction::RestoreLast => Some(&mut self.restore_last),
             HotkeyAction::ActiveWindowCapture => Some(&mut self.active_window_capture),
+            HotkeyAction::BlankScrap => Some(&mut self.blank_scrap),
             HotkeyAction::Region(_) => None,
         }
     }
@@ -396,6 +406,8 @@ pub struct AnnotationDefaults {
     pub font_size: u32,
     /// 文字の書体の名前。入っていない書体でも誤りにはせず、描くときに DirectWrite が代わりの書体で描く。
     pub font: String,
+    /// 新しく作る白紙スクラップの背景色。作ったあとの白紙スクラップは、作ったときの色を持つ。
+    pub background: Background,
 }
 
 impl Default for AnnotationDefaults {
@@ -406,6 +418,7 @@ impl Default for AnnotationDefaults {
             width: 3,
             font_size: 16,
             font: "Yu Gothic UI".to_owned(),
+            background: Background::WHITE,
         }
     }
 }
@@ -577,6 +590,8 @@ pub enum SettingsItem {
     RestoreLastHotkey,
     /// `[hotkeys] active_window_capture`。
     ActiveWindowCaptureHotkey,
+    /// `[hotkeys] blank_scrap`。
+    BlankScrapHotkey,
     /// `[shortcuts]` のスクラップ操作の id。
     Shortcut(String),
     /// `[mouse]` のスクラップ操作の id。
@@ -599,6 +614,7 @@ impl From<HotkeyAction> for SettingsItem {
             HotkeyAction::SelectCapture => SettingsItem::SelectCaptureHotkey,
             HotkeyAction::RestoreLast => SettingsItem::RestoreLastHotkey,
             HotkeyAction::ActiveWindowCapture => SettingsItem::ActiveWindowCaptureHotkey,
+            HotkeyAction::BlankScrap => SettingsItem::BlankScrapHotkey,
             HotkeyAction::Region(i) => SettingsItem::RegionHotkey(i),
         }
     }
@@ -613,6 +629,7 @@ impl std::fmt::Display for SettingsItem {
             SettingsItem::SelectCaptureHotkey => f.write_str("hotkeys.select_capture"),
             SettingsItem::RestoreLastHotkey => f.write_str("hotkeys.restore_last"),
             SettingsItem::ActiveWindowCaptureHotkey => f.write_str("hotkeys.active_window_capture"),
+            SettingsItem::BlankScrapHotkey => f.write_str("hotkeys.blank_scrap"),
             SettingsItem::Shortcut(id) => write!(f, "shortcuts.{id}"),
             SettingsItem::Mouse(id) => write!(f, "mouse.{id}"),
             SettingsItem::RegionHotkey(i) => write!(f, "regions[{}].hotkey", i + 1),
@@ -1061,6 +1078,9 @@ pub fn load(src: &str) -> (Settings, Vec<SettingsIssue>) {
     if let Some(font) = r.value(annotation, "annotation", "font", non_empty_str) {
         s.annotation.font = font;
     }
+    if let Some(background) = r.value(annotation, "annotation", "background", background) {
+        s.annotation.background = background;
+    }
 
     let selection = r.table(root, "selection");
     if let Some(mode) = r.value(selection, "selection", "mode", selection_mode) {
@@ -1386,6 +1406,10 @@ fn rgb(item: &Item) -> Option<Rgb> {
     item.as_str()?.parse().ok()
 }
 
+fn background(item: &Item) -> Option<Background> {
+    item.as_str()?.parse().ok()
+}
+
 fn selection_mode(item: &Item) -> Option<Mode> {
     match item.as_str()? {
         "normal" => Some(Mode::Normal),
@@ -1551,6 +1575,7 @@ shadow = false
                     select_capture: Some(chord("Win+Shift+PrintScreen")),
                     restore_last: Some(chord("Ctrl+Alt+Z")),
                     active_window_capture: None,
+                    blank_scrap: None,
                 },
                 shortcuts: BTreeMap::from([
                     ("close".to_owned(), None),
@@ -2083,6 +2108,7 @@ a = 1
             select_capture: Some(chord("Ctrl+Alt+S")),
             restore_last: None,
             active_window_capture: None,
+            blank_scrap: None,
         };
         let assigned = hotkeys.assign();
         assert_eq!(
@@ -2111,6 +2137,51 @@ a = 1
             settings.hotkeys.assign().bound,
             BTreeMap::from([(chord("Ctrl+Alt+Z"), HotkeyAction::RestoreLast)])
         );
+    }
+
+    #[test]
+    fn blank_scrap_hotkey_is_unset_by_default_and_read_and_assigned() {
+        let (settings, issues) = load("version = 1\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.hotkeys.get(HotkeyAction::BlankScrap), None);
+        let (settings, issues) = load("version = 1\n[hotkeys]\nblank_scrap = \"Ctrl+Alt+N\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.hotkeys.get(HotkeyAction::BlankScrap),
+            Some(chord("Ctrl+Alt+N"))
+        );
+        assert_eq!(
+            settings.hotkeys.assign().bound,
+            BTreeMap::from([(chord("Ctrl+Alt+N"), HotkeyAction::BlankScrap)])
+        );
+        let (_, issues) = load("version = 1\n[hotkeys]\nblank_scrap = \"Ctrl+Nope\"\n");
+        assert_eq!(issues, vec![invalid("hotkeys.blank_scrap")]);
+    }
+
+    #[test]
+    fn the_blank_scrap_background_defaults_to_white_and_reads_a_colour() {
+        let (settings, _) = load("version = 1\n");
+        assert_eq!(
+            settings.annotation.background,
+            Background::Color(Rgb(0xFF, 0xFF, 0xFF))
+        );
+        let (settings, issues) = load("version = 1\n[annotation]\nbackground = \"#fff8e1\"\n");
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            settings.annotation.background,
+            Background::Color(Rgb(0xFF, 0xF8, 0xE1))
+        );
+    }
+
+    #[test]
+    fn an_invalid_blank_scrap_background_falls_back_to_white_and_is_named() {
+        for value in ["\"white\"", "\"#FFF\"", "1", "\"\""] {
+            let (settings, issues) = load(&format!(
+                "version = 1\n[annotation]\nbackground = {value}\n"
+            ));
+            assert_eq!(issues, vec![invalid("annotation.background")], "{value}");
+            assert_eq!(settings.annotation.background, Background::WHITE, "{value}");
+        }
     }
 
     #[test]

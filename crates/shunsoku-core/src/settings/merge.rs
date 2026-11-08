@@ -103,6 +103,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         select_capture,
         restore_last,
         active_window_capture,
+        blank_scrap,
     } = hotkeys;
     let ScrapAppearance {
         opacity,
@@ -119,6 +120,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         width: annotation_width,
         font_size,
         font,
+        background,
     } = annotation;
     let SelectionScreen {
         mode,
@@ -163,6 +165,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
         active_window_capture,
         hotkeys.active_window_capture
     );
+    value!("hotkeys.blank_scrap", blank_scrap, hotkeys.blank_scrap);
     value!("scrap.opacity", opacity, scrap.opacity);
     value!("scrap.border", border_visible, scrap.border.visible);
     value!("scrap.border_width", border_width, scrap.border.width);
@@ -172,6 +175,7 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Merged {
     value!("annotation.width", annotation_width, annotation.width);
     value!("annotation.font_size", font_size, annotation.font_size);
     value!("annotation.font", font, annotation.font);
+    value!("annotation.background", background, annotation.background);
     value!("selection.mode", mode, selection.mode);
     value!("selection.crosshair", crosshair, selection.crosshair);
     value!(
@@ -658,6 +662,9 @@ mod tests {
             ("hotkeys.active_window_capture", |s| {
                 s.hotkeys.active_window_capture = Some("Ctrl+Shift+W".parse().unwrap())
             }),
+            ("hotkeys.blank_scrap", |s| {
+                s.hotkeys.blank_scrap = Some("Ctrl+Shift+N".parse().unwrap())
+            }),
             ("shortcuts.copy", |s| {
                 s.shortcuts.insert("copy".into(), None);
             }),
@@ -675,6 +682,9 @@ mod tests {
             ("annotation.width", |s| s.annotation.width = 9),
             ("annotation.font_size", |s| s.annotation.font_size = 30),
             ("annotation.font", |s| s.annotation.font = "Meiryo".into()),
+            ("annotation.background", |s| {
+                s.annotation.background = crate::scrap::Background::Color(Rgb(1, 2, 3))
+            }),
             ("selection.mode", |s| s.selection.mode = Mode::Precise),
             ("selection.crosshair", |s| s.selection.crosshair = true),
             ("selection.crosshair_color", |s| {
