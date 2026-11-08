@@ -1201,6 +1201,17 @@ fn draw_toolbar_button(
                 plain,
                 stroke,
             )?,
+            Button::Tool(ToolSlot::Eraser) => {
+                // 斜めに置いた消しゴム（先の 1/4 に仕切り）と、その下の線
+                lines(
+                    &[(0.30, 0.92), (0.02, 0.64), (0.58, 0.08), (0.86, 0.36)],
+                    true,
+                    plain,
+                    stroke,
+                )?;
+                lines(&[(0.16, 0.50), (0.44, 0.78)], false, plain, stroke)?;
+                lines(&[(0.30, 0.92), (0.98, 0.92)], false, plain, stroke)?;
+            }
             Button::Color(color) => {
                 let swatch = to_rect_f(rect.inflate(-(6.0 * scale).round() as i32));
                 let fill = target.CreateSolidColorBrush(&rgb_color(color), None)?;

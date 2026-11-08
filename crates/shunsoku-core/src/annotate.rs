@@ -19,6 +19,10 @@
 //! `Delete` / `Backspace` / ツールバーの削除で消す。書き込みを変えるのは `Annotations` の `push` / `translate` /
 //! `restyle` / `remove` だけで、ひとまとまりの変更（ドラッグは押してから離すまで）がそれぞれ履歴の 1 件になる。
 //!
+//! 消しゴム（`Tool::Eraser`、`E` と 7 の数字キー）では、押したまま動かして、なぞって触れた書き込みを丸ごと消す
+//! （当たり方は選択と同じ `Annotation::hits`）。押しただけなら、そこにあるいちばん上のものだけを消す。なぞって
+//! いる間にすぐ消し、押してから離すまでに消したものを履歴の 1 件にまとめる（`Annotations::erase`）。
+//!
 //! 履歴（元に戻す / やり直す）は `Annotations` が書き込みと一緒に持つ（`mode` の外なので、モードを抜けても、
 //! ごみ箱から戻しても残る）。編集モードの間、`Ctrl+Z` で元に戻し、`Ctrl+Y` か `Ctrl+Shift+Z` でやり直す。
 //! 元に戻す・やり直すと選択は外れる。新しい変更を積むと、やり直しの履歴は消える。
@@ -329,9 +333,9 @@ enum Change {
         before: Annotation,
         after: Annotation,
     },
-    /// いくつもの変更を 1 件にまとめたもの（まとめて選んだ書き込みの移動・削除・変更）。並びの順に当て、
-    /// 元に戻すときは逆の順に当てる。
-    Batch(Vec<Change>),
+    /// いくつもの変更を 1 件にまとめたもの（まとめて選んだ書き込みの移動・削除・変更、消しゴムの 1 回の
+    /// なぞり）。順に当て、元に戻すときは逆の順に戻す。
+    Many(Vec<Change>),
 }
 
 impl Change {
@@ -347,12 +351,12 @@ impl Change {
             }
             (Change::Replace { index, after, .. }, true) => items[*index] = after.clone(),
             (Change::Replace { index, before, .. }, false) => items[*index] = before.clone(),
-            (Change::Batch(changes), true) => {
+            (Change::Many(changes), true) => {
                 for change in changes {
                     change.apply(items, true);
                 }
             }
-            (Change::Batch(changes), false) => {
+            (Change::Many(changes), false) => {
                 for change in changes.iter().rev() {
                     change.apply(items, false);
                 }
@@ -420,7 +424,7 @@ impl Annotations {
         match changes.len() {
             0 => return false,
             1 => self.record(changes.remove(0)),
-            _ => self.record(Change::Batch(changes)),
+            _ => self.record(Change::Many(changes)),
         }
         true
     }
@@ -454,6 +458,22 @@ impl Annotations {
             })
             .collect();
         self.record_all(changes)
+    }
+
+    /// 消しゴムで `index` の書き込みを消す。`continuing`（同じなぞりで前にも消した）なら直前の履歴に
+    /// まとめるので、なぞり全体が 1 件になる。
+    fn erase(&mut self, index: usize, continuing: bool) {
+        let Some(annotation) = self.items.get(index).cloned() else {
+            return;
+        };
+        let change = Change::Remove { index, annotation };
+        match self.undo.last_mut() {
+            Some(Change::Many(changes)) if continuing => {
+                change.apply(&mut self.items, true);
+                changes.push(change);
+            }
+            _ => self.record(Change::Many(vec![change])),
+        }
     }
 
     /// `index` の書き込みを `after` に置き換える。同じなら何もせずに false。
@@ -491,7 +511,7 @@ impl Annotations {
     fn drag(&mut self, indices: &[usize], dx: i32, dy: i32) {
         let same = match self.undo.last() {
             Some(Change::Replace { index, .. }) => indices == [*index],
-            Some(Change::Batch(changes)) => {
+            Some(Change::Many(changes)) => {
                 changes.len() == indices.len()
                     && changes
                         .iter()
@@ -506,7 +526,7 @@ impl Annotations {
         }
         let last = self.undo.last_mut().expect("直前の履歴がある");
         let changes = match last {
-            Change::Batch(changes) => changes.iter_mut().collect::<Vec<_>>(),
+            Change::Many(changes) => changes.iter_mut().collect::<Vec<_>>(),
             change => vec![change],
         };
         for change in changes {
@@ -532,17 +552,20 @@ pub enum Tool {
     /// 文字。クリックした所から文字を打つ。
     Text,
     Freehand,
+    /// 消しゴム。押したまま動かして、なぞって触れた書き込みを丸ごと消す（描かない）。
+    Eraser,
 }
 
 impl Tool {
     /// 数字キー（上の段とテンキー、修飾キーなし）で選ぶ道具。番号は 1 から矩形・楕円・矢印・線・文字・
-    /// フリーハンドの順で、キーは固定（割り当て直しの対象外）。
+    /// フリーハンド・消しゴムの順で、キーは固定（割り当て直しの対象外）。`V` で選択、`E` で消しゴム。
     fn from_key(chord: Chord) -> Option<Tool> {
         if chord.modifiers != Modifiers::default() {
             return None;
         }
         let n = match chord.key.vk() {
             VK_V => return Some(Tool::Select),
+            VK_E => return Some(Tool::Eraser),
             vk @ 0x31..=0x39 => vk - 0x30,
             vk @ 0x61..=0x69 => vk - 0x60,
             _ => return None,
@@ -554,6 +577,7 @@ impl Tool {
             4 => Some(Tool::Line),
             5 => Some(Tool::Text),
             6 => Some(Tool::Freehand),
+            7 => Some(Tool::Eraser),
             _ => None,
         }
     }
@@ -610,7 +634,7 @@ impl Draft {
             Tool::Ellipse => Some(Shape::Ellipse { from, to }),
             Tool::Arrow => Some(Shape::Arrow { from, to }),
             Tool::Line => Some(Shape::Line { from, to }),
-            Tool::Select | Tool::Text | Tool::Freehand => None,
+            Tool::Select | Tool::Text | Tool::Freehand | Tool::Eraser => None,
         }
     }
 
@@ -626,7 +650,7 @@ impl Draft {
                 let side = dx.abs().max(dy.abs());
                 Point::new(self.from.x + side * sign(dx), self.from.y + side * sign(dy))
             }
-            Tool::Select | Tool::Text | Tool::Freehand => self.to,
+            Tool::Select | Tool::Text | Tool::Freehand | Tool::Eraser => self.to,
             Tool::Arrow | Tool::Line => {
                 let (ax, ay) = (f64::from(dx.abs()), f64::from(dy.abs()));
                 let (dx, dy) = if ay < ax * TAN_22_5 {
@@ -671,6 +695,8 @@ pub struct EditState {
     pub font: Font,
     /// 打っている文字（文字の道具でクリックしてから確定するまで）。
     typing: Option<Box<Typing>>,
+    /// 消しゴムでなぞっている間（押してから離すまで）。
+    erasing: Option<Erasing>,
 }
 
 /// 編集モードへの入力 1 回の間の、スクラップの表示から決まる値（`ScrapModel::edit_input` が入れる）。
@@ -790,6 +816,15 @@ struct Grab {
     moved: bool,
 }
 
+/// 消しゴムのなぞり。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Erasing {
+    /// 最後のカーソルの画素。
+    last: Point,
+    /// もう消したか。最初に消したときに履歴を 1 件足し、あとはそこにまとめる。
+    erased: bool,
+}
+
 impl EditState {
     pub fn new(style: Style) -> EditState {
         EditState {
@@ -801,6 +836,7 @@ impl EditState {
             marquee: None,
             font: Font::default(),
             typing: None,
+            erasing: None,
         }
     }
 
@@ -924,6 +960,9 @@ impl EditState {
             EditInput::ShiftPress(at) if self.tool == Tool::Select => {
                 self.select_at(at, true, annotations, cx)
             }
+            EditInput::Press(at) | EditInput::ShiftPress(at) if self.tool == Tool::Eraser => {
+                self.start_erasing(at, annotations, cx)
+            }
             EditInput::Press(at) | EditInput::ShiftPress(at) => {
                 self.draft = Some(Draft::new(at));
                 vec![]
@@ -938,6 +977,9 @@ impl EditState {
                 }
                 _ => vec![],
             },
+            EditInput::Move { at, .. } if self.erasing.is_some() => {
+                self.erase_to(at, annotations, cx)
+            }
             EditInput::Move { at, shift } => match &mut self.draft {
                 Some(draft) if (draft.to, draft.shift) != (at, shift) => {
                     draft.move_to(at, shift);
@@ -947,12 +989,17 @@ impl EditState {
             },
             EditInput::Release => {
                 self.grab = None;
+                self.erasing = None;
                 let mut outputs = self.select_in_marquee(annotations, cx);
                 outputs.extend(self.commit(annotations));
                 outputs
             }
             EditInput::Pick(pick) => self.pick(pick, annotations),
             EditInput::Char(_) | EditInput::Utf16(_) | EditInput::Composition { .. } => vec![],
+            // 消しゴムでは文字を打ち直さず、ふつうの押下と同じに消す
+            EditInput::DoubleClick(at) if self.tool == Tool::Eraser => {
+                self.start_erasing(at, annotations, cx)
+            }
             // 2 つ以上選んでいるときは、どれを打ち直すか決まらないので打ち直さない
             EditInput::DoubleClick(at) => match self.text_at(at, annotations, cx) {
                 Some(index) if self.selected.len() < 2 => self.retype(index, annotations),
@@ -1150,6 +1197,7 @@ impl EditState {
         match pick {
             Pick::Tool(tool) => {
                 outputs = self.commit(annotations);
+                self.erasing = None;
                 self.tool = tool;
                 if tool != Tool::Select {
                     self.grab = None;
@@ -1294,6 +1342,64 @@ impl EditState {
         vec![EditOutput::Redraw]
     }
 
+    /// 消しゴムで `at` を押した。そこにある書き込みのうち、いちばん上のものを消す。
+    fn start_erasing(
+        &mut self,
+        at: Point,
+        annotations: &mut Annotations,
+        cx: &EditContext,
+    ) -> Vec<EditOutput> {
+        let hit = annotations.items().iter().rposition(|a| cx.hits(a, at));
+        if let Some(index) = hit {
+            annotations.erase(index, false);
+        }
+        self.erasing = Some(Erasing {
+            last: at,
+            erased: hit.is_some(),
+        });
+        match hit {
+            Some(_) => vec![EditOutput::Redraw],
+            None => vec![],
+        }
+    }
+
+    /// 消しゴムでなぞってカーソルが `at` に動いた。前の画素から `at` までの 1 画素ごとに、当たった書き込みを
+    /// すべて消す（速く動かしても間を飛ばさない）。
+    fn erase_to(
+        &mut self,
+        at: Point,
+        annotations: &mut Annotations,
+        cx: &EditContext,
+    ) -> Vec<EditOutput> {
+        let Some(mut erasing) = self.erasing else {
+            return vec![];
+        };
+        if at == erasing.last {
+            return vec![];
+        }
+        let (dx, dy) = (at.x - erasing.last.x, at.y - erasing.last.y);
+        let steps = dx.unsigned_abs().max(dy.unsigned_abs());
+        let mut erased_now = false;
+        for i in 1..=i64::from(steps) {
+            let along = |d: i32| (i64::from(d) * i / i64::from(steps)) as i32;
+            let point = Point::new(erasing.last.x + along(dx), erasing.last.y + along(dy));
+            for index in (0..annotations.items().len()).rev() {
+                if cx.hits(&annotations.items()[index], point) {
+                    annotations.erase(index, erasing.erased);
+                    erasing.erased = true;
+                    erased_now = true;
+                }
+            }
+        }
+        erasing.last = at;
+        self.erasing = Some(erasing);
+        if erased_now {
+            vec![EditOutput::Redraw]
+        } else {
+            vec![]
+        }
+    }
+
     /// 選んだ書き込みのドラッグでカーソルが `at` に動いた。動いた分だけずらす。
     fn drag_selected(
         &mut self,
@@ -1370,6 +1476,8 @@ impl EditState {
         let committed = self.commit(annotations);
         self.grab = None;
         self.marquee = None;
+        // なぞりの続きを、戻した（やり直した）変更にまとめないため
+        self.erasing = None;
         let deselected = !std::mem::take(&mut self.selected).is_empty();
         if step(annotations) || deselected || !committed.is_empty() {
             vec![EditOutput::Redraw]
@@ -1437,6 +1545,10 @@ const SELECT_ALL: Chord = Chord::plain(Key::known(0x41)).ctrl();
 /// `V`。選択の道具を選ぶ。
 const VK_V: u16 = 0x56;
 
+/// `E`。消しゴムを選ぶ（編集モードの外では、スクラップのショートカットの「書き込み」の既定のキー。編集モードの
+/// 間はキーを編集モードが先に受けるので、ショートカットには届かない）。
+const VK_E: u16 = 0x45;
+
 /// `Ctrl+Z`。元に戻す。
 const UNDO: Chord = Chord::plain(Key::known(0x5A)).ctrl();
 
@@ -1464,7 +1576,7 @@ pub enum EditInput {
     /// `Shift` を押しながら左ボタンを押した。選択の道具では選択に足したり外したりし、ほかは `Press` と同じ。
     ShiftPress(Point),
     /// ダブルクリックした（2 回目の押下。1 回目は `Press`）。文字の書き込みの上なら打ち直し（2 つ以上選んで
-    /// いるときは打ち直さない）、ほかは `Press` と同じ。
+    /// いるときは打ち直さない）、ほかは `Press` と同じ（消しゴムでは、文字の上でも `Press` と同じ）。
     DoubleClick(Point),
     /// カーソルが動いた。押している間だけ描きかけを変える。`shift` は `Shift` を押しているか（図形の制約）。
     Move { at: Point, shift: bool },
@@ -1543,7 +1655,7 @@ pub enum Pick {
 /// （`Carryover::settings_changed`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Carryover {
-    /// 最後に使った描く道具（選択は覚えない）。最初は矩形。
+    /// 最後に使った描く道具（選択と消しゴムは覚えない）。最初は矩形。
     tool: Tool,
     color: Option<Rgb>,
     width: Option<u32>,
@@ -1589,8 +1701,8 @@ impl Carryover {
     pub fn record(&mut self, outputs: &[EditOutput]) {
         for output in outputs {
             match *output {
-                // 選択は描く道具ではないので、次の編集モードは最後に使った描く道具で始める
-                EditOutput::Picked(Pick::Tool(Tool::Select)) => {}
+                // 選択と消しゴムは描く道具ではないので、次の編集モードは最後に使った描く道具で始める
+                EditOutput::Picked(Pick::Tool(Tool::Select | Tool::Eraser)) => {}
                 EditOutput::Picked(Pick::Tool(tool)) => self.tool = tool,
                 EditOutput::Picked(Pick::Color(color)) => self.color = Some(color),
                 EditOutput::Picked(Pick::Width(width)) => self.width = Some(width),
@@ -1876,11 +1988,11 @@ mod tests {
     }
 
     #[test]
-    fn number_keys_past_six_and_modified_number_keys_are_not_taken() {
+    fn number_keys_past_seven_and_modified_number_keys_are_not_taken() {
         let mut state = EditState::new(BLUE);
         let mut annotations = Annotations::default();
         state.input(digit(3), &mut annotations);
-        assert_eq!(state.input(digit(7), &mut annotations), vec![]);
+        assert_eq!(state.input(digit(8), &mut annotations), vec![]);
         // 修飾キーつきの数字は道具を選ばない
         let ctrl_1 = EditInput::Key(Chord::plain(Key::known(0x31)).ctrl());
         assert_eq!(state.input(ctrl_1, &mut annotations), vec![]);
@@ -3268,6 +3380,255 @@ mod tests {
                 size: 24,
             }
         );
+    }
+
+    const E: u16 = 0x45;
+
+    /// 押して `path` の順にカーソルを動かし、離す。
+    fn stroke(
+        state: &mut EditState,
+        annotations: &mut Annotations,
+        path: &[Point],
+    ) -> Vec<EditOutput> {
+        let mut outputs = state.input(EditInput::Press(path[0]), annotations);
+        for &at in &path[1..] {
+            outputs.extend(state.input(EditInput::Move { at, shift: false }, annotations));
+        }
+        outputs.extend(state.input(EditInput::Release, annotations));
+        outputs
+    }
+
+    /// 横線を 3 本（y = 0, 20, 40）と、矩形（(100, 0)-(160, 60)）を 1 つ描いたもの。
+    fn three_lines_and_a_rect(state: &mut EditState, annotations: &mut Annotations) {
+        for y in [0, 20, 40] {
+            draw(state, annotations, Tool::Line, p(0, y), p(40, y));
+        }
+        draw(state, annotations, Tool::Rect, p(100, 0), p(160, 60));
+    }
+
+    #[test]
+    fn e_and_the_seventh_number_key_pick_the_eraser_and_it_drops_the_selection() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        state.input(key(V), &mut annotations);
+        click(&mut state, &mut annotations, p(10, 0));
+        assert_eq!(state.selected(), [0]);
+        assert_eq!(
+            state.input(key(E), &mut annotations),
+            vec![
+                EditOutput::Redraw,
+                EditOutput::ToolChanged,
+                EditOutput::Picked(Pick::Tool(Tool::Eraser))
+            ]
+        );
+        assert_eq!(state.tool, Tool::Eraser);
+        assert!(state.selected().is_empty());
+        state.input(digit(1), &mut annotations);
+        assert_eq!(state.tool, Tool::Rect);
+        assert_ne!(state.input(digit(7), &mut annotations), vec![]);
+        assert_eq!(state.tool, Tool::Eraser);
+        // 修飾キーつきの E は選ばない
+        let ctrl_e = EditInput::Key(Chord::plain(Key::known(E)).ctrl());
+        state.input(digit(1), &mut annotations);
+        assert_eq!(state.input(ctrl_e, &mut annotations), vec![]);
+        assert_eq!(state.tool, Tool::Rect);
+    }
+
+    #[test]
+    fn e_while_typing_does_not_pick_the_eraser() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        state.input(EditInput::Press(p(0, 0)), &mut annotations);
+        assert_eq!(state.input(key(E), &mut annotations), vec![]);
+        assert_eq!(state.tool, Tool::Text);
+        assert!(state.is_typing());
+    }
+
+    #[test]
+    fn a_stroke_of_the_eraser_removes_only_what_it_touched_and_not_a_rect_it_crossed_inside() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        three_lines_and_a_rect(&mut state, &mut annotations);
+        state.input(key(E), &mut annotations);
+        // y = 0 と y = 20 の線を縦に切る
+        let outputs = stroke(&mut state, &mut annotations, &[p(10, -5), p(10, 25)]);
+        assert!(outputs.contains(&EditOutput::Redraw));
+        // 矩形の中をなぞる（縁には触れない）
+        assert_eq!(
+            stroke(
+                &mut state,
+                &mut annotations,
+                &[p(110, 10), p(150, 50), p(110, 50)]
+            ),
+            vec![]
+        );
+        assert_eq!(
+            shapes(&annotations),
+            vec![
+                Shape::Line {
+                    from: p(0, 40),
+                    to: p(40, 40),
+                },
+                Shape::Rect {
+                    from: p(100, 0),
+                    to: p(160, 60),
+                },
+            ]
+        );
+        // 描かない
+        assert_eq!(state.draft(), None);
+    }
+
+    #[test]
+    fn a_click_of_the_eraser_removes_only_the_topmost_annotation_there() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(0, 10),
+            p(40, 10),
+        );
+        state.input(key(E), &mut annotations);
+        assert_eq!(
+            click(&mut state, &mut annotations, p(20, 0)),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(annotations.items().len(), 2);
+        // 何もない所のクリックは何もしない
+        assert_eq!(click(&mut state, &mut annotations, p(20, 100)), vec![]);
+        assert_eq!(annotations.items().len(), 2);
+    }
+
+    #[test]
+    fn everything_erased_in_one_stroke_comes_back_with_one_undo() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        three_lines_and_a_rect(&mut state, &mut annotations);
+        let drawn = annotations.items().to_vec();
+        state.input(key(E), &mut annotations);
+        stroke(
+            &mut state,
+            &mut annotations,
+            &[p(10, -5), p(10, 45), p(100, 30)],
+        );
+        assert!(annotations.is_empty());
+        state.input(undo(), &mut annotations);
+        assert_eq!(annotations.items(), drawn.as_slice());
+        state.input(redo(), &mut annotations);
+        assert!(annotations.is_empty());
+        state.input(undo(), &mut annotations);
+        // 2 回の消しゴムは 2 件
+        stroke(&mut state, &mut annotations, &[p(10, 0)]);
+        stroke(&mut state, &mut annotations, &[p(10, 20)]);
+        state.input(undo(), &mut annotations);
+        assert_eq!(annotations.items().len(), 3);
+        state.input(undo(), &mut annotations);
+        assert_eq!(annotations.items(), drawn.as_slice());
+    }
+
+    #[test]
+    fn a_double_click_of_the_eraser_on_a_text_erases_it_and_does_not_type_it_again() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        state.input(digit(5), &mut annotations);
+        state.input(EditInput::Press(p(0, 0)), &mut annotations);
+        chars(&mut state, &mut annotations, "ab");
+        state.input(EditInput::Pick(Pick::Tool(Tool::Eraser)), &mut annotations);
+        assert_eq!(annotations.items().len(), 1);
+        state.input(EditInput::DoubleClick(p(5, 5)), &mut annotations);
+        state.input(EditInput::Release, &mut annotations);
+        assert!(!state.is_typing());
+        assert!(annotations.is_empty());
+    }
+
+    #[test]
+    fn a_stroke_that_touches_nothing_leaves_no_history() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        state.input(key(E), &mut annotations);
+        assert_eq!(
+            stroke(&mut state, &mut annotations, &[p(0, 50), p(40, 50)]),
+            vec![]
+        );
+        state.input(undo(), &mut annotations);
+        assert!(annotations.is_empty());
+    }
+
+    #[test]
+    fn undo_mid_stroke_ends_the_stroke_and_the_rest_of_it_erases_nothing() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        three_lines_and_a_rect(&mut state, &mut annotations);
+        state.input(key(E), &mut annotations);
+        state.input(EditInput::Press(p(10, 0)), &mut annotations);
+        state.input(undo(), &mut annotations);
+        assert_eq!(annotations.items().len(), 4);
+        state.input(
+            EditInput::Move {
+                at: p(10, 40),
+                shift: false,
+            },
+            &mut annotations,
+        );
+        state.input(EditInput::Release, &mut annotations);
+        assert_eq!(annotations.items().len(), 4);
+        // 戻したものはやり直せる
+        state.input(redo(), &mut annotations);
+        assert_eq!(annotations.items().len(), 3);
+    }
+
+    #[test]
+    fn the_eraser_does_not_touch_what_is_outside_the_visible_area() {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(0, 100),
+            p(40, 100),
+        );
+        state.input(key(E), &mut annotations);
+        let cx = EditContext {
+            hit_slop: 0,
+            visible: Some(Rect::new(0, 50, 200, 200)),
+        };
+        for input in [
+            EditInput::Press(p(10, -5)),
+            EditInput::Move {
+                at: p(10, 105),
+                shift: false,
+            },
+            EditInput::Release,
+        ] {
+            state.input_in(input, &mut annotations, &cx);
+        }
+        assert_eq!(
+            shapes(&annotations),
+            vec![Shape::Line {
+                from: p(0, 0),
+                to: p(40, 0),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_next_edit_mode_starts_with_the_last_drawing_tool_not_the_eraser() {
+        let mut carryover = Carryover::default();
+        let mut state = carryover.start(BLUE);
+        let mut annotations = Annotations::default();
+        carryover.record(&state.input(digit(4), &mut annotations));
+        carryover.record(&state.input(key(E), &mut annotations));
+        assert_eq!(state.tool, Tool::Eraser);
+        assert_eq!(carryover.start(BLUE).tool, Tool::Line);
     }
 
     /// 矩形 (10, 10)〜(50, 40)、線 (100, 20)〜(200, 20)、矩形 (20, 60)〜(40, 80) を描いて選択の道具にする。

@@ -53,7 +53,7 @@ pub const WIDTHS: [u32; 4] = [2, 3, 5, 8];
 /// 文字の大きさの選択肢（元の画像の画素）。文字の道具の間（と打っている間）は、太さの欄がこれになる。
 pub const FONT_SIZES: [u32; 4] = [12, 16, 24, 32];
 
-/// ツールバーの道具の欄。選択と 6 種の道具を並べる。
+/// ツールバーの道具の欄。選択と 6 種の描く道具、消しゴムを並べる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSlot {
     Select,
@@ -63,10 +63,11 @@ pub enum ToolSlot {
     Line,
     Text,
     Freehand,
+    Eraser,
 }
 
 impl ToolSlot {
-    pub const ALL: [ToolSlot; 7] = [
+    pub const ALL: [ToolSlot; 8] = [
         ToolSlot::Select,
         ToolSlot::Rect,
         ToolSlot::Ellipse,
@@ -74,6 +75,7 @@ impl ToolSlot {
         ToolSlot::Line,
         ToolSlot::Text,
         ToolSlot::Freehand,
+        ToolSlot::Eraser,
     ];
 
     /// この欄で選ぶ道具。まだない道具なら None。
@@ -86,6 +88,7 @@ impl ToolSlot {
             ToolSlot::Freehand => Some(Tool::Freehand),
             ToolSlot::Select => Some(Tool::Select),
             ToolSlot::Text => Some(Tool::Text),
+            ToolSlot::Eraser => Some(Tool::Eraser),
         }
     }
 }
@@ -356,12 +359,26 @@ mod tests {
     fn the_tools_wrap_around_at_either_end() {
         assert_eq!(
             wheel_pick(&editing(Tool::Freehand), &PALETTE, PLAIN, DOWN),
+            Some(Pick::Tool(Tool::Eraser))
+        );
+        assert_eq!(
+            wheel_pick(&editing(Tool::Eraser), &PALETTE, PLAIN, DOWN),
             Some(Pick::Tool(Tool::Select))
         );
         assert_eq!(
             wheel_pick(&editing(Tool::Select), &PALETTE, PLAIN, UP),
-            Some(Pick::Tool(Tool::Freehand))
+            Some(Pick::Tool(Tool::Eraser))
         );
+    }
+
+    #[test]
+    fn the_eraser_button_comes_last_among_the_tools_and_picks_the_eraser() {
+        assert_eq!(ToolSlot::ALL.last(), Some(&ToolSlot::Eraser));
+        assert_eq!(
+            Button::Tool(ToolSlot::Eraser).pick(),
+            Some(Pick::Tool(Tool::Eraser))
+        );
+        assert!(Button::Tool(ToolSlot::Eraser).is_current(&editing(Tool::Eraser)));
     }
 
     #[test]
@@ -622,10 +639,10 @@ mod tests {
             Button::Grip,
         ]);
         assert_eq!(order, expected);
-        // 7 + 8 + 4 + 4 個の 28px のボタン、間 2px、組の間 10px、つまみ 14px、外の余白 4px
+        // 8 + 8 + 4 + 4 個の 28px のボタン、間 2px、組の間 10px、つまみ 14px、外の余白 4px
         assert_eq!(
             layout.size(),
-            Size::new(4 + 23 * 28 + 19 * 2 + 4 * 10 + 14 + 4, 36)
+            Size::new(4 + 24 * 28 + 20 * 2 + 4 * 10 + 14 + 4, 36)
         );
     }
 
@@ -644,10 +661,10 @@ mod tests {
         assert_eq!(layout.hit(Point::new(2, 20)), None);
         let right = layout.size().width as i32;
         assert_eq!(layout.hit(Point::new(right - 6, 20)), Some(Button::Grip));
-        // 色の組は、道具の組から 10px 空けて始まる（7 個目の右端 32+6*30=212、そこから 10px）
-        assert_eq!(layout.hit(Point::new(215, 20)), None);
+        // 色の組は、道具の組から 10px 空けて始まる（8 個目の右端 32+7*30=242、そこから 10px）
+        assert_eq!(layout.hit(Point::new(245, 20)), None);
         assert_eq!(
-            layout.hit(Point::new(222, 20)),
+            layout.hit(Point::new(252, 20)),
             Some(Button::Color(PALETTE[0]))
         );
     }
