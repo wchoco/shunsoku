@@ -12,10 +12,12 @@
 //!   `move_region`。「範囲を選び直す」は `set_region_range`。GUI を開いている間にトレイから登録した定型領域は
 //!   `new_registered_region` で名前を決め、書いたら `registered` で base と写しに足す。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
 //! - 「レシピ」タブの一覧の追加・削除は `add_recipe` / `remove_recipe`、名前は `set_recipe_name`。操作の並びは
-//!   `step_choices`（足せる操作と見た目を指定する手）/ `add_step` / `move_step` / `remove_step`。見た目を指定する手の
+//!   `step_choices`（足せる操作と見た目を指定する操作）/ `add_step` / `move_step` / `remove_step`。選んでいる操作に
+//!   出すパラメータの欄の種類は `param_fields`（パラメータのない操作は None）。足したら、`add_step` が返す位置の
+//!   操作を選ぶ。見た目を指定する操作の
 //!   欄（`AppearanceItem`）は `appearance` / `set_appearance` で読み書きする（「変えない」は書かない）。ショートカットは
 //!   `set_chord` の `RecipeShortcut`。検査（`recipe::plan`）で引っかかったもの（欄に打った範囲外の値を含む）は `mark` の
-//!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（値のある手は書いた値の要約）。
+//!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（パラメータを添えた操作はパラメータの要約）。
 
 use std::collections::BTreeSet;
 
@@ -66,7 +68,7 @@ impl Mark {
             Mark::Problem(Problem::DuplicateName) => "settings_gui.mark.duplicate_name",
             Mark::Problem(Problem::NoSteps) => "settings_gui.mark.no_steps",
             Mark::Problem(Problem::NotAStep) => "settings_gui.mark.not_a_step",
-            Mark::Problem(Problem::CloseNotLast) => "settings_gui.mark.close_not_last",
+            Mark::Problem(Problem::LastOnlyNotLast) => "settings_gui.mark.last_only_not_last",
             Mark::Problem(Problem::OutOfRange) => "settings_gui.mark.out_of_range",
             Mark::Problem(Problem::BadValue) => "settings_gui.mark.bad_value",
             Mark::Problem(Problem::UnknownKey) => "settings_gui.mark.unknown_key",
@@ -318,9 +320,10 @@ impl Editor {
         }
     }
 
-    /// レシピ `index` の「操作を足す」で選べるもの。値のない操作（表の順）と、最後に見た目を指定する手。値のない
-    /// 操作は、レシピに入れられる操作（`recipe::can_be_step`）のうち、`close` で終わるレシピには `close` を出さない
-    /// （`add_step` は `close` の前に足すので、2 つ目の `close` は最後に置けない）。`index` のレシピがなければ空。
+    /// レシピ `index` の「操作を足す」で選べるもの。パラメータのない操作（表の順）と、最後に見た目を指定する操作。
+    /// パラメータのない操作は、レシピに入れられる操作（`recipe::can_be_step`）。最後にだけ置ける操作（`close`、
+    /// `annotate`）で終わるレシピには最後にだけ置ける操作を出さない（`add_step` はその前に足すので、2 つ目は最後に
+    /// 置けない）。`index` のレシピがなければ空。
     pub fn step_choices(&self, index: usize) -> Vec<StepChoice> {
         let Some(r) = self.draft.recipes.get(index) else {
             return Vec::new();
@@ -338,8 +341,8 @@ impl Editor {
             .collect()
     }
 
-    /// レシピ `index` に `choice` を足す。見た目を指定する手は、全部の項目が「変えない」（そのままでは
-    /// `NoValues`）。レシピが `close` で終わっていれば、その前に入れる（`close` は最後にだけ置けるため）。入れた
+    /// レシピ `index` に `choice` を足す。見た目を指定する操作は、全部の項目が「変えない」（そのままでは
+    /// `NoValues`）。レシピが最後にだけ置ける操作（`close`、`annotate`）で終わっていれば、その前に入れる。入れた
     /// 位置を返す。`index` のレシピがなければ何もせず None。
     pub fn add_step(&mut self, index: usize, choice: impl Into<StepChoice>) -> Option<usize> {
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
@@ -359,7 +362,7 @@ impl Editor {
         Some(at)
     }
 
-    /// レシピ `index` の手 `step` を隣と入れ替える（「上へ」「下へ」）。端か、手がなければ動かさない。移った
+    /// レシピ `index` の操作 `step` を隣と入れ替える（「上へ」「下へ」）。端か、操作がなければ動かさない。移った
     /// 位置を返す。
     pub fn move_step(&mut self, index: usize, step: usize, to: Move) -> usize {
         let Some(r) = self.draft.recipes.get_mut(index) else {
@@ -378,8 +381,8 @@ impl Editor {
         }
     }
 
-    /// レシピ `index` の手 `step` を消す。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を
-    /// 返す。手がなければ何もせず None。
+    /// レシピ `index` の操作 `step` を消す。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を
+    /// 返す。操作がなければ何もせず None。
     pub fn remove_step(&mut self, index: usize, step: usize) -> Option<usize> {
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
         if step >= steps.len() {
@@ -390,8 +393,17 @@ impl Editor {
         (len > 0).then(|| step.min(len - 1))
     }
 
-    /// レシピ `index` の手 `step` が見た目を指定する手なら、その項目 `item` の欄に出す値。「変えない」は
-    /// `Switch(None)` か空の `Text`。読めなかった値（範囲外など）は書いたまま出す。見た目を指定する手でなければ None。
+    /// レシピ `index` の操作 `step` を選んでいる間に出すパラメータの欄。パラメータの欄のない操作か、操作が
+    /// なければ None（欄を出さない）。
+    pub fn param_fields(&self, index: usize, step: usize) -> Option<ParamFields> {
+        match self.draft.recipes.get(index)?.steps.get(step)? {
+            Step::Appearance(_) => Some(ParamFields::Appearance),
+            Step::Op(_) | Step::Background(_) => None,
+        }
+    }
+
+    /// レシピ `index` の操作 `step` が見た目を指定する操作なら、その項目 `item` の欄に出す値。「変えない」は
+    /// `Switch(None)` か空の `Text`。読めなかった値（範囲外など）は書いたまま出す。見た目を指定する操作でなければ None。
     pub fn appearance(
         &self,
         index: usize,
@@ -420,10 +432,10 @@ impl Editor {
         ))
     }
 
-    /// レシピ `index` の手 `step`（見た目を指定する手）の項目 `item` を、欄の入力 `input` にする。「変えない」
+    /// レシピ `index` の操作 `step`（見た目を指定する操作）の項目 `item` を、欄の入力 `input` にする。「変えない」
     /// （`Switch(None)`、空白だけの `Text`）は書かない。読めない文字（範囲外の数、`#RRGGBB` でない色）は書いたまま
     /// 残し、設定ファイルから読めなかった値と同じくレシピの問題にする（適用できない）。項目を書き直したら、その
-    /// 項目の読めなかった値は消す。見た目を指定する手でないか、欄と違う種類の入力なら何もしない。
+    /// 項目の読めなかった値は消す。見た目を指定する操作でないか、欄と違う種類の入力なら何もしない。
     pub fn set_appearance(
         &mut self,
         index: usize,
@@ -481,7 +493,7 @@ impl Editor {
     }
 }
 
-/// 「レシピ」タブの手の一覧の行の文言。値のない手は操作の名前（表にない id はそのまま）、値のある手は
+/// 「レシピ」タブの操作の一覧の行の文言。パラメータのない操作は操作の名前（表にない id はそのまま）、パラメータを添えた操作は
 /// 「見た目: 枠 #FF0000 3px」のように、書いた項目を決まった順（透明度、枠、枠の太さ、影）に並べた要約。`text` は文言のキーから
 /// 文言を引く。
 pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> String {
@@ -565,7 +577,7 @@ impl AppearanceItem {
     }
 }
 
-/// 見た目を指定する手の欄の値（`Editor::appearance` / `set_appearance`）。
+/// 見た目を指定する操作の欄の値（`Editor::appearance` / `set_appearance`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppearanceInput {
     /// オン・オフの欄（枠・影）。None は「変えない」。
@@ -592,12 +604,20 @@ fn unquoted(written: &str) -> String {
     }
 }
 
+/// レシピのタブで、選んでいる操作に添えて出すパラメータの欄の種類（`Editor::param_fields`）。Win32 層は、
+/// 種類ごとの欄のまとまりを、選んでいる操作の種類のときだけ出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamFields {
+    /// 見た目（透明度・枠・影。`Editor::appearance` / `set_appearance`）。
+    Appearance,
+}
+
 /// 「操作を足す」で選べるもの（`Editor::step_choices`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepChoice {
     /// 値のない操作。
     Op(OperationId),
-    /// 見た目を指定する手（値は足してから欄で入れる）。
+    /// 見た目を指定する操作（パラメータは足してから欄で入れる）。
     Appearance,
 }
 
@@ -921,7 +941,7 @@ mod tests {
             Mark::Problem(Problem::DuplicateName),
             Mark::Problem(Problem::NoSteps),
             Mark::Problem(Problem::NotAStep),
-            Mark::Problem(Problem::CloseNotLast),
+            Mark::Problem(Problem::LastOnlyNotLast),
             Mark::Problem(Problem::OutOfRange),
             Mark::Problem(Problem::BadValue),
             Mark::Problem(Problem::UnknownKey),
@@ -1321,7 +1341,7 @@ mod tests {
             editor.draft().recipes[0].steps[1],
             Step::Appearance(recipe::AppearanceStep::default())
         );
-        // 項目のない手のままでは適用できない
+        // 項目を 1 つも書いていない操作のままでは適用できない
         assert_eq!(
             editor.mark(&SettingsItem::RecipeSteps(0)),
             Some(Mark::Problem(Problem::NoValues))
@@ -1334,11 +1354,11 @@ mod tests {
         let mut editor = Editor::new(Settings::default());
         editor.add_recipe("R");
         let ids = choice_ids(&editor, 0);
-        for id in ["copy", "zoom_in", "toggle_compact", "close"] {
+        for id in ["copy", "zoom_in", "toggle_compact", "close", "annotate"] {
             assert!(ids.contains(&id), "{id} in {ids:?}");
         }
-        // モードを切り替える操作、引数を取る操作、ドラッグ専用の操作は出さない
-        for id in ["trim", "annotate", "zoom", "opacity", "move"] {
+        // トリム、引数を取る操作、ドラッグ専用の操作は出さない
+        for id in ["trim", "zoom", "opacity", "move"] {
             assert!(!ids.contains(&id), "{id} in {ids:?}");
         }
     }
@@ -1354,6 +1374,19 @@ mod tests {
         assert_eq!(steps(&editor, 0), ["copy", "copy", "close"]);
         assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
         assert_eq!(editor.add_step(1, "copy"), None);
+    }
+
+    #[test]
+    fn a_recipe_ending_with_one_last_only_step_is_not_offered_the_other() {
+        // 最後にだけ置ける操作は 1 つまで。足すとその前に入るので、「閉じる」と「書き込み」は一緒に出さない
+        for (last, other) in [("close", "annotate"), ("annotate", "close")] {
+            let mut editor = Editor::new(Settings::default());
+            editor.add_recipe("R");
+            editor.add_step(0, last);
+            let ids = choice_ids(&editor, 0);
+            assert!(!ids.contains(&last) && !ids.contains(&other), "{ids:?}");
+            assert!(ids.contains(&"copy"), "{ids:?}");
+        }
     }
 
     /// 操作の並びが `ids` のレシピ 1 つを持つ写し（ほかに適用を止める問題はない）。
@@ -1448,7 +1481,7 @@ mod tests {
         }
     }
 
-    /// レシピ 1 つに、全部の項目が「変えない」の見た目の手を 1 つ足した写し。
+    /// レシピ 1 つに、全部の項目が「変えない」の見た目を指定する操作を 1 つ足した写し。
     fn with_an_appearance_step() -> Editor {
         let mut editor = with_steps(&["copy"]);
         editor.add_step(0, StepChoice::Appearance);
@@ -1476,7 +1509,7 @@ mod tests {
             fields(&editor, 1),
             AppearanceItem::ALL.map(unchanged).to_vec()
         );
-        // 値のない手には欄がない
+        // パラメータのない操作には欄がない
         assert_eq!(fields(&editor, 0), vec![None; 5]);
         assert_eq!(editor.appearance(0, 2, AppearanceItem::Border), None);
     }
@@ -1715,7 +1748,7 @@ mod tests {
         assert_eq!(steps(&editor, 0), ["zoom_in", "close", "copy"]);
         assert_eq!(
             editor.mark(&SettingsItem::RecipeSteps(0)),
-            Some(Mark::Problem(Problem::CloseNotLast))
+            Some(Mark::Problem(Problem::LastOnlyNotLast))
         );
         assert_eq!(editor.move_step(1, 0, Move::Down), 0);
     }
@@ -1755,6 +1788,32 @@ mod tests {
         editor.set_recipe_name(1, "閉じる");
         assert_eq!(editor.mark(&SettingsItem::RecipeName(1)), None);
         assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn only_the_appearance_operation_shows_parameter_fields() {
+        let editor = with_steps_read(
+            r##"["copy", { op = "appearance", opacity = 50 }, { op = "background", color = "#ffffff" }]"##,
+        );
+        assert_eq!(editor.param_fields(0, 0), None);
+        assert_eq!(editor.param_fields(0, 1), Some(ParamFields::Appearance));
+        // 背景色の欄はまだない（#158）
+        assert_eq!(editor.param_fields(0, 2), None);
+        // 選んでいる操作やレシピがない
+        assert_eq!(editor.param_fields(0, 3), None);
+        assert_eq!(editor.param_fields(1, 0), None);
+    }
+
+    #[test]
+    fn an_added_appearance_operation_is_the_one_to_select_and_shows_its_fields() {
+        let mut editor = with_steps(&["copy", "close"]);
+        // `close` の前に入るので、選ぶのは末尾ではなく入った位置
+        let added = editor.add_step(0, StepChoice::Appearance).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(editor.param_fields(0, added), Some(ParamFields::Appearance));
+
+        let added = editor.add_step(0, "copy").unwrap();
+        assert_eq!(editor.param_fields(0, added), None);
     }
 
     #[test]

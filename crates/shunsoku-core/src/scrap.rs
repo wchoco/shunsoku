@@ -329,6 +329,13 @@ impl ScrapModel {
         self.is_transparent_blank() && self.annotations.is_empty()
     }
 
+    /// 浮かべたらすぐ書き込みの編集モードに入るか。白紙スクラップを作ったとき（ホットキー・トレイ・レシピの
+    /// どの作り方でも）と、スクラップファイルを開いたときに、この規則で決める。入るのは何も書かれていない透明な
+    /// 白紙だけ（見えずにつかめるだけの物にしないため。何も書かずに抜けると捨てる）。不透明な白紙はそのまま浮かぶ。
+    pub fn starts_in_edit_mode(&self) -> bool {
+        self.is_empty_transparent_blank()
+    }
+
     /// 白紙スクラップの元の画像に当たる下地（大きさが `image_size` の、背景色の一色）。画素は持たずに背景色から
     /// 作るので、ごみ箱は白紙スクラップの画素を退避しない。画像を持つスクラップなら None。
     pub fn blank_image(&self) -> Option<Image> {
@@ -1052,7 +1059,7 @@ pub struct AppearanceOverrides {
     /// 枠の太さ（物理ピクセル）。枠の有無とは別に持つので、枠を隠したり色を変えたりしても残る。
     /// 物理ピクセルのまま持つのは、全体の既定値 `Border::width`（設定の `[scrap] border_width`）をそのまま
     /// 差し替える値だから。既定値が DPI で換算しない物理ピクセルなので、上書きだけを 96 DPI の値にすると、同じ数を
-    /// 書いても `[scrap]` と手とで太さが違って見える。96 DPI の値にするなら既定値と一緒に変える。
+    /// 書いても `[scrap]` とレシピのパラメータとで太さが違って見える。96 DPI の値にするなら既定値と一緒に変える。
     pub border_width: Option<u32>,
     /// 影の有無。
     pub shadow: Option<bool>,
@@ -1323,6 +1330,28 @@ mod tests {
         written.edit_input(EditInput::Leave);
         assert_eq!(written.annotations().items().len(), 1);
         assert!(!written.is_empty_transparent_blank());
+    }
+
+    #[test]
+    fn only_a_transparent_blank_scrap_with_nothing_written_starts_in_edit_mode() {
+        let size = Size::new(4, 4);
+        let transparent = ScrapModel::blank(Point::default(), size, Background::Transparent);
+        assert!(transparent.starts_in_edit_mode());
+        assert!(
+            !ScrapModel::blank(Point::default(), size, Background::WHITE).starts_in_edit_mode()
+        );
+        let dark = Background::Color(Rgb(0x21, 0x21, 0x21));
+        assert!(!ScrapModel::blank(Point::default(), size, dark).starts_in_edit_mode());
+        assert!(!ScrapModel::new(Point::default(), size).starts_in_edit_mode());
+        let mut written = transparent.clone();
+        written.start_editing(Style::default());
+        written.edit_input(EditInput::Press(Point::new(0, 0)));
+        written.edit_input(EditInput::Move {
+            at: Point::new(3, 3),
+            shift: false,
+        });
+        written.edit_input(EditInput::Leave);
+        assert!(!written.starts_in_edit_mode());
     }
 
     #[test]

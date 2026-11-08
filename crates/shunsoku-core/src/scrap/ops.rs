@@ -30,12 +30,12 @@
 //! 引数で受け取る。メニューでは 3 つの一覧を「見た目」の子メニュー（`FOLDERS`、`MenuEntry::Folder`）にまとめる。
 //! 上書きを全部消す `reset_appearance`（見た目を既定に戻す）は値のない操作で、同じ子メニューの区切りの下に置く。
 //!
-//! 見た目を指定（`appearance`）は、設定ファイルのレシピに値のある手（`{ op = "appearance", border_color = ... }`）
+//! 見た目を指定（`appearance`）は、設定ファイルのレシピにパラメータを添えた操作（`{ op = "appearance", border_color = ... }`）
 //! として書いたときだけ動く（ADR-0008）。書いた値は `OpContext::values` で渡り、書いた項目だけを上書きする。
 //! `takes_values` の操作はショートカット・マウス・「スクラップ操作」タブの行のどれにも出さない。
 //!
 //! 背景色（`background`）は白紙スクラップだけの操作で、普通のスクラップのメニューには出さない（`BLANK_ONLY`）。
-//! メニューではツールバーと同じ 8 色と「その他の色…」の子メニューにし、レシピでは値のある手
+//! メニューではツールバーと同じ 8 色と「その他の色…」の子メニューにし、レシピではパラメータを添えた操作
 //! （`{ op = "background", color = "#RRGGBB" }`）で呼ぶ。普通のスクラップでは `can_execute` が false なので、
 //! レシピはそこで止まる（ADR-0007）。背景色は見た目ではなく中身なので、`reset_appearance` では戻らない。
 
@@ -69,8 +69,8 @@ pub struct OperationDescriptor {
     /// ドラッグの量（`OpContext::drag`）を引数に取る操作。ドラッグでしか呼べないので、メニューにも
     /// ショートカットの対応表にも出さない。
     pub drag_only: bool,
-    /// レシピの値のある手の値（`OpContext::values`）を引数に取る操作（`appearance`、`background`。ADR-0008）。
-    /// ショートカットとマウスの対応表にも、値のない手にも出さない。
+    /// レシピの操作に添えたパラメータ（`OpContext::values`）を引数に取る操作（`appearance`、`background`。ADR-0008）。
+    /// ショートカットとマウスの対応表にも、パラメータのない操作にも出さない。
     pub takes_values: bool,
     /// レシピのどこに置けるか（ADR-0007）。引数のある操作とドラッグ専用の操作は `Never` にする。
     pub in_recipe: InRecipe,
@@ -100,9 +100,10 @@ impl OperationDescriptor {
 pub enum InRecipe {
     /// どこにでも置ける。
     Anywhere,
-    /// 最後にだけ置ける（`close`。閉じたあとの手は実行できない）。
+    /// 最後にだけ置ける（`close`、`annotate`）。閉じたあとの操作は実行できず、書き込みの編集モードの間は入力を
+    /// 奪うのでほかの操作を実行できない。レシピに 1 つまで。
     Last,
-    /// 置けない。引数を取る操作と、モードを切り替えて入力を奪う操作（`trim`、`annotate`）。
+    /// 置けない。引数を取る操作と、モードを切り替えて入力を奪う操作（`trim`）。
     Never,
 }
 
@@ -263,7 +264,7 @@ pub struct OpContext {
     pub carryover: Carryover,
     /// 文字の書き込みの書体と大きさの既定値（設定ファイルの `[annotation]`）。
     pub font: Font,
-    /// レシピの値のある手に書いた値（`takes_values` の操作に渡す）。ほかから呼んだときは None。
+    /// レシピの操作に添えたパラメータ（`takes_values` の操作に渡す）。ほかから呼んだときは None。
     pub values: Option<StepValues>,
 }
 
@@ -558,8 +559,8 @@ fn shadow_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     vec![Effect::Redraw]
 }
 
-/// レシピの値のある手に書いた項目だけを、スクラップごとの上書きに重ねる（ADR-0008）。書かなかった項目は今の
-/// 値のまま。枠の色か太さを書けば枠も出す。見た目が変わらなければ何もしない（手は成功として次へ進む）。
+/// レシピの操作に添えたパラメータに書いた項目だけを、スクラップごとの上書きに重ねる（ADR-0008）。書かなかった項目は今の
+/// 値のまま。枠の色か太さを書けば枠も出す。見た目が変わらなければ何もしない（操作は成功として次へ進む）。
 fn set_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     let Some(StepValues::Appearance(values)) = context.values else {
         return Vec::new();
@@ -576,7 +577,7 @@ fn set_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
         overrides.border_width = Some(width);
     }
     // 枠を出す（色か太さを書いたときも）なら、全体の既定値で枠を出していても、枠を出す上書きを入れる（あとで
-    // 既定値が枠を出さなくなっても、この手で決めた枠は残す）。色を書かなければ今の色のまま
+    // 既定値が枠を出さなくなっても、この操作で決めた枠は残す）。色を書かなければ今の色のまま
     let shows = values.border == Some(true)
         || values.border_color.is_some()
         || values.border_width.is_some();
@@ -679,8 +680,8 @@ fn background_choices(model: &ScrapModel, _: &Appearance) -> Vec<Choice> {
     colours.chain([transparent, other]).collect()
 }
 
-/// 背景色を、レシピの手の値か、一覧から選んだ色にする。「その他の色…」なら色の選択ダイアログを出す。
-/// 背景色が変わったときだけ描き直す（変わらなければ、手は成功として次へ進む）。
+/// 背景色を、レシピの操作に添えたパラメータか、一覧から選んだ色にする。「その他の色…」なら色の選択ダイアログを出す。
+/// 背景色が変わったときだけ描き直す（変わらなければ、操作は成功として次へ進む）。
 fn background_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     let background = match (context.values, context.choice) {
         (Some(StepValues::Background(background)), _) => background,
@@ -906,7 +907,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 30,
         drag_only: false,
         takes_values: false,
-        in_recipe: InRecipe::Never,
+        in_recipe: InRecipe::Last,
         in_menu: true,
         can_execute: can_annotate,
         checked: Some(editing),
@@ -1240,7 +1241,7 @@ impl BindingRow {
 
 /// 設定 GUI の「スクラップ操作」タブの行の一覧。`ops`（ふつうは `OPERATIONS`）の表の順で、ショートカットか
 /// マウスを割り当てられる操作の行を作る。引数の選択肢を持つ操作（`choices` が Some）はメニュー専用なので
-/// 行にしない。レシピの値のある手からだけ呼ぶ操作（`takes_values`）も行にしない。左ドラッグの移動（`drag_only`）は行にするが、ショートカットの欄はない。
+/// 行にしない。レシピでパラメータを添えたときだけ呼ぶ操作（`takes_values`）も行にしない。左ドラッグの移動（`drag_only`）は行にするが、ショートカットの欄はない。
 pub fn binding_rows(ops: &'static [OperationDescriptor]) -> Vec<BindingRow> {
     ops.iter()
         .filter(|op| op.choices.is_none() && !op.takes_values)

@@ -505,7 +505,7 @@ pub fn show_page(hwnd: HWND, page: Page) {
             unsafe {
                 let _ = ShowWindow(
                     child,
-                    if shown.contains(&id) {
+                    if shown.contains(&id) && !recipes::is_hidden_param(id) {
                         SW_SHOW
                     } else {
                         SW_HIDE

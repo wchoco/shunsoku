@@ -6,8 +6,12 @@
 //!   `Editor::set_recipe_name` で写しに入れる。
 //! - 操作の並びは、見出しのない 1 列の一覧と、横の「上へ」「下へ」「削除」。下のドロップダウンには、その時点で
 //!   レシピに足せる操作（`Editor::step_choices`）だけを出し、「足す」で足す（`chosen_step`）。
-//! - 操作の並びの下に、見た目の手の 5 項目（枠を出すか・枠の色・枠の太さ・透明度・影、#141）。並びで見た目の手を選んでいる
-//!   間だけ使え、ほかの手では無効にする（ページを出し直すと全部見えるので、隠さずに無効にする）。どの欄も先頭が
+//! - ショートカットの欄の下に、選んでいる操作のパラメータの欄（#157）。種類（`ParamFields`）ごとの欄のまとまりを
+//!   同じ位置に重ねて置き（`PARAM_FIELDS`）、`Editor::param_fields` が返す種類のまとまりだけを出す。パラメータの
+//!   ない操作を選んでいるか、何も選んでいなければ、どれも出さない。タブを出し直したとき（`settings_dialog::show_page`）
+//!   も、出していないまとまりは隠したまま（`is_hidden_param`）。種類を足すときは、`build` の最後にまとまりを置き、
+//!   `PARAM_FIELDS` に足す。
+//! - 見た目のパラメータの欄は 5 項目（枠を出すか・枠の色・枠の太さ・透明度・影、#141）。どの欄も先頭が
 //!   「変えない」で、枠と影はドロップダウン、太さと透明度は数の欄、枠の色は文字の欄と「選ぶ…」（部品は
 //!   「スクラップ」タブと同じ `PageBuilder` の `choice_control` / `number_controls` / `color_controls`）。値の出し入れは
 //!   `Editor::appearance` / `set_appearance` で、呼び出し側が `appearance_item` / `appearance_input` で受ける。
@@ -22,7 +26,8 @@ use std::cell::{Cell, RefCell};
 
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::{
-    AppearanceInput, AppearanceItem, Editor, SWITCH_CHOICES, StepChoice, UNCHANGED_KEY, step_label,
+    AppearanceInput, AppearanceItem, Editor, ParamFields, SWITCH_CHOICES, StepChoice,
+    UNCHANGED_KEY, step_label,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
@@ -35,13 +40,17 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCOUNT, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
-    SM_CXVSCROLL, SendMessageW, SetDlgItemTextW, WINDOW_STYLE, WS_BORDER, WS_TABSTOP,
+    IsWindowVisible, SM_CXVSCROLL, SW_HIDE, SW_SHOW, SendMessageW, SetDlgItemTextW, ShowWindow,
+    WINDOW_STYLE, WS_BORDER, WS_TABSTOP,
 };
 use windows::core::{PCWSTR, PWSTR};
 
 use super::fields::{set_window_text, window_text};
 use super::list_view::{self, set_cell};
-use super::{Class, During, PAGE_WIDTH, Page, PageBuilder, STATIC_TEXT, Text, item, page_first_id};
+use super::{
+    Class, During, PAGE_WIDTH, Page, PageBuilder, STATIC_TEXT, Text, current_page, item,
+    page_first_id,
+};
 use crate::wide::to_wide;
 
 /// ページの帯の最初からの位置（`build` が置く順）。
@@ -57,23 +66,27 @@ const STEP_UP: i32 = 8;
 const STEP_DOWN: i32 = 9;
 const STEP_REMOVE: i32 = 10;
 const STEPS_MARK: i32 = 11;
-/// 見た目を指定する手の欄（見出しと上下のボタンを含む）。ここから `APPEARANCE_END` の手前までを、見た目を
-/// 指定する手を選んでいなければ使えなくする。
-const APPEARANCE_FIRST: i32 = 12;
-const BORDER: i32 = 13;
-const BORDER_COLOR: i32 = 15;
-const PICK_COLOR: i32 = 16;
-const BORDER_WIDTH: i32 = 18;
-const BORDER_WIDTH_UPDOWN: i32 = 19;
-const OPACITY: i32 = 21;
-const OPACITY_UPDOWN: i32 = 22;
-const SHADOW: i32 = 24;
-const APPEARANCE_END: i32 = 25;
-const STEP_CHOICE: i32 = 25;
-const STEP_ADD: i32 = 26;
-const SHORTCUT: i32 = 28;
-const DETAIL_END: i32 = 30;
-/// 見た目を指定する手の項目と、その欄。
+const STEP_CHOICE: i32 = 12;
+const STEP_ADD: i32 = 13;
+const SHORTCUT: i32 = 15;
+const DETAIL_END: i32 = 17;
+/// 見た目のパラメータの欄（見出しと上下のボタンを含む）。
+const APPEARANCE_FIRST: i32 = DETAIL_END;
+const BORDER: i32 = 18;
+const BORDER_COLOR: i32 = 20;
+const PICK_COLOR: i32 = 21;
+const BORDER_WIDTH: i32 = 23;
+const BORDER_WIDTH_UPDOWN: i32 = 24;
+const OPACITY: i32 = 26;
+const OPACITY_UPDOWN: i32 = 27;
+const SHADOW: i32 = 29;
+const APPEARANCE_END: i32 = 30;
+/// パラメータの欄の種類と、そのまとまり（ページの帯の位置の範囲）。選んでいる操作の種類のまとまりだけを出す。
+const PARAM_FIELDS: [(ParamFields, i32, i32); 1] =
+    [(ParamFields::Appearance, APPEARANCE_FIRST, APPEARANCE_END)];
+/// ページの帯の、最後のコントロールの次。
+const PAGE_END: i32 = APPEARANCE_END;
+/// 見た目を指定する操作の項目と、その欄。
 const APPEARANCE_FIELDS: [(AppearanceItem, i32); 5] = [
     (AppearanceItem::Border, BORDER),
     (AppearanceItem::BorderColor, BORDER_COLOR),
@@ -104,16 +117,18 @@ const STEPS_MARK_HEIGHT: i16 = 20;
 const STEP_BUTTON_WIDTH: i16 = 40;
 const STEPS_WIDTH: i16 = FIELD_WIDTH - STEP_BUTTON_WIDTH - 4;
 const STEP_BUTTON_X: i16 = FIELD_X + STEPS_WIDTH + 4;
-/// 見た目を指定する手の欄（4 行）。上から枠を出すか、枠の色、枠の太さ、透明度と影。2 列目の見出しと欄の左端。
-const APPEARANCE_Y: i16 = STEPS_Y + STEPS_HEIGHT + 2 + STEPS_MARK_HEIGHT + 2;
+/// 足す操作のドロップダウンと、ショートカット（印は欄の下に 2 行まで）。
+const STEP_CHOICE_Y: i16 = STEPS_Y + STEPS_HEIGHT + 2 + STEPS_MARK_HEIGHT + 2;
+const SHORTCUT_Y: i16 = STEP_CHOICE_Y + 22;
+/// パラメータの欄の上端（ショートカットの印の下）。種類ごとのまとまりをここに重ねて置く。
+const PARAMS_Y: i16 = SHORTCUT_Y + 16 + 18 + 2;
+/// 見た目のパラメータの欄（4 行）。上から枠を出すか、枠の色、枠の太さ、透明度と影。2 列目の見出しと欄の左端。
 const APPEARANCE_ROW: i16 = 16;
 const SWITCH_WIDTH: i16 = 56;
 const NUMBER_WIDTH: i16 = 48;
 const SECOND_LABEL_X: i16 = FIELD_X + SWITCH_WIDTH + 6;
 const SECOND_LABEL_WIDTH: i16 = 32;
 const SECOND_FIELD_X: i16 = FIELD_X + 96;
-const STEP_CHOICE_Y: i16 = APPEARANCE_Y + 4 * APPEARANCE_ROW + 2;
-const SHORTCUT_Y: i16 = STEP_CHOICE_Y + 22;
 /// 一覧の列の見出し。幅は中身に合わせる（`fit_columns`）。
 const COLUMNS: [&str; 3] = [
     "settings_gui.recipes.name",
@@ -201,34 +216,6 @@ pub(super) fn build(b: &mut PageBuilder) {
         FIELD_WIDTH,
         STEPS_MARK_HEIGHT,
     );
-    // 見た目を指定する手の欄。部品は「スクラップ」タブと同じ（数は上下のボタン付き、色は「選ぶ…」付き）。
-    // オン・オフは「変えない」を先頭に置くドロップダウン
-    let appearance_first = b.next_id;
-    let label = |b: &mut PageBuilder, item: AppearanceItem, x: i16, y: i16, cx: i16| {
-        b.label(item.label_key(), x, y + 2, cx, 10);
-    };
-    let mut y = APPEARANCE_Y;
-    label(b, AppearanceItem::Border, DETAIL_X, y, LABEL_WIDTH);
-    let border = b.choice_control(FIELD_X, y, SWITCH_WIDTH, 60);
-    y += APPEARANCE_ROW;
-    label(b, AppearanceItem::BorderColor, DETAIL_X, y, LABEL_WIDTH);
-    let (border_color, pick_color) = b.color_controls(FIELD_X, y);
-    y += APPEARANCE_ROW;
-    label(b, AppearanceItem::BorderWidth, DETAIL_X, y, LABEL_WIDTH);
-    let (border_width, border_width_updown) = b.number_controls(FIELD_X, y, NUMBER_WIDTH);
-    y += APPEARANCE_ROW;
-    label(b, AppearanceItem::Opacity, DETAIL_X, y, LABEL_WIDTH);
-    let (opacity, opacity_updown) = b.number_controls(FIELD_X, y, NUMBER_WIDTH);
-    label(
-        b,
-        AppearanceItem::Shadow,
-        SECOND_LABEL_X,
-        y,
-        SECOND_LABEL_WIDTH,
-    );
-    let shadow_width = PAGE_WIDTH - SECOND_FIELD_X;
-    let shadow = b.choice_control(SECOND_FIELD_X, y, shadow_width, 60);
-    let appearance_end = b.next_id;
     // 足す操作を選ぶドロップダウン（高さは開いたときの一覧の高さ）と「足す」
     let choice = b.choice_control(FIELD_X, STEP_CHOICE_Y, STEPS_WIDTH, 120);
     let add_text = (b.text)("settings_gui.recipes.add_step");
@@ -251,6 +238,36 @@ pub(super) fn build(b: &mut PageBuilder) {
     );
     let shortcut = b.next_id;
     b.chord_field(SettingsItem::RecipeShortcut(0), FIELD_X, SHORTCUT_Y, 110);
+
+    // パラメータの欄。種類ごとのまとまりを同じ位置（`PARAMS_Y`）に重ねて置く（`PARAM_FIELDS`）。
+    // 見た目: 部品は「スクラップ」タブと同じ（数は上下のボタン付き、色は「選ぶ…」付き）。オン・オフは
+    // 「変えない」を先頭に置くドロップダウン
+    let appearance_first = b.next_id;
+    let label = |b: &mut PageBuilder, item: AppearanceItem, x: i16, y: i16, cx: i16| {
+        b.label(item.label_key(), x, y + 2, cx, 10);
+    };
+    let mut y = PARAMS_Y;
+    label(b, AppearanceItem::Border, DETAIL_X, y, LABEL_WIDTH);
+    let border = b.choice_control(FIELD_X, y, SWITCH_WIDTH, 60);
+    y += APPEARANCE_ROW;
+    label(b, AppearanceItem::BorderColor, DETAIL_X, y, LABEL_WIDTH);
+    let (border_color, pick_color) = b.color_controls(FIELD_X, y);
+    y += APPEARANCE_ROW;
+    label(b, AppearanceItem::BorderWidth, DETAIL_X, y, LABEL_WIDTH);
+    let (border_width, border_width_updown) = b.number_controls(FIELD_X, y, NUMBER_WIDTH);
+    y += APPEARANCE_ROW;
+    label(b, AppearanceItem::Opacity, DETAIL_X, y, LABEL_WIDTH);
+    let (opacity, opacity_updown) = b.number_controls(FIELD_X, y, NUMBER_WIDTH);
+    label(
+        b,
+        AppearanceItem::Shadow,
+        SECOND_LABEL_X,
+        y,
+        SECOND_LABEL_WIDTH,
+    );
+    let shadow_width = PAGE_WIDTH - SECOND_FIELD_X;
+    let shadow = b.choice_control(SECOND_FIELD_X, y, shadow_width, 60);
+    let appearance_end = b.next_id;
 
     let offsets = |ids: &[i32]| ids.iter().map(|id| id - first).collect::<Vec<_>>();
     debug_assert_eq!(offsets(&[list]), [LIST]);
@@ -296,7 +313,7 @@ pub(super) fn build(b: &mut PageBuilder) {
             APPEARANCE_END
         ]
     );
-    debug_assert_eq!(b.next_id - first, DETAIL_END);
+    debug_assert_eq!(b.next_id - first, PAGE_END);
 }
 
 fn id(offset: i32) -> i32 {
@@ -330,15 +347,15 @@ pub enum Button {
     Add,
     /// レシピを消す。
     Remove,
-    /// 選んだ手を上へ。
+    /// 選んだ操作を上へ。
     StepUp,
-    /// 選んだ手を下へ。
+    /// 選んだ操作を下へ。
     StepDown,
-    /// 選んだ手を消す。
+    /// 選んだ操作を消す。
     StepRemove,
     /// ドロップダウンで選んだ操作を足す。
     StepAdd,
-    /// 見た目を指定する手の枠の色を、色を選ぶダイアログで選ぶ。
+    /// 見た目を指定する操作の枠の色を、色を選ぶダイアログで選ぶ。
     PickColor,
 }
 
@@ -368,19 +385,19 @@ pub fn select(hwnd: HWND, index: usize) {
     }
 }
 
-/// 操作の並びの一覧で選んでいる手。
+/// 操作の並びの一覧で選んでいる操作。
 pub fn selected_step(hwnd: HWND) -> Option<usize> {
     list_view::selected(item(hwnd, steps_id())?)
 }
 
-/// 操作の並びの一覧の手 `index` を選ぶ。選び直しの通知が届く。
+/// 操作の並びの一覧の操作 `index` を選ぶ。選び直しの通知が届く。
 pub fn select_step(hwnd: HWND, index: usize) {
     if let Some(list) = item(hwnd, steps_id()) {
         list_view::select(list, index);
     }
 }
 
-/// ID `id` が見た目を指定する手の欄なら、その項目。
+/// ID `id` が見た目を指定する操作の欄なら、その項目。
 pub fn appearance_item(id: i32) -> Option<AppearanceItem> {
     let offset = id - page_first_id(Page::Recipes);
     APPEARANCE_FIELDS
@@ -389,7 +406,7 @@ pub fn appearance_item(id: i32) -> Option<AppearanceItem> {
         .map(|&(item, _)| item)
 }
 
-/// 見た目を指定する手の欄 `item` の今の入力。
+/// 見た目を指定する操作の欄 `item` の今の入力。
 pub fn appearance_input(hwnd: HWND, item: AppearanceItem) -> Option<AppearanceInput> {
     let control = self::item(hwnd, appearance_id(item))?;
     if !item.is_switch() {
@@ -419,8 +436,10 @@ thread_local! {
     static SYNCING: Cell<bool> = const { Cell::new(false) };
     /// ドロップダウンに出している、足せるもの（`chosen_step`）。
     static CHOICES: RefCell<Vec<StepChoice>> = const { RefCell::new(Vec::new()) };
-    /// 操作の並びの一覧に出しているレシピの位置と、手の文言。
+    /// 操作の並びの一覧に出しているレシピの位置と、操作の文言。
     static STEPS_SHOWN: RefCell<(Option<usize>, Vec<String>)> = const { RefCell::new((None, Vec::new())) };
+    /// 出しているパラメータの欄の種類。
+    static PARAMS_SHOWN: Cell<Option<ParamFields>> = const { Cell::new(None) };
 }
 
 /// 一覧の行や名前の欄を揃えている途中か（届いた通知では写しを変えない）。
@@ -504,8 +523,8 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
         mark(selected.map(SettingsItem::RecipeSteps)),
     );
 
-    // 操作の並び。変わったときだけ入れ直す（一覧で手を選んだ通知の中で、行を消さないため）。レシピを選び直したら、
-    // 手は選ばない
+    // 操作の並び。変わったときだけ入れ直す（一覧で操作を選んだ通知の中で、行を消さないため）。レシピを選び直したら、
+    // 操作は選ばない
     let labels: Vec<String> = recipe.map_or_else(Vec::new, |(_, r)| {
         r.steps.iter().map(|s| step_label(s, text)).collect()
     });
@@ -570,15 +589,21 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
         CHOICES.set(choices.clone());
     }
 
-    let appearance = fill_appearance(hwnd, editor, selected.zip(step), text);
+    let params = selected
+        .zip(step)
+        .and_then(|(i, s)| editor.param_fields(i, s));
+    fill_appearance(
+        hwnd,
+        editor,
+        selected
+            .zip(step)
+            .filter(|_| params == Some(ParamFields::Appearance)),
+        text,
+    );
+    show_params(hwnd, params);
 
     for offset in DETAIL_FIRST..DETAIL_END {
-        let in_appearance = (APPEARANCE_FIRST..APPEARANCE_END).contains(&offset);
-        enable(
-            hwnd,
-            id(offset),
-            selected.is_some() && (appearance || !in_appearance),
-        );
+        enable(hwnd, id(offset), selected.is_some());
     }
     enable(hwnd, id(REMOVE), selected.is_some());
     enable(hwnd, id(STEP_UP), step.is_some_and(|s| s > 0));
@@ -591,10 +616,40 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
     );
 }
 
-/// 見た目を指定する手の欄に、レシピと手 `at` の値を出す。見た目を指定する手でなければ、欄を空にする。初めて
-/// 出すときに、ドロップダウンの選択肢・数の範囲・空のときの「変えない」を入れる。見た目を指定する手か
-/// （欄を使えるか）を返す。
-fn fill_appearance(hwnd: HWND, editor: &Editor, at: Option<(usize, usize)>, text: Text) -> bool {
+/// パラメータの欄のうち、種類 `params` のまとまりだけを出し、ほかは隠す（None なら全部隠す）。レシピのタブを
+/// 出していなければ、覚えるだけで出さない（タブを出すときに `show_page` が `is_hidden_param` で従う）。
+fn show_params(hwnd: HWND, params: Option<ParamFields>) {
+    PARAMS_SHOWN.set(params);
+    let page_shown = current_page(hwnd) == Page::Recipes;
+    for (kind, first, end) in PARAM_FIELDS {
+        let shown = page_shown && params == Some(kind);
+        for offset in first..end {
+            // 出し方が変わるときだけ（打つたびに出し直さない）
+            if let Some(control) = item(hwnd, id(offset))
+                // SAFETY: 自分のダイアログのコントロール
+                && unsafe { IsWindowVisible(control) }.as_bool() != shown
+            {
+                // SAFETY: 自分のダイアログのコントロール
+                unsafe {
+                    let _ = ShowWindow(control, if shown { SW_SHOW } else { SW_HIDE });
+                }
+            }
+        }
+    }
+}
+
+/// ID `id` が、いま出していないパラメータの欄か（タブを出し直しても隠したままにする）。
+pub(super) fn is_hidden_param(id: i32) -> bool {
+    let offset = id - page_first_id(Page::Recipes);
+    let shown = PARAMS_SHOWN.get();
+    PARAM_FIELDS
+        .iter()
+        .any(|&(kind, first, end)| (first..end).contains(&offset) && shown != Some(kind))
+}
+
+/// 見た目のパラメータの欄に、レシピと操作 `at` の値を出す。None なら欄を空にする。初めて出すときに、
+/// ドロップダウンの選択肢・数の範囲・空のときの「変えない」を入れる。
+fn fill_appearance(hwnd: HWND, editor: &Editor, at: Option<(usize, usize)>, text: Text) {
     // SAFETY: フォーカスのあるウィンドウを読むだけ
     let focus = unsafe { GetFocus() };
     let shown = at
@@ -619,7 +674,7 @@ fn fill_appearance(hwnd: HWND, editor: &Editor, at: Option<(usize, usize)>, text
                         );
                     }
                 }
-                // 見た目を指定する手でなければ、何も選ばない（-1）
+                // 見た目を指定する操作でなければ、何も選ばない（-1）
                 let index = match value {
                     Some(AppearanceInput::Switch(on)) => SWITCH_CHOICES
                         .iter()
@@ -638,7 +693,7 @@ fn fill_appearance(hwnd: HWND, editor: &Editor, at: Option<(usize, usize)>, text
             if control != focus && window_text(control) != value {
                 set_window_text(control, &value);
             }
-            // 空のときは「変えない」を薄く出す（見た目を指定する手を選んでいる間だけ）
+            // 空のときは「変えない」を薄く出す（見た目を指定する操作を選んでいる間だけ）
             let cue = to_wide(if shown && value.is_empty() {
                 text(UNCHANGED_KEY)
             } else {
@@ -670,7 +725,6 @@ fn fill_appearance(hwnd: HWND, editor: &Editor, at: Option<(usize, usize)>, text
             }
         }
     }
-    shown
 }
 
 /// 足せるもの `choice` の文言（ドロップダウンに出す）。表にない id はそのまま。

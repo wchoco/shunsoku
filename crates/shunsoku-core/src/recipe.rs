@@ -9,30 +9,30 @@ use crate::settings::{BORDER_WIDTH_RANGE, OPACITY_RANGE, Rgb};
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Recipe {
     pub name: String,
-    /// 手の並び。
+    /// 操作の並び。
     pub steps: Vec<Step>,
     pub shortcut: Option<Chord>,
 }
 
-/// 値のある手の操作の id（設定ファイルの `op = "appearance"`）。ADR-0008。
+/// 見た目を指定する操作の id（設定ファイルの `op = "appearance"`）。ADR-0008。
 pub const APPEARANCE: &str = "appearance";
 
-/// 背景色を指定する値のある手の操作の id（設定ファイルの `op = "background"`）。白紙スクラップだけで動く。
+/// 背景色を指定する操作の id（設定ファイルの `op = "background"`）。白紙スクラップだけで動く。
 pub const BACKGROUND: &str = "background";
 
-/// レシピの手 1 つ（設定ファイルの `steps` の要素）。中身の検査はまだしていない（書いたまま）。
+/// レシピの操作 1 つ（設定ファイルの `steps` の要素）。中身の検査はまだしていない（書いたまま）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
-    /// 値のない手。スクラップ操作の id（設定ファイルでは文字列）。
+    /// パラメータのない操作。スクラップ操作の id（設定ファイルでは文字列）。
     Op(String),
-    /// 値のある手。見た目を指定する操作（`APPEARANCE`）と、その値（設定ファイルではインライン表）。
+    /// パラメータを添えた操作。見た目を指定する操作（`APPEARANCE`）と、その値（設定ファイルではインライン表）。
     Appearance(AppearanceStep),
-    /// 値のある手。背景色を指定する操作（`BACKGROUND`）と、その色（設定ファイルではインライン表）。
+    /// パラメータを添えた操作。背景色を指定する操作（`BACKGROUND`）と、その色（設定ファイルではインライン表）。
     Background(BackgroundStep),
 }
 
 impl Step {
-    /// 手が呼ぶ操作の id。
+    /// 呼ぶ操作の id。
     pub fn op_id(&self) -> &str {
         match self {
             Step::Op(id) => id,
@@ -41,7 +41,7 @@ impl Step {
         }
     }
 
-    /// 見た目を指定する手に書いた値。ほかの手は None。
+    /// 見た目を指定する操作に添えたパラメータ。ほかの操作は None。
     pub fn values(&self) -> Option<&AppearanceStep> {
         match self {
             Step::Op(_) | Step::Background(_) => None,
@@ -51,28 +51,28 @@ impl Step {
 }
 
 impl From<&str> for Step {
-    /// 値のない手。
+    /// パラメータのない操作。
     fn from(id: &str) -> Step {
         Step::Op(id.to_owned())
     }
 }
 
-/// 見た目を指定する手（ADR-0008）。書いたまま（範囲と矛盾の検査は `plan` がする）。
+/// 見た目を指定する操作（ADR-0008）。書いたまま（範囲と矛盾の検査は `plan` がする）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AppearanceStep {
     /// 読めた項目。
     pub values: AppearanceValues,
-    /// 読めなかった項目（書いた順）。どれか 1 つでもあれば、その手はレシピの問題になる。
+    /// 読めなかった項目（書いた順）。どれか 1 つでもあれば、その操作はレシピの問題になる。
     pub rejected: Vec<Rejected>,
 }
 
-/// 背景色を指定する手（`{ op = "background", color = "#RRGGBB" }`）。書いたまま（検査は `plan` がする）。
+/// 背景色を指定する操作（`{ op = "background", color = "#RRGGBB" }`）。書いたまま（検査は `plan` がする）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BackgroundStep {
     /// 読めた色（`Background` の書き方。設定ファイルの `[annotation] background` と同じ）。書いていないか
     /// 読めなければ None。
     pub color: Option<Background>,
-    /// 読めなかった項目（書いた順）。どれか 1 つでもあれば、その手はレシピの問題になる。
+    /// 読めなかった項目（書いた順）。どれか 1 つでもあれば、その操作はレシピの問題になる。
     pub rejected: Vec<Rejected>,
 }
 
@@ -88,16 +88,16 @@ impl BackgroundStep {
     }
 }
 
-/// 検査を通った値のある手の値。実行するときに `OpContext::values` で操作へ渡す。
+/// 検査を通った操作に添えたパラメータ。実行するときに `OpContext::values` で操作へ渡す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepValues {
-    /// 見た目を指定する手（`APPEARANCE`）。
+    /// 見た目を指定する操作（`APPEARANCE`）。
     Appearance(AppearanceValues),
-    /// 背景色を指定する手（`BACKGROUND`）。
+    /// 背景色を指定する操作（`BACKGROUND`）。
     Background(Background),
 }
 
-/// 見た目を指定する手に書いた値。書いた項目だけが Some。キーと値の範囲は設定ファイルの `[scrap]` と同じ。
+/// 見た目を指定する操作に添えたパラメータ。書いた項目だけが Some。キーと値の範囲は設定ファイルの `[scrap]` と同じ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AppearanceValues {
     /// 透明度（%、`settings::OPACITY_RANGE`）。
@@ -181,7 +181,7 @@ fn ranged<T: TryFrom<i64> + PartialOrd>(
         .ok_or(Rejection::OutOfRange)
 }
 
-/// 見た目を指定する手の項目。並びは設定ファイルに書くキーの順で、設定 GUI の欄の順。
+/// 見た目を指定する操作の項目。並びは設定ファイルに書くキーの順で、設定 GUI の欄の順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppearanceItem {
     /// 枠を出すか（`border`）。
@@ -206,7 +206,7 @@ impl AppearanceItem {
         AppearanceItem::Shadow,
     ];
 
-    /// 設定ファイルの手のキー。
+    /// 設定ファイルのパラメータのキー。
     pub fn key(self) -> &'static str {
         match self {
             AppearanceItem::Border => "border",
@@ -217,7 +217,7 @@ impl AppearanceItem {
         }
     }
 
-    /// 設定ファイルの手のキー `key` の項目。
+    /// 設定ファイルのパラメータのキー `key` の項目。
     pub fn from_key(key: &str) -> Option<AppearanceItem> {
         AppearanceItem::ALL
             .into_iter()
@@ -268,14 +268,14 @@ impl Written<'_> {
     }
 }
 
-/// 見た目を指定する手に書いたキー。
+/// 見た目を指定する操作に書いたキー。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepKey {
     /// `op`。
     Op,
     /// 見た目の項目のキー。
     Item(AppearanceItem),
-    /// 背景色を指定する手の色（`color`）。
+    /// 背景色を指定する操作の色（`color`）。
     Color,
     /// 知らないキー。
     Unknown(String),
@@ -293,7 +293,7 @@ impl StepKey {
     }
 }
 
-/// 見た目を指定する手の、読めなかった項目 1 つ。
+/// 見た目を指定する操作の、読めなかった項目 1 つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejected {
     pub key: StepKey,
@@ -315,11 +315,11 @@ pub enum Rejection {
     NotAppearance,
 }
 
-/// 検査を通った手 1 つ。
+/// 検査を通った操作 1 つ。
 #[derive(Debug, Clone)]
 pub struct PlannedStep {
     pub op: &'static OperationDescriptor,
-    /// 手に書いた値。値のない手は None。実行するときに `OpContext::values` で操作へ渡す。
+    /// 操作に添えたパラメータ。パラメータのない操作は None。実行するときに `OpContext::values` で操作へ渡す。
     pub values: Option<StepValues>,
 }
 
@@ -344,19 +344,20 @@ pub enum Problem {
     NoSteps,
     /// レシピに入れられない操作（表にない、`InRecipe::Never`、別のレシピ）。書いた id。
     NotAStep(String),
-    /// 最後にだけ置ける操作（`InRecipe::Last`。`close`）が最後以外にある。
-    CloseNotLast,
-    /// 値のある手の値が範囲外。書いたキー。
+    /// 最後にだけ置ける操作（`InRecipe::Last`。`close`、`annotate`）が最後以外にある。2 つ置いたときも、前の
+    /// ほうが最後以外になるのでこれ。
+    LastOnlyNotLast,
+    /// 操作に添えたパラメータが範囲外。書いたキー。
     OutOfRange(String),
-    /// 値のある手の値の型か書式の誤り。書いたキー。
+    /// 操作に添えたパラメータの型か書式の誤り。書いたキー。
     BadValue(String),
-    /// 値のある手の知らないキー。
+    /// パラメータを添えた操作の知らないキー。
     UnknownKey(String),
-    /// 値のある手の `op` が `appearance` でも `background` でもない（書いていないときも）。
+    /// パラメータを添えた操作の `op` が `appearance` でも `background` でもない（書いていないときも）。
     NotAppearance,
-    /// 値のある手に、項目を 1 つも書いていない。
+    /// パラメータを添えた操作に、項目を 1 つも書いていない。
     NoValues,
-    /// 値のある手に、`border = false` と枠の色か太さを一緒に書いた。
+    /// パラメータを添えた操作に、`border = false` と枠の色か太さを一緒に書いた。
     BorderOffWithColorOrWidth,
 }
 
@@ -418,7 +419,7 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
                     &mut problems,
                 ))),
             };
-            // 値のある手は値を取る操作（`takes_values`）を、値のない手はレシピに入れられる操作を呼ぶ
+            // パラメータを添えた操作は値を取る操作（`takes_values`）を、パラメータのない操作はレシピに入れられる操作を呼ぶ
             let fits = |op: &OperationDescriptor| match values {
                 Some(_) => op.takes_values,
                 None => can_be_step(op),
@@ -431,7 +432,7 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
         if let Some((_, before_last)) = recipe.steps.split_last()
             && before_last.iter().any(|s| is_last_only(s.op_id(), ops))
         {
-            problems.push(Problem::CloseNotLast);
+            problems.push(Problem::LastOnlyNotLast);
         }
         if problems.is_empty() {
             checked.plans.push(Plan {
@@ -461,7 +462,7 @@ fn check_rejected(rejected: &[Rejected], problems: &mut Vec<Problem>) {
     }
 }
 
-/// 背景色を指定する手を検査し、問題を `problems` に足す。読めた色を返す（読めなければ既定の白。問題がある
+/// 背景色を指定する操作を検査し、問題を `problems` に足す。読めた色を返す（読めなければ既定の白。問題がある
 /// ので実行はしない）。
 fn check_background(step: &BackgroundStep, problems: &mut Vec<Problem>) -> Background {
     check_rejected(&step.rejected, problems);
@@ -472,7 +473,7 @@ fn check_background(step: &BackgroundStep, problems: &mut Vec<Problem>) -> Backg
     step.color.unwrap_or_default()
 }
 
-/// 見た目を指定する手の値を検査し、問題を `problems` に足す。読めた値を返す（問題があっても）。
+/// 見た目を指定する操作のパラメータを検査し、問題を `problems` に足す。読めた値を返す（問題があっても）。
 fn check_appearance(step: &AppearanceStep, problems: &mut Vec<Problem>) -> AppearanceValues {
     check_rejected(&step.rejected, problems);
     let values = step.values;
@@ -488,7 +489,7 @@ fn check_appearance(step: &AppearanceStep, problems: &mut Vec<Problem>) -> Appea
     values
 }
 
-/// 1 手の結果。Win32 層がその手の `Effect` を実行して決め、`Run::settle` で返す。
+/// 1 つの操作の結果。Win32 層がその操作の `Effect` を実行して決め、`Run::settle` で返す。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Outcome {
     /// 成功した。結果を返さない `Effect`（移動、描き直しなど）もこれ。
@@ -501,42 +502,42 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// 1 手の `Effect` ごとの結果をまとめた、その手の結果。いちばん悪いもの（失敗 → 取り消し → 成功）。
+    /// 1 つの操作の `Effect` ごとの結果をまとめた、その操作の結果。いちばん悪いもの（失敗 → 取り消し → 成功）。
     /// `Effect` がなければ成功。
     pub fn of(outcomes: impl IntoIterator<Item = Outcome>) -> Outcome {
         outcomes.into_iter().max().unwrap_or(Outcome::Succeeded)
     }
 }
 
-/// レシピが止まったわけ。どれも、その手（id）より後ろの手は実行していない。
+/// レシピが止まったわけ。どれも、その操作（id）より後ろの操作は実行していない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
-    /// その手は今は実行できなかった（`can_execute` が偽）。実行していない。
+    /// その操作は今は実行できなかった（`can_execute` が偽）。実行していない。
     CannotRun(OperationId),
-    /// その手が失敗した。
+    /// その操作が失敗した。
     Failed(OperationId),
-    /// その手が取り消された。
+    /// その操作が取り消された。
     Cancelled(OperationId),
 }
 
 /// `Run::advance` の結果。
 #[derive(Debug, Clone)]
 pub enum Advance {
-    /// 次の手を実行した（`ScrapModel` を変えた）。Win32 層は `effects` を実行し、その結果を `Run::settle` で
-    /// 返す。結果を返すまで、次の手へは進まない。
+    /// 次の操作を実行した（`ScrapModel` を変えた）。Win32 層は `effects` を実行し、その結果を `Run::settle` で
+    /// 返す。結果を返すまで、次の操作へは進まない。
     Step {
         op: &'static OperationDescriptor,
         effects: Vec<Effect>,
     },
-    /// その手の結果をまだ受けていない（何もしていない）。
+    /// その操作の結果をまだ受けていない（何もしていない）。
     Waiting(OperationId),
-    /// 全部の手が成功した。
+    /// 全部の操作が成功した。
     Finished,
     /// 止まった。
     Stopped(Stop),
 }
 
-/// 手は id で比べる（`OperationDescriptor` は関数を持つので比べない）。
+/// 操作は id で比べる（`OperationDescriptor` は関数を持つので比べない）。
 impl PartialEq for Advance {
     fn eq(&self, other: &Advance) -> bool {
         match (self, other) {
@@ -555,24 +556,24 @@ impl PartialEq for Advance {
     }
 }
 
-/// 走っているレシピの進み具合（ADR-0007）。1 手ずつ実行し、その手の結果を受けてから次の手へ進む。
+/// 走っているレシピの進み具合（ADR-0007）。1 つずつ実行し、その操作の結果を受けてから次の操作へ進む。
 ///
-/// Win32 層は `advance` で手を 1 つ実行させ、返った `Effect` を実行して、その結果を `settle` で返す。結果が
+/// Win32 層は `advance` で操作を 1 つ実行させ、返った `Effect` を実行して、その結果を `settle` で返す。結果が
 /// あとから届く `Effect`（裏のスレッドの保存など）は、届くまで `Run` を持っておき、届いたら `settle` してから
 /// `advance` を続ける。`Effect` を実行する前にスクラップが閉じられたら、`Run` を捨てる。
 #[derive(Debug, Clone)]
 pub struct Run {
     steps: Vec<PlannedStep>,
-    /// 次に実行する手の位置。
+    /// 次に実行する操作の位置。
     next: usize,
     state: State,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// 次の手を実行できる。
+    /// 次の操作を実行できる。
     Ready,
-    /// 実行した手（`next - 1`）の結果を待っている。
+    /// 実行した操作（`next - 1`）の結果を待っている。
     Waiting,
     Stopped(Stop),
 }
@@ -586,7 +587,7 @@ impl Run {
         }
     }
 
-    /// 次の手へ進む。前の手の結果を待っている間と、止まったあとは何もしない。
+    /// 次の操作へ進む。前の操作の結果を待っている間と、止まったあとは何もしない。
     pub fn advance(&mut self, model: &mut ScrapModel, context: &OpContext) -> Advance {
         match self.state {
             State::Stopped(stop) => return Advance::Stopped(stop),
@@ -613,12 +614,12 @@ impl Run {
         }
     }
 
-    /// 結果を待っている手の id。
+    /// 結果を待っている操作の id。
     pub fn waiting_for(&self) -> Option<OperationId> {
         (self.state == State::Waiting).then(|| self.steps[self.next - 1].op.id)
     }
 
-    /// 実行した手の結果を受ける。成功なら次の手へ進めるようにし、失敗か取り消しなら止める。結果を待って
+    /// 実行した操作の結果を受ける。成功なら次の操作へ進めるようにし、失敗か取り消しなら止める。結果を待って
     /// いなければ何もしない。
     pub fn settle(&mut self, outcome: Outcome) {
         let Some(id) = self.waiting_for() else {
@@ -634,7 +635,7 @@ impl Run {
 
 /// あとから届く結果（裏のスレッドの保存）を待っているレシピ。待たせるのは 1 つだけ。
 ///
-/// Win32 層は、結果を待つ手を実行したら `Run` をここに預け、結果の知らせ（`ticket`。保存先など）が届いたら
+/// Win32 層は、結果を待つ操作を実行したら `Run` をここに預け、結果の知らせ（`ticket`。保存先など）が届いたら
 /// `resume` で取り出して `Run::settle` し、`Run::advance` を続ける。待っている間にそのスクラップを閉じたら
 /// `discard_for`、ほかのレシピを始めたら `discard` で捨てる（捨てたレシピは、結果が届いても進めない）。
 /// `S` はスクラップを、`T` は結果の知らせを見分けるもの。
@@ -732,16 +733,9 @@ mod tests {
 
     #[test]
     fn steps_that_cannot_go_in_a_recipe_make_it_an_error() {
-        // trim と annotate はモードを変える。zoom は選択肢を持ち、move はドラッグ専用。fly は表にない（別の
+        // trim はモードを変える。zoom は選択肢を持ち、move はドラッグ専用。fly は表にない（別の
         // レシピの名前も同じ）
-        for step in [
-            "trim",
-            "annotate",
-            "zoom",
-            "move",
-            "fly",
-            "コピーして閉じる",
-        ] {
+        for step in ["trim", "zoom", "move", "fly", "コピーして閉じる"] {
             let checked = plan(
                 &[
                     recipe("コピーして閉じる", &["copy", "close"]),
@@ -788,11 +782,38 @@ mod tests {
         );
         assert_eq!(
             checked.problems,
-            vec![(0, Problem::CloseNotLast), (1, Problem::CloseNotLast)]
+            vec![(0, Problem::LastOnlyNotLast), (1, Problem::LastOnlyNotLast)]
         );
         assert_eq!(
             checked.plans.iter().map(|p| p.index).collect::<Vec<_>>(),
             [2]
+        );
+    }
+
+    #[test]
+    fn annotate_goes_only_at_the_end_and_not_with_close() {
+        let checked = plan(
+            &[
+                recipe("a", &["annotate", "copy"]),
+                recipe("b", &["copy", "close", "annotate"]),
+                recipe("c", &["annotate", "close"]),
+                recipe("d", &["annotate", "annotate"]),
+                recipe("e", &["copy", "annotate"]),
+            ],
+            OPERATIONS,
+        );
+        assert_eq!(
+            checked.problems,
+            vec![
+                (0, Problem::LastOnlyNotLast),
+                (1, Problem::LastOnlyNotLast),
+                (2, Problem::LastOnlyNotLast),
+                (3, Problem::LastOnlyNotLast),
+            ]
+        );
+        assert_eq!(
+            checked.plans.iter().map(|p| p.index).collect::<Vec<_>>(),
+            [4]
         );
     }
 
@@ -954,7 +975,7 @@ mod tests {
                 ),
                 issue(
                     SettingsItem::RecipeSteps(1),
-                    settings::Problem::CloseNotLast
+                    settings::Problem::LastOnlyNotLast
                 ),
                 issue(
                     SettingsItem::RecipeName(2),
@@ -986,7 +1007,7 @@ mod tests {
         ScrapModel::new(Point::new(0, 0), Size::new(300, 200))
     }
 
-    /// 次の手を実行し、その手の id と Effect を返す。手でなければ panic。
+    /// 次の操作を実行し、その操作の id と Effect を返す。`Advance::Step` でなければ panic。
     fn step(run: &mut Run, model: &mut ScrapModel) -> (&'static str, Vec<Effect>) {
         match run.advance(model, &OpContext::default()) {
             Advance::Step { op, effects } => (op.id, effects),
@@ -1002,7 +1023,7 @@ mod tests {
             step(&mut run, &mut model),
             ("copy", vec![Effect::CopyToClipboard])
         );
-        // 結果を受けるまで次の手へ進まない
+        // 結果を受けるまで次の操作へ進まない
         assert_eq!(run.waiting_for(), Some("copy"));
         assert!(matches!(
             run.advance(&mut model, &OpContext::default()),
@@ -1014,6 +1035,24 @@ mod tests {
             step(&mut run, &mut model),
             ("close", vec![Effect::MoveToTrash])
         );
+        run.settle(Outcome::Succeeded);
+        assert!(matches!(
+            run.advance(&mut model, &OpContext::default()),
+            Advance::Finished
+        ));
+    }
+
+    #[test]
+    fn annotate_at_the_end_enters_the_edit_mode_after_the_steps_before_it() {
+        let mut run = run_of(&["zoom_in", "annotate"]);
+        let mut model = model();
+        assert_eq!(step(&mut run, &mut model).0, "zoom_in");
+        run.settle(Outcome::Succeeded);
+        assert_eq!(
+            step(&mut run, &mut model),
+            ("annotate", vec![Effect::EnterEditMode])
+        );
+        assert!(model.is_editing());
         run.settle(Outcome::Succeeded);
         assert!(matches!(
             run.advance(&mut model, &OpContext::default()),
@@ -1304,7 +1343,7 @@ mod tests {
         assert_eq!(checked.problems, vec![]);
         assert_eq!(checked.plans.len(), 2);
 
-        // もう既定の見た目なので何も変わらないが、次の手へ進む
+        // もう既定の見た目なので何も変わらないが、次の操作へ進む
         let mut run = Run::new(checked.plans[0].steps.clone());
         let mut model = model();
         assert_eq!(step(&mut run, &mut model), ("reset_appearance", vec![]));
@@ -1415,7 +1454,7 @@ mod tests {
                 r#"[{ op = "appearance", border = false, border_width = 3 }]"#,
                 vec![Problem::BorderOffWithColorOrWidth],
             ),
-            // 値のない手として appearance は書けない（値がないと実行できない）
+            // パラメータのない操作として appearance は書けない（値がないと実行できない）
             (
                 r#"["appearance"]"#,
                 vec![Problem::NotAStep("appearance".into())],
@@ -1555,7 +1594,7 @@ mod tests {
                 vec![Problem::UnknownKey("opacity".into())],
             ),
             (r#"[{ op = "background" }]"#, vec![Problem::NoValues]),
-            // 値のない手として background は書けない（色がないと実行できない）
+            // パラメータのない操作として background は書けない（色がないと実行できない）
             (
                 r#"["background"]"#,
                 vec![Problem::NotAStep("background".into())],

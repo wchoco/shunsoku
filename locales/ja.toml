@@ -185,7 +185,7 @@ shortcut_label = "ショートカット:"
 # 「追加」で足すレシピの名前（後ろに番号が付く）
 default_name = "レシピ"
 
-# 手の一覧の、見た目を指定する手の要約（「見た目: 枠 #FF0000」）
+# 操作の一覧の、パラメータを添えた操作の要約（「見た目: 枠 #FF0000」）
 [settings_gui.recipes.step]
 appearance = "見た目: {items}"
 opacity = "透明度 {percent}%"
@@ -197,7 +197,7 @@ shadow_on = "影"
 shadow_off = "影なし"
 background = "背景色: {color}"
 
-# 見た目を指定する手の欄（手の一覧で選んでいる間、一覧の下に出す）
+# 見た目を指定する操作のパラメータの欄（操作の一覧で選んでいる間、一覧の下に出す）
 [settings_gui.recipes.appearance]
 border = "枠:"
 border_color = "枠の色:"
@@ -220,12 +220,12 @@ empty_name = "名前が空です"
 duplicate_name = "名前が重なっています"
 no_steps = "操作がありません"
 not_a_step = "レシピに入れられない操作があります"
-close_not_last = "閉じるは最後にだけ置けます"
-out_of_range = "見た目の値が範囲外です（透明度は 10〜100、枠の太さは 1〜16）"
-bad_value = "値の書き方が違います（色は #RRGGBB、枠と影は true か false）"
-unknown_key = "値のある手に知らないキーがあります"
-not_appearance = "表で書ける手は op = \"appearance\" と op = \"background\" だけです"
-no_values = "値のある手に項目がありません"
+last_only_not_last = "閉じると書き込みは、どちらか 1 つだけを最後に置けます"
+out_of_range = "見た目のパラメータが範囲外です（透明度は 10〜100、枠の太さは 1〜16）"
+bad_value = "パラメータの書き方が違います（色は #RRGGBB、枠と影は true か false）"
+unknown_key = "パラメータに知らないキーがあります"
+not_appearance = "表で書ける操作は op = \"appearance\" と op = \"background\" だけです"
+no_values = "パラメータを 1 つも書いていない操作があります"
 border_off_with_color_or_width = "border = false と枠の色・太さは一緒に書けません"
 
 [hotkey]

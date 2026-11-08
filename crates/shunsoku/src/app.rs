@@ -31,9 +31,9 @@
 //!   `App::shortcuts`、`ops::mouse_operation`、`ops::menu`）でスクラップ操作に変え、`run_scrap_operation` で
 //!   実行する。操作が返す `Effect` を実行するのはここ（`perform`）。操作を足すときは core の表に
 //!   行を足し、新しい `Effect` があればそこに足す。
-//! - ショートカットに付いたレシピ（`[[recipes]]`）は `run_recipe` で実行する。手を進めるのは core の
-//!   `recipe::Run`（ADR-0007）で、ここは手ごとに `Effect` を実行し（`perform`）、その結果（`Outcome`）を返す。
-//!   保存の手は、裏のスレッドの書き込みの結果（`WM_APP_SAVED`）を受けるまで `App::recipe` に預けて待つ。待って
+//! - ショートカットに付いたレシピ（`[[recipes]]`）は `run_recipe` で実行する。操作を進めるのは core の
+//!   `recipe::Run`（ADR-0007）で、ここは操作ごとに `Effect` を実行し（`perform`）、その結果（`Outcome`）を返す。
+//!   保存の操作は、裏のスレッドの書き込みの結果（`WM_APP_SAVED`）を受けるまで `App::recipe` に預けて待つ。待って
 //!   いる間にそのスクラップを閉じるか、ほかのレシピを始めたら、待っているレシピは捨てる。
 //! - 設定（`%APPDATA%\shunsoku\settings.toml`、ポータブルモードでは exe の横のもの。場所は core の
 //!   `settings::locate`）は起動時に読み、`settings_watch` の知らせ（`WM_APP_SETTINGS`）で
@@ -2182,11 +2182,11 @@ fn on_scrap_key(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
 /// ショートカットに付いたもの（`on_scrap_key` で `App` を返してから実行するため、借りずに持てる形にする）。
 enum Bound {
     Operation(&'static OperationDescriptor),
-    /// レシピの名前（ログ用）と手。
+    /// レシピの名前（ログ用）と操作の並び。
     Recipe(String, Vec<PlannedStep>),
 }
 
-/// レシピを実行する。手を 1 つずつ実行し、その手の `Effect` を実行し終えてから結果を返して次の手へ進む
+/// レシピを実行する。操作を 1 つずつ実行し、その操作の `Effect` を実行し終えてから結果を返して次の操作へ進む
 /// （ADR-0007）。保存の結果を待っているレシピがあれば捨てる。
 fn run_recipe(hwnd: HWND, name: &str, steps: Vec<PlannedStep>) {
     if with_app(|app| app.recipe.discard()).flatten().is_some() {
@@ -2196,8 +2196,8 @@ fn run_recipe(hwnd: HWND, name: &str, steps: Vec<PlannedStep>) {
     drive_recipe(hwnd, Run::new(steps));
 }
 
-/// レシピを進められるところまで進める。失敗・取り消し・今は実行できない手で止まる。止まったわけはログに書く
-/// （失敗の通知はその手の `Effect` を実行した側が出している）。保存を裏のスレッドに渡した手は、結果を受ける
+/// レシピを進められるところまで進める。失敗・取り消し・今は実行できない操作で止まる。止まったわけはログに書く
+/// （失敗の通知はその操作の `Effect` を実行した側が出している）。保存を裏のスレッドに渡した操作は、結果を受ける
 /// まで `App::recipe` に預けて返る（`on_saved` が続きを進める）。
 fn drive_recipe(hwnd: HWND, mut run: Run) {
     loop {
@@ -2229,7 +2229,7 @@ fn drive_recipe(hwnd: HWND, mut run: Run) {
                     }
                 }
             }
-            // 結果を待っている手はここで預けて返るので、待ったまま来ることはない
+            // 結果を待っている操作はここで預けて返るので、待ったまま来ることはない
             Some(Advance::Waiting(id)) => {
                 log::warn!("recipe is still waiting for {id}");
                 return;
@@ -2242,7 +2242,7 @@ fn drive_recipe(hwnd: HWND, mut run: Run) {
                 log::info!("recipe stopped: {stop:?}");
                 return;
             }
-            // スクラップがもうない（最後の手の「閉じる」で閉じたなど）
+            // スクラップがもうない（最後の操作の「閉じる」で閉じたなど）
             None => {
                 log::info!("recipe ended with the scrap gone");
                 return;
@@ -2353,7 +2353,7 @@ fn scrap_menu_entries(
     items
 }
 
-/// `perform` で実行した 1 手の結果。
+/// `perform` で実行した 1 つの操作の結果。
 #[derive(Default)]
 struct Performed {
     /// その場でわかった結果（`Outcome::of`）。
@@ -4304,8 +4304,8 @@ fn float_model(model: ScrapModel, image: Image, focus: bool) -> std::result::Res
     }
 }
 
-/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移し、すぐに書き込みの
-/// 編集モードに入る。出せなければ通知する。
+/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移す。背景が透明なときだけ
+/// すぐに書き込みの編集モードに入る（core の `ScrapModel::starts_in_edit_mode`）。出せなければ通知する。
 fn create_blank_scrap(rect: Rect) {
     let Some(background) = with_app(|app| app.settings.annotation.background) else {
         return;
@@ -4322,7 +4322,7 @@ fn create_blank_scrap(rect: Rect) {
         rect.left,
         rect.top
     );
-    if let Err(reason) = float_model_to_edit(model, image) {
+    if let Err(reason) = float_new_model(model, image) {
         notify_user(
             notify::Level::Error,
             &format!("{}\n{reason}", text("blank_scrap.failed")),
@@ -4330,11 +4330,12 @@ fn create_blank_scrap(rect: Rect) {
     }
 }
 
-/// `model` のスクラップを浮かべてフォーカスを移し、すぐに書き込みの編集モードに入る（白紙スクラップを作った
-/// ときと、何も書かれていない透明な白紙スクラップを開いたとき）。出せなければ理由を返す。
-fn float_model_to_edit(model: ScrapModel, image: Image) -> std::result::Result<HWND, String> {
+/// 作った・開いた `model` のスクラップを浮かべてフォーカスを移す。core の `ScrapModel::starts_in_edit_mode` なら
+/// （何も書かれていない透明な白紙）すぐに書き込みの編集モードに入る。出せなければ理由を返す。
+fn float_new_model(model: ScrapModel, image: Image) -> std::result::Result<HWND, String> {
+    let edit = model.starts_in_edit_mode();
     let hwnd = float_model(model, image, true)?;
-    if let Some(op) = ops::find("annotate") {
+    if edit && let Some(op) = ops::find("annotate") {
         run_scrap_operation(hwnd, op, OpContext::default());
     }
     Ok(hwnd)
@@ -4404,12 +4405,7 @@ fn open_scrap_path(path: &Path) -> std::result::Result<(), OpenFailure> {
             .ok_or_else(|| failed(format!("could not paint the blank scrap of {size:?}")))?,
     };
     // 何も書かれていない透明な白紙は、作ったときと同じく書き込みの編集モードで浮かべる（何も書かずに抜けると捨てる）
-    if model.is_empty_transparent_blank() {
-        float_model_to_edit(model, image)
-    } else {
-        float_model(model, image, true)
-    }
-    .map_err(failed)?;
+    float_new_model(model, image).map_err(failed)?;
     log::info!("opened {}", path.display());
     Ok(())
 }
