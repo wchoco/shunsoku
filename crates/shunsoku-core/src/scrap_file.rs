@@ -297,8 +297,28 @@ fn annotation_table(annotation: &Annotation) -> Table {
 }
 
 /// `path` のファイルを読む。上限より大きいファイルは、上限の分だけ読んで止める。
+///
+/// パスは CLI（`open`）から届くこともあり、常駐本体は管理者として動くことがあるので、ふつうのファイルでなければ
+/// （デバイス、名前付きパイプ、フォルダ など）読まずに `Unreadable` にする。Windows では、開いた先が名前付きパイプ
+/// だったときに相手にこのプロセスとして振る舞わせないよう、なりすましの範囲を識別だけにして開く。
 pub fn read(path: &Path) -> Result<ScrapFile, LoadError> {
-    let file = std::fs::File::open(path).map_err(LoadError::Unreadable)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`。
+        const IDENTIFICATION_ONLY: u32 = 0x0010_0000 | 0x0001_0000;
+        options.security_qos_flags(IDENTIFICATION_ONLY);
+    }
+    let file = options.open(path).map_err(LoadError::Unreadable)?;
+    let metadata = file.metadata().map_err(LoadError::Unreadable)?;
+    if !metadata.is_file() {
+        return Err(LoadError::Unreadable(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a plain file",
+        )));
+    }
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -971,6 +991,17 @@ mod tests {
     #[test]
     fn a_missing_file_is_unreadable() {
         let error = read(Path::new("/nonexistent/shunsoku/scrap.shunsoku")).unwrap_err();
+        assert_eq!(error.kind(), LoadErrorKind::Unreadable);
+    }
+
+    #[test]
+    fn something_other_than_a_plain_file_is_unreadable_without_reading_it() {
+        // 読みに行くと上限まで読んでしまう（デバイスやパイプを CLI から渡されても読まない）
+        #[cfg(unix)]
+        let device = Path::new("/dev/zero");
+        #[cfg(windows)]
+        let device = Path::new(r"C:\Windows");
+        let error = read(device).unwrap_err();
         assert_eq!(error.kind(), LoadErrorKind::Unreadable);
     }
 

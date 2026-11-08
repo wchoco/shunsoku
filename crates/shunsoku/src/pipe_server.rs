@@ -2,7 +2,8 @@
 //!
 //! - 受付のスレッドが 1 本、接続ごとに仕事のスレッドが 1 本。仕事のスレッドは依頼を読み、キャプチャなら
 //!   `CaptureRequest`（`reply` 付き）にして UI スレッドに渡し（`WM_APP_*` で起こす）、`Replier::reply` で
-//!   返ってきた応答を書いて切る。`monitors` は UI スレッドを通さずにその場で答える。
+//!   返ってきた応答を書いて切る。`open` も同じく `PipeRequest::Open` にして UI スレッドに渡す。`monitors` は
+//!   UI スレッドを通さずにその場で答える。
 //! - 仕事のスレッドのパニックは、その依頼の失敗（終了コード 1）として返す。
 //! - 応答を待つ間、CLI が切った（Ctrl+C など）か、待つ時間の上限（`protocol::reply_timeout`）を過ぎたら、
 //!   応答の行き先を消して UI スレッドを起こす。UI スレッドは行き先のない依頼を取りやめる
@@ -18,10 +19,13 @@
 //!   - 接続してきたクライアントのセッションを `GetNamedPipeClientSessionId` で確かめ、違えば何も読まずに切る
 //!     （同じユーザーの別のセッションは DACL では区別できないため）。念のためクライアントのプロセスのユーザーも
 //!     確かめる。クライアントのプロセスの整合性レベルも確かめ、本体より低ければ何も読まずに切る。
-//! - 届いた `capture` の依頼は、CLI の引数と同じ規則で確かめ直す（`protocol::decode_request`）。
+//! - 届いた `capture` の依頼は、CLI の引数と同じ規則で確かめ直す（`protocol::decode_request`）。`open` のパスも
+//!   確かめ直し、絶対パスの `.shunsoku` で、デバイスの名前空間・UNC のパイプでないものだけを UI スレッドに渡す
+//!   （`cli_args::check_open`。読むときは `scrap_file::read` が、ふつうのファイルでなければ読まない）。
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -57,14 +61,22 @@ const RETRY: Duration = Duration::from_millis(200);
 /// 応答を待つ間に、CLI がまだつながっているか確かめる間隔。
 const CLIENT_CHECK: Duration = Duration::from_millis(500);
 
+/// UI スレッドに渡す依頼。
+pub enum PipeRequest {
+    /// `capture`。
+    Capture(CaptureRequest),
+    /// `open`: スクラップファイルを開いて浮かべ、`reply` に応答する。
+    Open { path: PathBuf, reply: ReplyTo },
+}
+
 /// UI スレッドが持つ受け口。
 pub struct PipeServer {
-    requests: mpsc::Receiver<CaptureRequest>,
+    requests: mpsc::Receiver<PipeRequest>,
 }
 
 impl PipeServer {
-    /// 届いているキャプチャの依頼を 1 件取り出す。
-    pub fn next(&self) -> Option<CaptureRequest> {
+    /// 届いている依頼を 1 件取り出す。
+    pub fn next(&self) -> Option<PipeRequest> {
         self.requests.try_recv().ok()
     }
 }
@@ -126,7 +138,7 @@ struct Shared {
     /// このプロセスの整合性レベル。これより低いクライアントは断る。
     integrity: pipe_identity::Integrity,
     replier: Replier,
-    requests: Mutex<mpsc::Sender<CaptureRequest>>,
+    requests: Mutex<mpsc::Sender<PipeRequest>>,
     next_id: AtomicU64,
     /// UI スレッドのメッセージ専用ウィンドウ（HWND は Send でないので番号で持つ）と、起こすメッセージ。
     window: isize,
@@ -375,38 +387,53 @@ fn answer(pipe: HANDLE, shared: &Shared) -> Option<Response> {
     log::info!("pipe request: {request:?}");
     match request {
         Request::Monitors => Some(Response::Monitors(crate::monitor_list::list())),
-        Request::Capture(capture) => {
-            let deadline = Instant::now() + protocol::reply_timeout(&capture);
-            let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-            let replies = shared.replier.register(id);
-            let request = CaptureRequest::from_cli(&capture, ReplyTo(id));
-            let sent = shared
-                .requests
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .send(request)
-                .is_ok();
-            let response = if sent && wake(shared) {
-                match wait_reply(pipe, shared, id, &replies, deadline) {
-                    Waited::Reply(response) => Some(response),
-                    Waited::ClientGone => return None,
-                    Waited::TimedOut => {
-                        return Some(Response::Failed {
-                            kind: ErrorKind::CaptureFailed,
-                            message: shared.timed_out.clone(),
-                        });
-                    }
-                }
-            } else {
-                shared.replier.forget(id);
-                None
-            };
-            Some(response.unwrap_or_else(|| Response::Failed {
-                kind: ErrorKind::CaptureFailed,
-                message: shared.panicked.clone(),
-            }))
-        }
+        Request::Capture(capture) => relay(pipe, shared, protocol::reply_timeout(&capture), |to| {
+            PipeRequest::Capture(CaptureRequest::from_cli(&capture, to))
+        }),
+        Request::Open(open) => relay(pipe, shared, protocol::OPEN_REPLY_TIMEOUT, |reply| {
+            PipeRequest::Open {
+                path: PathBuf::from(open.path),
+                reply,
+            }
+        }),
     }
+}
+
+/// 依頼を UI スレッドに渡し、`timeout` まで応答を待つ。CLI が切ったら None（答えずに切る）。
+fn relay(
+    pipe: HANDLE,
+    shared: &Shared,
+    timeout: Duration,
+    request: impl FnOnce(ReplyTo) -> PipeRequest,
+) -> Option<Response> {
+    let deadline = Instant::now() + timeout;
+    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+    let replies = shared.replier.register(id);
+    let sent = shared
+        .requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .send(request(ReplyTo(id)))
+        .is_ok();
+    let response = if sent && wake(shared) {
+        match wait_reply(pipe, shared, id, &replies, deadline) {
+            Waited::Reply(response) => Some(response),
+            Waited::ClientGone => return None,
+            Waited::TimedOut => {
+                return Some(Response::Failed {
+                    kind: ErrorKind::CaptureFailed,
+                    message: shared.timed_out.clone(),
+                });
+            }
+        }
+    } else {
+        shared.replier.forget(id);
+        None
+    };
+    Some(response.unwrap_or_else(|| Response::Failed {
+        kind: ErrorKind::CaptureFailed,
+        message: shared.panicked.clone(),
+    }))
 }
 
 /// UI スレッドを起こす（`WM_APP_PIPE`）。
