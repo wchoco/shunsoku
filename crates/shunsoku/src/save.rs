@@ -21,11 +21,12 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTask
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Shell::Common::{COMDLG_FILTERSPEC, ITEMIDLIST};
 use windows::Win32::UI::Shell::{
-    FOLDERID_Pictures, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT,
-    FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FOS_STRICTFILETYPES, FileOpenDialog, FileSaveDialog,
-    IFileOpenDialog, IFileSaveDialog, ILFree, IShellItem, KF_FLAG_DEFAULT, SEE_MASK_CLASSNAME,
-    SEE_MASK_IDLIST, SHCreateItemFromParsingName, SHELLEXECUTEINFOW, SHGetKnownFolderPath,
-    SHParseDisplayName, SIGDN_FILESYSPATH, ShellExecuteExW,
+    FILEOPENDIALOGOPTIONS, FOLDERID_Pictures, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
+    FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FOS_STRICTFILETYPES, FileOpenDialog,
+    FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, ILFree, IShellItem,
+    KF_FLAG_DEFAULT, SEE_MASK_CLASSNAME, SEE_MASK_IDLIST, SHCreateItemFromParsingName,
+    SHELLEXECUTEINFOW, SHGetKnownFolderPath, SHParseDisplayName, SIGDN_FILESYSPATH,
+    ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
@@ -128,44 +129,24 @@ pub fn ask_path(
     path: &Path,
     file_type: FileType,
 ) -> windows::core::Result<Option<PathBuf>> {
-    let folder = path
-        .ancestors()
-        .skip(1)
-        .find(|dir| dir.is_dir())
-        .map(HSTRING::from);
     let file_name = path.file_name().map(HSTRING::from).unwrap_or_default();
-    let filter_name = HSTRING::from(file_type.name);
-    let filter_spec = HSTRING::from(format!("*.{}", file_type.extension));
     let extension = HSTRING::from(file_type.extension);
-    let filters = [COMDLG_FILTERSPEC {
-        pszName: PCWSTR(filter_name.as_ptr()),
-        pszSpec: PCWSTR(filter_spec.as_ptr()),
-    }];
-    // SAFETY: 渡す文字列はどれも呼び出しの間生きている。返った文字列は CoTaskMemFree で返す
-    unsafe {
+    // SAFETY: 渡す文字列はどれも呼び出しの間生きている
+    let dialog: IFileSaveDialog = unsafe {
         let dialog: IFileSaveDialog =
             CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
-        dialog.SetFileTypes(&filters)?;
         dialog.SetDefaultExtension(&extension)?;
-        let options = dialog.GetOptions()?;
-        dialog.SetOptions(
-            options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_STRICTFILETYPES,
-        )?;
-        if let Some(folder) = &folder {
-            let item: IShellItem = SHCreateItemFromParsingName(folder, None)?;
-            dialog.SetFolder(&item)?;
-        }
-        dialog.SetFileName(&file_name)?;
-        match dialog.Show(Some(owner)) {
-            Ok(()) => {}
-            Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let chosen = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
-        let text = chosen.to_string();
-        CoTaskMemFree(Some(chosen.0 as *const _));
-        Ok(Some(PathBuf::from(text?)))
-    }
+        dialog
+    };
+    set_file_type(&dialog, file_type)?;
+    add_options(
+        &dialog,
+        FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_STRICTFILETYPES,
+    )?;
+    set_folder(&dialog, path.ancestors().skip(1).find(|dir| dir.is_dir()))?;
+    // SAFETY: 渡す文字列は呼び出しの間生きている
+    unsafe { dialog.SetFileName(&file_name)? };
+    show(&dialog, owner)
 }
 
 /// 開くファイルを選ぶダイアログを出し、選ばれたパスを返す。キャンセルされたら None。種類は `file_type` だけを
@@ -176,55 +157,69 @@ pub fn ask_open_path(
     initial: Option<&Path>,
     file_type: FileType,
 ) -> windows::core::Result<Option<PathBuf>> {
-    let folder = initial
-        .and_then(|path| path.ancestors().find(|dir| dir.is_dir()))
-        .map(HSTRING::from);
-    let filter_name = HSTRING::from(file_type.name);
-    let filter_spec = HSTRING::from(format!("*.{}", file_type.extension));
-    let filters = [COMDLG_FILTERSPEC {
-        pszName: PCWSTR(filter_name.as_ptr()),
-        pszSpec: PCWSTR(filter_spec.as_ptr()),
-    }];
-    // SAFETY: 渡す文字列はどれも呼び出しの間生きている。返った文字列は CoTaskMemFree で返す
-    unsafe {
-        let dialog: IFileOpenDialog =
-            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
-        dialog.SetFileTypes(&filters)?;
-        let options = dialog.GetOptions()?;
-        dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)?;
-        if let Some(folder) = &folder {
-            let item: IShellItem = SHCreateItemFromParsingName(folder, None)?;
-            dialog.SetFolder(&item)?;
-        }
-        match dialog.Show(Some(owner)) {
-            Ok(()) => {}
-            Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let chosen = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
-        let text = chosen.to_string();
-        CoTaskMemFree(Some(chosen.0 as *const _));
-        Ok(Some(PathBuf::from(text?)))
-    }
+    let dialog = open_dialog()?;
+    set_file_type(&dialog, file_type)?;
+    add_options(
+        &dialog,
+        FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST,
+    )?;
+    set_folder(
+        &dialog,
+        initial.and_then(|path| path.ancestors().find(|dir| dir.is_dir())),
+    )?;
+    show(&dialog, owner)
 }
 
 /// フォルダを選ぶダイアログを出し、選ばれたフォルダを返す。`initial` があればそこ（なければその上のあるフォルダ）
 /// から開く。キャンセルされたら None。
 pub fn ask_folder(owner: HWND, initial: &Path) -> windows::core::Result<Option<PathBuf>> {
-    let folder = initial
-        .ancestors()
-        .find(|dir| dir.is_dir())
-        .map(HSTRING::from);
-    // SAFETY: 渡す文字列はどれも呼び出しの間生きている。返った文字列は CoTaskMemFree で返す
+    let dialog = open_dialog()?;
+    add_options(&dialog, FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)?;
+    set_folder(&dialog, initial.ancestors().find(|dir| dir.is_dir()))?;
+    show(&dialog, owner)
+}
+
+/// 開くダイアログを作る。
+fn open_dialog() -> windows::core::Result<IFileOpenDialog> {
+    // SAFETY: 引数を持たない COM の生成
+    unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+}
+
+/// ダイアログの種類を `file_type` だけにする（名前と `*.<拡張子>`）。
+fn set_file_type(dialog: &IFileDialog, file_type: FileType) -> windows::core::Result<()> {
+    let name = HSTRING::from(file_type.name);
+    let spec = HSTRING::from(format!("*.{}", file_type.extension));
+    let filters = [COMDLG_FILTERSPEC {
+        pszName: PCWSTR(name.as_ptr()),
+        pszSpec: PCWSTR(spec.as_ptr()),
+    }];
+    // SAFETY: 渡す文字列は呼び出しの間生きている（ダイアログが写し取る）
+    unsafe { dialog.SetFileTypes(&filters) }
+}
+
+/// ダイアログの今のオプションに `options` を足す。
+fn add_options(dialog: &IFileDialog, options: FILEOPENDIALOGOPTIONS) -> windows::core::Result<()> {
+    // SAFETY: ダイアログは生きている
+    unsafe { dialog.SetOptions(dialog.GetOptions()? | options) }
+}
+
+/// ダイアログを `folder` から開くようにする。None なら何もしない（ダイアログの既定のまま）。
+fn set_folder(dialog: &IFileDialog, folder: Option<&Path>) -> windows::core::Result<()> {
+    let Some(folder) = folder else {
+        return Ok(());
+    };
+    let folder = HSTRING::from(folder);
+    // SAFETY: 渡す文字列は呼び出しの間生きている
     unsafe {
-        let dialog: IFileOpenDialog =
-            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
-        let options = dialog.GetOptions()?;
-        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)?;
-        if let Some(folder) = &folder {
-            let item: IShellItem = SHCreateItemFromParsingName(folder, None)?;
-            dialog.SetFolder(&item)?;
-        }
+        let item: IShellItem = SHCreateItemFromParsingName(&folder, None)?;
+        dialog.SetFolder(&item)
+    }
+}
+
+/// ダイアログをモーダルで出し、選ばれたパスを返す。キャンセルされたら None。
+fn show(dialog: &IFileDialog, owner: HWND) -> windows::core::Result<Option<PathBuf>> {
+    // SAFETY: 返った文字列は CoTaskMemFree で返す
+    unsafe {
         match dialog.Show(Some(owner)) {
             Ok(()) => {}
             Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => return Ok(None),
