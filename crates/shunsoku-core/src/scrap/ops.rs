@@ -100,9 +100,10 @@ impl OperationDescriptor {
 pub enum InRecipe {
     /// どこにでも置ける。
     Anywhere,
-    /// 最後にだけ置ける（`close`。閉じたあとの操作は実行できない）。
+    /// 最後にだけ置ける（`close`、`annotate`）。閉じたあとの操作は実行できず、書き込みの編集モードの間は入力を
+    /// 奪うのでほかの操作を実行できない。レシピに 1 つまで。
     Last,
-    /// 置けない。引数を取る操作と、モードを切り替えて入力を奪う操作（`trim`、`annotate`）。
+    /// 置けない。引数を取る操作と、モードを切り替えて入力を奪う操作（`trim`）。
     Never,
 }
 
@@ -906,7 +907,7 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         order: 30,
         drag_only: false,
         takes_values: false,
-        in_recipe: InRecipe::Never,
+        in_recipe: InRecipe::Last,
         in_menu: true,
         can_execute: can_annotate,
         checked: Some(editing),
