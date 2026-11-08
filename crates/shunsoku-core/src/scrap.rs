@@ -714,6 +714,11 @@ impl ScrapModel {
             .collect()
     }
 
+    /// 編集モードで範囲で選んでいる間の範囲（元の画像の画素）。範囲を描くのに使う。
+    pub fn selection_range(&self) -> Option<Rect> {
+        self.edit_state()?.marquee()
+    }
+
     /// 書き込み（描き終えたもの）。
     pub fn annotations(&self) -> &Annotations {
         &self.annotations

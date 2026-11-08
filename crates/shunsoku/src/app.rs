@@ -608,6 +608,7 @@ fn paint_scrap(
             annotations: &annotations,
             view: model.annotation_view(),
             selected: &selected,
+            selection_range: model.selection_range(),
             typing: typing.as_ref().map(|annotation| render::TypingLayer {
                 annotation,
                 composition: composition.map_or("", |c| c.text.as_str()),
@@ -1388,7 +1389,13 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             // SAFETY: 自分のウィンドウ
             unsafe { SetCapture(hwnd) };
             let at = message_screen_point();
-            if on_edit_input(hwnd, EditInput::Press(at)).is_some() {
+            // Shift を押していれば、選択の道具では選択に足したり外したりする
+            let press = if wparam.0 & MK_SHIFT != 0 {
+                EditInput::ShiftPress(at)
+            } else {
+                EditInput::Press(at)
+            };
+            if on_edit_input(hwnd, press).is_some() {
                 return Some(LRESULT(0));
             }
             if !on_trim_input(hwnd, TrimInput::Press(at)) {
@@ -1755,13 +1762,14 @@ fn is_editing(hwnd: HWND) -> bool {
     .unwrap_or(false)
 }
 
+/// マウスのメッセージの wparam の、`Shift` を押しているかの印。Win32_System_SystemServices を足さないよう値で持つ。
+const MK_SHIFT: usize = 0x0004;
+
 /// 書き込みの編集モードのカーソルの移動。押したままでなければ（離したことを取りこぼしたなど）離したことにする。
 fn on_edit_move(hwnd: HWND, wparam: WPARAM, at: Point) {
     let pointer = pointer_on_move(hwnd, wparam);
     let input = if pointer.holding() {
-        // Shift を押していれば図形に制約をかける（正方形・円・45° 刻み）。wparam の MK_SHIFT は
-        // Win32_System_SystemServices を足さないよう値で持つ
-        const MK_SHIFT: usize = 0x0004;
+        // Shift を押していれば図形に制約をかける（正方形・円・45° 刻み）
         let shift = wparam.0 & MK_SHIFT != 0;
         EditInput::Move { at, shift }
     } else {
@@ -2282,6 +2290,7 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
         annotations: scrap.model.annotations().items(),
         view: scrap.model.output_view(),
         selected: &[],
+        selection_range: None,
         typing: None,
         // 選択の印もキャレットも描かない
         scale: 1.0,
@@ -2761,6 +2770,7 @@ fn trash_thumbnail(scrap: &Scrap) -> Image {
         annotations: scrap.model.annotations().items(),
         view: scrap.model.output_view(),
         selected: &[],
+        selection_range: None,
         typing: None,
         scale: 1.0,
     };

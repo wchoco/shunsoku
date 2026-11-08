@@ -120,6 +120,9 @@ pub struct AnnotationLayer<'a> {
     /// 選んでいる書き込みの外接矩形（元の画像の画素、`Annotation::bounds`）。それぞれに選択の印を描く。
     /// 保存とコピーには描かない（空）。
     pub selected: &'a [Rect],
+    /// 範囲で選んでいる間の範囲（元の画像の画素、`EditState::marquee`）。あれば描く。保存とコピーには描かない
+    /// （None）。
+    pub selection_range: Option<Rect>,
     /// 打っている文字。保存とコピーには描かない（None）。
     pub typing: Option<TypingLayer<'a>>,
     /// 選択の印とキャレットの大きさの倍率（ウィンドウのあるモニタの DPI / 96）。書き込みそのものは画像の画素で
@@ -477,7 +480,9 @@ fn draw_annotations(
     layer: AnnotationLayer,
     image_rect: Rect,
 ) -> Result<Option<Rect>> {
-    if (layer.annotations.is_empty() && layer.typing.is_none()) || image_rect.is_empty() {
+    if (layer.annotations.is_empty() && layer.typing.is_none() && layer.selection_range.is_none())
+        || image_rect.is_empty()
+    {
         return Ok(None);
     }
     let (dx, dy) = (f64::from(image_rect.left), f64::from(image_rect.top));
@@ -546,6 +551,17 @@ fn draw_annotations(
                 let (x1, y1) = at(Point::new(bounds.right, bounds.bottom));
                 draw_selection_mark(target, (x0, y0, x1, y1), layer.scale)?;
             }
+            if let Some(range) = layer.selection_range {
+                // 範囲は画素の矩形なので、左上の画素の左上の角から右下の画素の右下の角まで
+                let (x0, y0) = at(Point::new(range.left, range.top));
+                let (x1, y1) = at(Point::new(range.right, range.bottom));
+                let half = (layer.view.scale_x / 2.0, layer.view.scale_y / 2.0);
+                draw_selection_range(
+                    target,
+                    (x0 - half.0, y0 - half.1, x1 - half.0, y1 - half.1),
+                    layer.scale,
+                )?;
+            }
             Ok(caret)
         });
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
@@ -604,6 +620,32 @@ fn draw_selection_mark(
     }
     Ok(())
 }
+
+/// 範囲で選んでいる間の範囲（描く先の座標）。選択の印と同じ色の枠と、薄く塗った中。
+fn draw_selection_range(
+    target: &ID2D1RenderTarget,
+    (left, top, right, bottom): (f64, f64, f64, f64),
+    scale: f32,
+) -> Result<()> {
+    let frame = D2D_RECT_F {
+        left: left as f32,
+        top: top as f32,
+        right: right as f32,
+        bottom: bottom as f32,
+    };
+    // SAFETY: BeginDraw と EndDraw の間で呼ぶ（draw_annotations）
+    unsafe {
+        let brush =
+            &target.CreateSolidColorBrush(&rgb(SELECTION_COLOR, SELECTION_RANGE_FILL), None)?;
+        target.FillRectangle(&frame, brush);
+        brush.SetColor(&rgb(SELECTION_COLOR, 1.0));
+        target.DrawRectangle(&frame, brush, SELECTION_LINE * scale.max(1.0), None);
+    }
+    Ok(())
+}
+
+/// 範囲で選んでいる間の範囲の中を塗る不透明度。
+const SELECTION_RANGE_FILL: f32 = 0.15;
 
 /// 書き込みの色（不透明）。
 fn color_of(annotation: &Annotation) -> D2D1_COLOR_F {
