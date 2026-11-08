@@ -161,6 +161,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, IDC_SIZEALL, LoadCursorW, MA_NOACTIVATE, SetCursor, WM_MOUSEACTIVATE,
 };
+// 消しゴム（#145）で足したもの
+use shunsoku_core::annotate::Tool;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, IDC_ARROW, WindowFromPoint};
 
 mod cli;
 mod settings_gui;
@@ -1465,6 +1469,11 @@ fn on_scrap_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Opt
             overlay::set_cursor(shape);
             Some(LRESULT(1))
         }
+        // 書き込みの編集モードで消しゴムを選んでいる間は、消しゴムのカーソルにする
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && has_eraser(hwnd) => {
+            scrap_window::set_eraser_cursor();
+            Some(LRESULT(1))
+        }
         // 文字を打っている間の文字（TranslateMessage が作る）
         WM_CHAR => on_scrap_char(hwnd, wparam).then_some(LRESULT(0)),
         // 変換中の文字は IME の窓に出さず、スクラップに描く。App は借りない（IME の呼び出しの中でも届く）
@@ -1775,6 +1784,9 @@ fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
         if outputs.contains(&EditOutput::CompositionTaken) {
             ime::cancel(hwnd);
         }
+        if outputs.contains(&EditOutput::ToolChanged) {
+            refresh_edit_cursor(hwnd);
+        }
         if !outputs.is_empty() {
             let switch = outputs
                 .iter()
@@ -1783,6 +1795,38 @@ fn on_edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
         }
     }
     outputs
+}
+
+/// 書き込みの編集モードで消しゴムを選んでいるか。
+fn has_eraser(hwnd: HWND) -> bool {
+    with_app(|app| {
+        app.scrap(hwnd)
+            .is_some_and(|s| s.model.edit_state().is_some_and(|e| e.tool == Tool::Eraser))
+    })
+    .unwrap_or(false)
+}
+
+/// 道具が替わったら、カーソルがスクラップの上にあればその形にし直す（キーで替えたとき、動かすまで前の形の
+/// ままにならないように）。ツールバーの上なら、スクラップに戻ったときの `WM_SETCURSOR` に任せる。
+fn refresh_edit_cursor(hwnd: HWND) {
+    let mut at = POINT::default();
+    // SAFETY: 書き込み先は生きている
+    if unsafe { GetCursorPos(&mut at) }.is_err() {
+        return;
+    }
+    // SAFETY: 問い合わせだけ
+    if unsafe { WindowFromPoint(at) } != hwnd {
+        return;
+    }
+    if has_eraser(hwnd) {
+        scrap_window::set_eraser_cursor();
+    } else {
+        // SAFETY: 共有のカーソルなので壊さなくてよい
+        if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+            // SAFETY: UI スレッドで呼ぶ
+            unsafe { SetCursor(Some(cursor)) };
+        }
+    }
 }
 
 /// 文字を打っているか。
