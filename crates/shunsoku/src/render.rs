@@ -16,6 +16,7 @@
 //!   下線を引いてつなげ、キャレットを描く（その矩形を IME の窓の位置に使う）。
 //! - スクラップの画像のビットマップは、画像と一緒に作り置きにする（`CachedImage`）。画像が変わらない描き直しでは、
 //!   画像全体の premultiplied への変換とビットマップの作り直しをしない。
+//! - レンダー ターゲットはソフトウェア（`D2D1_RENDER_TARGET_TYPE_SOFTWARE`）。CPU で DIB に直接描く。
 //! - 透明度はここでは掛けない（レイヤード ウィンドウの `SourceConstantAlpha` で掛ける）。
 //! - 透明な白紙スクラップは、画像の下に当たり判定のための見えないほど小さいアルファ（`Appearance::hit_alpha`）を
 //!   敷く。コピーと保存の画像（`render_image`）には敷かないので、透明な部分はアルファ 0 のまま。
@@ -47,7 +48,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
     D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_LINE_JOIN_ROUND,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE,
     D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
     ID2D1Bitmap, ID2D1Brush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget,
     ID2D1SolidColorBrush, ID2D1StrokeStyle,
@@ -330,7 +331,9 @@ pub struct Renderer {
 impl Renderer {
     pub fn new() -> Result<Renderer> {
         let props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            // GPU で描いて DIB に読み戻すより、CPU で DIB に直接描く方が速い（#168、docs/perf.md の書き込みの
+            // 更新の表）。GPU のないマシンでも同じ種類で描ける。
+            r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
