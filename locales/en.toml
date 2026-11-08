@@ -381,3 +381,5 @@ seq3 = "{seq:3}  3-digit sequence number (001, 002, …)"
 
 [blank_scrap]
 failed = "Could not create a blank scrap."
+# The background colour of a blank scrap ([annotation] background) could not be read (the line after failed)
+no_background = "Could not read the background colour from the settings. See the log for details."

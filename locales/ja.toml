@@ -413,3 +413,5 @@ seq3 = "{seq:3}  3 桁の連番（001, 002, …）"
 
 [blank_scrap]
 failed = "白紙スクラップを作れませんでした。"
+# 白紙の背景色（[annotation] background）を読めなかったとき（failed の次の行）
+no_background = "背景色を設定から読めませんでした。詳しくはログを見てください。"

@@ -4460,7 +4460,8 @@ fn notify_blank_scrap_failed(reason: &str) {
 /// `rect`（スクリーン座標）に置く、設定の既定の背景色の白紙スクラップと、その下地。作れなければ理由を返す。
 fn blank_model(rect: Rect) -> std::result::Result<(ScrapModel, Image), String> {
     let Some(background) = with_app(|app| app.settings.annotation.background) else {
-        return Err(text("job.panicked").to_owned());
+        log::error!("could not read the background of a blank scrap: the app is not available");
+        return Err(text("blank_scrap.no_background").to_owned());
     };
     let model = ScrapModel::blank(rect.origin(), rect.size(), background);
     let Some(image) = model.blank_image() else {
