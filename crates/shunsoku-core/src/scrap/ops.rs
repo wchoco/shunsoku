@@ -32,16 +32,24 @@
 //!
 //! 見た目を指定（`appearance`）は、設定ファイルのレシピに値のある手（`{ op = "appearance", border_color = ... }`）
 //! として書いたときだけ動く（ADR-0008）。書いた値は `OpContext::values` で渡り、書いた項目だけを上書きする。
-//! `takes_values` の操作はショートカット・マウス・「スクラップ操作」タブの行・メニューのどれにも出さない。
+//! `takes_values` の操作はショートカット・マウス・「スクラップ操作」タブの行のどれにも出さない。
+//!
+//! 背景色（`background`）は白紙スクラップだけの操作で、普通のスクラップのメニューには出さない（`BLANK_ONLY`）。
+//! メニューではツールバーと同じ 8 色と「その他の色…」の子メニューにし、レシピでは値のある手
+//! （`{ op = "background", color = "#RRGGBB" }`）で呼ぶ。普通のスクラップでは `can_execute` が false なので、
+//! レシピはそこで止まる（ADR-0007）。背景色は見た目ではなく中身なので、`reset_appearance` では戻らない。
 
 use std::collections::BTreeMap;
 
+use crate::annotate::toolbar::PALETTE;
 use crate::annotate::{Carryover, EditInput, Font, Style};
 use crate::geometry::Point;
 use crate::keys::{Chord, Key, Modifiers};
-use crate::recipe::{AppearanceValues, Plan};
-use crate::scrap::{Appearance, AppearanceOverrides, BorderOverride, Mode, ScrapModel, ZoomAnchor};
-use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, ShortcutOverrides};
+use crate::recipe::{Plan, StepValues};
+use crate::scrap::{
+    Appearance, AppearanceOverrides, Background, BorderOverride, Mode, ScrapModel, ZoomAnchor,
+};
+use crate::settings::{self, Conflict, MouseOverrides, OPACITY_RANGE, Rgb, ShortcutOverrides};
 
 /// スクラップ操作の id。設定ファイルの `[shortcuts]` のキーにもなる。
 pub type OperationId = &'static str;
@@ -61,8 +69,8 @@ pub struct OperationDescriptor {
     /// ドラッグの量（`OpContext::drag`）を引数に取る操作。ドラッグでしか呼べないので、メニューにも
     /// ショートカットの対応表にも出さない。
     pub drag_only: bool,
-    /// レシピの値のある手の値（`OpContext::values`）を引数に取る操作（`appearance`。ADR-0008）。値のある手から
-    /// だけ呼ぶので、メニューにも、ショートカットとマウスの対応表にも、値のない手にも出さない。
+    /// レシピの値のある手の値（`OpContext::values`）を引数に取る操作（`appearance`、`background`。ADR-0008）。
+    /// ショートカットとマウスの対応表にも、値のない手にも出さない。
     pub takes_values: bool,
     /// レシピのどこに置けるか（ADR-0007）。引数のある操作とドラッグ専用の操作は `Never` にする。
     pub in_recipe: InRecipe,
@@ -256,7 +264,7 @@ pub struct OpContext {
     /// 文字の書き込みの書体と大きさの既定値（設定ファイルの `[annotation]`）。
     pub font: Font,
     /// レシピの値のある手に書いた値（`takes_values` の操作に渡す）。ほかから呼んだときは None。
-    pub values: Option<AppearanceValues>,
+    pub values: Option<StepValues>,
 }
 
 /// 操作の結果、Win32 層がすること。
@@ -284,6 +292,8 @@ pub enum Effect {
     EnterEditMode,
     /// 書き込みの編集モードを抜けた。
     LeaveEditMode,
+    /// 背景色の「その他の色…」: 色の選択ダイアログを出し、選ばれた色を `background` の選択肢として実行する。
+    ShowBackgroundDialog,
 }
 
 const ESC: Chord = Chord::plain(Key::known(0x1B));
@@ -547,7 +557,7 @@ fn shadow_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
 /// レシピの値のある手に書いた項目だけを、スクラップごとの上書きに重ねる（ADR-0008）。書かなかった項目は今の
 /// 値のまま。枠の色か太さを書けば枠も出す。見た目が変わらなければ何もしない（手は成功として次へ進む）。
 fn set_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
-    let Some(values) = context.values else {
+    let Some(StepValues::Appearance(values)) = context.values else {
         return Vec::new();
     };
     let before = model.appearance(&context.appearance);
@@ -582,6 +592,62 @@ fn reset_appearance(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> 
     let before = model.appearance(&context.appearance);
     model.appearance_overrides = AppearanceOverrides::default();
     redrawn(model.appearance(&context.appearance) != before)
+}
+
+/// 背景色の一覧の文言のキー（`PALETTE` と同じ順）。
+const BACKGROUND_LABELS: [&str; 8] = [
+    "scrap.background.red",
+    "scrap.background.orange",
+    "scrap.background.yellow",
+    "scrap.background.green",
+    "scrap.background.blue",
+    "scrap.background.purple",
+    "scrap.background.black",
+    "scrap.background.white",
+];
+
+/// 背景色の一覧の「その他の色…」の値。色の値（`0xRRGGBB`）は 0 以上なので重ならない。
+pub const OTHER_BACKGROUND: i32 = -1;
+
+/// 白紙スクラップで、畳んでいなければ実行できる。
+fn blank_and_not_compact(model: &ScrapModel) -> bool {
+    not_compact(model) && model.background().is_some()
+}
+
+/// 背景色の一覧: ツールバーと同じ 8 色（`PALETTE`）と「その他の色…」。並びにない色なら「その他の色…」に
+/// チェックを付ける。
+fn background_choices(model: &ScrapModel, _: &Appearance) -> Vec<Choice> {
+    let now = model.background();
+    let listed = PALETTE.map(|c| Some(Background::Color(c)));
+    let colours = PALETTE
+        .iter()
+        .zip(BACKGROUND_LABELS)
+        .map(|(&colour, key)| Choice {
+            label: ChoiceLabel::Key(key),
+            value: colour.to_rrggbb() as i32,
+            checked: now == Some(Background::Color(colour)),
+        });
+    let other = Choice {
+        label: ChoiceLabel::Key("scrap.background.other"),
+        value: OTHER_BACKGROUND,
+        checked: now.is_some() && !listed.contains(&now),
+    };
+    colours.chain(std::iter::once(other)).collect()
+}
+
+/// 背景色を、レシピの手の値か、一覧から選んだ色にする。「その他の色…」なら色の選択ダイアログを出す。
+/// 背景色が変わったときだけ描き直す（変わらなければ、手は成功として次へ進む）。
+fn background_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
+    let background = match (context.values, context.choice) {
+        (Some(StepValues::Background(background)), _) => background,
+        (_, Some(OTHER_BACKGROUND)) => return vec![Effect::ShowBackgroundDialog],
+        (_, Some(choice)) => match u32::try_from(choice) {
+            Ok(rrggbb) => Background::Color(Rgb::from_rrggbb(rrggbb)),
+            Err(_) => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    redrawn(model.set_background(background))
 }
 
 /// コンパクト表示に畳む、または広げる。畳む基準点は拡大縮小と同じ（マウスならカーソル、ほかは中心）。
@@ -782,6 +848,22 @@ pub static OPERATIONS: &[OperationDescriptor] = &[
         checked: Some(editing),
         choices: None,
         run: annotate,
+    },
+    OperationDescriptor {
+        id: "background",
+        label_key: "scrap.op.background",
+        default_shortcut: &[],
+        default_mouse: None,
+        group: Group::Edit,
+        order: 40,
+        drag_only: false,
+        takes_values: true,
+        in_recipe: InRecipe::Anywhere,
+        in_menu: true,
+        can_execute: blank_and_not_compact,
+        checked: None,
+        choices: Some(background_choices),
+        run: background_to,
     },
     keyboard_move(
         "move_left",
@@ -1378,6 +1460,9 @@ const FOLDERS: &[(&str, &[&[OperationId]])] = &[(
     &[&["opacity", "border", "shadow"], &["reset_appearance"]],
 )];
 
+/// 白紙スクラップのメニューにだけ出す操作。普通のスクラップでは、グレー表示にもせずに出さない。
+const BLANK_ONLY: &[OperationId] = &["background"];
+
 /// `id` をまとめる子メニューの文言のキーと、その中の区切りで分けた並びの番号。
 fn folder_of(id: OperationId) -> Option<(&'static str, usize)> {
     FOLDERS.iter().find_map(|&(label_key, sections)| {
@@ -1414,7 +1499,7 @@ pub struct MenuItem {
 /// 右クリックメニューを `ops`（ふつうは `OPERATIONS`）から作る。`group` の宣言の順、その中は `order` の順に並べ、
 /// `group` の変わり目に区切りを入れる。ドラッグでしか呼べない操作と `in_menu` が false の操作は出さない。
 /// 引数のある操作（`choices`）は子メニュー（`MenuEntry::Submenu`）にし、`FOLDERS` の操作は `MenuEntry::Folder`
-/// にまとめる。`defaults` は全体の見た目の既定値（見た目の一覧のチェックに使う）。
+/// にまとめる。白紙スクラップだけの操作（`BLANK_ONLY`）は、白紙スクラップのときだけ出す。`defaults` は全体の見た目の既定値（見た目の一覧のチェックに使う）。
 pub fn menu(
     ops: &'static [OperationDescriptor],
     model: &ScrapModel,
@@ -1424,6 +1509,7 @@ pub fn menu(
     let mut listed: Vec<&OperationDescriptor> = ops
         .iter()
         .filter(|op| op.in_menu && !op.drag_only)
+        .filter(|op| model.background().is_some() || !BLANK_ONLY.contains(&op.id))
         .collect();
     listed.sort_by_key(|op| (op.group, op.order));
     let mut entries = Vec::new();
@@ -1479,9 +1565,10 @@ mod tests {
     use crate::annotate::{Carryover, EditOutput, Font, Pick, Style, Tool};
     use crate::geometry::{Point, Rect, Size};
     use crate::image::Image;
+    use crate::recipe::AppearanceValues;
     use crate::scrap::{
-        Appearance, Border, Mode, ScrapModel, TrimInput, ZOOM_ACTUAL, ZOOM_MAX, ZOOM_MIN,
-        ZoomAnchor,
+        Appearance, Background, Border, Mode, ScrapModel, TrimInput, ZOOM_ACTUAL, ZOOM_MAX,
+        ZOOM_MIN, ZoomAnchor,
     };
     use crate::settings::{Conflict, Rgb};
 
@@ -2149,10 +2236,10 @@ mod tests {
         };
         let mut model = scrap();
         let width = |w| OpContext {
-            values: Some(AppearanceValues {
+            values: Some(StepValues::Appearance(AppearanceValues {
                 border_width: Some(w),
                 ..AppearanceValues::default()
-            }),
+            })),
             ..with_defaults(defaults)
         };
         // 太さを書けば、既定値で枠を出さなくても枠が出る
@@ -2224,7 +2311,7 @@ mod tests {
         ] {
             let mut model = scrap();
             let context = OpContext {
-                values: Some(values),
+                values: Some(StepValues::Appearance(values)),
                 ..with_defaults(shown)
             };
             execute(op("appearance"), &mut model, &context);
@@ -3039,6 +3126,169 @@ reset_appearance = "Ctrl+Shift+D"
         for (gesture, _) in MouseGesture::NAMES {
             let key = gesture.label_key();
             assert_ne!(catalog.text(key), key, "{gesture}");
+        }
+    }
+
+    fn blank(colour: Rgb) -> ScrapModel {
+        ScrapModel::blank(
+            Point::new(0, 0),
+            Size::new(40, 30),
+            Background::Color(colour),
+        )
+    }
+
+    fn choose(value: i32) -> OpContext {
+        OpContext {
+            choice: Some(value),
+            ..OpContext::default()
+        }
+    }
+
+    /// メニューの「背景色」の子メニュー。出ていなければ None。
+    fn background_menu(model: &ScrapModel) -> Option<Submenu> {
+        let shortcuts = Shortcuts::new(OPERATIONS, &ShortcutOverrides::new());
+        menu(OPERATIONS, model, &shortcuts, &Appearance::default())
+            .into_iter()
+            .find_map(|entry| match entry {
+                MenuEntry::Submenu(submenu) if submenu.id == "background" => Some(submenu),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn only_a_blank_scrap_shows_the_background_in_its_menu() {
+        assert!(background_menu(&blank(Rgb(0xFF, 0xFF, 0xFF))).is_some());
+        assert_eq!(background_menu(&scrap()), None);
+    }
+
+    #[test]
+    fn the_background_menu_lists_the_toolbar_colours_and_other_colours_checking_the_current_one() {
+        let white = Rgb(0xFF, 0xFF, 0xFF);
+        let submenu = background_menu(&blank(white)).unwrap();
+        assert!(submenu.enabled);
+        let values: Vec<i32> = submenu.choices.iter().map(|c| c.value).collect();
+        assert_eq!(
+            values,
+            [
+                0xE5_39_35, 0xFB_8C_00, 0xFD_D8_35, 0x43_A0_47, 0x1E_88_E5, 0x8E_24_AA, 0x21_21_21,
+                0xFF_FF_FF, -1
+            ]
+        );
+        let checked: Vec<i32> = submenu
+            .choices
+            .iter()
+            .filter(|c| c.checked)
+            .map(|c| c.value)
+            .collect();
+        assert_eq!(checked, [0xFF_FF_FF]);
+        assert_eq!(
+            submenu.choices.last().unwrap().label,
+            ChoiceLabel::Key("scrap.background.other")
+        );
+        // 並びにない色なら「その他の色…」にチェックを付ける
+        let custom = background_menu(&blank(Rgb(1, 2, 3))).unwrap();
+        let checked: Vec<i32> = custom
+            .choices
+            .iter()
+            .filter(|c| c.checked)
+            .map(|c| c.value)
+            .collect();
+        assert_eq!(checked, [-1]);
+    }
+
+    #[test]
+    fn choosing_a_background_colour_repaints_the_blank_scrap_with_it() {
+        let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
+        assert_eq!(
+            execute(op("background"), &mut model, &choose(0x1E_88_E5)),
+            vec![Effect::Redraw]
+        );
+        assert_eq!(
+            model.background(),
+            Some(Background::Color(Rgb(0x1E, 0x88, 0xE5)))
+        );
+        assert_eq!(
+            model.blank_image().unwrap().pixel(0, 0),
+            [0xE5, 0x88, 0x1E, 0xFF]
+        );
+        // 同じ色なら何もしない
+        assert_eq!(
+            execute(op("background"), &mut model, &choose(0x1E_88_E5)),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn other_colours_asks_for_a_colour_with_a_dialog() {
+        let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
+        let before = model.clone();
+        assert_eq!(
+            execute(op("background"), &mut model, &choose(-1)),
+            vec![Effect::ShowBackgroundDialog]
+        );
+        assert_eq!(model, before);
+    }
+
+    #[test]
+    fn the_background_of_a_captured_scrap_cannot_be_changed() {
+        let mut model = scrap();
+        let before = model.clone();
+        assert!(!(op("background").can_execute)(&model));
+        assert_eq!(
+            execute(op("background"), &mut model, &choose(0xFF_00_00)),
+            vec![]
+        );
+        assert_eq!(model, before);
+    }
+
+    #[test]
+    fn the_background_cannot_be_changed_while_folded_or_editing() {
+        let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
+        model.enter_compact(ZoomAnchor::Center);
+        assert!(!(op("background").can_execute)(&model));
+        model.leave_compact();
+        execute(op("annotate"), &mut model, &editing_context());
+        assert!(!(op("background").can_execute)(&model));
+    }
+
+    #[test]
+    fn resetting_the_appearance_keeps_the_background() {
+        let defaults = Appearance::default();
+        let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
+        execute(op("background"), &mut model, &choose(0x21_21_21));
+        execute(op("shadow"), &mut model, &choose(0));
+        execute(op("reset_appearance"), &mut model, &with_defaults(defaults));
+        assert_eq!(model.appearance(&defaults), defaults);
+        assert_eq!(
+            model.background(),
+            Some(Background::Color(Rgb(0x21, 0x21, 0x21)))
+        );
+    }
+
+    #[test]
+    fn the_background_takes_no_shortcut_and_has_no_row_of_its_own() {
+        let background = op("background");
+        assert_eq!(background.default_shortcut, &[]);
+        assert!(!background.takes_binding());
+        assert!(
+            !binding_rows(OPERATIONS)
+                .iter()
+                .any(|row| row.op.id == "background")
+        );
+    }
+
+    #[test]
+    fn every_background_choice_has_a_label() {
+        let catalog =
+            crate::i18n::Catalog::parse(include_str!("../../../../locales/ja.toml")).unwrap();
+        for choice in background_menu(&blank(Rgb(0xFF, 0xFF, 0xFF)))
+            .unwrap()
+            .choices
+        {
+            let ChoiceLabel::Key(key) = choice.label else {
+                panic!("{choice:?}");
+            };
+            assert_ne!(catalog.text(key), key);
         }
     }
 }
