@@ -569,7 +569,32 @@ impl Scrap {
 /// （`D2DERR_RECREATE_TARGET` など）次に作り直せるように入れない。
 /// 文字を打っていれば、IME の変換中の文字（`EditState::composition`）をつなげて描き、キャレットの矩形（ウィンドウの
 /// 中の座標）を返す。トリムの最中は、範囲・つまみ・十字線（色は `crosshair`）・拡大鏡を重ねる。
+///
+/// 書き込みの編集モード中なら、どの経路の描き直しでも（書き込み・元に戻す・やり直す・見た目の変更など）、始めた時点と
+/// 出し終えた時点に計測の区切り（`annotate_paint_start` / `annotate_paint_end`）を書く。描けなかったときは終わりを
+/// 書かない。計測していなければ（`SHUNSOKU_PERF_LOG` がなければ）何も書かない。
 fn paint_scrap(
+    renderer: &mut Option<render::Renderer>,
+    window: &scrap_window::ScrapWindow,
+    image: &render::CachedImage,
+    model: &ScrapModel,
+    appearance: &Appearance,
+    label: Option<render::ZoomLabel>,
+    crosshair: Rgb,
+) -> Result<Option<Rect>> {
+    let editing = model.is_editing();
+    if editing {
+        perf::mark(Mark::AnnotatePaintStart);
+    }
+    let caret = paint_scrap_unmarked(renderer, window, image, model, appearance, label, crosshair)?;
+    if editing {
+        perf::mark(Mark::AnnotatePaintEnd);
+    }
+    Ok(caret)
+}
+
+/// `paint_scrap` の、計測の区切りを書かない中身。
+fn paint_scrap_unmarked(
     renderer: &mut Option<render::Renderer>,
     window: &scrap_window::ScrapWindow,
     image: &render::CachedImage,
@@ -1983,10 +2008,8 @@ fn edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
         }
         if !outputs.is_empty() {
             // 描くだけで App を借りるメッセージは届かないので、借りたまま描く
-            perf::mark(Mark::AnnotatePaintStart);
-            match scrap.paint(&appearance, renderer) {
-                Ok(()) => perf::mark(Mark::AnnotatePaintEnd),
-                Err(e) => log::warn!("could not draw the annotations: {e}"),
+            if let Err(e) = scrap.paint(&appearance, renderer) {
+                log::warn!("could not draw the annotations: {e}");
             }
         }
         app.carryover.record(&outputs);
