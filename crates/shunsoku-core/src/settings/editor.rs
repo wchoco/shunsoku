@@ -16,7 +16,8 @@
 //!   出すパラメータの欄の種類は `param_fields`（パラメータのない操作は None）。足したら、`add_step` が返す位置の
 //!   操作を選ぶ。見た目を指定する操作の
 //!   欄（`AppearanceItem`）は `appearance` / `set_appearance` で読み書きする（「変えない」は書かない）。ショートカットは
-//!   `set_chord` の `RecipeShortcut`。検査（`recipe::plan`）で引っかかったもの（欄に打った範囲外の値を含む）は `mark` の
+//!   `set_chord` の `RecipeShortcut`、キャプチャで始まるレシピのホットキーは `RecipeHotkey`（どちらの欄を出すかは
+//!   `key_item`。最初の操作がキャプチャ系かどうかが変わったら、両方のキーを消す）。検査（`recipe::plan`）で引っかかったもの（欄に打った範囲外の値を含む）は `mark` の
 //!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（パラメータを添えた操作はパラメータの要約）。
 
 use std::collections::BTreeSet;
@@ -25,6 +26,7 @@ use super::{Problem, Region, Settings, SettingsItem, new_region};
 use crate::geometry::Rect;
 use crate::keys::Chord;
 pub use crate::recipe::AppearanceItem;
+pub use crate::recipe::Capture;
 use crate::recipe::{self, AppearanceStep, ItemValue, Recipe, Step, StepKey, Written};
 use crate::scrap::Background;
 use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationId};
@@ -69,6 +71,11 @@ impl Mark {
             Mark::Problem(Problem::NoSteps) => "settings_gui.mark.no_steps",
             Mark::Problem(Problem::NotAStep) => "settings_gui.mark.not_a_step",
             Mark::Problem(Problem::LastOnlyNotLast) => "settings_gui.mark.last_only_not_last",
+            Mark::Problem(Problem::FirstOnlyNotFirst) => "settings_gui.mark.first_only_not_first",
+            Mark::Problem(Problem::ShortcutOnCapture) => "settings_gui.mark.shortcut_on_capture",
+            Mark::Problem(Problem::HotkeyWithoutCapture) => {
+                "settings_gui.mark.hotkey_without_capture"
+            }
             Mark::Problem(Problem::OutOfRange) => "settings_gui.mark.out_of_range",
             Mark::Problem(Problem::BadValue) => "settings_gui.mark.bad_value",
             Mark::Problem(Problem::UnknownKey) => "settings_gui.mark.unknown_key",
@@ -157,10 +164,19 @@ impl Editor {
     }
 
     /// キーの組み合わせの欄 `item` に `chord` を入れる。None は空（割り当てなし）。キーの組み合わせの項目で
-    /// なければ何もしない。
+    /// なければ何もしない。レシピのショートカットかホットキーを入れたら、もう片方（設定 GUI に出ていない欄。
+    /// 設定ファイルに両方を書いたときだけ値がある）を消す。
     pub fn set_chord(&mut self, item: &SettingsItem, chord: Option<Chord>) {
         if let Some(slot) = chord_slot(&mut self.draft, item) {
             *slot = chord;
+        }
+        let other = match *item {
+            SettingsItem::RecipeShortcut(i) => self.draft.recipes.get_mut(i).map(|r| &mut r.hotkey),
+            SettingsItem::RecipeHotkey(i) => self.draft.recipes.get_mut(i).map(|r| &mut r.shortcut),
+            _ => None,
+        };
+        if let Some(other) = other {
+            *other = None;
         }
     }
 
@@ -309,6 +325,9 @@ impl Editor {
             return None;
         }
         self.draft.recipes.remove(index);
+        // ホットキーは位置で指すので、登録できなかった印は位置がずれたら当たらない
+        self.not_registered
+            .retain(|item| !matches!(item, SettingsItem::RecipeHotkey(_)));
         let len = self.draft.recipes.len();
         (len > 0).then(|| index.min(len - 1))
     }
@@ -320,7 +339,8 @@ impl Editor {
         }
     }
 
-    /// レシピ `index` の「操作を足す」で選べるもの。パラメータのない操作（表の順）と、最後に見た目を指定する操作。
+    /// レシピ `index` の「操作を足す」で選べるもの。最初にキャプチャ系（`Capture::ALL` の順）、次にパラメータの
+    /// ない操作（表の順）、最後に見た目を指定する操作。
     /// パラメータのない操作は、レシピに入れられる操作（`recipe::can_be_step`）。最後にだけ置ける操作（`close`、
     /// `annotate`）で終わるレシピには最後にだけ置ける操作を出さない（`add_step` はその前に足すので、2 つ目は最後に
     /// 置けない）。`index` のレシピがなければ空。
@@ -332,11 +352,16 @@ impl Editor {
             .steps
             .last()
             .is_some_and(|s| recipe::is_last_only(s.op_id(), OPERATIONS));
-        OPERATIONS
-            .iter()
-            .filter(|op| recipe::can_be_step(op))
-            .filter(|op| !(ends_with_last_only && op.in_recipe == InRecipe::Last))
-            .map(|op| StepChoice::Op(op.id))
+        // キャプチャ系は、操作の位置にかかわらず出す（最初以外に足せば `FirstOnlyNotFirst` の印が出る）
+        let captures = Capture::ALL.into_iter().map(StepChoice::Capture);
+        captures
+            .chain(
+                OPERATIONS
+                    .iter()
+                    .filter(|op| recipe::can_be_step(op))
+                    .filter(|op| !(ends_with_last_only && op.in_recipe == InRecipe::Last))
+                    .map(|op| StepChoice::Op(op.id)),
+            )
             .chain(std::iter::once(StepChoice::Appearance))
             .collect()
     }
@@ -345,6 +370,7 @@ impl Editor {
     /// `NoValues`）。レシピが最後にだけ置ける操作（`close`、`annotate`）で終わっていれば、その前に入れる。入れた
     /// 位置を返す。`index` のレシピがなければ何もせず None。
     pub fn add_step(&mut self, index: usize, choice: impl Into<StepChoice>) -> Option<usize> {
+        let first = self.starts_with_capture(index);
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
         let at = if steps
             .last()
@@ -356,15 +382,49 @@ impl Editor {
         };
         let step = match choice.into() {
             StepChoice::Op(id) => id.into(),
+            StepChoice::Capture(c) => c.id().into(),
             StepChoice::Appearance => Step::Appearance(AppearanceStep::default()),
         };
         steps.insert(at, step);
+        self.first_step_changed(index, first);
         Some(at)
+    }
+
+    /// レシピ `index` の最初の操作がキャプチャ系か。
+    fn starts_with_capture(&self, index: usize) -> bool {
+        self.draft
+            .recipes
+            .get(index)
+            .and_then(|r| r.steps.first())
+            .is_some_and(|s| recipe::is_first_only(s.op_id()))
+    }
+
+    /// 操作の並びを変えたあと、最初の操作がキャプチャ系かどうか（変える前は `before`）が変わったら、
+    /// ショートカットとホットキーを消す（欄が入れ替わるため）。
+    fn first_step_changed(&mut self, index: usize, before: bool) {
+        if self.starts_with_capture(index) != before
+            && let Some(r) = self.draft.recipes.get_mut(index)
+        {
+            r.shortcut = None;
+            r.hotkey = None;
+        }
+    }
+
+    /// レシピ `index` のキーの欄（ショートカットの欄の場所に出す欄）。最初の操作がキャプチャ系なら
+    /// `RecipeHotkey`、ほかは `RecipeShortcut`。`index` のレシピがなければ None。
+    pub fn key_item(&self, index: usize) -> Option<SettingsItem> {
+        self.draft.recipes.get(index)?;
+        Some(if self.starts_with_capture(index) {
+            SettingsItem::RecipeHotkey(index)
+        } else {
+            SettingsItem::RecipeShortcut(index)
+        })
     }
 
     /// レシピ `index` の操作 `step` を隣と入れ替える（「上へ」「下へ」）。端か、操作がなければ動かさない。移った
     /// 位置を返す。
     pub fn move_step(&mut self, index: usize, step: usize, to: Move) -> usize {
+        let first = self.starts_with_capture(index);
         let Some(r) = self.draft.recipes.get_mut(index) else {
             return step;
         };
@@ -375,6 +435,7 @@ impl Editor {
         match other.filter(|&o| o < r.steps.len() && step < r.steps.len()) {
             Some(other) => {
                 r.steps.swap(step, other);
+                self.first_step_changed(index, first);
                 other
             }
             None => step,
@@ -384,12 +445,14 @@ impl Editor {
     /// レシピ `index` の操作 `step` を消す。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を
     /// 返す。操作がなければ何もせず None。
     pub fn remove_step(&mut self, index: usize, step: usize) -> Option<usize> {
+        let first = self.starts_with_capture(index);
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
         if step >= steps.len() {
             return None;
         }
         steps.remove(step);
         let len = steps.len();
+        self.first_step_changed(index, first);
         (len > 0).then(|| step.min(len - 1))
     }
 
@@ -499,6 +562,9 @@ impl Editor {
 pub fn step_label(step: &Step, text: impl Fn(&'static str) -> &'static str) -> String {
     let values = match step {
         Step::Op(id) => {
+            if let Some(c) = Capture::from_id(id) {
+                return text(c.label_key()).to_owned();
+            }
             return OPERATIONS
                 .iter()
                 .find(|op| op.id == id)
@@ -619,6 +685,8 @@ pub enum StepChoice {
     Op(OperationId),
     /// 見た目を指定する操作（パラメータは足してから欄で入れる）。
     Appearance,
+    /// キャプチャ系の操作（ADR-0010。最初にだけ置ける）。
+    Capture(Capture),
 }
 
 impl StepChoice {
@@ -627,6 +695,7 @@ impl StepChoice {
         let id = match self {
             StepChoice::Op(id) => id,
             StepChoice::Appearance => recipe::APPEARANCE,
+            StepChoice::Capture(c) => return Some(c.label_key()),
         };
         OPERATIONS
             .iter()
@@ -679,6 +748,7 @@ fn chord_of(settings: &Settings, item: &SettingsItem) -> Option<Chord> {
         SettingsItem::RegionHotkey(i) => settings.regions.get(*i).and_then(|r| r.hotkey),
         SettingsItem::Shortcut(id) => settings.shortcuts.get(id).copied().flatten(),
         SettingsItem::RecipeShortcut(i) => settings.recipes.get(*i).and_then(|r| r.shortcut),
+        SettingsItem::RecipeHotkey(i) => settings.recipes.get(*i).and_then(|r| r.hotkey),
         SettingsItem::Mouse(_)
         | SettingsItem::RegionName(_)
         | SettingsItem::RecipeName(_)
@@ -701,6 +771,7 @@ fn chord_slot<'a>(
         SettingsItem::RegionHotkey(i) => settings.regions.get_mut(*i).map(|r| &mut r.hotkey),
         SettingsItem::Shortcut(id) => Some(settings.shortcuts.entry(id.clone()).or_default()),
         SettingsItem::RecipeShortcut(i) => settings.recipes.get_mut(*i).map(|r| &mut r.shortcut),
+        SettingsItem::RecipeHotkey(i) => settings.recipes.get_mut(*i).map(|r| &mut r.hotkey),
         SettingsItem::Mouse(_)
         | SettingsItem::RegionName(_)
         | SettingsItem::RecipeName(_)
@@ -1316,7 +1387,7 @@ mod tests {
             .iter()
             .filter_map(|c| match c {
                 StepChoice::Op(id) => Some(*id),
-                StepChoice::Appearance => None,
+                StepChoice::Appearance | StepChoice::Capture(_) => None,
             })
             .collect()
     }
@@ -1397,6 +1468,7 @@ mod tests {
             name: "R".to_owned(),
             steps: ids.iter().map(|&id| id.into()).collect(),
             shortcut: None,
+            hotkey: None,
         });
         Editor::new(settings)
     }
@@ -1829,5 +1901,124 @@ mod tests {
             Some(Mark::Problem(Problem::Conflict(_)))
         ));
         assert!(!editor.buttons().ok);
+    }
+
+    fn captures(editor: &Editor, index: usize) -> Vec<Capture> {
+        editor
+            .step_choices(index)
+            .iter()
+            .filter_map(|c| match c {
+                StepChoice::Capture(c) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn captures_are_always_offered_first_and_named_in_the_step_list() {
+        for ids in [&[][..], &["copy"], &["copy", "close"], &["select_capture"]] {
+            let editor = with_steps(ids);
+            assert_eq!(captures(&editor, 0), [Capture::Select], "{ids:?}");
+            assert_eq!(
+                editor.step_choices(0)[0],
+                StepChoice::Capture(Capture::Select),
+                "{ids:?}"
+            );
+        }
+        assert_eq!(
+            StepChoice::Capture(Capture::Select).label_key(),
+            Some("recipe.capture.select_capture")
+        );
+        let editor = with_steps(&["select_capture", "copy"]);
+        assert_eq!(labels(&editor), ["範囲選択キャプチャ", "コピー"]);
+    }
+
+    #[test]
+    fn a_capture_added_after_the_first_step_is_a_problem_until_it_is_first() {
+        let mut editor = with_steps(&["copy", "close"]);
+        // ほかの操作と同じく、最後にだけ置ける操作の前に入る
+        assert_eq!(
+            editor.add_step(0, StepChoice::Capture(Capture::Select)),
+            Some(1)
+        );
+        assert_eq!(steps(&editor, 0), ["copy", "select_capture", "close"]);
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::FirstOnlyNotFirst))
+        );
+        assert!(!editor.buttons().ok);
+        editor.move_step(0, 1, Move::Up);
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Alt+C")));
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn the_key_field_follows_the_first_step_and_switching_clears_the_key() {
+        let mut editor = with_steps(&["copy"]);
+        assert_eq!(editor.key_item(0), Some(SettingsItem::RecipeShortcut(0)));
+        editor.set_chord(&SettingsItem::RecipeShortcut(0), Some(chord("Ctrl+Q")));
+        editor.add_step(0, StepChoice::Capture(Capture::Select));
+        // 2 つ目に足しただけでは最初の操作は変わらない
+        assert_eq!(editor.key_item(0), Some(SettingsItem::RecipeShortcut(0)));
+        assert_eq!(
+            editor.chord(&SettingsItem::RecipeShortcut(0)),
+            Some(chord("Ctrl+Q"))
+        );
+
+        editor.move_step(0, 1, Move::Up);
+        assert_eq!(editor.key_item(0), Some(SettingsItem::RecipeHotkey(0)));
+        assert_eq!(editor.chord(&SettingsItem::RecipeShortcut(0)), None);
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeHotkey(0)),
+            Some(Mark::Problem(Problem::Unset))
+        );
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Alt+C")));
+        assert_eq!(editor.mark(&SettingsItem::RecipeHotkey(0)), None);
+        assert!(editor.buttons().ok);
+
+        // 並べ替えで最初がキャプチャのままなら、キーは残る
+        editor.add_step(0, "close");
+        editor.move_step(0, 2, Move::Up);
+        assert_eq!(
+            editor.chord(&SettingsItem::RecipeHotkey(0)),
+            Some(chord("Ctrl+Alt+C"))
+        );
+
+        editor.remove_step(0, 0);
+        assert_eq!(editor.key_item(0), Some(SettingsItem::RecipeShortcut(0)));
+        assert_eq!(editor.chord(&SettingsItem::RecipeHotkey(0)), None);
+        assert_eq!(editor.key_item(1), None);
+    }
+
+    #[test]
+    fn a_capture_recipe_hotkey_overlapping_another_hotkey_is_marked() {
+        let mut editor = with_steps(&["select_capture"]);
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Shift+A")));
+        assert!(matches!(
+            editor.mark(&SettingsItem::RecipeHotkey(0)),
+            Some(Mark::Problem(Problem::Conflict(_)))
+        ));
+        assert!(matches!(
+            editor.mark(&SettingsItem::SelectCaptureHotkey),
+            Some(Mark::Problem(Problem::Conflict(_)))
+        ));
+        assert!(!editor.buttons().ok);
+    }
+
+    #[test]
+    fn entering_the_shown_key_clears_the_hidden_one_written_in_the_file() {
+        let (settings, _) = super::super::load(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Shift+A\"\n[[recipes]]\nname = \"R\"\nsteps = [\"select_capture\"]\nshortcut = \"Ctrl+Q\"\nhotkey = \"Ctrl+Alt+C\"\n",
+        );
+        let mut editor = Editor::new(settings);
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeHotkey(0)),
+            Some(Mark::Problem(Problem::ShortcutOnCapture))
+        );
+        editor.set_chord(&SettingsItem::RecipeHotkey(0), Some(chord("Ctrl+Alt+C")));
+        assert_eq!(editor.chord(&SettingsItem::RecipeShortcut(0)), None);
+        assert_eq!(editor.mark(&SettingsItem::RecipeHotkey(0)), None);
+        assert!(editor.buttons().ok);
     }
 }

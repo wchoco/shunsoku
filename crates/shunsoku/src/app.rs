@@ -104,7 +104,9 @@ use shunsoku_core::monitors::{self, LocateError};
 use shunsoku_core::notice::Notices;
 use shunsoku_core::perf::Mark;
 use shunsoku_core::protocol::{ErrorKind, Response};
-use shunsoku_core::recipe::{Advance, Outcome, Parked, PlannedStep, Run, StepValues};
+use shunsoku_core::recipe::{
+    self, Advance, Launch, Outcome, Parked, PlannedStep, Run, Shown, StepValues,
+};
 use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseBindings, MouseGesture, OpContext,
     OperationDescriptor, OperationId, Shortcuts,
@@ -3413,6 +3415,29 @@ fn request_capture(source: Source) {
     submit(CaptureRequest::from_source(source));
 }
 
+/// キャプチャで始まるレシピ（`index` は `Settings::recipes` の添字）を始める（ADR-0010）。キャプチャを依頼し、
+/// 撮れたら `output` がスクラップを出してから残りの操作を進める。
+fn request_capture_recipe(index: usize) {
+    let Some(launch) = capture_recipe_launch(index) else {
+        log::warn!("recipe {index} does not start with a capture");
+        return;
+    };
+    log::info!("capture recipe {index} requested from hotkey");
+    submit(CaptureRequest::recipe(index, launch.capture()));
+}
+
+/// いまの設定での、`index` 番目のレシピの実行。キャプチャで始まる、問題のないレシピでなければ None。
+fn capture_recipe_launch(index: usize) -> Option<Launch> {
+    with_app(|app| {
+        recipe::plan(&app.settings.recipes, ops::OPERATIONS)
+            .plans
+            .iter()
+            .find(|plan| plan.index == index)
+            .and_then(Launch::of)
+    })
+    .flatten()
+}
+
 /// キャプチャの依頼を受ける。ほかの依頼を進めている間（範囲選択の画面を開いている間など）は、ホットキー・
 /// トレイの依頼は無視し、CLI の依頼は失敗として返す。
 ///
@@ -3531,6 +3556,7 @@ fn output(request: CaptureRequest, area: Rect, image: Image) {
         outputs,
         notify,
         reply: reply_to,
+        recipe,
         ..
     } = request;
     // 失敗として返す依頼の失敗
@@ -3555,7 +3581,13 @@ fn output(request: CaptureRequest, area: Rect, image: Image) {
         }
     }
     if outputs.scrap {
-        match float_scrap(area.origin(), image.clone(), outputs.focus_scrap) {
+        let floated = match recipe.and_then(capture_recipe_launch) {
+            Some(launch) => {
+                float_recipe_scrap(launch, area.origin(), image.clone(), outputs.focus_scrap)
+            }
+            None => float_scrap(area.origin(), image.clone(), outputs.focus_scrap),
+        };
+        match floated {
             Ok(()) => perf::mark(Mark::ScrapShown),
             Err(reason) if strict => {
                 fail(&reason);
@@ -3884,6 +3916,7 @@ fn on_hotkey(wparam: WPARAM) {
             request_capture(Source::ActiveWindowHotkey)
         }
         Some(settings::HotkeyAction::BlankScrap) => request_capture(Source::BlankScrap),
+        Some(settings::HotkeyAction::Recipe(i)) => request_capture_recipe(i),
         None => log::warn!("unknown hotkey id {}", wparam.0),
     }
 }
@@ -4278,6 +4311,38 @@ fn resolve_save_target(
 fn float_scrap(at: Point, image: Image, focus: bool) -> std::result::Result<(), String> {
     let model = ScrapModel::new(at, image.size());
     float_model(model, image, focus).map(|_| ())
+}
+
+/// キャプチャで始まるレシピ `launch` で撮った画像を、出す前に当てる操作（見た目・背景色）を当ててから浮かべ、
+/// 残りの操作を進める（ADR-0010）。出せなければ理由を返す。
+fn float_recipe_scrap(
+    launch: Launch,
+    at: Point,
+    image: Image,
+    focus: bool,
+) -> std::result::Result<(), String> {
+    let mut model = ScrapModel::new(at, image.size());
+    let context = with_app(|app| OpContext {
+        appearance: Appearance::from(app.settings.scrap),
+        annotation: Style::from(&app.settings.annotation),
+        font: Font::from(&app.settings.annotation),
+        carryover: app.carryover,
+        ..OpContext::default()
+    })
+    .unwrap_or_default();
+    let Shown { run, effects } = launch.captured(&mut model, &context);
+    let hwnd = float_model(model, image, focus)?;
+    if with_app(|app| app.recipe.discard()).flatten().is_some() {
+        log::info!("the recipe waiting for a save was discarded");
+    }
+    log::info!("capture recipe started");
+    if !effects.is_empty() {
+        perform(hwnd, OpContext::default(), |_, _| {
+            Some((recipe::APPEARANCE, effects))
+        });
+    }
+    drive_recipe(hwnd, run);
+    Ok(())
 }
 
 /// `model` のスクラップ（元の画像は `image`）を浮かべ、`App::scraps` に入れる。出したウィンドウを返す。

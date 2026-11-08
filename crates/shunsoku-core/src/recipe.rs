@@ -1,4 +1,4 @@
-//! レシピ（名前を付けた、スクラップ操作の並び）。ADR-0007。
+//! レシピ（名前を付けた、スクラップ操作の並び）。ADR-0007。キャプチャで始まるレシピは ADR-0010。
 
 use crate::keys::Chord;
 use crate::scrap::ops::{Effect, InRecipe, OpContext, OperationDescriptor, OperationId};
@@ -11,7 +11,47 @@ pub struct Recipe {
     pub name: String,
     /// 操作の並び。
     pub steps: Vec<Step>,
+    /// スクラップのショートカット。キャプチャで始まらないレシピだけが持てる。
     pub shortcut: Option<Chord>,
+    /// ホットキー。キャプチャで始まるレシピだけが持てる（ADR-0010）。
+    pub hotkey: Option<Chord>,
+}
+
+/// キャプチャ系の操作（ADR-0010）。レシピの最初にだけ置け、スクラップを作る。スクラップに対する操作ではないので、
+/// スクラップ操作の表（`scrap::ops::OPERATIONS`）には入れない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capture {
+    /// 範囲選択キャプチャ。範囲選択の画面で選んだ範囲か、クリックしたウィンドウを撮る。
+    Select,
+}
+
+impl Capture {
+    /// キャプチャ系の操作のすべて（「追加」の一覧の順）。
+    pub const ALL: [Capture; 1] = [Capture::Select];
+
+    /// レシピの `steps` に書く id。
+    pub fn id(self) -> &'static str {
+        match self {
+            Capture::Select => "select_capture",
+        }
+    }
+
+    /// `id` のキャプチャ系の操作。
+    pub fn from_id(id: &str) -> Option<Capture> {
+        Capture::ALL.into_iter().find(|c| c.id() == id)
+    }
+
+    /// 設定 GUI の操作の名前の文言のキー。
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Capture::Select => "recipe.capture.select_capture",
+        }
+    }
+}
+
+/// 最初にだけ置ける操作（キャプチャ系）の id か。最後にだけ置ける操作（`is_last_only`）と対になる。
+pub fn is_first_only(id: &str) -> bool {
+    Capture::from_id(id).is_some()
 }
 
 /// 見た目を指定する操作の id（設定ファイルの `op = "appearance"`）。ADR-0008。
@@ -323,14 +363,18 @@ pub struct PlannedStep {
     pub values: Option<StepValues>,
 }
 
-/// 検査を通ったレシピ。ショートカットから実行できる。
+/// 検査を通ったレシピ。キャプチャで始まるレシピはホットキーから、ほかのレシピはショートカットから実行できる。
 #[derive(Debug, Clone)]
 pub struct Plan {
     /// `Settings::recipes` の中の位置。
     pub index: usize,
     pub name: String,
+    /// 最初に置いたキャプチャ系の操作。キャプチャで始まらないレシピは None。
+    pub capture: Option<Capture>,
+    /// スクラップ操作の並び（キャプチャ系の操作を除く）。
     pub steps: Vec<PlannedStep>,
     pub shortcut: Option<Chord>,
+    pub hotkey: Option<Chord>,
 }
 
 /// レシピの問題（設定のエラー）。問題のあるレシピは実行できず、ショートカットにも付けない。
@@ -347,6 +391,14 @@ pub enum Problem {
     /// 最後にだけ置ける操作（`InRecipe::Last`。`close`、`annotate`）が最後以外にある。2 つ置いたときも、前の
     /// ほうが最後以外になるのでこれ。
     LastOnlyNotLast,
+    /// 最初にだけ置ける操作（キャプチャ系。`is_first_only`）が最初以外にある。`LastOnlyNotLast` と対になる。
+    FirstOnlyNotFirst,
+    /// キャプチャで始まるレシピに `shortcut` がある（ホットキーで呼ぶ）。
+    ShortcutOnCapture,
+    /// キャプチャで始まるレシピに `hotkey` がない。
+    NoHotkey,
+    /// キャプチャで始まらないレシピに `hotkey` がある（ショートカットで呼ぶ）。
+    HotkeyWithoutCapture,
     /// 操作に添えたパラメータが範囲外。書いたキー。
     OutOfRange(String),
     /// 操作に添えたパラメータの型か書式の誤り。書いたキー。
@@ -361,10 +413,25 @@ pub enum Problem {
     BorderOffWithColorOrWidth,
 }
 
+/// レシピの欄（問題が載る場所）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Name,
+    Steps,
+    Shortcut,
+    Hotkey,
+}
+
 impl Problem {
-    /// 問題が名前の欄にあるか（ないなら操作の並びの欄）。
-    pub fn is_about_name(&self) -> bool {
-        matches!(self, Problem::EmptyName | Problem::DuplicateName)
+    /// 問題が載る欄。キーの食い違いは、設定 GUI に出ている欄（キャプチャで始まるならホットキー、ほかはショートカット）
+    /// に載せる。
+    pub fn field(&self) -> Field {
+        match self {
+            Problem::EmptyName | Problem::DuplicateName => Field::Name,
+            Problem::NoHotkey | Problem::ShortcutOnCapture => Field::Hotkey,
+            Problem::HotkeyWithoutCapture => Field::Shortcut,
+            _ => Field::Steps,
+        }
     }
 }
 
@@ -407,7 +474,18 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
             problems.push(Problem::NoSteps);
         }
         let mut steps = Vec::with_capacity(recipe.steps.len());
-        for step in &recipe.steps {
+        let mut capture = None;
+        for (position, step) in recipe.steps.iter().enumerate() {
+            if let Step::Op(id) = step
+                && let Some(c) = Capture::from_id(id)
+            {
+                if position == 0 {
+                    capture = Some(c);
+                } else if !problems.contains(&Problem::FirstOnlyNotFirst) {
+                    problems.push(Problem::FirstOnlyNotFirst);
+                }
+                continue;
+            }
             let values = match step {
                 Step::Op(_) => None,
                 Step::Appearance(step) => Some(StepValues::Appearance(check_appearance(
@@ -434,12 +512,29 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
         {
             problems.push(Problem::LastOnlyNotLast);
         }
+        // キャプチャで始まるレシピはホットキーで、ほかのレシピはショートカットで呼ぶ
+        let starts_with_capture = recipe
+            .steps
+            .first()
+            .is_some_and(|s| is_first_only(s.op_id()));
+        if starts_with_capture {
+            if recipe.shortcut.is_some() {
+                problems.push(Problem::ShortcutOnCapture);
+            }
+            if recipe.hotkey.is_none() {
+                problems.push(Problem::NoHotkey);
+            }
+        } else if recipe.hotkey.is_some() {
+            problems.push(Problem::HotkeyWithoutCapture);
+        }
         if problems.is_empty() {
             checked.plans.push(Plan {
                 index,
                 name: recipe.name.clone(),
+                capture,
                 steps,
                 shortcut: recipe.shortcut,
+                hotkey: recipe.hotkey,
             });
         } else {
             checked
@@ -633,6 +728,85 @@ impl Run {
     }
 }
 
+/// キャプチャで始まるレシピの実行（ADR-0010）。キャプチャ・出す前に当てる操作・残りの操作の 3 つに分けて持つ。
+///
+/// Win32 層はホットキーを受けたら `Launch::of` で作り、`capture` のキャプチャを行う。キャプチャをやめたら
+/// （範囲選択の画面の `Esc`）捨てるだけで、何も作らない。できた `ScrapModel` に `captured` で出す前に当てる操作を
+/// 当ててから最初に出し、返った `Run` を、ショートカットから呼んだレシピと同じく 1 つずつ進める（ADR-0007）。
+#[derive(Debug, Clone)]
+pub struct Launch {
+    capture: Capture,
+    /// キャプチャの直後に続く、見た目（`APPEARANCE`）と背景色（`BACKGROUND`）の操作。
+    before_show: Vec<PlannedStep>,
+    /// 残りの操作（出す前に当てる操作のあと、最初のほかの操作から先）。
+    rest: Vec<PlannedStep>,
+}
+
+/// 出す前に当てる操作を当てた結果（`Launch::captured`）。
+#[derive(Debug, Clone)]
+pub struct Shown {
+    /// 出したあとに進める残りの操作。出す前に当てる操作が今は実行できなければ、止まっている。
+    pub run: Run,
+    /// 出す前に当てた操作の `Effect` のうち、出したあとに実行するもの。描き直し（`Effect::Redraw`）は、出すとき
+    /// に描くので除く。
+    pub effects: Vec<Effect>,
+}
+
+impl Launch {
+    /// キャプチャで始まるレシピ `plan` の実行。キャプチャで始まらなければ None。
+    pub fn of(plan: &Plan) -> Option<Launch> {
+        let capture = plan.capture?;
+        let shown_with = |s: &PlannedStep| s.op.id == APPEARANCE || s.op.id == BACKGROUND;
+        let split = plan
+            .steps
+            .iter()
+            .position(|s| !shown_with(s))
+            .unwrap_or(plan.steps.len());
+        let (before_show, rest) = plan.steps.split_at(split);
+        Some(Launch {
+            capture,
+            before_show: before_show.to_vec(),
+            rest: rest.to_vec(),
+        })
+    }
+
+    /// 最初に行うキャプチャ。
+    pub fn capture(&self) -> Capture {
+        self.capture
+    }
+
+    /// キャプチャでできた、まだ出していない `model` に、出す前に当てる操作を並べた順に当てる。今は実行できない操作
+    /// （撮ったスクラップへの背景色など）があれば、その前で止め、残りの操作も実行しない。
+    pub fn captured(self, model: &mut ScrapModel, context: &OpContext) -> Shown {
+        let mut effects = Vec::new();
+        for PlannedStep { op, values } in self.before_show {
+            if !(op.can_execute)(model) {
+                return Shown {
+                    run: Run {
+                        steps: self.rest,
+                        next: 0,
+                        state: State::Stopped(Stop::CannotRun(op.id)),
+                    },
+                    effects,
+                };
+            }
+            let context = OpContext {
+                values,
+                ..context.clone()
+            };
+            effects.extend(
+                (op.run)(model, &context)
+                    .into_iter()
+                    .filter(|e| *e != Effect::Redraw),
+            );
+        }
+        Shown {
+            run: Run::new(self.rest),
+            effects,
+        }
+    }
+}
+
 /// あとから届く結果（裏のスレッドの保存）を待っているレシピ。待たせるのは 1 つだけ。
 ///
 /// Win32 層は、結果を待つ操作を実行したら `Run` をここに預け、結果の知らせ（`ticket`。保存先など）が届いたら
@@ -706,7 +880,7 @@ mod tests {
         Recipe {
             name: name.into(),
             steps: steps.iter().map(|&s| s.into()).collect(),
-            shortcut: None,
+            ..Recipe::default()
         }
     }
 
@@ -815,6 +989,64 @@ mod tests {
             checked.plans.iter().map(|p| p.index).collect::<Vec<_>>(),
             [4]
         );
+    }
+
+    fn capture_recipe(name: &str, steps: &[&str], hotkey: &str) -> Recipe {
+        Recipe {
+            hotkey: Some(chord(hotkey)),
+            ..recipe(name, steps)
+        }
+    }
+
+    #[test]
+    fn a_capture_goes_only_first_and_is_taken_out_of_the_scrap_steps() {
+        let checked = plan(
+            &[
+                capture_recipe("撮ってコピー", &["select_capture", "copy"], "Ctrl+Alt+C"),
+                capture_recipe("撮るだけ", &["select_capture"], "Ctrl+Alt+D"),
+                recipe("a", &["copy", "select_capture"]),
+                capture_recipe("b", &["select_capture", "select_capture"], "Ctrl+Alt+E"),
+            ],
+            OPERATIONS,
+        );
+        assert_eq!(
+            checked.problems,
+            vec![
+                (2, Problem::FirstOnlyNotFirst),
+                (3, Problem::FirstOnlyNotFirst)
+            ]
+        );
+        assert_eq!(
+            checked.plans.iter().map(|p| p.index).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(checked.plans[0].capture, Some(Capture::Select));
+        assert_eq!(ids(&checked.plans[0]), ["copy"]);
+        assert_eq!(checked.plans[0].hotkey, Some(chord("Ctrl+Alt+C")));
+        assert_eq!(checked.plans[1].capture, Some(Capture::Select));
+        assert_eq!(ids(&checked.plans[1]), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_capture_recipe_takes_a_hotkey_and_other_recipes_take_a_shortcut() {
+        let with_both = Recipe {
+            shortcut: Some(chord("Ctrl+Q")),
+            ..capture_recipe("a", &["select_capture", "copy"], "Ctrl+Alt+C")
+        };
+        let no_hotkey = recipe("b", &["select_capture", "copy"]);
+        let hotkey_on_scrap_recipe = capture_recipe("c", &["copy"], "Ctrl+Alt+D");
+        let checked = plan(&[with_both, no_hotkey, hotkey_on_scrap_recipe], OPERATIONS);
+        assert_eq!(
+            checked.problems,
+            vec![
+                (0, Problem::ShortcutOnCapture),
+                (1, Problem::NoHotkey),
+                (2, Problem::HotkeyWithoutCapture),
+            ]
+        );
+        assert!(checked.plans.is_empty());
+        assert!(is_first_only("select_capture"));
+        assert!(!is_first_only("copy"));
     }
 
     #[test]
@@ -1520,6 +1752,103 @@ mod tests {
         );
     }
 
+    /// `steps = [...]` のキャプチャで始まるレシピ 1 つの `Launch`。
+    fn launch_of(steps: &str) -> Launch {
+        let (settings, issues) = settings::load(&format!(
+            "version = 1\n[[recipes]]\nname = \"r\"\nsteps = {steps}\nhotkey = \"Ctrl+Alt+C\"\n"
+        ));
+        assert_eq!(issues, vec![], "{steps}");
+        let checked = plan(&settings.recipes, OPERATIONS);
+        assert_eq!(checked.problems, vec![], "{steps}");
+        Launch::of(&checked.plans[0]).expect("starts with a capture")
+    }
+
+    #[test]
+    fn only_a_recipe_starting_with_a_capture_is_launched() {
+        let checked = checked_steps(r#"["copy"]"#);
+        assert!(Launch::of(&checked.plans[0]).is_none());
+        assert_eq!(
+            launch_of(r#"["select_capture"]"#).capture(),
+            Capture::Select
+        );
+    }
+
+    #[test]
+    fn the_appearance_right_after_a_capture_is_applied_before_showing_and_the_rest_runs_after() {
+        let launch = launch_of(
+            r##"["select_capture", { op = "appearance", border_color = "#FF0000" }, { op = "appearance", shadow = false }, "copy", { op = "appearance", opacity = 50 }, "close"]"##,
+        );
+        let context = no_border_context();
+        let mut scrap = model();
+        let Shown { mut run, effects } = launch.captured(&mut scrap, &context);
+        // 出すときに描くので、描き直しは返さない
+        assert_eq!(effects, vec![]);
+        assert_eq!(
+            scrap.appearance(&context.appearance),
+            Appearance {
+                opacity: 100,
+                border: Border {
+                    width: 1,
+                    color: 0xFF_00_00
+                },
+                show_border: true,
+                shadow: false,
+            }
+        );
+        // ほかの操作が出てきたら、そこから先（後ろの見た目も）は出したあとに 1 つずつ実行する
+        assert_eq!(
+            step_in(&mut run, &mut scrap, &context),
+            ("copy", vec![Effect::CopyToClipboard])
+        );
+        run.settle(Outcome::Succeeded);
+        assert_eq!(
+            step_in(&mut run, &mut scrap, &context),
+            ("appearance", vec![Effect::Redraw])
+        );
+        assert_eq!(scrap.appearance(&context.appearance).opacity, 50);
+        run.settle(Outcome::Succeeded);
+        assert_eq!(step_in(&mut run, &mut scrap, &context).0, "close");
+        run.settle(Outcome::Succeeded);
+        assert_eq!(run.advance(&mut scrap, &context), Advance::Finished);
+    }
+
+    #[test]
+    fn the_background_right_after_a_capture_is_applied_before_showing_a_blank_scrap() {
+        let launch = launch_of(
+            r##"["select_capture", { op = "background", color = "#212121" }, { op = "appearance", opacity = 50 }, "copy"]"##,
+        );
+        let context = no_border_context();
+        let mut scrap = white_blank();
+        let Shown { mut run, effects } = launch.captured(&mut scrap, &context);
+        assert_eq!(effects, vec![]);
+        assert_eq!(
+            scrap.background(),
+            Some(Background::Color(Rgb(0x21, 0x21, 0x21)))
+        );
+        assert_eq!(scrap.appearance(&context.appearance).opacity, 50);
+        assert_eq!(
+            step_in(&mut run, &mut scrap, &context),
+            ("copy", vec![Effect::CopyToClipboard])
+        );
+    }
+
+    #[test]
+    fn a_step_before_showing_that_cannot_run_stops_the_recipe_once_shown() {
+        // 背景色は白紙スクラップだけで動く。範囲選択キャプチャで撮ったスクラップでは動かない
+        let launch = launch_of(
+            r##"["select_capture", { op = "appearance", opacity = 50 }, { op = "background", color = "#212121" }, "copy"]"##,
+        );
+        let context = no_border_context();
+        let mut scrap = model();
+        let Shown { mut run, effects } = launch.captured(&mut scrap, &context);
+        assert_eq!(effects, vec![]);
+        assert_eq!(scrap.appearance(&context.appearance).opacity, 50);
+        assert_eq!(
+            run.advance(&mut scrap, &context),
+            Advance::Stopped(Stop::CannotRun("background"))
+        );
+    }
+
     #[test]
     fn a_background_step_with_a_misspelt_transparent_makes_the_recipe_an_error() {
         let checked = checked_steps(r#"[{ op = "background", color = "Transparent" }]"#);
@@ -1645,11 +1974,13 @@ steps = ["copy", "copy"]
                     name: "コピーして閉じる".into(),
                     steps: vec!["copy".into(), "close".into()],
                     shortcut: Some(chord("Ctrl+Shift+C")),
+                    hotkey: None,
                 },
                 Recipe {
                     name: "二度コピー".into(),
                     steps: vec!["copy".into(), "copy".into()],
                     shortcut: None,
+                    hotkey: None,
                 },
             ]
         );
@@ -1685,6 +2016,7 @@ shortcut = "Ctrl+Nope"
                 name: "b".into(),
                 steps: vec!["copy".into()],
                 shortcut: None,
+                hotkey: None,
             }]
         );
     }

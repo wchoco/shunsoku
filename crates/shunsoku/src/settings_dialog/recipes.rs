@@ -16,7 +16,9 @@
 //!   「スクラップ」タブと同じ `PageBuilder` の `choice_control` / `number_controls` / `color_controls`）。値の出し入れは
 //!   `Editor::appearance` / `set_appearance` で、呼び出し側が `appearance_item` / `appearance_input` で受ける。
 //! - ショートカットは全体のホットキーと同じ入力欄（`chord_field`）で、`ChordRow` の 1 つ。行を選び直したら、
-//!   呼び出し側が `ChordRow::item` をその行の `SettingsItem::RecipeShortcut` に差し替える（`shortcut_id`）。
+//!   呼び出し側が `ChordRow::item` をその行の `Editor::key_item`（キャプチャで始まるレシピは
+//!   `SettingsItem::RecipeHotkey`、ほかは `RecipeShortcut`。ADR-0010）に差し替える（`shortcut_id`）。見出しも
+//!   「ショートカット」と「ホットキー」を切り替える。
 //! - 一覧の行の数は `sync_list` で写しに揃える。揃えて選んでいる行がなくなったら、ショートカットの欄が指していた
 //!   位置の行を選ぶ。`sync_list` と `fill` の中で行を選んで届く通知と、名前の欄に文字を入れて届く通知では、
 //!   写しを変えない（`is_syncing`）。
@@ -68,6 +70,7 @@ const STEP_REMOVE: i32 = 10;
 const STEPS_MARK: i32 = 11;
 const STEP_CHOICE: i32 = 12;
 const STEP_ADD: i32 = 13;
+const SHORTCUT_LABEL: i32 = 14;
 const SHORTCUT: i32 = 15;
 const DETAIL_END: i32 = 17;
 /// 見た目のパラメータの欄（見出しと上下のボタンを含む）。
@@ -470,7 +473,7 @@ pub fn sync_list(hwnd: HWND, editor: &Editor, bound: usize, text: Text) {
     set_row_count(list, recipes.len());
     for (i, r) in recipes.iter().enumerate() {
         set_cell(list, i, 0, &r.name);
-        let shortcut = r.shortcut.map_or_else(
+        let shortcut = r.shortcut.or(r.hotkey).map_or_else(
             || text("settings_gui.scrap_ops.none").to_owned(),
             |c| c.to_string(),
         );
@@ -479,6 +482,7 @@ pub fn sync_list(hwnd: HWND, editor: &Editor, bound: usize, text: Text) {
             SettingsItem::RecipeName(i),
             SettingsItem::RecipeSteps(i),
             SettingsItem::RecipeShortcut(i),
+            SettingsItem::RecipeHotkey(i),
         ]
         .iter()
         .find_map(|item| editor.mark(item))
@@ -512,6 +516,12 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
         item.and_then(|item| editor.mark(&item))
             .map_or("", |m| text(m.label_key()))
     };
+    // キーの欄の見出し。キャプチャで始まるレシピはホットキー（ADR-0010）
+    let key_label = match selected.and_then(|i| editor.key_item(i)) {
+        Some(SettingsItem::RecipeHotkey(_)) => "settings_gui.recipes.hotkey_label",
+        _ => "settings_gui.recipes.shortcut_label",
+    };
+    set_text(hwnd, id(SHORTCUT_LABEL), text(key_label));
     set_text(
         hwnd,
         id(NAME_MARK),
@@ -732,7 +742,7 @@ fn choice_label(choice: StepChoice, text: Text) -> String {
     match (choice.label_key(), choice) {
         (Some(key), _) => text(key).to_owned(),
         (None, StepChoice::Op(id)) => id.to_owned(),
-        (None, StepChoice::Appearance) => String::new(),
+        (None, StepChoice::Appearance | StepChoice::Capture(_)) => String::new(),
     }
 }
 

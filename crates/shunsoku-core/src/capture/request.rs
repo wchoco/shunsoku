@@ -137,6 +137,9 @@ pub struct CaptureRequest {
     pub notify: bool,
     /// 結果（保存したパス、失敗）を返す先。CLI からの依頼だけが持つ。
     pub reply: Option<ReplyTo>,
+    /// 撮ったスクラップに続けて実行するレシピ（`Settings::recipes` の中の位置。ADR-0010）。キャプチャで始まる
+    /// レシピのホットキーからの依頼だけが持つ。
+    pub recipe: Option<usize>,
 }
 
 impl CaptureRequest {
@@ -155,6 +158,19 @@ impl CaptureRequest {
                 },
                 ..CaptureRequest::scrap(CaptureMethod::RegisterRegion)
             },
+        }
+    }
+
+    /// キャプチャで始まるレシピ（`Settings::recipes` の `index`）のホットキー: レシピのキャプチャ `capture` で撮り、
+    /// スクラップを出してフォーカスを移す（範囲選択キャプチャのホットキーと同じ）。出したスクラップに続きの操作を
+    /// 実行する。
+    pub fn recipe(index: usize, capture: crate::recipe::Capture) -> CaptureRequest {
+        let method = match capture {
+            crate::recipe::Capture::Select => CaptureMethod::Select,
+        };
+        CaptureRequest {
+            recipe: Some(index),
+            ..CaptureRequest::scrap(method)
         }
     }
 
@@ -206,6 +222,7 @@ impl CaptureRequest {
             delay,
             notify: !output.quiet,
             reply: Some(reply),
+            recipe: None,
         }
     }
 
@@ -224,6 +241,7 @@ impl CaptureRequest {
             delay: Duration::ZERO,
             notify: true,
             reply: None,
+            recipe: None,
         }
     }
 
@@ -296,6 +314,7 @@ impl CaptureRequest {
             delay: Duration::ZERO,
             notify: true,
             reply: None,
+            recipe: None,
         }
     }
 }
@@ -330,7 +349,19 @@ mod tests {
             delay: Duration::ZERO,
             notify: true,
             reply: None,
+            recipe: None,
         }
+    }
+
+    #[test]
+    fn a_capture_recipe_hotkey_selects_like_the_select_capture_hotkey_and_names_the_recipe() {
+        assert_eq!(
+            CaptureRequest::recipe(2, crate::recipe::Capture::Select),
+            CaptureRequest {
+                recipe: Some(2),
+                ..select_capture()
+            }
+        );
     }
 
     #[test]
@@ -488,6 +519,7 @@ mod tests {
                 delay: Duration::ZERO,
                 notify: true,
                 reply: Some(ReplyTo(7)),
+                recipe: None,
             }
         );
     }
@@ -610,6 +642,7 @@ mod tests {
                 delay: Duration::ZERO,
                 notify: true,
                 reply: None,
+                recipe: None,
             }
         );
     }
@@ -747,6 +780,7 @@ mod tests {
             delay,
             notify: true,
             reply: Some(ReplyTo(3)),
+            recipe: None,
         }
     }
 
