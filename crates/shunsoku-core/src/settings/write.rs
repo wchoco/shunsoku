@@ -490,9 +490,9 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
     );
 }
 
-/// レシピの手 1 つ。値のない手は操作の id の文字列、値のある手は `op` と書いた項目のキーを持つインライン表
+/// レシピの操作 1 つ。パラメータのない操作は操作の id の文字列、パラメータを添えた操作は `op` と書いた項目のキーを持つインライン表
 /// （`op` のあと、項目は `AppearanceItem::ALL` の順）。読めなかった項目は、その後ろに書いたまま書く（`op` を
-/// 読めなかったなら、その `op` で書く）。背景色を指定する手は `op` と `color`。
+/// 読めなかったなら、その `op` で書く）。背景色を指定する操作は `op` と `color`。
 fn step_value(step: &Step) -> Value {
     let step = match step {
         Step::Op(id) => return id.as_str().into(),
@@ -522,7 +522,7 @@ fn step_value(step: &Step) -> Value {
     Value::InlineTable(table)
 }
 
-/// 値のある手の読めなかった項目を、書いたまま `table` に足す。
+/// パラメータを添えた操作の読めなかった項目を、書いたまま `table` に足す。
 fn insert_rejected(table: &mut toml_edit::InlineTable, rejected: &[crate::recipe::Rejected]) {
     for r in rejected {
         if let Some(value) = r.value.as_deref().and_then(|v| v.parse::<Value>().ok()) {

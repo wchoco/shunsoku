@@ -678,17 +678,17 @@ pub enum Problem {
     NotAStep,
     /// レシピの `close` が最後以外にある。
     CloseNotLast,
-    /// レシピの値のある手の値が範囲外。
+    /// レシピの操作に添えたパラメータが範囲外。
     OutOfRange,
-    /// レシピの値のある手の値の型か書式の誤り。
+    /// レシピの操作に添えたパラメータの型か書式の誤り。
     BadValue,
-    /// レシピの値のある手の知らないキー。
+    /// レシピのパラメータを添えた操作の知らないキー。
     UnknownKey,
-    /// レシピの値のある手の `op` が `appearance` でない。
+    /// レシピのパラメータを添えた操作の `op` が `appearance` でない。
     NotAppearance,
-    /// レシピの値のある手に項目がない。
+    /// レシピのパラメータを添えた操作に項目がない。
     NoValues,
-    /// レシピの値のある手に `border = false` と枠の色か太さを一緒に書いた。
+    /// レシピのパラメータを添えた操作に `border = false` と枠の色か太さを一緒に書いた。
     BorderOffWithColorOrWidth,
 }
 
@@ -1204,9 +1204,9 @@ fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
     recipes
 }
 
-/// レシピの手の並び。値のない手（操作の id の文字列）と、値のある手（インライン表）の配列。ほかの値があれば
+/// レシピの操作の並び。パラメータのない操作（操作の id の文字列）と、パラメータを添えた操作（インライン表）の配列。ほかの値があれば
 /// None。表の中身の誤りは `AppearanceStep::rejected` / `BackgroundStep::rejected` に残す（`recipe::plan` が
-/// 問題にする）。`op = "background"` の表は背景色を指定する手、ほかは見た目を指定する手として読む。
+/// 問題にする）。`op = "background"` の表は背景色を指定する操作、ほかは見た目を指定する操作として読む。
 fn recipe_steps(item: &Item) -> Option<Vec<Step>> {
     item.as_array()?
         .iter()
@@ -1223,7 +1223,7 @@ fn recipe_steps(item: &Item) -> Option<Vec<Step>> {
         .collect()
 }
 
-/// 値のある手（`{ op = "appearance", ... }`）。項目のキーと値の範囲は `[scrap]` と同じ（`AppearanceValues::set`）。
+/// 見た目を指定する操作（`{ op = "appearance", ... }`）。項目のキーと値の範囲は `[scrap]` と同じ（`AppearanceValues::set`）。
 fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
     let mut step = AppearanceStep::default();
     let mut wrote_op = false;
@@ -1264,7 +1264,7 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
     step
 }
 
-/// 背景色を指定する値のある手（`{ op = "background", color = "#RRGGBB" | "transparent" }`）。色の書き方は
+/// 背景色を指定する操作（`{ op = "background", color = "#RRGGBB" | "transparent" }`）。色の書き方は
 /// `[annotation] background` と同じ（`Background` の `FromStr`）。
 fn background_step(table: &toml_edit::InlineTable) -> BackgroundStep {
     let mut step = BackgroundStep::default();
