@@ -71,6 +71,9 @@ pub fn is_first_only(id: &str) -> bool {
     Capture::from_id(id).is_some()
 }
 
+/// 書き込みの編集モードに入る操作の id（スクラップ操作 `annotate`）。レシピの最後では、入るだけで抜けない。
+pub const ANNOTATE: &str = "annotate";
+
 /// 見た目を指定する操作の id（設定ファイルの `op = "appearance"`）。ADR-0008。
 pub const APPEARANCE: &str = "appearance";
 
@@ -771,6 +774,14 @@ impl Run {
         }
         self.next += 1;
         self.state = State::Waiting;
+        // レシピの「編集モードに入る」は入るだけ。もう編集モードなら何もしない（右クリックメニューやショートカットの
+        // ように抜けはしない）
+        if op.id == ANNOTATE && model.is_editing() {
+            return Advance::Step {
+                op,
+                effects: Vec::new(),
+            };
+        }
         let context = OpContext {
             values,
             ..context.clone()
@@ -1388,6 +1399,20 @@ mod tests {
             step(&mut run, &mut model),
             ("annotate", vec![Effect::EnterEditMode])
         );
+        assert!(model.is_editing());
+        run.settle(Outcome::Succeeded);
+        assert!(matches!(
+            run.advance(&mut model, &OpContext::default()),
+            Advance::Finished
+        ));
+    }
+
+    #[test]
+    fn annotate_at_the_end_only_enters_and_does_nothing_when_already_editing() {
+        let mut run = run_of(&["annotate"]);
+        let mut model = model();
+        model.start_editing(crate::annotate::Style::default());
+        assert_eq!(step(&mut run, &mut model), ("annotate", vec![]));
         assert!(model.is_editing());
         run.settle(Outcome::Succeeded);
         assert!(matches!(
