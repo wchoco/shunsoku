@@ -15,7 +15,7 @@
 - エージェントが確かめるときは、`tools/win-driver` を通して操作し、[docs/agents/manual-check.md](agents/manual-check.md) の決まり（安全、結果の書き方、判定の仕方）に従う。
 - 確かめる exe: リリースの workflow が作った zip を展開したもの（M5-18、M5-19）。
 - 番号は `<マイルストーン>-<spec の番号>`。マイルストーンの後に足した spec やチケットの項目は、足した先のマイルストーンの表の後ろに続きの番号で足す。手順と期待する結果は、各 spec の表のまま写した。後のマイルストーンで振る舞いが変わった項目は、表の後の「置き換わった項目」に書いた。そちらを優先する。
-- 出典: M1 [#32](https://github.com/wchoco/shunsoku/issues/32)、M2 [#33](https://github.com/wchoco/shunsoku/issues/33)、M3 [#34](https://github.com/wchoco/shunsoku/issues/34)、M4 [#35](https://github.com/wchoco/shunsoku/issues/35)（M4-16 は [#122](https://github.com/wchoco/shunsoku/issues/122)、M4-17〜M4-43 は書き込みの拡張の spec [#143](https://github.com/wchoco/shunsoku/issues/143) のチケット #144〜#151、#159、#157、#156、#155、#158。M4-23 は #154 で、M4-24 は #155 で直した）、M5 [#36](https://github.com/wchoco/shunsoku/issues/36)。
+- 出典: M1 [#32](https://github.com/wchoco/shunsoku/issues/32)、M2 [#33](https://github.com/wchoco/shunsoku/issues/33)、M3 [#34](https://github.com/wchoco/shunsoku/issues/34)、M4 [#35](https://github.com/wchoco/shunsoku/issues/35)（M4-16 は [#122](https://github.com/wchoco/shunsoku/issues/122)、M4-17〜M4-45 は書き込みの拡張の spec [#143](https://github.com/wchoco/shunsoku/issues/143) のチケット #144〜#151、#159、#157、#156、#155、#158、#160。M4-23 は #154 で、M4-24 は #155 で直した）、M5 [#36](https://github.com/wchoco/shunsoku/issues/36)。
 
 マイルストーンを足したら、その spec の表をここに写す。
 
