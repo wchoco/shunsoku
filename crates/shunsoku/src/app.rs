@@ -4188,6 +4188,27 @@ fn capture_region(request: CaptureRequest) {
     };
     let monitor_rect = monitors[located.index].rect;
     let screen = located.screen;
+    if region.blank_scrap {
+        // 白紙スクラップにする定型領域は撮らず、その範囲の白紙スクラップを浮かべる。何も保存しない
+        // （保存先・ファイル名テンプレート・保存する・スクラップにするは見ない）
+        match float_blank_scrap(screen) {
+            Ok(_) => {
+                if let Some(to) = request.reply {
+                    reply(to, Response::Captured { path: None });
+                }
+            }
+            Err(reason) => {
+                if request.notify {
+                    notify_user(
+                        notify::Level::Error,
+                        &format!("{}\n{reason}", text("blank_scrap.failed")),
+                    );
+                }
+                reply_failed(request.reply, &reason);
+            }
+        }
+        return;
+    }
     // 直前に閉じたウィンドウ（メニューなど）が消えた画面を撮るよう、合成を 1 回待つ
     // SAFETY: 引数なしの呼び出し
     unsafe {
@@ -4372,13 +4393,24 @@ fn float_model(model: ScrapModel, image: Image, focus: bool) -> std::result::Res
 /// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移す。背景が透明なときだけ
 /// すぐに書き込みの編集モードに入る（core の `ScrapModel::starts_in_edit_mode`）。出せなければ通知する。
 fn create_blank_scrap(rect: Rect) {
+    if let Err(reason) = float_blank_scrap(rect) {
+        notify_user(
+            notify::Level::Error,
+            &format!("{}\n{reason}", text("blank_scrap.failed")),
+        );
+    }
+}
+
+/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移す（`float_new_model`）。
+/// 範囲選択の画面で選んだ範囲と、白紙スクラップにする定型領域で使う。通知はせず、出せなければ理由を返す。
+fn float_blank_scrap(rect: Rect) -> std::result::Result<HWND, String> {
     let Some(background) = with_app(|app| app.settings.annotation.background) else {
-        return;
+        return Err(text("job.panicked").to_owned());
     };
     let model = ScrapModel::blank(rect.origin(), rect.size(), background);
     let Some(image) = model.blank_image() else {
         log::error!("could not paint the blank scrap of {:?}", rect.size());
-        return;
+        return Err(format!("{}x{}", rect.width(), rect.height()));
     };
     log::info!(
         "blank scrap {}x{} at ({}, {})",
@@ -4387,12 +4419,7 @@ fn create_blank_scrap(rect: Rect) {
         rect.left,
         rect.top
     );
-    if let Err(reason) = float_new_model(model, image) {
-        notify_user(
-            notify::Level::Error,
-            &format!("{}\n{reason}", text("blank_scrap.failed")),
-        );
-    }
+    float_new_model(model, image)
 }
 
 /// 作った・開いた `model` のスクラップを浮かべてフォーカスを移す。core の `ScrapModel::starts_in_edit_mode` なら

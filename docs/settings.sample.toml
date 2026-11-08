@@ -222,6 +222,10 @@ crosshair_color = "#FFFFFF"
 #   save                保存するかどうか（true / false）。既定は true
 #   scrap               撮った範囲の真上にスクラップとして表示するかどうか。既定は false
 #                       （フォーカスは元のアプリに残ります。保存できなかったときも表示します）
+#   blank_scrap         true にすると、画面を撮らずに、範囲の位置と大きさで白紙スクラップを作ります。
+#                       既定は false。背景色は [annotation] の background で、透明なときだけ
+#                       すぐに書き込みの編集モードに入ります。何も保存せず、save_dir・file_name_template・
+#                       save・scrap は書いてあっても使いません（CLI の capture region でも同じ）
 # save と scrap の両方を false にはできません（save を true として扱います）。
 # モニタがないときと、範囲がモニタからはみ出すときは、撮らずに通知で知らせます。
 #

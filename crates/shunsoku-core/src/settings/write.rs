@@ -586,6 +586,14 @@ fn write_region(t: &mut dyn TableLike, r: &Region) {
     put(t, "scrap", Item::as_bool, Some(false), &r.scrap, |&v| {
         Some(v.into())
     });
+    put(
+        t,
+        "blank_scrap",
+        Item::as_bool,
+        Some(false),
+        &r.blank_scrap,
+        |&v| Some(v.into()),
+    );
 }
 
 /// 表 `name` の中を `f` で書く。表がなければ（表でない値なら置き換えて）、何か書いたときだけ文書の末尾に足す。
@@ -911,6 +919,7 @@ paste = "Ctrl+V"
             file_name_template: DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned(),
             save: true,
             scrap: false,
+            blank_scrap: false,
             loaded_name: None,
         }
     }
@@ -932,6 +941,19 @@ paste = "Ctrl+V"
         assert_eq!(issues, vec![]);
         assert_eq!(read.regions, vec![added]);
         assert!(out.starts_with(src), "{out}");
+    }
+
+    #[test]
+    fn a_region_turned_into_a_blank_scrap_writes_only_that_and_back() {
+        let out = written(TWO_REGIONS, |s| s.regions[1].blank_scrap = true);
+        assert_eq!(
+            out,
+            TWO_REGIONS.replace("height = 20\n", "height = 20\nblank_scrap = true\n")
+        );
+        assert!(load(&out).0.regions[1].blank_scrap);
+
+        let back = written(&out, |s| s.regions[1].blank_scrap = false);
+        assert!(!load(&back).0.regions[1].blank_scrap);
     }
 
     /// 手で書いた定型領域 2 つと、その後ろの表。

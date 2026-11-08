@@ -50,6 +50,7 @@ apply = "Apply"
 write_failed = "Could not write the settings file. The changes in Settings are not applied yet."
 browse = "Browse…"
 pick_color = "Pick…"
+transparent = "Transparent"
 chord_none = "None"
 insert_variable = "Insert variable"
 
@@ -99,6 +100,9 @@ mode_precise = "Precise (adjust, then capture)"
 crosshair = "Show a crosshair when selecting"
 crosshair_color = "Crosshair color:"
 hint = "Select a field and press keys to assign them. Tab moves to the next field."
+blank_scrap = "Blank scrap"
+blank_scrap_hotkey = "Hotkey to create:"
+blank_background = "Background:"
 
 [settings_gui.regions]
 name = "Name"
@@ -126,6 +130,7 @@ open_folder = "Open folder"
 template_label = "File name:"
 save = "Save"
 scrap = "Show as a scrap"
+blank_scrap = "Make a blank scrap instead of capturing"
 
 [settings_gui.scrap]
 opacity = "Opacity (%):"
@@ -144,8 +149,6 @@ width = "Width:"
 font_size = "Text size:"
 font = "Font:"
 hint = "Defaults for new drawings. Existing drawings do not change."
-blank_scrap = "Blank scrap:"
-blank_background = "Blank background:"
 
 [settings_gui.scrap_ops]
 operation = "Action"
@@ -193,6 +196,10 @@ shadow = "Shadow:"
 unchanged = "Keep"
 on = "On"
 off = "Off"
+
+# Parameter fields of a background colour operation (label before "Pick..." and "Transparent")
+[settings_gui.recipes.background]
+color = "Color:"
 
 [settings_gui.mark]
 unset = "Not set"

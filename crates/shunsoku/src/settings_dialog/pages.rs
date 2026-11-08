@@ -1,8 +1,9 @@
-//! 「一般」「スクラップ」「書き込み」のタブ。行は上から `y` を進めて置く。
+//! 「一般」「キャプチャ」「スクラップ」「書き込み」のタブ。行は上から `y` を進めて置く。
 
 use super::fields::{Field, TemplateOf};
 use super::{FIELD_X, LABEL_WIDTH, PAGE_WIDTH, PageBuilder};
 use shunsoku_core::settings::SettingsItem;
+use shunsoku_core::settings::tabs::{CAPTURE_TAB, CaptureItem};
 
 /// 行の間隔（欄 1 行）。
 const ROW: i16 = 20;
@@ -42,6 +43,62 @@ pub(super) fn general(b: &mut PageBuilder) {
         10,
     );
     b.template_field(TemplateOf::General, FIELD_X, y, FIELD_WIDTH);
+}
+
+/// キーの組み合わせの欄の幅。
+const CHORD_WIDTH: i16 = 110;
+/// 「キャプチャ」タブのホットキーの行の間隔。印は欄の右に 3 行まで出し、下には出さない。
+const HOTKEY_ROW: i16 = 26;
+
+/// 「キャプチャ」タブ。項目は core の `CAPTURE_TAB` の順に上から置く。
+pub(super) fn capture(b: &mut PageBuilder) {
+    let mut y = 0;
+    for item in CAPTURE_TAB {
+        let key = item.label_key();
+        match item {
+            CaptureItem::Hotkey(action) => {
+                b.label(key, 0, y + 2, LABEL_WIDTH, 10);
+                let mark_x = FIELD_X + CHORD_WIDTH + 4;
+                b.chord_field_at(
+                    SettingsItem::from(action),
+                    (FIELD_X, y, CHORD_WIDTH),
+                    (mark_x, y + 2, PAGE_WIDTH - mark_x, 24),
+                );
+                y += HOTKEY_ROW;
+            }
+            CaptureItem::CaptureCursor => {
+                b.check(Field::CaptureCursor, key, 0, y, PAGE_WIDTH);
+                y += 16;
+            }
+            CaptureItem::SelectionMode => {
+                b.label(key, 0, y + 2, LABEL_WIDTH, 10);
+                b.choice(Field::SelectionMode, FIELD_X, y, CHORD_WIDTH, 60);
+                y += 18;
+            }
+            CaptureItem::Crosshair => {
+                b.check(Field::Crosshair, key, 0, y, PAGE_WIDTH);
+                y += 16;
+            }
+            CaptureItem::CrosshairColor => {
+                b.label(key, 0, y + 2, LABEL_WIDTH, 10);
+                b.color_field(Field::CrosshairColor, FIELD_X, y);
+                y += 18;
+            }
+            CaptureItem::Hint => {
+                b.label(key, 0, y, PAGE_WIDTH, 16);
+                y += 22;
+            }
+            CaptureItem::BlankScrapHeading => {
+                b.label(key, 0, y, PAGE_WIDTH, 10);
+                y += 12;
+            }
+            CaptureItem::BlankBackground => {
+                b.label(key, 0, y + 2, LABEL_WIDTH, 10);
+                b.background_field(Field::BlankBackground, FIELD_X, y);
+                y += 18;
+            }
+        }
+    }
 }
 
 /// 「スクラップ」タブ。
@@ -89,23 +146,4 @@ pub(super) fn annotation(b: &mut PageBuilder) {
     b.choice(Field::AnnotationFont, FIELD_X, y, FIELD_WIDTH, 120);
     y += ROW + 4;
     b.label("settings_gui.annotation.hint", 0, y, PAGE_WIDTH, 20);
-    // 白紙スクラップは書き込むための台紙なので、作るホットキーと背景色もこのタブに置く
-    y += 20 + 8;
-    b.label(
-        "settings_gui.annotation.blank_scrap",
-        0,
-        y + 2,
-        LABEL_WIDTH,
-        10,
-    );
-    b.chord_field(SettingsItem::BlankScrapHotkey, FIELD_X, y, 110);
-    y += 34;
-    b.label(
-        "settings_gui.annotation.blank_background",
-        0,
-        y + 2,
-        LABEL_WIDTH,
-        10,
-    );
-    b.color_field(Field::BlankBackground, FIELD_X, y);
 }

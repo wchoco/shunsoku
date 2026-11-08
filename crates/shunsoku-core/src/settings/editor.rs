@@ -12,10 +12,10 @@
 //!   `move_region`。「範囲を選び直す」は `set_region_range`。GUI を開いている間にトレイから登録した定型領域は
 //!   `new_registered_region` で名前を決め、書いたら `registered` で base と写しに足す。詳細の欄は `draft_mut` で変える（名前の空・重なりは `mark` の `RegionName` に出る）。
 //! - 「レシピ」タブの一覧の追加・削除は `add_recipe` / `remove_recipe`、名前は `set_recipe_name`。操作の並びは
-//!   `step_choices`（足せる操作と見た目を指定する操作）/ `add_step` / `move_step` / `remove_step`。選んでいる操作に
+//!   `step_choices`（足せる操作と、見た目・背景色を指定する操作）/ `add_step` / `move_step` / `remove_step`。選んでいる操作に
 //!   出すパラメータの欄の種類は `param_fields`（パラメータのない操作は None）。足したら、`add_step` が返す位置の
 //!   操作を選ぶ。見た目を指定する操作の
-//!   欄（`AppearanceItem`）は `appearance` / `set_appearance` で読み書きする（「変えない」は書かない）。ショートカットは
+//!   欄（`AppearanceItem`）は `appearance` / `set_appearance` で、背景色を指定する操作の色は `background` / `set_background` で読み書きする（「変えない」は書かない）。ショートカットは
 //!   `set_chord` の `RecipeShortcut`、キャプチャで始まるレシピのホットキーは `RecipeHotkey`（どちらの欄を出すかは
 //!   `key_item`。最初の操作がキャプチャ系かどうかが変わったら、両方のキーを消す）。検査（`recipe::plan`）で引っかかったもの（欄に打った範囲外の値を含む）は `mark` の
 //!   `RecipeName` / `RecipeSteps` に出る。操作の並びの行の文言は `step_label`（パラメータを添えた操作はパラメータの要約）。
@@ -27,7 +27,9 @@ use crate::geometry::Rect;
 use crate::keys::Chord;
 pub use crate::recipe::AppearanceItem;
 pub use crate::recipe::Capture;
-use crate::recipe::{self, AppearanceStep, ItemValue, Recipe, Step, StepKey, Written};
+use crate::recipe::{
+    self, AppearanceStep, BackgroundStep, ItemValue, Recipe, Step, StepKey, Written,
+};
 use crate::scrap::Background;
 use crate::scrap::ops::{BindingRow, InRecipe, MouseGesture, OPERATIONS, OperationId};
 
@@ -275,6 +277,16 @@ impl Editor {
         index + 1
     }
 
+    /// 写しの定型領域 `index` の、撮ったものの出し方の欄（保存先・ファイル名テンプレート・保存する・スクラップに
+    /// する）を使えるか。白紙スクラップにする定型領域は撮らず何も保存しないので、使えない。`index` の定型領域が
+    /// なければ false。
+    pub fn region_uses_capture_outputs(&self, index: usize) -> bool {
+        self.draft
+            .regions
+            .get(index)
+            .is_some_and(|region| !region.blank_scrap)
+    }
+
     /// 定型領域 `index` を消す（「削除」）。次に選ぶ位置（同じ位置、末尾を消したらその前。なくなれば None）を返す。
     pub fn remove_region(&mut self, index: usize) -> Option<usize> {
         self.draft.regions.remove(index);
@@ -340,7 +352,7 @@ impl Editor {
     }
 
     /// レシピ `index` の「操作を足す」で選べるもの。最初にキャプチャ系（`Capture::ALL` の順）、次にパラメータの
-    /// ない操作（表の順）、最後に見た目を指定する操作。
+    /// ない操作（表の順）、最後に見た目を指定する操作と背景色を指定する操作。
     /// パラメータのない操作は、レシピに入れられる操作（`recipe::can_be_step`）。最後にだけ置ける操作（`close`、
     /// `annotate`）で終わるレシピには最後にだけ置ける操作を出さない（`add_step` はその前に足すので、2 つ目は最後に
     /// 置けない）。`index` のレシピがなければ空。
@@ -362,12 +374,12 @@ impl Editor {
                     .filter(|op| !(ends_with_last_only && op.in_recipe == InRecipe::Last))
                     .map(|op| StepChoice::Op(op.id)),
             )
-            .chain(std::iter::once(StepChoice::Appearance))
+            .chain([StepChoice::Appearance, StepChoice::Background])
             .collect()
     }
 
-    /// レシピ `index` に `choice` を足す。見た目を指定する操作は、全部の項目が「変えない」（そのままでは
-    /// `NoValues`）。レシピが最後にだけ置ける操作（`close`、`annotate`）で終わっていれば、その前に入れる。入れた
+    /// レシピ `index` に `choice` を足す。見た目を指定する操作は、全部の項目が「変えない」、背景色を指定する操作は
+    /// 色を選んでいない（どちらもそのままでは `NoValues`）。レシピが最後にだけ置ける操作（`close`、`annotate`）で終わっていれば、その前に入れる。入れた
     /// 位置を返す。`index` のレシピがなければ何もせず None。
     pub fn add_step(&mut self, index: usize, choice: impl Into<StepChoice>) -> Option<usize> {
         let first = self.starts_with_capture(index);
@@ -384,6 +396,7 @@ impl Editor {
             StepChoice::Op(id) => id.into(),
             StepChoice::Capture(c) => c.id().into(),
             StepChoice::Appearance => Step::Appearance(AppearanceStep::default()),
+            StepChoice::Background => Step::Background(BackgroundStep::default()),
         };
         steps.insert(at, step);
         self.first_step_changed(index, first);
@@ -461,8 +474,34 @@ impl Editor {
     pub fn param_fields(&self, index: usize, step: usize) -> Option<ParamFields> {
         match self.draft.recipes.get(index)?.steps.get(step)? {
             Step::Appearance(_) => Some(ParamFields::Appearance),
-            Step::Op(_) | Step::Background(_) => None,
+            Step::Background(_) => Some(ParamFields::Background),
+            Step::Op(_) => None,
         }
+    }
+
+    /// レシピ `index` の操作 `step` が背景色を指定する操作なら、その色（選んでいないか、設定ファイルに書いた色が
+    /// 読めなければ None）。背景色を指定する操作でなければ None。
+    pub fn background(&self, index: usize, step: usize) -> Option<Option<Background>> {
+        match self.draft.recipes.get(index)?.steps.get(step)? {
+            Step::Background(step) => Some(step.color),
+            Step::Op(_) | Step::Appearance(_) => None,
+        }
+    }
+
+    /// レシピ `index` の操作 `step`（背景色を指定する操作）の色を `color` にする（「選ぶ…」で選んだ色か、「透明」の
+    /// チェックで `Transparent`。チェックを外したら None で、色を選ぶまで `NoValues`）。設定ファイルから読めなかった
+    /// 色は消す。背景色を指定する操作でなければ何もしない。
+    pub fn set_background(&mut self, index: usize, step: usize, color: Option<Background>) {
+        let Some(Step::Background(step)) = self
+            .draft
+            .recipes
+            .get_mut(index)
+            .and_then(|r| r.steps.get_mut(step))
+        else {
+            return;
+        };
+        step.rejected.retain(|r| r.key != StepKey::Color);
+        step.color = color;
     }
 
     /// レシピ `index` の操作 `step` が見た目を指定する操作なら、その項目 `item` の欄に出す値。「変えない」は
@@ -676,6 +715,8 @@ fn unquoted(written: &str) -> String {
 pub enum ParamFields {
     /// 見た目（透明度・枠・影。`Editor::appearance` / `set_appearance`）。
     Appearance,
+    /// 背景色（「選ぶ…」と「透明」。`Editor::background` / `set_background`）。
+    Background,
 }
 
 /// 「操作を足す」で選べるもの（`Editor::step_choices`）。
@@ -685,6 +726,8 @@ pub enum StepChoice {
     Op(OperationId),
     /// 見た目を指定する操作（パラメータは足してから欄で入れる）。
     Appearance,
+    /// 背景色を指定する操作（色は足してから欄で選ぶ）。
+    Background,
     /// キャプチャ系の操作（ADR-0010。最初にだけ置ける）。
     Capture(Capture),
 }
@@ -695,6 +738,7 @@ impl StepChoice {
         let id = match self {
             StepChoice::Op(id) => id,
             StepChoice::Appearance => recipe::APPEARANCE,
+            StepChoice::Background => recipe::BACKGROUND,
             StepChoice::Capture(c) => return Some(c.label_key()),
         };
         OPERATIONS
@@ -1034,7 +1078,8 @@ mod tests {
             .into_iter()
             .chain(SWITCH_CHOICES.map(|(_, key)| key))
             .chain([UNCHANGED_KEY])
-            .chain(StepChoice::Appearance.label_key());
+            .chain(StepChoice::Appearance.label_key())
+            .chain(StepChoice::Background.label_key());
         for key in keys {
             assert_ne!(catalog.text(key), key);
         }
@@ -1296,6 +1341,22 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_scrap_region_cannot_use_its_save_and_scrap_items_and_copies_the_choice() {
+        let mut editor = Editor::new(with_regions(&["a", "b"]));
+        assert!(editor.region_uses_capture_outputs(0));
+
+        editor.draft_mut().regions[0].blank_scrap = true;
+
+        assert!(!editor.region_uses_capture_outputs(0));
+        assert!(editor.region_uses_capture_outputs(1));
+        assert!(!editor.region_uses_capture_outputs(2));
+        let i = editor.duplicate_region(0, "a のコピー");
+        assert!(!editor.region_uses_capture_outputs(i));
+        // 白紙スクラップにしても、適用は止めない
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
     fn a_removed_region_leaves_the_next_one_selected() {
         let mut editor = Editor::new(with_regions(&["a", "b", "c"]));
 
@@ -1387,16 +1448,15 @@ mod tests {
             .iter()
             .filter_map(|c| match c {
                 StepChoice::Op(id) => Some(*id),
-                StepChoice::Appearance | StepChoice::Capture(_) => None,
+                StepChoice::Appearance | StepChoice::Background | StepChoice::Capture(_) => None,
             })
             .collect()
     }
 
     #[test]
-    fn an_appearance_step_is_offered_last_and_starts_with_every_item_unchanged() {
+    fn an_appearance_step_is_offered_once_and_starts_with_every_item_unchanged() {
         let mut editor = with_steps(&["copy", "close"]);
         let choices = editor.step_choices(0);
-        assert_eq!(choices.last(), Some(&StepChoice::Appearance));
         assert_eq!(
             choices
                 .iter()
@@ -1863,14 +1923,13 @@ mod tests {
     }
 
     #[test]
-    fn only_the_appearance_operation_shows_parameter_fields() {
+    fn only_operations_with_parameters_show_parameter_fields() {
         let editor = with_steps_read(
             r##"["copy", { op = "appearance", opacity = 50 }, { op = "background", color = "#ffffff" }]"##,
         );
         assert_eq!(editor.param_fields(0, 0), None);
         assert_eq!(editor.param_fields(0, 1), Some(ParamFields::Appearance));
-        // 背景色の欄はまだない（#158）
-        assert_eq!(editor.param_fields(0, 2), None);
+        assert_eq!(editor.param_fields(0, 2), Some(ParamFields::Background));
         // 選んでいる操作やレシピがない
         assert_eq!(editor.param_fields(0, 3), None);
         assert_eq!(editor.param_fields(1, 0), None);
@@ -1886,6 +1945,104 @@ mod tests {
 
         let added = editor.add_step(0, "copy").unwrap();
         assert_eq!(editor.param_fields(0, added), None);
+    }
+
+    #[test]
+    fn a_background_operation_is_offered_last_and_an_added_one_is_selected_with_its_fields() {
+        let mut editor = with_steps(&["copy", "close"]);
+        let choices = editor.step_choices(0);
+        assert_eq!(
+            choices[choices.len() - 2..],
+            [StepChoice::Appearance, StepChoice::Background]
+        );
+
+        // `close` の前に入る。色はまだ選んでいない（そのままでは適用できない）
+        let added = editor.add_step(0, StepChoice::Background).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(steps(&editor, 0), ["copy", "background", "close"]);
+        assert_eq!(editor.param_fields(0, added), Some(ParamFields::Background));
+        assert_eq!(editor.background(0, added), Some(None));
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoValues))
+        );
+        assert!(!editor.buttons().ok);
+    }
+
+    #[test]
+    fn a_background_chosen_in_the_fields_is_written_as_a_background_step_and_reads_back_the_same() {
+        let mut editor = with_steps(&["copy"]);
+        editor.add_step(0, StepChoice::Background);
+        editor.add_step(0, StepChoice::Background);
+        // 「選ぶ…」で選んだ色と、「透明」のチェック
+        editor.set_background(
+            0,
+            1,
+            Some(Background::Color(super::super::Rgb(0x1E, 0x88, 0xE5))),
+        );
+        editor.set_background(0, 2, Some(Background::Transparent));
+        assert_eq!(
+            editor.background(0, 1),
+            Some(Some(Background::Color(super::super::Rgb(0x1E, 0x88, 0xE5))))
+        );
+        assert_eq!(editor.background(0, 2), Some(Some(Background::Transparent)));
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().apply);
+
+        let written = super::super::write::rewrite("version = 1\n", editor.draft()).unwrap();
+
+        assert!(
+            written.contains(
+                r##"steps = ["copy", { op = "background", color = "#1E88E5" }, { op = "background", color = "transparent" }]"##
+            ),
+            "{written}"
+        );
+        let (read, issues) = super::super::load(&written);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, editor.draft().recipes);
+        let reopened = Editor::new(read);
+        assert_eq!(
+            reopened.background(0, 2),
+            Some(Some(Background::Transparent))
+        );
+    }
+
+    #[test]
+    fn unchecking_transparent_leaves_the_colour_to_be_chosen() {
+        let mut editor = with_steps_read(r#"[{ op = "background", color = "transparent" }]"#);
+        editor.set_background(0, 0, None);
+        assert_eq!(editor.background(0, 0), Some(None));
+        assert_eq!(
+            editor.mark(&SettingsItem::RecipeSteps(0)),
+            Some(Mark::Problem(Problem::NoValues))
+        );
+    }
+
+    #[test]
+    fn choosing_a_background_replaces_a_colour_that_could_not_be_read() {
+        let (settings, _) = super::super::load(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Shift+A\"\n[[recipes]]\nname = \"R\"\nsteps = [{ op = \"background\", color = \"white\" }]\n",
+        );
+        let mut editor = Editor::new(settings);
+        assert_eq!(editor.background(0, 0), Some(None));
+        assert!(editor.mark(&SettingsItem::RecipeSteps(0)).is_some());
+
+        editor.set_background(0, 0, Some(Background::WHITE));
+
+        assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
+        assert!(editor.buttons().ok);
+    }
+
+    #[test]
+    fn choosing_a_background_for_another_operation_changes_nothing() {
+        let mut editor = with_steps_read(r#"["copy", { op = "appearance", opacity = 50 }]"#);
+        let before = editor.draft().clone();
+        editor.set_background(0, 0, Some(Background::Transparent));
+        editor.set_background(0, 1, Some(Background::Transparent));
+        editor.set_background(0, 2, Some(Background::Transparent));
+        editor.set_background(1, 0, Some(Background::Transparent));
+        assert_eq!(editor.draft(), &before);
+        assert_eq!(editor.background(0, 1), None);
     }
 
     #[test]

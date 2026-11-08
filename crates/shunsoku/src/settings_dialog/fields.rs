@@ -113,6 +113,9 @@ pub enum RegionKey {
     Save,
     /// 撮ったらスクラップとして表示する。
     Scrap,
+    /// 撮らずに、範囲の位置と大きさで白紙スクラップを作る。入れると保存先・ファイル名テンプレート・保存する・
+    /// スクラップとして表示するの欄が使えなくなる（`Editor::region_uses_capture_outputs`）。
+    BlankScrap,
 }
 
 impl Field {
@@ -175,6 +178,8 @@ pub enum Action {
     BrowseFolder(Field),
     /// 色を選ばせて `Field` に入れる。
     PickColor(Field),
+    /// 背景色の欄 `Field` を透明にする。
+    Transparent(Field),
     /// 変数のメニューを出し、テンプレートの欄に入れる。
     InsertVariable(TemplateOf),
     /// `Field` の保存先をエクスプローラーで開く。
@@ -225,6 +230,7 @@ impl Fields {
             button.action = match button.action {
                 Action::BrowseFolder(f) => Action::BrowseFolder(f.with_region(index)),
                 Action::PickColor(f) => Action::PickColor(f.with_region(index)),
+                Action::Transparent(f) => Action::Transparent(f.with_region(index)),
                 Action::OpenFolder(f) => Action::OpenFolder(f.with_region(index)),
                 Action::InsertVariable(TemplateOf::Region(_)) => {
                     Action::InsertVariable(TemplateOf::Region(index))
@@ -253,7 +259,9 @@ fn kind(field: Field) -> Kind {
         | Field::Crosshair
         | Field::Border
         | Field::Shadow
-        | Field::Region(_, RegionKey::Save | RegionKey::Scrap) => Kind::Check,
+        | Field::Region(_, RegionKey::Save | RegionKey::Scrap | RegionKey::BlankScrap) => {
+            Kind::Check
+        }
         Field::SaveDir
         | Field::Template(_)
         | Field::BorderColor
@@ -400,7 +408,7 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
 fn region_shown(region: Option<&Region>, key: RegionKey) -> Shown {
     let Some(r) = region else {
         return match key {
-            RegionKey::Save | RegionKey::Scrap => Shown::Check(false),
+            RegionKey::Save | RegionKey::Scrap | RegionKey::BlankScrap => Shown::Check(false),
             _ => Shown::Text(String::new()),
         };
     };
@@ -418,6 +426,7 @@ fn region_shown(region: Option<&Region>, key: RegionKey) -> Shown {
         ),
         RegionKey::Save => Shown::Check(r.save),
         RegionKey::Scrap => Shown::Check(r.scrap),
+        RegionKey::BlankScrap => Shown::Check(r.blank_scrap),
     }
 }
 
@@ -539,6 +548,7 @@ fn set_region(region: &mut Region, key: RegionKey, input: Input) {
         }
         (RegionKey::Save, Input::Check(v)) if v || region.scrap => region.save = v,
         (RegionKey::Scrap, Input::Check(v)) if v || region.save => region.scrap = v,
+        (RegionKey::BlankScrap, Input::Check(v)) => region.blank_scrap = v,
         _ => {}
     }
 }
@@ -1097,6 +1107,18 @@ impl PageBuilder<'_> {
             id: pick,
             action: Action::PickColor(field),
         });
+    }
+
+    /// 背景色の欄（`#RRGGBB` か `transparent`）と「選ぶ…」「透明」。
+    pub fn background_field(&mut self, field: Field, x: i16, y: i16) {
+        self.color_field(field, x, y);
+        self.button(
+            Action::Transparent(field),
+            "settings_gui.transparent",
+            x + COLOR_WIDTH + BUTTON_GAP + SIDE_BUTTON + BUTTON_GAP,
+            y,
+            SIDE_BUTTON,
+        );
     }
 
     /// 色の欄と「選ぶ…」を置いて、その ID を返す（`Field` と `Action` の行には入れない）。
