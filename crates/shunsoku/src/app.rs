@@ -596,13 +596,18 @@ fn paint_scrap(
         }
     });
     let annotations = model.annotations_to_draw();
+    let selected: Vec<Rect> = model
+        .selected_annotations()
+        .iter()
+        .map(|a| a.bounds())
+        .collect();
     let typing = model.typing_annotation();
     let composition = model.edit_state().and_then(EditState::composition);
     let overlays = render::Overlays {
         annotations: render::AnnotationLayer {
             annotations: &annotations,
             view: model.annotation_view(),
-            selected: model.selected_annotation().map(|a| a.bounds()),
+            selected: &selected,
             typing: typing.as_ref().map(|annotation| render::TypingLayer {
                 annotation,
                 composition: composition.map_or("", |c| c.text.as_str()),
@@ -2276,7 +2281,7 @@ fn render_for(scrap: &Scrap, job: fn(Image) -> Deferred, failed_key: &'static st
     let layer = render::AnnotationLayer {
         annotations: scrap.model.annotations().items(),
         view: scrap.model.output_view(),
-        selected: None,
+        selected: &[],
         typing: None,
         // 選択の印もキャレットも描かない
         scale: 1.0,
@@ -2755,7 +2760,7 @@ fn trash_thumbnail(scrap: &Scrap) -> Image {
     let layer = render::AnnotationLayer {
         annotations: scrap.model.annotations().items(),
         view: scrap.model.output_view(),
-        selected: None,
+        selected: &[],
         typing: None,
         scale: 1.0,
     };

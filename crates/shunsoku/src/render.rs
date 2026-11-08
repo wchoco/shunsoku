@@ -117,9 +117,9 @@ pub struct AnnotationLayer<'a> {
     pub annotations: &'a [Annotation],
     /// 元の画像の画素から、画像の左上を原点とした座標への変換。
     pub view: View,
-    /// 選んでいる書き込みの外接矩形（元の画像の画素、`Annotation::bounds`）。あれば選択の印を描く。
-    /// 保存とコピーには描かない（None）。
-    pub selected: Option<Rect>,
+    /// 選んでいる書き込みの外接矩形（元の画像の画素、`Annotation::bounds`）。それぞれに選択の印を描く。
+    /// 保存とコピーには描かない（空）。
+    pub selected: &'a [Rect],
     /// 打っている文字。保存とコピーには描かない（None）。
     pub typing: Option<TypingLayer<'a>>,
     /// 選択の印とキャレットの大きさの倍率（ウィンドウのあるモニタの DPI / 96）。書き込みそのものは画像の画素で
@@ -540,14 +540,14 @@ fn draw_annotations(
         })();
         target.PopAxisAlignedClip();
         // 選択の印は画像の端の書き込みでも見えるよう、画像の矩形で切らない
-        let marked = match (drawn, layer.selected) {
-            (Ok(caret), Some(bounds)) => {
+        let marked = drawn.and_then(|caret| {
+            for bounds in layer.selected {
                 let (x0, y0) = at(Point::new(bounds.left, bounds.top));
                 let (x1, y1) = at(Point::new(bounds.right, bounds.bottom));
-                draw_selection_mark(target, (x0, y0, x1, y1), layer.scale).map(|()| caret)
+                draw_selection_mark(target, (x0, y0, x1, y1), layer.scale)?;
             }
-            (drawn, _) => drawn,
-        };
+            Ok(caret)
+        });
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
         marked
     }

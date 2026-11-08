@@ -297,8 +297,9 @@ fn segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
 
 /// 1 枚のスクラップの書き込みと、その元に戻す / やり直すの履歴。描いた順に並べ、後のものほど上に描く。
 ///
-/// 書き込みを変えるのは private な `push` / `translate` / `restyle` / `remove`（と、ひとまとまりの変更を
-/// 続けて足す `drag`）だけで、それぞれが履歴に 1 件を積み、やり直しの履歴を捨てる。履歴は書き込みと一緒に
+/// 書き込みを変えるのは private な `push` / `replace` / `update` / `translate` / `remove`（と、ひとまとまりの
+/// 変更を続けて足す `drag`）だけで、それぞれが（いくつもの書き込みを変えても）履歴に 1 件を積み、やり直しの
+/// 履歴を捨てる。履歴は書き込みと一緒に
 /// `ScrapModel` の `mode` の外にあるので、編集モードを抜けても、ごみ箱から戻しても残る。上限はない。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Annotations {
@@ -328,6 +329,9 @@ enum Change {
         before: Annotation,
         after: Annotation,
     },
+    /// いくつもの変更を 1 件にまとめたもの（まとめて選んだ書き込みの移動・削除・変更）。並びの順に当て、
+    /// 元に戻すときは逆の順に当てる。
+    Batch(Vec<Change>),
 }
 
 impl Change {
@@ -343,6 +347,16 @@ impl Change {
             }
             (Change::Replace { index, after, .. }, true) => items[*index] = after.clone(),
             (Change::Replace { index, before, .. }, false) => items[*index] = before.clone(),
+            (Change::Batch(changes), true) => {
+                for change in changes {
+                    change.apply(items, true);
+                }
+            }
+            (Change::Batch(changes), false) => {
+                for change in changes.iter().rev() {
+                    change.apply(items, false);
+                }
+            }
         }
     }
 }
@@ -401,6 +415,16 @@ impl Annotations {
         });
     }
 
+    /// `changes` を 1 件の履歴として当てる。空なら何もせずに false。
+    fn record_all(&mut self, mut changes: Vec<Change>) -> bool {
+        match changes.len() {
+            0 => return false,
+            1 => self.record(changes.remove(0)),
+            _ => self.record(Change::Batch(changes)),
+        }
+        true
+    }
+
     /// `index` の書き込みを消す。
     fn remove(&mut self, index: usize) -> Option<Annotation> {
         let annotation = self.items.get(index)?.clone();
@@ -411,55 +435,84 @@ impl Annotations {
         Some(annotation)
     }
 
+    /// `indices` の書き込みをまとめて消す（1 件の履歴）。消したら true。
+    fn remove_all(&mut self, indices: &[usize]) -> bool {
+        let mut indices: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| i < self.items.len())
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        // 後ろから消す（前のものを消して後ろの位置がずれないように）
+        let changes = indices
+            .iter()
+            .rev()
+            .map(|&index| Change::Remove {
+                index,
+                annotation: self.items[index].clone(),
+            })
+            .collect();
+        self.record_all(changes)
+    }
+
     /// `index` の書き込みを `after` に置き換える。同じなら何もせずに false。
     fn replace(&mut self, index: usize, after: Annotation) -> bool {
-        match self.items.get(index) {
-            Some(before) if *before != after => {
-                let before = before.clone();
-                self.record(Change::Replace {
+        self.update(&[index], |a| *a = after.clone())
+    }
+
+    /// `indices` の書き込みをそれぞれ `change` で変える（1 件の履歴）。変わらなかったものは履歴に入れない。
+    /// どれかが変わったら true。
+    fn update(&mut self, indices: &[usize], mut change: impl FnMut(&mut Annotation)) -> bool {
+        let changes = indices
+            .iter()
+            .filter_map(|&index| {
+                let before = self.items.get(index)?;
+                let mut after = before.clone();
+                change(&mut after);
+                (after != *before).then(|| Change::Replace {
                     index,
-                    before,
+                    before: before.clone(),
                     after,
-                });
-                true
+                })
+            })
+            .collect();
+        self.record_all(changes)
+    }
+
+    /// `indices` の書き込みを `(dx, dy)` 画素ずらす。動いたら true。
+    fn translate(&mut self, indices: &[usize], dx: i32, dy: i32) -> bool {
+        self.update(indices, |a| a.shape.translate(dx, dy))
+    }
+
+    /// ドラッグの続きで `indices` の書き込みを `(dx, dy)` 画素ずらす。直前の履歴（ドラッグの最初の
+    /// `translate`）にまとめるので、ドラッグ全体が 1 件になる。直前の履歴が同じ書き込みの変更でなければ
+    /// `translate` と同じ。
+    fn drag(&mut self, indices: &[usize], dx: i32, dy: i32) {
+        let same = match self.undo.last() {
+            Some(Change::Replace { index, .. }) => indices == [*index],
+            Some(Change::Batch(changes)) => {
+                changes.len() == indices.len()
+                    && changes
+                        .iter()
+                        .zip(indices)
+                        .all(|(c, i)| matches!(c, Change::Replace { index, .. } if index == i))
             }
             _ => false,
+        };
+        if !same {
+            self.translate(indices, dx, dy);
+            return;
         }
-    }
-
-    /// `index` の書き込みの色と太さを `style` にする。変わったら true。
-    fn restyle(&mut self, index: usize, style: Style) -> bool {
-        let Some(annotation) = self.items.get(index) else {
-            return false;
+        let last = self.undo.last_mut().expect("直前の履歴がある");
+        let changes = match last {
+            Change::Batch(changes) => changes.iter_mut().collect::<Vec<_>>(),
+            change => vec![change],
         };
-        let after = Annotation {
-            style,
-            ..annotation.clone()
-        };
-        self.replace(index, after)
-    }
-
-    /// `index` の書き込みを `(dx, dy)` 画素ずらす。動いたら true。
-    fn translate(&mut self, index: usize, dx: i32, dy: i32) -> bool {
-        let Some(mut after) = self.items.get(index).cloned() else {
-            return false;
-        };
-        after.shape.translate(dx, dy);
-        self.replace(index, after)
-    }
-
-    /// ドラッグの続きで `index` の書き込みを `(dx, dy)` 画素ずらす。直前の履歴（ドラッグの最初の `translate`）に
-    /// まとめるので、ドラッグ全体が 1 件になる。直前の履歴が同じ書き込みの変更でなければ `translate` と同じ。
-    fn drag(&mut self, index: usize, dx: i32, dy: i32) {
-        match self.undo.last_mut() {
-            Some(Change::Replace {
-                index: i, after, ..
-            }) if *i == index => {
+        for change in changes {
+            if let Change::Replace { index, after, .. } = change {
                 after.shape.translate(dx, dy);
-                self.items[index].shape.translate(dx, dy);
-            }
-            _ => {
-                self.translate(index, dx, dy);
+                self.items[*index].shape.translate(dx, dy);
             }
         }
     }
@@ -607,8 +660,8 @@ pub struct EditState {
     /// これから描く書き込みの色と太さ。入ったときは設定の `[annotation]` の値。
     pub style: Style,
     draft: Option<Draft>,
-    /// 選んでいる書き込み（`Annotations::items` の位置）。選べるのは 1 回に 1 つだけ。
-    selected: Option<usize>,
+    /// 選んでいる書き込み（`Annotations::items` の位置）。小さい順で、重ならない。
+    selected: Vec<usize>,
     /// 選んだ書き込みをドラッグで動かしている間（押してから離すまで）。
     grab: Option<Grab>,
     /// これから打つ文字の書体と大きさ。入ったときは設定の `[annotation]` の値。
@@ -719,7 +772,7 @@ impl EditState {
             tool: Tool::default(),
             style,
             draft: None,
-            selected: None,
+            selected: Vec::new(),
             grab: None,
             font: Font::default(),
             typing: None,
@@ -748,19 +801,17 @@ impl EditState {
 
     /// 選んでいる書き込みが見えている範囲の外へ出たら、選択を外す（見えないものを動かしたり消したりしないため）。
     fn drop_hidden_selection(&mut self, annotations: &Annotations, cx: &EditContext) {
-        let hidden = self
-            .selected
-            .and_then(|i| annotations.items().get(i))
-            .is_some_and(|a| !cx.shows(a));
-        if hidden {
-            self.selected = None;
+        let before = self.selected.len();
+        self.selected
+            .retain(|&i| annotations.items().get(i).is_some_and(|a| cx.shows(a)));
+        if self.selected.is_empty() && before > 0 {
             self.grab = None;
         }
     }
 
     /// 選んでいる書き込みの位置（`Annotations::items` の添え字）。
-    pub fn selected(&self) -> Option<usize> {
-        self.selected
+    pub fn selected(&self) -> &[usize] {
+        &self.selected
     }
 
     /// 描きかけの書き込み（ドラッグ中だけ）。長さ 0 なら None。
@@ -974,7 +1025,7 @@ impl EditState {
     ) -> Vec<EditOutput> {
         self.draft = None;
         self.grab = None;
-        self.selected = None;
+        self.selected.clear();
         self.typing = Some(Box::new(match retyping {
             Some((
                 index,
@@ -1053,7 +1104,7 @@ impl EditState {
                 self.tool = tool;
                 if tool != Tool::Select {
                     self.grab = None;
-                    if self.selected.take().is_some() {
+                    if !std::mem::take(&mut self.selected).is_empty() {
                         outputs.push(EditOutput::Redraw);
                     }
                 }
@@ -1066,9 +1117,7 @@ impl EditState {
             Pick::Width(width) => {
                 self.style.width = width;
                 // 文字は太さを使わないので、選んだ文字の書き込みは変えない（履歴も積まない）
-                if !self.selected_is_text(annotations) {
-                    outputs = self.restyle_selected(annotations, |style| style.width = width);
-                }
+                outputs = self.restyle_selected(annotations, |style| style.width = width);
             }
             Pick::FontSize(size) => {
                 self.font.size = size;
@@ -1079,32 +1128,19 @@ impl EditState {
         outputs
     }
 
-    fn selected_is_text(&self, annotations: &Annotations) -> bool {
-        self.selected
-            .and_then(|index| annotations.items().get(index))
-            .is_some_and(|a| matches!(a.shape, Shape::Text { .. }))
-    }
-
-    /// 選んだ文字の書き込みの大きさを `size` にする。選んでいないか、文字でないか、もう同じなら何もしない。
+    /// 選んだ文字の書き込みの大きさを `size` にする（文字でないものは変えない）。選んでいないか、どれももう
+    /// 同じなら何もしない。
     fn resize_selected_text(
         &mut self,
         size: u32,
         annotations: &mut Annotations,
     ) -> Vec<EditOutput> {
-        let Some(index) = self.selected else {
-            return vec![];
-        };
-        let Some(mut after) = annotations.items().get(index).cloned() else {
-            return vec![];
-        };
-        let Shape::Text { font, .. } = &mut after.shape else {
-            return vec![];
-        };
-        font.size = size;
-        if !annotations.replace(index, after) {
-            return vec![];
-        }
-        vec![EditOutput::Redraw]
+        let changed = annotations.update(&self.selected, |a| {
+            if let Shape::Text { font, .. } = &mut a.shape {
+                font.size = size;
+            }
+        });
+        redraw_if(changed)
     }
 
     /// `at` にある書き込みのうち、いちばん上のものを選ぶ。何もなければ選択を外す。
@@ -1119,10 +1155,11 @@ impl EditState {
             last: at,
             moved: false,
         });
-        if hit == self.selected {
+        let selected: Vec<usize> = hit.into_iter().collect();
+        if selected == self.selected {
             return vec![];
         }
-        self.selected = hit;
+        self.selected = selected;
         vec![EditOutput::Redraw]
     }
 
@@ -1133,54 +1170,50 @@ impl EditState {
         annotations: &mut Annotations,
         cx: &EditContext,
     ) -> Vec<EditOutput> {
-        let (Some(index), Some(grab)) = (self.selected, self.grab) else {
+        let Some(grab) = self.grab else {
             return vec![];
         };
-        if at == grab.last {
+        if at == grab.last || self.selected.is_empty() {
             return vec![];
         }
         let (dx, dy) = (at.x - grab.last.x, at.y - grab.last.y);
         let moved = if grab.moved {
-            annotations.drag(index, dx, dy);
+            annotations.drag(&self.selected, dx, dy);
             true
         } else {
-            annotations.translate(index, dx, dy)
+            annotations.translate(&self.selected, dx, dy)
         };
         self.grab = Some(Grab { last: at, moved });
         self.drop_hidden_selection(annotations, cx);
         vec![EditOutput::Redraw]
     }
 
-    /// 選んだ書き込みの色か太さを `change` で変える。選んでいないか、もう同じなら何もしない。
+    /// 選んだ書き込みの色か太さを `change` で変える（1 件の履歴）。太さは文字に使わないので、文字の書き込みは
+    /// 太さを変えない。選んでいないか、どれももう同じなら何もしない。
     fn restyle_selected(
         &mut self,
         annotations: &mut Annotations,
-        change: impl FnOnce(&mut Style),
+        change: impl Fn(&mut Style),
     ) -> Vec<EditOutput> {
-        let Some(index) = self.selected else {
-            return vec![];
-        };
-        let Some(mut style) = annotations.items().get(index).map(|a| a.style) else {
-            return vec![];
-        };
-        change(&mut style);
-        if !annotations.restyle(index, style) {
-            return vec![];
-        }
-        vec![EditOutput::Redraw]
+        let changed = annotations.update(&self.selected, |a| {
+            let mut style = a.style;
+            change(&mut style);
+            if matches!(a.shape, Shape::Text { .. }) {
+                style.width = a.style.width;
+            }
+            a.style = style;
+        });
+        redraw_if(changed)
     }
 
-    /// 選んだ書き込みを消す。選んでいなければ受けない。
+    /// 選んだ書き込みを消す（1 件の履歴）。選んでいなければ受けない。
     fn delete_selected(&mut self, annotations: &mut Annotations) -> Vec<EditOutput> {
-        let Some(index) = self.selected.take() else {
-            return vec![];
-        };
+        let selected = std::mem::take(&mut self.selected);
         self.grab = None;
-        annotations.remove(index);
-        vec![EditOutput::Redraw]
+        redraw_if(annotations.remove_all(&selected))
     }
 
-    /// 選んだ書き込みを矢印キーで `(dx, dy)` 画素ずらす。選んでいなければ受けない。
+    /// 選んだ書き込みを矢印キーで `(dx, dy)` 画素ずらす（1 件の履歴）。選んでいなければ受けない。
     fn nudge(
         &mut self,
         dx: i32,
@@ -1188,10 +1221,7 @@ impl EditState {
         annotations: &mut Annotations,
         cx: &EditContext,
     ) -> Vec<EditOutput> {
-        let Some(index) = self.selected else {
-            return vec![];
-        };
-        if !annotations.translate(index, dx, dy) {
+        if !annotations.translate(&self.selected, dx, dy) {
             return vec![];
         }
         self.drop_hidden_selection(annotations, cx);
@@ -1208,7 +1238,7 @@ impl EditState {
     ) -> Vec<EditOutput> {
         let committed = self.commit(annotations);
         self.grab = None;
-        let deselected = self.selected.take().is_some();
+        let deselected = !std::mem::take(&mut self.selected).is_empty();
         if step(annotations) || deselected || !committed.is_empty() {
             vec![EditOutput::Redraw]
         } else {
@@ -1229,6 +1259,15 @@ impl EditState {
             style: self.style,
         });
         vec![EditOutput::Redraw]
+    }
+}
+
+/// 変わったら描き直す。
+fn redraw_if(changed: bool) -> Vec<EditOutput> {
+    if changed {
+        vec![EditOutput::Redraw]
+    } else {
+        vec![]
     }
 }
 
@@ -1782,12 +1821,12 @@ mod tests {
         );
         state.input(key(V), &mut annotations);
         assert_eq!(state.tool, Tool::Select);
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         assert_eq!(
             click(&mut state, &mut annotations, p(30, 11)),
             vec![EditOutput::Redraw]
         );
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         // 選択の道具のクリックでは描かない
         assert_eq!(annotations.items().len(), 1);
     }
@@ -1897,16 +1936,16 @@ mod tests {
         state.input(key(V), &mut annotations);
         // 線と矩形の上の辺が重なる。後に描いた矩形が上
         click(&mut state, &mut annotations, p(30, 20));
-        assert_eq!(state.selected(), Some(1));
+        assert_eq!(state.selected(), [1]);
         click(&mut state, &mut annotations, p(80, 20));
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         // 選んでいるものをもう一度押しても何も変わらない
         assert_eq!(click(&mut state, &mut annotations, p(80, 20)), vec![]);
         assert_eq!(
             click(&mut state, &mut annotations, p(30, 65)),
             vec![EditOutput::Redraw]
         );
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
     }
 
     fn shapes(annotations: &Annotations) -> Vec<Shape> {
@@ -1942,7 +1981,7 @@ mod tests {
             assert_eq!(outputs, vec![EditOutput::Redraw]);
         }
         state.input(EditInput::Release, &mut annotations);
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         state.input(EditInput::Press(p(104, 100)), &mut annotations);
         state.input(
             EditInput::Move {
@@ -1985,7 +2024,7 @@ mod tests {
         let before = annotations.clone();
         drag(&mut state, &mut annotations, p(50, 50), p(60, 60));
         assert_eq!(annotations, before);
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
     }
 
     const LEFT: u16 = 0x25;
@@ -2153,7 +2192,7 @@ mod tests {
             state.input(key(DELETE), &mut annotations),
             vec![EditOutput::Redraw]
         );
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         click(&mut state, &mut annotations, p(20, 30));
         state.input(key(BACKSPACE), &mut annotations);
         click(&mut state, &mut annotations, p(20, 0));
@@ -2190,7 +2229,7 @@ mod tests {
         state.input(key(V), &mut annotations);
         click(&mut state, &mut annotations, p(20, 0));
         state.input(digit(1), &mut annotations);
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         // 矢印キーはもう何も動かさない
         assert_eq!(state.input(key(RIGHT), &mut annotations), vec![]);
     }
@@ -2434,7 +2473,7 @@ mod tests {
             }]
         );
         // 元に戻すと選択が外れる
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         state.input(undo(), &mut annotations);
         assert_eq!(
             shapes(&annotations),
@@ -2689,12 +2728,12 @@ mod tests {
         state.input(key(V), &mut annotations);
         // ダブルクリックの 1 回目で選び、2 回目で打ち直しになる
         click(&mut state, &mut annotations, p(12, 15));
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         assert_eq!(
             state.input(EditInput::DoubleClick(p(12, 15)), &mut annotations),
             vec![EditOutput::TypingStarted, EditOutput::Redraw]
         );
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         // 打ち直している書き込みは、打っているものとして描く（元のものは描かない）
         assert_eq!(state.retyping(), Some(0));
         chars(&mut state, &mut annotations, "d");
@@ -2720,7 +2759,7 @@ mod tests {
         // 線の上のダブルクリックは打ち直しにならない（選択の道具のクリックと同じ）
         state.input(EditInput::DoubleClick(p(25, 100)), &mut annotations);
         assert!(!state.is_typing());
-        assert_eq!(state.selected(), Some(1));
+        assert_eq!(state.selected(), [1]);
     }
 
     #[test]
@@ -3035,7 +3074,7 @@ mod tests {
         // 選んだ文字の大きさを変えるのは履歴の 1 件。太さは文字には効かない
         state.input(key(V), &mut annotations);
         click(&mut state, &mut annotations, p(12, 12));
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         state.input(EditInput::Pick(Pick::FontSize(12)), &mut annotations);
         assert_eq!(annotations.items()[0].shape, text(p(10, 10), "a", 12));
         assert_eq!(

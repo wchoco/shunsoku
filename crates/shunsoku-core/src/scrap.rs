@@ -703,9 +703,15 @@ impl ScrapModel {
     }
 
     /// 編集モードで選んでいる書き込み。選択の印を描くのに使う。
-    pub fn selected_annotation(&self) -> Option<&Annotation> {
-        let index = self.edit_state()?.selected()?;
-        self.annotations.items().get(index)
+    pub fn selected_annotations(&self) -> Vec<&Annotation> {
+        let Some(state) = self.edit_state() else {
+            return vec![];
+        };
+        state
+            .selected()
+            .iter()
+            .filter_map(|&i| self.annotations.items().get(i))
+            .collect()
     }
 
     /// 書き込み（描き終えたもの）。
@@ -2243,7 +2249,7 @@ mod tests {
             scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x56))));
             scrap.edit_input(EditInput::Press(at(50, 57)));
             scrap.edit_input(EditInput::Release);
-            assert_eq!(scrap.selected_annotation().is_some(), hit, "{dpi} dpi");
+            assert_eq!(!scrap.selected_annotations().is_empty(), hit, "{dpi} dpi");
         }
     }
 
@@ -2264,18 +2270,18 @@ mod tests {
         scrap.edit_input(EditInput::Release);
         scrap.edit_input(EditInput::Leave);
         assert!(!scrap.is_editing());
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
 
         scrap.start_editing(Style::default());
         scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x56))));
         // 画面で 6px 離れた所（元の画像では 12 画素）は当たらない
         scrap.edit_input(EditInput::Press(at(50, 56)));
         scrap.edit_input(EditInput::Release);
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
         // 画面で 4px 離れた所（元の画像では 8 画素）は、太さの半分を超えても当たる（当たりの広さは画面の画素で決める）
         scrap.edit_input(EditInput::Press(at(50, 54)));
         scrap.edit_input(EditInput::Release);
-        let selected = scrap.selected_annotation().cloned();
+        let selected = scrap.selected_annotations().first().copied().cloned();
         assert_eq!(selected.as_ref(), scrap.annotations().items().first());
         // 矢印キーは元の画像の画素で動かす
         scrap.edit_input(EditInput::Key(Chord::plain(Key::known(0x28))));
@@ -2292,7 +2298,7 @@ mod tests {
         assert_eq!(scrap.edit_state().map(|s| s.style.color), Some(black));
         scrap.edit_input(EditInput::Delete);
         assert!(scrap.annotations().is_empty());
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
     }
 
     #[test]
@@ -2538,16 +2544,16 @@ mod tests {
         select_tool(&mut scrap);
         // 画像の外のクリックは右の縁の画素 (99, 30) になる。外の矩形の左の辺から 5 画素で当たりの内だが、選ばない
         click_at(&mut scrap, Point::new(100 + 300, 50 + 30));
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
         // 縁にまたがるものは、見えている部分のクリックで選べる
         click_at(&mut scrap, Point::new(100 + 90, 50 + 60));
-        assert_eq!(scrap.selected_annotation(), Some(&all[1]));
+        assert_eq!(scrap.selected_annotations(), [&all[1]]);
         scrap.edit_input(EditInput::Leave);
         assert!(scrap.untrim());
         assert_eq!(scrap.annotations_to_draw(), all);
         select_tool(&mut scrap);
         click_at(&mut scrap, Point::new(100 + 104, 50 + 30));
-        assert_eq!(scrap.selected_annotation(), Some(&all[2]));
+        assert_eq!(scrap.selected_annotations(), [&all[2]]);
     }
 
     #[test]
@@ -2556,12 +2562,12 @@ mod tests {
         let inside = scrap.annotations().items()[0].clone();
         select_tool(&mut scrap);
         click_at(&mut scrap, Point::new(100 + 25, 50 + 10));
-        assert_eq!(scrap.selected_annotation(), Some(&inside));
+        assert_eq!(scrap.selected_annotations(), [&inside]);
         let shift_right = EditInput::Key(Chord::plain(Key::known(0x27)).shift());
         // 左の辺の外側（太さの半分）が 8 なので、10 画素ずつ 10 回で範囲 (0, 0)〜(100, 100) の外に出る
         for _ in 0..9 {
             scrap.edit_input(shift_right.clone());
-            assert!(scrap.selected_annotation().is_some());
+            assert!(!scrap.selected_annotations().is_empty());
         }
         assert_eq!(
             scrap.edit_input(shift_right.clone()),
@@ -2570,7 +2576,7 @@ mod tests {
         assert_eq!(scrap.annotations().items().len(), 3);
         assert_eq!(scrap.annotations_to_draw().len(), 1);
         // 隠れたものは選択から外れ、矢印キーも Delete も効かない
-        assert_eq!(scrap.selected_annotation(), None);
+        assert!(scrap.selected_annotations().is_empty());
         assert_eq!(scrap.edit_input(shift_right), vec![]);
         assert_eq!(scrap.edit_input(EditInput::Delete), vec![]);
         // 元に戻すで範囲の中に戻る
