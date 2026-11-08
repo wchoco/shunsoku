@@ -15,6 +15,9 @@
 //!   「変えない」で、枠と影はドロップダウン、太さと透明度は数の欄、枠の色は文字の欄と「選ぶ…」（部品は
 //!   「スクラップ」タブと同じ `PageBuilder` の `choice_control` / `number_controls` / `color_controls`）。値の出し入れは
 //!   `Editor::appearance` / `set_appearance` で、呼び出し側が `appearance_item` / `appearance_input` で受ける。
+//! - 背景色のパラメータの欄は「選ぶ…」（色の選択ダイアログ）と「透明」のチェック（#158）。透明なら「選ぶ…」を
+//!   使えなくする。値の出し入れは `Editor::background` / `set_background` で、呼び出し側が `Button::PickBackground`
+//!   / `Button::Transparent`（`transparent_checked`）で受ける。チェックを外すと色は選んでいない状態に戻る。
 //! - ショートカットは全体のホットキーと同じ入力欄（`chord_field`）で、`ChordRow` の 1 つ。行を選び直したら、
 //!   呼び出し側が `ChordRow::item` をその行の `SettingsItem::RecipeShortcut` に差し替える（`shortcut_id`）。
 //! - 一覧の行の数は `sync_list` で写しに揃える。揃えて選んでいる行がなくなったら、ショートカットの欄が指していた
@@ -24,6 +27,7 @@
 
 use std::cell::{Cell, RefCell};
 
+use shunsoku_core::scrap::Background;
 use shunsoku_core::settings::SettingsItem;
 use shunsoku_core::settings::editor::{
     AppearanceInput, AppearanceItem, Editor, ParamFields, SWITCH_CHOICES, StepChoice,
@@ -31,17 +35,17 @@ use shunsoku_core::settings::editor::{
 };
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
-    EM_SETCUEBANNER, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS,
-    LVM_GETITEMCOUNT, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_NOSORTHEADER, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL, UDM_SETRANGE32,
+    BST_CHECKED, BST_UNCHECKED, EM_SETCUEBANNER, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT,
+    LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER,
+    LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, UDM_SETRANGE32,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCOUNT, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
-    IsWindowVisible, SM_CXVSCROLL, SW_HIDE, SW_SHOW, SendMessageW, SetDlgItemTextW, ShowWindow,
-    WINDOW_STYLE, WS_BORDER, WS_TABSTOP,
+    BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCOUNT,
+    CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, IsWindowVisible, SM_CXVSCROLL, SW_HIDE, SW_SHOW,
+    SendMessageW, SetDlgItemTextW, ShowWindow, WINDOW_STYLE, WS_BORDER, WS_TABSTOP,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -81,11 +85,18 @@ const OPACITY: i32 = 26;
 const OPACITY_UPDOWN: i32 = 27;
 const SHADOW: i32 = 29;
 const APPEARANCE_END: i32 = 30;
+/// 背景色のパラメータの欄（見出し・「選ぶ…」・「透明」）。
+const BACKGROUND_FIRST: i32 = APPEARANCE_END;
+const PICK_BACKGROUND: i32 = 31;
+const TRANSPARENT: i32 = 32;
+const BACKGROUND_END: i32 = 33;
 /// パラメータの欄の種類と、そのまとまり（ページの帯の位置の範囲）。選んでいる操作の種類のまとまりだけを出す。
-const PARAM_FIELDS: [(ParamFields, i32, i32); 1] =
-    [(ParamFields::Appearance, APPEARANCE_FIRST, APPEARANCE_END)];
+const PARAM_FIELDS: [(ParamFields, i32, i32); 2] = [
+    (ParamFields::Appearance, APPEARANCE_FIRST, APPEARANCE_END),
+    (ParamFields::Background, BACKGROUND_FIRST, BACKGROUND_END),
+];
 /// ページの帯の、最後のコントロールの次。
-const PAGE_END: i32 = APPEARANCE_END;
+const PAGE_END: i32 = BACKGROUND_END;
 /// 見た目を指定する操作の項目と、その欄。
 const APPEARANCE_FIELDS: [(AppearanceItem, i32); 5] = [
     (AppearanceItem::Border, BORDER),
@@ -129,6 +140,10 @@ const NUMBER_WIDTH: i16 = 48;
 const SECOND_LABEL_X: i16 = FIELD_X + SWITCH_WIDTH + 6;
 const SECOND_LABEL_WIDTH: i16 = 32;
 const SECOND_FIELD_X: i16 = FIELD_X + 96;
+/// 背景色のパラメータの欄（1 行）。「選ぶ…」の幅と、その右の「透明」のチェック。
+const PICK_BACKGROUND_WIDTH: i16 = 40;
+const TRANSPARENT_X: i16 = FIELD_X + PICK_BACKGROUND_WIDTH + 6;
+const TRANSPARENT_WIDTH: i16 = 60;
 /// 一覧の列の見出し。幅は中身に合わせる（`fit_columns`）。
 const COLUMNS: [&str; 3] = [
     "settings_gui.recipes.name",
@@ -268,6 +283,36 @@ pub(super) fn build(b: &mut PageBuilder) {
     let shadow_width = PAGE_WIDTH - SECOND_FIELD_X;
     let shadow = b.choice_control(SECOND_FIELD_X, y, shadow_width, 60);
     let appearance_end = b.next_id;
+    // 背景色: 「選ぶ…」（色の選択ダイアログ）と「透明」のチェック。透明なら「選ぶ…」は使えない
+    let background_first = b.next_id;
+    b.label(
+        "settings_gui.recipes.background.color",
+        DETAIL_X,
+        PARAMS_Y + 2,
+        LABEL_WIDTH,
+        10,
+    );
+    let pick_text = (b.text)("settings_gui.pick_color");
+    let pick_background = b.control(
+        Class::Button,
+        pick_text,
+        push,
+        FIELD_X,
+        PARAMS_Y,
+        PICK_BACKGROUND_WIDTH,
+        14,
+    );
+    let transparent_text = (b.text)("scrap.background.transparent");
+    let transparent = b.control(
+        Class::Button,
+        transparent_text,
+        WS_TABSTOP | style(BS_AUTOCHECKBOX as u32),
+        TRANSPARENT_X,
+        PARAMS_Y + 1,
+        TRANSPARENT_WIDTH,
+        12,
+    );
+    let background_end = b.next_id;
 
     let offsets = |ids: &[i32]| ids.iter().map(|id| id - first).collect::<Vec<_>>();
     debug_assert_eq!(offsets(&[list]), [LIST]);
@@ -311,6 +356,20 @@ pub(super) fn build(b: &mut PageBuilder) {
             OPACITY_UPDOWN,
             SHADOW,
             APPEARANCE_END
+        ]
+    );
+    debug_assert_eq!(
+        offsets(&[
+            background_first,
+            pick_background,
+            transparent,
+            background_end
+        ]),
+        [
+            BACKGROUND_FIRST,
+            PICK_BACKGROUND,
+            TRANSPARENT,
+            BACKGROUND_END
         ]
     );
     debug_assert_eq!(b.next_id - first, PAGE_END);
@@ -357,6 +416,10 @@ pub enum Button {
     StepAdd,
     /// 見た目を指定する操作の枠の色を、色を選ぶダイアログで選ぶ。
     PickColor,
+    /// 背景色を指定する操作の色を、色を選ぶダイアログで選ぶ。
+    PickBackground,
+    /// 背景色を指定する操作の「透明」のチェック（押したあとの状態は `transparent_checked`）。
+    Transparent,
 }
 
 /// ID `id` がタブのボタンならそれ。
@@ -369,6 +432,8 @@ pub fn button(id: i32) -> Option<Button> {
         STEP_REMOVE => Some(Button::StepRemove),
         STEP_ADD => Some(Button::StepAdd),
         PICK_COLOR => Some(Button::PickColor),
+        PICK_BACKGROUND => Some(Button::PickBackground),
+        TRANSPARENT => Some(Button::Transparent),
         _ => None,
     }
 }
@@ -424,6 +489,14 @@ fn appearance_id(item: AppearanceItem) -> i32 {
         .find(|&&(i, _)| i == item)
         .map_or(BORDER, |&(_, o)| o);
     id(offset)
+}
+
+/// 背景色を指定する操作の「透明」にチェックが入っているか。
+pub fn transparent_checked(hwnd: HWND) -> bool {
+    item(hwnd, id(TRANSPARENT)).is_some_and(|check| {
+        // SAFETY: 自分のダイアログのチェックボックスへのメッセージ
+        unsafe { SendMessageW(check, BM_GETCHECK, None, None) }.0 == BST_CHECKED.0 as isize
+    })
 }
 
 /// 名前の欄の今の文字。
@@ -600,6 +673,12 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text) {
             .filter(|_| params == Some(ParamFields::Appearance)),
         text,
     );
+    fill_background(
+        hwnd,
+        selected
+            .zip(step)
+            .and_then(|(i, s)| editor.background(i, s)),
+    );
     show_params(hwnd, params);
 
     for offset in DETAIL_FIRST..DETAIL_END {
@@ -727,12 +806,30 @@ fn fill_appearance(hwnd: HWND, editor: &Editor, at: Option<(usize, usize)>, text
     }
 }
 
+/// 背景色のパラメータの欄に、操作の色 `color`（背景色を指定する操作でなければ None）を出す。透明ならチェックを
+/// 入れて「選ぶ…」を使えなくする。
+fn fill_background(hwnd: HWND, color: Option<Option<Background>>) {
+    let transparent = color == Some(Some(Background::Transparent));
+    if let Some(check) = item(hwnd, id(TRANSPARENT)) {
+        let state = if transparent {
+            BST_CHECKED
+        } else {
+            BST_UNCHECKED
+        };
+        // SAFETY: 自分のダイアログのチェックボックスへのメッセージ
+        unsafe {
+            SendMessageW(check, BM_SETCHECK, Some(WPARAM(state.0 as usize)), None);
+        }
+    }
+    enable(hwnd, id(PICK_BACKGROUND), color.is_some() && !transparent);
+}
+
 /// 足せるもの `choice` の文言（ドロップダウンに出す）。表にない id はそのまま。
 fn choice_label(choice: StepChoice, text: Text) -> String {
     match (choice.label_key(), choice) {
         (Some(key), _) => text(key).to_owned(),
         (None, StepChoice::Op(id)) => id.to_owned(),
-        (None, StepChoice::Appearance) => String::new(),
+        (None, StepChoice::Appearance | StepChoice::Background) => String::new(),
     }
 }
 

@@ -193,6 +193,10 @@ unchanged = "Keep"
 on = "On"
 off = "Off"
 
+# Parameter fields of a background colour operation (label before "Pick..." and "Transparent")
+[settings_gui.recipes.background]
+color = "Color:"
+
 [settings_gui.mark]
 unset = "Not set"
 conflict = "Overlaps"
