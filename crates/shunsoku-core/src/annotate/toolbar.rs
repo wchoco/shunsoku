@@ -222,7 +222,7 @@ impl Button {
             Button::Tool(slot) => slot.tool().is_some(),
             Button::Undo => annotations.can_undo(),
             Button::Redo => annotations.can_redo(),
-            Button::Delete => state.selected().is_some(),
+            Button::Delete => !state.selected().is_empty(),
             _ => true,
         }
     }
@@ -542,7 +542,7 @@ mod tests {
         state.input(EditInput::Pick(Pick::Tool(Tool::Select)), &mut annotations);
         state.input(EditInput::Press(Point::new(10, 30)), &mut annotations);
         state.input(EditInput::Release, &mut annotations);
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         let shift = Modifiers {
             shift: true,
             ..PLAIN

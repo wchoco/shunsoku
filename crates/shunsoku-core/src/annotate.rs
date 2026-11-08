@@ -301,8 +301,9 @@ fn segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
 
 /// 1 枚のスクラップの書き込みと、その元に戻す / やり直すの履歴。描いた順に並べ、後のものほど上に描く。
 ///
-/// 書き込みを変えるのは private な `push` / `translate` / `restyle` / `remove`（と、ひとまとまりの変更を
-/// 続けて足す `drag`）だけで、それぞれが履歴に 1 件を積み、やり直しの履歴を捨てる。履歴は書き込みと一緒に
+/// 書き込みを変えるのは private な `push` / `replace` / `update` / `translate` / `remove`（と、ひとまとまりの
+/// 変更を続けて足す `drag`）だけで、それぞれが（いくつもの書き込みを変えても）履歴に 1 件を積み、やり直しの
+/// 履歴を捨てる。履歴は書き込みと一緒に
 /// `ScrapModel` の `mode` の外にあるので、編集モードを抜けても、ごみ箱から戻しても残る。上限はない。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Annotations {
@@ -332,7 +333,8 @@ enum Change {
         before: Annotation,
         after: Annotation,
     },
-    /// 続けて当てた変更のまとまり（消しゴムの 1 回のなぞり）。順に当て、元に戻すときは逆の順に戻す。
+    /// いくつもの変更を 1 件にまとめたもの（まとめて選んだ書き込みの移動・削除・変更、消しゴムの 1 回の
+    /// なぞり）。順に当て、元に戻すときは逆の順に戻す。
     Many(Vec<Change>),
 }
 
@@ -417,6 +419,16 @@ impl Annotations {
         });
     }
 
+    /// `changes` を 1 件の履歴として当てる。空なら何もせずに false。
+    fn record_all(&mut self, mut changes: Vec<Change>) -> bool {
+        match changes.len() {
+            0 => return false,
+            1 => self.record(changes.remove(0)),
+            _ => self.record(Change::Many(changes)),
+        }
+        true
+    }
+
     /// `index` の書き込みを消す。
     fn remove(&mut self, index: usize) -> Option<Annotation> {
         let annotation = self.items.get(index)?.clone();
@@ -425,6 +437,27 @@ impl Annotations {
             annotation: annotation.clone(),
         });
         Some(annotation)
+    }
+
+    /// `indices` の書き込みをまとめて消す（1 件の履歴）。消したら true。
+    fn remove_all(&mut self, indices: &[usize]) -> bool {
+        let mut indices: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| i < self.items.len())
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        // 後ろから消す（前のものを消して後ろの位置がずれないように）
+        let changes = indices
+            .iter()
+            .rev()
+            .map(|&index| Change::Remove {
+                index,
+                annotation: self.items[index].clone(),
+            })
+            .collect();
+        self.record_all(changes)
     }
 
     /// 消しゴムで `index` の書き込みを消す。`continuing`（同じなぞりで前にも消した）なら直前の履歴に
@@ -445,53 +478,61 @@ impl Annotations {
 
     /// `index` の書き込みを `after` に置き換える。同じなら何もせずに false。
     fn replace(&mut self, index: usize, after: Annotation) -> bool {
-        match self.items.get(index) {
-            Some(before) if *before != after => {
-                let before = before.clone();
-                self.record(Change::Replace {
+        self.update(&[index], |a| *a = after.clone())
+    }
+
+    /// `indices` の書き込みをそれぞれ `change` で変える（1 件の履歴）。変わらなかったものは履歴に入れない。
+    /// どれかが変わったら true。
+    fn update(&mut self, indices: &[usize], mut change: impl FnMut(&mut Annotation)) -> bool {
+        let changes = indices
+            .iter()
+            .filter_map(|&index| {
+                let before = self.items.get(index)?;
+                let mut after = before.clone();
+                change(&mut after);
+                (after != *before).then(|| Change::Replace {
                     index,
-                    before,
+                    before: before.clone(),
                     after,
-                });
-                true
+                })
+            })
+            .collect();
+        self.record_all(changes)
+    }
+
+    /// `indices` の書き込みを `(dx, dy)` 画素ずらす。動いたら true。
+    fn translate(&mut self, indices: &[usize], dx: i32, dy: i32) -> bool {
+        self.update(indices, |a| a.shape.translate(dx, dy))
+    }
+
+    /// ドラッグの続きで `indices` の書き込みを `(dx, dy)` 画素ずらす。直前の履歴（ドラッグの最初の
+    /// `translate`）にまとめるので、ドラッグ全体が 1 件になる。直前の履歴が同じ書き込みの変更でなければ
+    /// `translate` と同じ。
+    fn drag(&mut self, indices: &[usize], dx: i32, dy: i32) {
+        let same = match self.undo.last() {
+            Some(Change::Replace { index, .. }) => indices == [*index],
+            Some(Change::Many(changes)) => {
+                changes.len() == indices.len()
+                    && changes
+                        .iter()
+                        .zip(indices)
+                        .all(|(c, i)| matches!(c, Change::Replace { index, .. } if index == i))
             }
             _ => false,
+        };
+        if !same {
+            self.translate(indices, dx, dy);
+            return;
         }
-    }
-
-    /// `index` の書き込みの色と太さを `style` にする。変わったら true。
-    fn restyle(&mut self, index: usize, style: Style) -> bool {
-        let Some(annotation) = self.items.get(index) else {
-            return false;
+        let last = self.undo.last_mut().expect("直前の履歴がある");
+        let changes = match last {
+            Change::Many(changes) => changes.iter_mut().collect::<Vec<_>>(),
+            change => vec![change],
         };
-        let after = Annotation {
-            style,
-            ..annotation.clone()
-        };
-        self.replace(index, after)
-    }
-
-    /// `index` の書き込みを `(dx, dy)` 画素ずらす。動いたら true。
-    fn translate(&mut self, index: usize, dx: i32, dy: i32) -> bool {
-        let Some(mut after) = self.items.get(index).cloned() else {
-            return false;
-        };
-        after.shape.translate(dx, dy);
-        self.replace(index, after)
-    }
-
-    /// ドラッグの続きで `index` の書き込みを `(dx, dy)` 画素ずらす。直前の履歴（ドラッグの最初の `translate`）に
-    /// まとめるので、ドラッグ全体が 1 件になる。直前の履歴が同じ書き込みの変更でなければ `translate` と同じ。
-    fn drag(&mut self, index: usize, dx: i32, dy: i32) {
-        match self.undo.last_mut() {
-            Some(Change::Replace {
-                index: i, after, ..
-            }) if *i == index => {
+        for change in changes {
+            if let Change::Replace { index, after, .. } = change {
                 after.shape.translate(dx, dy);
-                self.items[index].shape.translate(dx, dy);
-            }
-            _ => {
-                self.translate(index, dx, dy);
+                self.items[*index].shape.translate(dx, dy);
             }
         }
     }
@@ -500,7 +541,8 @@ impl Annotations {
 /// 編集モードで左ドラッグが描くもの。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tool {
-    /// 選択。クリックで書き込みを 1 つ選び、ドラッグで動かす（描かない）。
+    /// 選択。クリックで書き込みを 1 つ選び（`Shift` なら選択に足すか外す）、書き込みのない所からのドラッグで
+    /// 範囲に全体が入ったものを選び、選んだもののドラッグで選んだ全部を動かす（描かない）。
     Select,
     #[default]
     Rect,
@@ -643,10 +685,12 @@ pub struct EditState {
     /// これから描く書き込みの色と太さ。入ったときは設定の `[annotation]` の値。
     pub style: Style,
     draft: Option<Draft>,
-    /// 選んでいる書き込み（`Annotations::items` の位置）。選べるのは 1 回に 1 つだけ。
-    selected: Option<usize>,
+    /// 選んでいる書き込み（`Annotations::items` の位置）。小さい順で、重ならない。
+    selected: Vec<usize>,
     /// 選んだ書き込みをドラッグで動かしている間（押してから離すまで）。
     grab: Option<Grab>,
+    /// 書き込みのない所から範囲で選んでいる間（押してから離すまで）。
+    marquee: Option<Marquee>,
     /// これから打つ文字の書体と大きさ。入ったときは設定の `[annotation]` の値。
     pub font: Font,
     /// 打っている文字（文字の道具でクリックしてから確定するまで）。
@@ -742,6 +786,27 @@ impl Typing {
     }
 }
 
+/// 範囲で選ぶドラッグ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Marquee {
+    /// 押した画素。
+    from: Point,
+    /// カーソルのいる画素。
+    to: Point,
+}
+
+impl Marquee {
+    /// `from` と `to` の画素を両方含む矩形。
+    fn rect(&self) -> Rect {
+        Rect::new(
+            self.from.x.min(self.to.x),
+            self.from.y.min(self.to.y),
+            self.from.x.max(self.to.x) + 1,
+            self.from.y.max(self.to.y) + 1,
+        )
+    }
+}
+
 /// 選んだ書き込みのドラッグ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Grab {
@@ -766,8 +831,9 @@ impl EditState {
             tool: Tool::default(),
             style,
             draft: None,
-            selected: None,
+            selected: Vec::new(),
             grab: None,
+            marquee: None,
             font: Font::default(),
             typing: None,
             erasing: None,
@@ -796,19 +862,25 @@ impl EditState {
 
     /// 選んでいる書き込みが見えている範囲の外へ出たら、選択を外す（見えないものを動かしたり消したりしないため）。
     fn drop_hidden_selection(&mut self, annotations: &Annotations, cx: &EditContext) {
-        let hidden = self
-            .selected
-            .and_then(|i| annotations.items().get(i))
-            .is_some_and(|a| !cx.shows(a));
-        if hidden {
-            self.selected = None;
+        let before = self.selected.len();
+        self.selected
+            .retain(|&i| annotations.items().get(i).is_some_and(|a| cx.shows(a)));
+        if self.selected.is_empty() && before > 0 {
             self.grab = None;
         }
     }
 
-    /// 選んでいる書き込みの位置（`Annotations::items` の添え字）。
-    pub fn selected(&self) -> Option<usize> {
-        self.selected
+    /// 選んでいる書き込みの位置（`Annotations::items` の添え字、小さい順）。
+    pub fn selected(&self) -> &[usize] {
+        &self.selected
+    }
+
+    /// 範囲で選んでいる間の範囲（元の画像の画素）。押した画素から動いていなければ None。
+    pub fn marquee(&self) -> Option<Rect> {
+        self.marquee
+            .filter(|m| m.from != m.to)
+            .as_ref()
+            .map(Marquee::rect)
     }
 
     /// 描きかけの書き込み（ドラッグ中だけ）。長さ 0 なら None。
@@ -879,20 +951,32 @@ impl EditState {
         cx: &EditContext,
     ) -> Vec<EditOutput> {
         match input {
-            EditInput::Press(at) if self.tool == Tool::Text => self.start_typing(at, None),
-            EditInput::Press(at) if self.tool == Tool::Select => {
-                self.select_at(at, annotations, cx)
+            EditInput::Press(at) | EditInput::ShiftPress(at) if self.tool == Tool::Text => {
+                self.start_typing(at, None)
             }
-            EditInput::Press(at) if self.tool == Tool::Eraser => {
+            EditInput::Press(at) if self.tool == Tool::Select => {
+                self.select_at(at, false, annotations, cx)
+            }
+            EditInput::ShiftPress(at) if self.tool == Tool::Select => {
+                self.select_at(at, true, annotations, cx)
+            }
+            EditInput::Press(at) | EditInput::ShiftPress(at) if self.tool == Tool::Eraser => {
                 self.start_erasing(at, annotations, cx)
             }
-            EditInput::Press(at) => {
+            EditInput::Press(at) | EditInput::ShiftPress(at) => {
                 self.draft = Some(Draft::new(at));
                 vec![]
             }
             EditInput::Move { at, .. } if self.grab.is_some() => {
                 self.drag_selected(at, annotations, cx)
             }
+            EditInput::Move { at, .. } if self.marquee.is_some() => match &mut self.marquee {
+                Some(marquee) if marquee.to != at => {
+                    marquee.to = at;
+                    vec![EditOutput::Redraw]
+                }
+                _ => vec![],
+            },
             EditInput::Move { at, .. } if self.erasing.is_some() => {
                 self.erase_to(at, annotations, cx)
             }
@@ -906,7 +990,9 @@ impl EditState {
             EditInput::Release => {
                 self.grab = None;
                 self.erasing = None;
-                self.commit(annotations)
+                let mut outputs = self.select_in_marquee(annotations, cx);
+                outputs.extend(self.commit(annotations));
+                outputs
             }
             EditInput::Pick(pick) => self.pick(pick, annotations),
             EditInput::Char(_) | EditInput::Utf16(_) | EditInput::Composition { .. } => vec![],
@@ -914,9 +1000,10 @@ impl EditState {
             EditInput::DoubleClick(at) if self.tool == Tool::Eraser => {
                 self.start_erasing(at, annotations, cx)
             }
+            // 2 つ以上選んでいるときは、どれを打ち直すか決まらないので打ち直さない
             EditInput::DoubleClick(at) => match self.text_at(at, annotations, cx) {
-                Some(index) => self.retype(index, annotations),
-                None => self.input_in(EditInput::Press(at), annotations, cx),
+                Some(index) if self.selected.len() < 2 => self.retype(index, annotations),
+                _ => self.input_in(EditInput::Press(at), annotations, cx),
             },
             EditInput::Key(chord) if chord == ESCAPE => {
                 let mut outputs = self.commit(annotations);
@@ -935,6 +1022,7 @@ impl EditState {
             EditInput::Key(chord) if chord == DELETE || chord == BACKSPACE => {
                 self.delete_selected(annotations)
             }
+            EditInput::Key(chord) if chord == SELECT_ALL => self.select_all(annotations, cx),
             EditInput::Key(chord) => {
                 if let Some((dx, dy)) = nudge(chord) {
                     return self.nudge(dx, dy, annotations, cx);
@@ -991,13 +1079,13 @@ impl EditState {
             }
             // ほかのキー（数字キーの道具、矢印、Delete など）は、打つ間は受けない
             EditInput::Key(_) => vec![],
-            EditInput::Press(at) if inside(at) => vec![],
+            EditInput::Press(at) | EditInput::ShiftPress(at) if inside(at) => vec![],
             // 打った文字の上のダブルクリックは、単語を選んだりせず何もしない
             EditInput::DoubleClick(at) if !typing.text.is_empty() && inside(at) => {
                 vec![]
             }
             // 外のクリックは確定だけ（そこから描いたり選んだりはしない）
-            EditInput::Press(_) => self.finish_typing(annotations),
+            EditInput::Press(_) | EditInput::ShiftPress(_) => self.finish_typing(annotations),
             EditInput::Pick(Pick::Color(color)) => {
                 typing.style.color = color;
                 self.style.color = color;
@@ -1033,7 +1121,7 @@ impl EditState {
     ) -> Vec<EditOutput> {
         self.draft = None;
         self.grab = None;
-        self.selected = None;
+        self.selected.clear();
         self.typing = Some(Box::new(match retyping {
             Some((
                 index,
@@ -1113,7 +1201,8 @@ impl EditState {
                 self.tool = tool;
                 if tool != Tool::Select {
                     self.grab = None;
-                    if self.selected.take().is_some() {
+                    self.marquee = None;
+                    if !std::mem::take(&mut self.selected).is_empty() {
                         outputs.push(EditOutput::Redraw);
                     }
                 }
@@ -1126,9 +1215,7 @@ impl EditState {
             Pick::Width(width) => {
                 self.style.width = width;
                 // 文字は太さを使わないので、選んだ文字の書き込みは変えない（履歴も積まない）
-                if !self.selected_is_text(annotations) {
-                    outputs = self.restyle_selected(annotations, |style| style.width = width);
-                }
+                outputs = self.restyle_selected(annotations, |style| style.width = width);
             }
             Pick::FontSize(size) => {
                 self.font.size = size;
@@ -1139,50 +1226,119 @@ impl EditState {
         outputs
     }
 
-    fn selected_is_text(&self, annotations: &Annotations) -> bool {
-        self.selected
-            .and_then(|index| annotations.items().get(index))
-            .is_some_and(|a| matches!(a.shape, Shape::Text { .. }))
-    }
-
-    /// 選んだ文字の書き込みの大きさを `size` にする。選んでいないか、文字でないか、もう同じなら何もしない。
+    /// 選んだ文字の書き込みの大きさを `size` にする（文字でないものは変えない）。選んでいないか、どれももう
+    /// 同じなら何もしない。
     fn resize_selected_text(
         &mut self,
         size: u32,
         annotations: &mut Annotations,
     ) -> Vec<EditOutput> {
-        let Some(index) = self.selected else {
-            return vec![];
-        };
-        let Some(mut after) = annotations.items().get(index).cloned() else {
-            return vec![];
-        };
-        let Shape::Text { font, .. } = &mut after.shape else {
-            return vec![];
-        };
-        font.size = size;
-        if !annotations.replace(index, after) {
-            return vec![];
-        }
-        vec![EditOutput::Redraw]
+        let changed = annotations.update(&self.selected, |a| {
+            if let Shape::Text { font, .. } = &mut a.shape {
+                font.size = size;
+            }
+        });
+        redraw_if(changed)
     }
 
-    /// `at` にある書き込みのうち、いちばん上のものを選ぶ。何もなければ選択を外す。
+    /// `at` にある書き込みのうち、いちばん上のものを選ぶ。`add`（`Shift`）なら、それを選択に足すか、選んで
+    /// いれば外す。選んでいるものの上なら選択をそのままにして、選んだ全部をドラッグで動かせるようにする。
+    /// 何もなければ範囲で選び始める（`add` でなければ、選択は外す）。
     fn select_at(
         &mut self,
         at: Point,
+        add: bool,
         annotations: &Annotations,
         cx: &EditContext,
     ) -> Vec<EditOutput> {
         let hit = annotations.items().iter().rposition(|a| cx.hits(a, at));
-        self.grab = hit.map(|_| Grab {
-            last: at,
-            moved: false,
-        });
-        if hit == self.selected {
+        let mut selected = self.selected.clone();
+        match hit {
+            Some(i) if add => match selected.binary_search(&i) {
+                Ok(pos) => {
+                    selected.remove(pos);
+                }
+                Err(pos) => selected.insert(pos, i),
+            },
+            Some(i) => {
+                if !selected.contains(&i) {
+                    selected = vec![i];
+                }
+                self.grab = Some(Grab {
+                    last: at,
+                    moved: false,
+                });
+            }
+            None => {
+                if !add {
+                    selected.clear();
+                }
+                self.marquee = Some(Marquee { from: at, to: at });
+            }
+        }
+        if selected == self.selected {
             return vec![];
         }
-        self.selected = hit;
+        self.selected = selected;
+        vec![EditOutput::Redraw]
+    }
+
+    /// 見えている書き込みをすべて選ぶ。選択の道具でなければ、選択の道具に替える。
+    fn select_all(&mut self, annotations: &mut Annotations, cx: &EditContext) -> Vec<EditOutput> {
+        let mut outputs = vec![];
+        if self.tool != Tool::Select {
+            outputs = self.pick(Pick::Tool(Tool::Select), annotations);
+        }
+        self.grab = None;
+        self.marquee = None;
+        let all: Vec<usize> = annotations
+            .items()
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| cx.shows(a))
+            .map(|(i, _)| i)
+            .collect();
+        if all != self.selected {
+            self.selected = all;
+            outputs.push(EditOutput::Redraw);
+        }
+        outputs
+    }
+
+    /// 範囲で選ぶドラッグを終える。範囲に全体（外接矩形）が入った、見えている書き込みを選ぶ。押した画素から
+    /// 動いていなければ何も選ばない。
+    fn select_in_marquee(
+        &mut self,
+        annotations: &Annotations,
+        cx: &EditContext,
+    ) -> Vec<EditOutput> {
+        let Some(area) = self
+            .marquee
+            .take()
+            .filter(|m| m.from != m.to)
+            .map(|m| m.rect())
+        else {
+            return vec![];
+        };
+        let inside = |b: Rect| {
+            area.left <= b.left
+                && area.top <= b.top
+                && b.right <= area.right
+                && b.bottom <= area.bottom
+        };
+        let mut selected = self.selected.clone();
+        selected.extend(
+            annotations
+                .items()
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| cx.shows(a) && inside(a.bounds()))
+                .map(|(i, _)| i),
+        );
+        selected.sort_unstable();
+        selected.dedup();
+        // 範囲を描いていたので、選ぶものが変わらなくても描き直す
+        self.selected = selected;
         vec![EditOutput::Redraw]
     }
 
@@ -1251,54 +1407,50 @@ impl EditState {
         annotations: &mut Annotations,
         cx: &EditContext,
     ) -> Vec<EditOutput> {
-        let (Some(index), Some(grab)) = (self.selected, self.grab) else {
+        let Some(grab) = self.grab else {
             return vec![];
         };
-        if at == grab.last {
+        if at == grab.last || self.selected.is_empty() {
             return vec![];
         }
         let (dx, dy) = (at.x - grab.last.x, at.y - grab.last.y);
         let moved = if grab.moved {
-            annotations.drag(index, dx, dy);
+            annotations.drag(&self.selected, dx, dy);
             true
         } else {
-            annotations.translate(index, dx, dy)
+            annotations.translate(&self.selected, dx, dy)
         };
         self.grab = Some(Grab { last: at, moved });
         self.drop_hidden_selection(annotations, cx);
         vec![EditOutput::Redraw]
     }
 
-    /// 選んだ書き込みの色か太さを `change` で変える。選んでいないか、もう同じなら何もしない。
+    /// 選んだ書き込みの色か太さを `change` で変える（1 件の履歴）。太さは文字に使わないので、文字の書き込みは
+    /// 太さを変えない。選んでいないか、どれももう同じなら何もしない。
     fn restyle_selected(
         &mut self,
         annotations: &mut Annotations,
-        change: impl FnOnce(&mut Style),
+        change: impl Fn(&mut Style),
     ) -> Vec<EditOutput> {
-        let Some(index) = self.selected else {
-            return vec![];
-        };
-        let Some(mut style) = annotations.items().get(index).map(|a| a.style) else {
-            return vec![];
-        };
-        change(&mut style);
-        if !annotations.restyle(index, style) {
-            return vec![];
-        }
-        vec![EditOutput::Redraw]
+        let changed = annotations.update(&self.selected, |a| {
+            let mut style = a.style;
+            change(&mut style);
+            if matches!(a.shape, Shape::Text { .. }) {
+                style.width = a.style.width;
+            }
+            a.style = style;
+        });
+        redraw_if(changed)
     }
 
-    /// 選んだ書き込みを消す。選んでいなければ受けない。
+    /// 選んだ書き込みを消す（1 件の履歴）。選んでいなければ受けない。
     fn delete_selected(&mut self, annotations: &mut Annotations) -> Vec<EditOutput> {
-        let Some(index) = self.selected.take() else {
-            return vec![];
-        };
+        let selected = std::mem::take(&mut self.selected);
         self.grab = None;
-        annotations.remove(index);
-        vec![EditOutput::Redraw]
+        redraw_if(annotations.remove_all(&selected))
     }
 
-    /// 選んだ書き込みを矢印キーで `(dx, dy)` 画素ずらす。選んでいなければ受けない。
+    /// 選んだ書き込みを矢印キーで `(dx, dy)` 画素ずらす（1 件の履歴）。選んでいなければ受けない。
     fn nudge(
         &mut self,
         dx: i32,
@@ -1306,10 +1458,7 @@ impl EditState {
         annotations: &mut Annotations,
         cx: &EditContext,
     ) -> Vec<EditOutput> {
-        let Some(index) = self.selected else {
-            return vec![];
-        };
-        if !annotations.translate(index, dx, dy) {
+        if !annotations.translate(&self.selected, dx, dy) {
             return vec![];
         }
         self.drop_hidden_selection(annotations, cx);
@@ -1326,9 +1475,10 @@ impl EditState {
     ) -> Vec<EditOutput> {
         let committed = self.commit(annotations);
         self.grab = None;
+        self.marquee = None;
         // なぞりの続きを、戻した（やり直した）変更にまとめないため
         self.erasing = None;
-        let deselected = self.selected.take().is_some();
+        let deselected = !std::mem::take(&mut self.selected).is_empty();
         if step(annotations) || deselected || !committed.is_empty() {
             vec![EditOutput::Redraw]
         } else {
@@ -1349,6 +1499,15 @@ impl EditState {
             style: self.style,
         });
         vec![EditOutput::Redraw]
+    }
+}
+
+/// 変わったら描き直す。
+fn redraw_if(changed: bool) -> Vec<EditOutput> {
+    if changed {
+        vec![EditOutput::Redraw]
+    } else {
+        vec![]
     }
 }
 
@@ -1379,6 +1538,9 @@ const NUDGE_SHIFT_STEP: i32 = 10;
 /// `Delete` と `Backspace`。選んだ書き込みを消す。
 const DELETE: Chord = Chord::plain(Key::known(0x2E));
 const BACKSPACE: Chord = Chord::plain(Key::known(0x08));
+
+/// `Ctrl+A`。すべての書き込みを選ぶ。
+const SELECT_ALL: Chord = Chord::plain(Key::known(0x41)).ctrl();
 
 /// `V`。選択の道具を選ぶ。
 const VK_V: u16 = 0x56;
@@ -1411,15 +1573,17 @@ const ENTER: [Chord; 2] = [
 pub enum EditInput {
     /// 左ボタンを押した。
     Press(Point),
-    /// ダブルクリックした（2 回目の押下。1 回目は `Press`）。文字の書き込みの上なら打ち直し、ほかは `Press`
-    /// と同じ（消しゴムでは、文字の上でも `Press` と同じ）。
+    /// `Shift` を押しながら左ボタンを押した。選択の道具では選択に足したり外したりし、ほかは `Press` と同じ。
+    ShiftPress(Point),
+    /// ダブルクリックした（2 回目の押下。1 回目は `Press`）。文字の書き込みの上なら打ち直し（2 つ以上選んで
+    /// いるときは打ち直さない）、ほかは `Press` と同じ（消しゴムでは、文字の上でも `Press` と同じ）。
     DoubleClick(Point),
     /// カーソルが動いた。押している間だけ描きかけを変える。`shift` は `Shift` を押しているか（図形の制約）。
     Move { at: Point, shift: bool },
     /// 左ボタンを離した、またはマウスを捕まえていられなくなった。描きかけを書き込みにする。
     Release,
     /// キーを押した。`Esc` で抜け、数字キーで道具を選び、`Ctrl+Z` で元に戻し、`Ctrl+Y` と `Ctrl+Shift+Z` で
-    /// やり直す。ほかのキーは受けない（何も返さない）。
+    /// やり直し、`Ctrl+A` ですべて選ぶ。ほかのキーは受けない（何も返さない）。
     Key(Chord),
     /// ツールバーで道具・色・太さを選んだ（数字キーで道具を選ぶのは `Key`）。
     Pick(Pick),
@@ -1448,6 +1612,7 @@ impl EditInput {
     pub fn map_point(self, f: impl FnOnce(Point) -> Point) -> EditInput {
         match self {
             EditInput::Press(at) => EditInput::Press(f(at)),
+            EditInput::ShiftPress(at) => EditInput::ShiftPress(f(at)),
             EditInput::DoubleClick(at) => EditInput::DoubleClick(f(at)),
             EditInput::Move { at, shift } => EditInput::Move { at: f(at), shift },
             other => other,
@@ -1906,12 +2071,12 @@ mod tests {
         );
         state.input(key(V), &mut annotations);
         assert_eq!(state.tool, Tool::Select);
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         assert_eq!(
             click(&mut state, &mut annotations, p(30, 11)),
             vec![EditOutput::Redraw]
         );
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         // 選択の道具のクリックでは描かない
         assert_eq!(annotations.items().len(), 1);
     }
@@ -2021,16 +2186,16 @@ mod tests {
         state.input(key(V), &mut annotations);
         // 線と矩形の上の辺が重なる。後に描いた矩形が上
         click(&mut state, &mut annotations, p(30, 20));
-        assert_eq!(state.selected(), Some(1));
+        assert_eq!(state.selected(), [1]);
         click(&mut state, &mut annotations, p(80, 20));
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         // 選んでいるものをもう一度押しても何も変わらない
         assert_eq!(click(&mut state, &mut annotations, p(80, 20)), vec![]);
         assert_eq!(
             click(&mut state, &mut annotations, p(30, 65)),
             vec![EditOutput::Redraw]
         );
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
     }
 
     fn shapes(annotations: &Annotations) -> Vec<Shape> {
@@ -2066,7 +2231,7 @@ mod tests {
             assert_eq!(outputs, vec![EditOutput::Redraw]);
         }
         state.input(EditInput::Release, &mut annotations);
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         state.input(EditInput::Press(p(104, 100)), &mut annotations);
         state.input(
             EditInput::Move {
@@ -2109,7 +2274,7 @@ mod tests {
         let before = annotations.clone();
         drag(&mut state, &mut annotations, p(50, 50), p(60, 60));
         assert_eq!(annotations, before);
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
     }
 
     const LEFT: u16 = 0x25;
@@ -2277,7 +2442,7 @@ mod tests {
             state.input(key(DELETE), &mut annotations),
             vec![EditOutput::Redraw]
         );
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         click(&mut state, &mut annotations, p(20, 30));
         state.input(key(BACKSPACE), &mut annotations);
         click(&mut state, &mut annotations, p(20, 0));
@@ -2314,7 +2479,7 @@ mod tests {
         state.input(key(V), &mut annotations);
         click(&mut state, &mut annotations, p(20, 0));
         state.input(digit(1), &mut annotations);
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         // 矢印キーはもう何も動かさない
         assert_eq!(state.input(key(RIGHT), &mut annotations), vec![]);
     }
@@ -2558,7 +2723,7 @@ mod tests {
             }]
         );
         // 元に戻すと選択が外れる
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         state.input(undo(), &mut annotations);
         assert_eq!(
             shapes(&annotations),
@@ -2813,12 +2978,12 @@ mod tests {
         state.input(key(V), &mut annotations);
         // ダブルクリックの 1 回目で選び、2 回目で打ち直しになる
         click(&mut state, &mut annotations, p(12, 15));
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         assert_eq!(
             state.input(EditInput::DoubleClick(p(12, 15)), &mut annotations),
             vec![EditOutput::TypingStarted, EditOutput::Redraw]
         );
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         // 打ち直している書き込みは、打っているものとして描く（元のものは描かない）
         assert_eq!(state.retyping(), Some(0));
         chars(&mut state, &mut annotations, "d");
@@ -2844,7 +3009,7 @@ mod tests {
         // 線の上のダブルクリックは打ち直しにならない（選択の道具のクリックと同じ）
         state.input(EditInput::DoubleClick(p(25, 100)), &mut annotations);
         assert!(!state.is_typing());
-        assert_eq!(state.selected(), Some(1));
+        assert_eq!(state.selected(), [1]);
     }
 
     #[test]
@@ -3159,7 +3324,7 @@ mod tests {
         // 選んだ文字の大きさを変えるのは履歴の 1 件。太さは文字には効かない
         state.input(key(V), &mut annotations);
         click(&mut state, &mut annotations, p(12, 12));
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         state.input(EditInput::Pick(Pick::FontSize(12)), &mut annotations);
         assert_eq!(annotations.items()[0].shape, text(p(10, 10), "a", 12));
         assert_eq!(
@@ -3248,7 +3413,7 @@ mod tests {
         draw(&mut state, &mut annotations, Tool::Line, p(0, 0), p(40, 0));
         state.input(key(V), &mut annotations);
         click(&mut state, &mut annotations, p(10, 0));
-        assert_eq!(state.selected(), Some(0));
+        assert_eq!(state.selected(), [0]);
         assert_eq!(
             state.input(key(E), &mut annotations),
             vec![
@@ -3258,7 +3423,7 @@ mod tests {
             ]
         );
         assert_eq!(state.tool, Tool::Eraser);
-        assert_eq!(state.selected(), None);
+        assert!(state.selected().is_empty());
         state.input(digit(1), &mut annotations);
         assert_eq!(state.tool, Tool::Rect);
         assert_ne!(state.input(digit(7), &mut annotations), vec![]);
@@ -3464,5 +3629,254 @@ mod tests {
         carryover.record(&state.input(key(E), &mut annotations));
         assert_eq!(state.tool, Tool::Eraser);
         assert_eq!(carryover.start(BLUE).tool, Tool::Line);
+    }
+
+    /// 矩形 (10, 10)〜(50, 40)、線 (100, 20)〜(200, 20)、矩形 (20, 60)〜(40, 80) を描いて選択の道具にする。
+    fn three_drawn() -> (EditState, Annotations) {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Rect,
+            p(10, 10),
+            p(50, 40),
+        );
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Line,
+            p(100, 20),
+            p(200, 20),
+        );
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Rect,
+            p(20, 60),
+            p(40, 80),
+        );
+        state.input(key(V), &mut annotations);
+        (state, annotations)
+    }
+
+    #[test]
+    fn a_drag_from_an_empty_spot_selects_only_what_lies_wholly_inside_the_range() {
+        let (mut state, mut annotations) = three_drawn();
+        // 線の左の端だけがかかる。2 つ目の矩形は下の辺の太さの画素（82）が外
+        drag(&mut state, &mut annotations, p(0, 0), p(120, 81));
+        assert_eq!(state.selected(), [0]);
+        drag(&mut state, &mut annotations, p(120, 90), p(0, 0));
+        assert_eq!(state.selected(), [0, 2]);
+        // 何も動かさない
+        assert!(!annotations.can_redo());
+        assert_eq!(annotations.items().len(), 3);
+    }
+
+    #[test]
+    fn the_range_is_there_to_draw_only_while_dragging() {
+        let (mut state, mut annotations) = three_drawn();
+        state.input(EditInput::Press(p(70, 70)), &mut annotations);
+        assert_eq!(state.marquee(), None);
+        let moved = state.input(
+            EditInput::Move {
+                at: p(60, 90),
+                shift: false,
+            },
+            &mut annotations,
+        );
+        assert_eq!(moved, vec![EditOutput::Redraw]);
+        assert_eq!(state.marquee(), Some(Rect::new(60, 70, 71, 91)));
+        state.input(EditInput::Release, &mut annotations);
+        assert_eq!(state.marquee(), None);
+    }
+
+    /// `Shift` を押しながら左ボタンを押して離す（動かさない）。
+    fn shift_click(state: &mut EditState, annotations: &mut Annotations, at: Point) {
+        state.input(EditInput::ShiftPress(at), annotations);
+        state.input(EditInput::Release, annotations);
+    }
+
+    #[test]
+    fn shift_click_adds_to_and_takes_from_the_selection_and_a_shift_range_adds_to_it() {
+        let (mut state, mut annotations) = three_drawn();
+        click(&mut state, &mut annotations, p(150, 20));
+        shift_click(&mut state, &mut annotations, p(30, 10));
+        assert_eq!(state.selected(), [0, 1]);
+        shift_click(&mut state, &mut annotations, p(150, 20));
+        assert_eq!(state.selected(), [0]);
+        // 書き込みのない所の Shift のクリックは、選択を外さない
+        shift_click(&mut state, &mut annotations, p(300, 300));
+        assert_eq!(state.selected(), [0]);
+        state.input(EditInput::ShiftPress(p(10, 50)), &mut annotations);
+        state.input(
+            EditInput::Move {
+                at: p(50, 90),
+                shift: true,
+            },
+            &mut annotations,
+        );
+        state.input(EditInput::Release, &mut annotations);
+        assert_eq!(state.selected(), [0, 2]);
+        // Shift なしの範囲は、選び直す
+        drag(&mut state, &mut annotations, p(90, 0), p(210, 30));
+        assert_eq!(state.selected(), [1]);
+    }
+
+    #[test]
+    fn a_click_on_an_empty_spot_without_a_drag_clears_a_selection_of_many() {
+        let (mut state, mut annotations) = three_drawn();
+        drag(&mut state, &mut annotations, p(0, 0), p(250, 100));
+        assert_eq!(state.selected(), [0, 1, 2]);
+        assert_eq!(
+            click(&mut state, &mut annotations, p(300, 300)),
+            vec![EditOutput::Redraw]
+        );
+        assert!(state.selected().is_empty());
+    }
+
+    const CTRL_A: Chord = Chord::plain(Key::known(0x41)).ctrl();
+
+    #[test]
+    fn ctrl_a_selects_everything_with_the_select_tool() {
+        let (mut state, mut annotations) = three_drawn();
+        state.input(digit(1), &mut annotations);
+        let outputs = state.input(EditInput::Key(CTRL_A), &mut annotations);
+        assert!(outputs.contains(&EditOutput::Redraw));
+        assert!(outputs.contains(&EditOutput::ToolChanged));
+        assert_eq!(state.tool, Tool::Select);
+        assert_eq!(state.selected(), [0, 1, 2]);
+        // 書き込みがなければ受けるだけで何も選ばない
+        let mut empty = Annotations::default();
+        let mut state = EditState::new(BLUE);
+        state.tool = Tool::Select;
+        state.input(EditInput::Key(CTRL_A), &mut empty);
+        assert!(state.selected().is_empty());
+    }
+
+    /// 矩形 (10, 10)〜(50, 40) と、(100, 100) からの文字 "ab"（大きさ 20）を描き、Ctrl+A で両方を選ぶ。
+    fn rect_and_text_selected() -> (EditState, Annotations) {
+        let mut state = EditState::new(BLUE);
+        let mut annotations = Annotations::default();
+        draw(
+            &mut state,
+            &mut annotations,
+            Tool::Rect,
+            p(10, 10),
+            p(50, 40),
+        );
+        state.input(EditInput::Pick(Pick::FontSize(20)), &mut annotations);
+        state.input(digit(5), &mut annotations);
+        click(&mut state, &mut annotations, p(100, 100));
+        chars(&mut state, &mut annotations, "ab");
+        state.input(key(ESC), &mut annotations);
+        state.input(EditInput::Key(CTRL_A), &mut annotations);
+        assert_eq!(state.selected(), [0, 1]);
+        (state, annotations)
+    }
+
+    #[test]
+    fn dragging_one_of_many_selected_moves_them_all_and_ctrl_z_takes_the_whole_drag_back() {
+        let (mut state, mut annotations) = rect_and_text_selected();
+        let before = annotations.items().to_vec();
+        state.input(EditInput::Press(p(30, 10)), &mut annotations);
+        for at in [p(35, 12), p(40, 15)] {
+            state.input(EditInput::Move { at, shift: false }, &mut annotations);
+        }
+        state.input(EditInput::Release, &mut annotations);
+        assert_eq!(
+            shapes(&annotations),
+            vec![
+                Shape::Rect {
+                    from: p(20, 15),
+                    to: p(60, 45)
+                },
+                text(p(110, 105), "ab", 20),
+            ]
+        );
+        assert_eq!(state.selected(), [0, 1]);
+        state.input(EditInput::Undo, &mut annotations);
+        assert_eq!(annotations.items(), before);
+    }
+
+    #[test]
+    fn arrow_keys_move_everything_selected_and_each_move_is_one_entry() {
+        let (mut state, mut annotations) = rect_and_text_selected();
+        let before = annotations.items().to_vec();
+        state.input(key(RIGHT), &mut annotations);
+        assert_eq!(
+            shapes(&annotations),
+            vec![
+                Shape::Rect {
+                    from: p(11, 10),
+                    to: p(51, 40)
+                },
+                text(p(101, 100), "ab", 20),
+            ]
+        );
+        state.input(EditInput::Undo, &mut annotations);
+        assert_eq!(annotations.items(), before);
+    }
+
+    #[test]
+    fn delete_removes_everything_selected_and_ctrl_z_brings_it_all_back_in_place() {
+        let (mut state, mut annotations) = three_drawn();
+        let before = annotations.items().to_vec();
+        click(&mut state, &mut annotations, p(30, 10));
+        shift_click(&mut state, &mut annotations, p(30, 80));
+        assert_eq!(
+            state.input(EditInput::Delete, &mut annotations),
+            vec![EditOutput::Redraw]
+        );
+        assert_eq!(
+            shapes(&annotations),
+            vec![Shape::Line {
+                from: p(100, 20),
+                to: p(200, 20)
+            }]
+        );
+        assert!(state.selected().is_empty());
+        state.input(EditInput::Undo, &mut annotations);
+        assert_eq!(annotations.items(), before);
+    }
+
+    #[test]
+    fn colour_width_and_font_size_apply_to_everything_selected_that_uses_them_as_one_entry_each() {
+        let (mut state, mut annotations) = rect_and_text_selected();
+        let red = Rgb(0xE5, 0x39, 0x35);
+        let original = annotations.items().to_vec();
+        state.input(EditInput::Pick(Pick::Color(red)), &mut annotations);
+        assert!(annotations.items().iter().all(|a| a.style.color == red));
+        let coloured = annotations.items().to_vec();
+        // 太さは文字に使わない
+        state.input(EditInput::Pick(Pick::Width(9)), &mut annotations);
+        assert_eq!(annotations.items()[0].style.width, 9);
+        assert_eq!(annotations.items()[1].style.width, BLUE.width);
+        let widened = annotations.items().to_vec();
+        // 文字の大きさは文字にだけ
+        state.input(EditInput::Pick(Pick::FontSize(30)), &mut annotations);
+        assert_eq!(annotations.items()[0], widened[0]);
+        assert_eq!(annotations.items()[1].shape, text(p(100, 100), "ab", 30));
+        state.input(EditInput::Undo, &mut annotations);
+        assert_eq!(annotations.items(), widened);
+        state.input(EditInput::Undo, &mut annotations);
+        assert_eq!(annotations.items(), coloured);
+        state.input(EditInput::Undo, &mut annotations);
+        assert_eq!(annotations.items(), original);
+    }
+
+    #[test]
+    fn a_double_click_on_a_text_does_not_type_it_again_while_many_are_selected() {
+        let (mut state, mut annotations) = rect_and_text_selected();
+        click(&mut state, &mut annotations, p(105, 105));
+        state.input(EditInput::DoubleClick(p(105, 105)), &mut annotations);
+        state.input(EditInput::Release, &mut annotations);
+        assert!(!state.is_typing());
+        assert_eq!(state.selected(), [0, 1]);
+        // 1 つだけ選んでいれば打ち直す
+        click(&mut state, &mut annotations, p(300, 300));
+        click(&mut state, &mut annotations, p(105, 105));
+        state.input(EditInput::DoubleClick(p(105, 105)), &mut annotations);
+        assert_eq!(state.retyping(), Some(1));
     }
 }
