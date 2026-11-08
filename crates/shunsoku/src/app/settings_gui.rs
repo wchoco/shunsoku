@@ -123,9 +123,21 @@ impl SettingsGui {
             .iter()
             .find(|row| row.field == recipes::shortcut_id())?;
         match row.item {
-            SettingsItem::RecipeShortcut(i) => Some(i),
+            SettingsItem::RecipeShortcut(i) | SettingsItem::RecipeHotkey(i) => Some(i),
             _ => None,
         }
+    }
+
+    /// 「レシピ」タブのキーの欄を、結んでいるレシピのいまの最初の操作に合う項目（キャプチャで始まればホットキー、
+    /// ほかはショートカット。ADR-0010）に結び直す。
+    fn rebind_recipe_key(&mut self) {
+        let Some(item) = self
+            .bound_recipe()
+            .and_then(|index| self.editor.key_item(index))
+        else {
+            return;
+        };
+        self.rebind_chord_row(recipes::shortcut_id(), item);
     }
 
     /// 一覧の行で変わるキーの欄（ID `field`）を、設定の項目 `item` に結び直す。
@@ -353,6 +365,7 @@ fn refresh(hwnd: HWND) {
     }
     let snapshot = with_app(|app| {
         app.settings_gui.as_mut().map(|gui| {
+            gui.rebind_recipe_key();
             let pass = gui.fields.begin_fill();
             let fields = gui.fields.clone();
             (
@@ -937,7 +950,11 @@ fn on_recipe_selected(hwnd: HWND) {
     let field = recipes::shortcut_id();
     with_app(|app| {
         if let Some(gui) = app.settings_gui.as_mut() {
-            gui.rebind_chord_row(field, SettingsItem::RecipeShortcut(index));
+            let item = gui
+                .editor
+                .key_item(index)
+                .unwrap_or(SettingsItem::RecipeShortcut(index));
+            gui.rebind_chord_row(field, item);
         }
     });
     // 一覧を揃えている途中なら、揃えたあとで出す（`refresh`）

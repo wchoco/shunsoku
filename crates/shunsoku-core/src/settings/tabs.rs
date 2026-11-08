@@ -53,6 +53,7 @@ impl CaptureItem {
                 "settings_gui.capture.blank_scrap_hotkey"
             }
             CaptureItem::Hotkey(HotkeyAction::Region(_)) => "settings_gui.regions.hotkey",
+            CaptureItem::Hotkey(HotkeyAction::Recipe(_)) => "settings_gui.recipes.hotkey_label",
             CaptureItem::CaptureCursor => "settings_gui.capture.capture_cursor",
             CaptureItem::SelectionMode => "settings_gui.capture.mode",
             CaptureItem::Crosshair => "settings_gui.capture.crosshair",

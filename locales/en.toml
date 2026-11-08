@@ -169,6 +169,7 @@ name_label = "Name:"
 steps_label = "Steps:"
 add_step = "Add"
 shortcut_label = "Shortcut:"
+hotkey_label = "Hotkey:"
 # Name of a recipe added with "Add" (a number follows)
 default_name = "Recipe"
 
@@ -211,12 +212,19 @@ duplicate_name = "The name is used twice"
 no_steps = "No steps"
 not_a_step = "Has a step that cannot go in a recipe"
 last_only_not_last = "Only one of Close and Draw can be in a recipe, and only as the last step"
+first_only_not_first = "Only one capture can be in a recipe, and only as the first step"
+shortcut_on_capture = "A recipe that starts with a capture is called by a hotkey (it cannot have a shortcut)"
+hotkey_without_capture = "A recipe that does not start with a capture is called by a shortcut (it cannot have a hotkey)"
 out_of_range = "An appearance parameter is out of range (opacity is 10-100, border width is 1-16)"
 bad_value = "A parameter is written wrong (colors are #RRGGBB, border and shadow are true or false)"
 unknown_key = "A step has an unknown parameter"
 not_appearance = "Only op = \"appearance\" and op = \"background\" can be written as a table"
 no_values = "A step written as a table has no parameters"
 border_off_with_color_or_width = "border = false cannot go with a border color or width"
+
+# Capture steps that can start a recipe (recipe::Capture::label_key)
+[recipe.capture]
+select_capture = "Region capture"
 
 [hotkey]
 failed = "Could not register these hotkeys (another app may be using them): "

@@ -183,6 +183,7 @@ name_label = "名前:"
 steps_label = "操作:"
 add_step = "追加"
 shortcut_label = "ショートカット:"
+hotkey_label = "ホットキー:"
 # 「追加」で足すレシピの名前（後ろに番号が付く）
 default_name = "レシピ"
 
@@ -226,12 +227,19 @@ duplicate_name = "名前が重なっています"
 no_steps = "操作がありません"
 not_a_step = "レシピに入れられない操作があります"
 last_only_not_last = "閉じると書き込みは、どちらか 1 つだけを最後に置けます"
+first_only_not_first = "キャプチャは 1 つだけを最初に置けます"
+shortcut_on_capture = "キャプチャで始まるレシピはホットキーで呼びます（ショートカットは付けられません）"
+hotkey_without_capture = "キャプチャで始まらないレシピはショートカットで呼びます（ホットキーは付けられません）"
 out_of_range = "見た目のパラメータが範囲外です（透明度は 10〜100、枠の太さは 1〜16）"
 bad_value = "パラメータの書き方が違います（色は #RRGGBB、枠と影は true か false）"
 unknown_key = "パラメータに知らないキーがあります"
 not_appearance = "表で書ける操作は op = \"appearance\" と op = \"background\" だけです"
 no_values = "パラメータを 1 つも書いていない操作があります"
 border_off_with_color_or_width = "border = false と枠の色・太さは一緒に書けません"
+
+# レシピの最初に置けるキャプチャ系の操作（recipe::Capture::label_key）
+[recipe.capture]
+select_capture = "範囲選択キャプチャ"
 
 [hotkey]
 failed = "次のホットキーを登録できませんでした（他のアプリが使っている可能性があります）: "

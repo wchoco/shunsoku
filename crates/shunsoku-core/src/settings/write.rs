@@ -467,7 +467,7 @@ fn write_recipes(root: &mut Table, recipes: &[Recipe]) {
     tables.extend(out);
 }
 
-/// レシピ 1 つ。ショートカットがなければ項目を消す。
+/// レシピ 1 つ。ショートカットかホットキーがなければ、その項目を消す。
 fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
     put(
         t,
@@ -488,6 +488,9 @@ fn write_recipe(t: &mut dyn TableLike, r: &Recipe) {
         &r.shortcut,
         |c| c.map(|c| c.to_string().into()),
     );
+    put(t, "hotkey", optional_chord, Some(None), &r.hotkey, |c| {
+        c.map(|c| c.to_string().into())
+    });
 }
 
 /// レシピの操作 1 つ。パラメータのない操作は操作の id の文字列、パラメータを添えた操作は `op` と書いた項目のキーを持つインライン表
@@ -1231,6 +1234,7 @@ font = "Meiryo"     # 書体
             name: name.to_owned(),
             steps: steps.iter().map(|&s| s.into()).collect(),
             shortcut: shortcut.and_then(chord),
+            hotkey: None,
         }
     }
 
@@ -1245,6 +1249,22 @@ font = "Meiryo"     # 書体
         assert_eq!(issues, vec![]);
         assert_eq!(read.recipes, wanted);
         assert!(!out.contains("shortcut = \"\""), "{out}");
+        assert!(!out.contains("hotkey"), "{out}");
+    }
+
+    #[test]
+    fn a_recipe_hotkey_is_written_and_reads_back_the_same() {
+        let mut r = recipe("撮ってコピー", &["select_capture", "copy"], None);
+        r.hotkey = chord("Ctrl+Alt+C");
+        let out = written("version = 1\n", |s| s.recipes = vec![r.clone()]);
+        assert!(out.contains("hotkey = \"Ctrl+Alt+C\""), "{out}");
+        assert!(!out.contains("shortcut"), "{out}");
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(read.recipes, vec![r]);
+        // ホットキーを消したら項目も消す
+        let cleared = written(&out, |s| s.recipes[0].hotkey = None);
+        assert!(!cleared.contains("hotkey"), "{cleared}");
     }
     const RECIPES: &str = r#"version = 1
 

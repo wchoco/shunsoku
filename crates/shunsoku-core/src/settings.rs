@@ -293,6 +293,8 @@ pub enum HotkeyAction {
     BlankScrap,
     /// 定型領域キャプチャ。`Settings::regions` の中の位置。`[[regions]]` の `hotkey` に書く。
     Region(usize),
+    /// キャプチャで始まるレシピ（ADR-0010）。`Settings::recipes` の中の位置。`[[recipes]]` の `hotkey` に書く。
+    Recipe(usize),
 }
 
 impl HotkeyAction {
@@ -304,14 +306,14 @@ impl HotkeyAction {
         HotkeyAction::BlankScrap,
     ];
 
-    /// `[hotkeys]` の中のキー（定型領域では `[[regions]]` の中のキー）。
+    /// `[hotkeys]` の中のキー（定型領域では `[[regions]]`、レシピでは `[[recipes]]` の中のキー）。
     pub fn key(self) -> &'static str {
         match self {
             HotkeyAction::SelectCapture => "select_capture",
             HotkeyAction::RestoreLast => "restore_last",
             HotkeyAction::ActiveWindowCapture => "active_window_capture",
             HotkeyAction::BlankScrap => "blank_scrap",
-            HotkeyAction::Region(_) => "hotkey",
+            HotkeyAction::Region(_) | HotkeyAction::Recipe(_) => "hotkey",
         }
     }
 }
@@ -333,7 +335,7 @@ impl Hotkeys {
             HotkeyAction::RestoreLast => self.restore_last,
             HotkeyAction::ActiveWindowCapture => self.active_window_capture,
             HotkeyAction::BlankScrap => self.blank_scrap,
-            HotkeyAction::Region(_) => None,
+            HotkeyAction::Region(_) | HotkeyAction::Recipe(_) => None,
         }
     }
 
@@ -352,7 +354,7 @@ impl Hotkeys {
             HotkeyAction::RestoreLast => Some(&mut self.restore_last),
             HotkeyAction::ActiveWindowCapture => Some(&mut self.active_window_capture),
             HotkeyAction::BlankScrap => Some(&mut self.blank_scrap),
-            HotkeyAction::Region(_) => None,
+            HotkeyAction::Region(_) | HotkeyAction::Recipe(_) => None,
         }
     }
 }
@@ -624,6 +626,8 @@ pub enum SettingsItem {
     RecipeSteps(usize),
     /// レシピのショートカット。`Settings::recipes` の中の位置。
     RecipeShortcut(usize),
+    /// レシピのホットキー（キャプチャで始まるレシピ）。`Settings::recipes` の中の位置。
+    RecipeHotkey(usize),
 }
 
 impl From<HotkeyAction> for SettingsItem {
@@ -634,6 +638,7 @@ impl From<HotkeyAction> for SettingsItem {
             HotkeyAction::ActiveWindowCapture => SettingsItem::ActiveWindowCaptureHotkey,
             HotkeyAction::BlankScrap => SettingsItem::BlankScrapHotkey,
             HotkeyAction::Region(i) => SettingsItem::RegionHotkey(i),
+            HotkeyAction::Recipe(i) => SettingsItem::RecipeHotkey(i),
         }
     }
 }
@@ -655,6 +660,7 @@ impl std::fmt::Display for SettingsItem {
             SettingsItem::RecipeName(i) => write!(f, "recipes[{}].name", i + 1),
             SettingsItem::RecipeSteps(i) => write!(f, "recipes[{}].steps", i + 1),
             SettingsItem::RecipeShortcut(i) => write!(f, "recipes[{}].shortcut", i + 1),
+            SettingsItem::RecipeHotkey(i) => write!(f, "recipes[{}].hotkey", i + 1),
         }
     }
 }
@@ -670,7 +676,7 @@ impl std::fmt::Debug for SettingsItem {
 /// 設定 GUI で適用する前に見つける問題の中身（`validate`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Problem {
-    /// 必須の項目が空（範囲選択キャプチャのホットキー）。
+    /// 必須の項目が空（範囲選択キャプチャのホットキー、キャプチャで始まるレシピのホットキー）。
     Unset,
     /// 同じ範囲（ホットキー同士、ショートカット同士）で重なったキーの組み合わせ。
     Conflict(Chord),
@@ -688,6 +694,12 @@ pub enum Problem {
     NotAStep,
     /// レシピの最後にだけ置ける操作（`close`、`annotate`）が最後以外にある。
     LastOnlyNotLast,
+    /// レシピの最初にだけ置ける操作（キャプチャ系）が最初以外にある。
+    FirstOnlyNotFirst,
+    /// キャプチャで始まるレシピにショートカットがある。
+    ShortcutOnCapture,
+    /// キャプチャで始まらないレシピにホットキーがある。
+    HotkeyWithoutCapture,
     /// レシピの操作に添えたパラメータが範囲外。
     OutOfRange,
     /// レシピの操作に添えたパラメータの型か書式の誤り。
@@ -793,6 +805,10 @@ pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
                 recipe::Problem::NoSteps => Problem::NoSteps,
                 recipe::Problem::NotAStep(_) => Problem::NotAStep,
                 recipe::Problem::LastOnlyNotLast => Problem::LastOnlyNotLast,
+                recipe::Problem::FirstOnlyNotFirst => Problem::FirstOnlyNotFirst,
+                recipe::Problem::ShortcutOnCapture => Problem::ShortcutOnCapture,
+                recipe::Problem::NoHotkey => Problem::Unset,
+                recipe::Problem::HotkeyWithoutCapture => Problem::HotkeyWithoutCapture,
                 recipe::Problem::OutOfRange(_) => Problem::OutOfRange,
                 recipe::Problem::BadValue(_) => Problem::BadValue,
                 recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
@@ -835,13 +851,19 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
         .iter()
         .enumerate()
         .filter_map(|(i, region)| Some((region.hotkey?, HotkeyAction::Region(i))));
+    let recipes = recipe::plan(&settings.recipes, ops);
+    // 問題のないキャプチャで始まるレシピのホットキー（問題のあるレシピはショートカットと同じく付けない）
+    let recipe_hotkeys = recipes
+        .plans
+        .iter()
+        .filter_map(|plan| Some((plan.hotkey?, HotkeyAction::Recipe(plan.index))));
     let hotkeys = assign(
         HotkeyAction::ALL
             .into_iter()
             .filter_map(|action| Some((settings.hotkeys.get(action)?, action)))
-            .chain(region_hotkeys),
+            .chain(region_hotkeys)
+            .chain(recipe_hotkeys),
     );
-    let recipes = recipe::plan(&settings.recipes, ops);
     let shortcuts = Shortcuts::with_recipes(ops, &settings.shortcuts, &recipes.plans);
     let shortcut_item = |owner: ShortcutOwner| match owner {
         ShortcutOwner::Operation(id) => SettingsItem::Shortcut(id.to_owned()),
@@ -917,10 +939,11 @@ pub fn keymap(settings: &Settings, ops: &'static [OperationDescriptor]) -> Keyma
 
 /// レシピの問題が載る欄。
 fn recipe_problem_item(index: usize, problem: &recipe::Problem) -> SettingsItem {
-    if problem.is_about_name() {
-        SettingsItem::RecipeName(index)
-    } else {
-        SettingsItem::RecipeSteps(index)
+    match problem.field() {
+        recipe::Field::Name => SettingsItem::RecipeName(index),
+        recipe::Field::Steps => SettingsItem::RecipeSteps(index),
+        recipe::Field::Shortcut => SettingsItem::RecipeShortcut(index),
+        recipe::Field::Hotkey => SettingsItem::RecipeHotkey(index),
     }
 }
 
@@ -959,7 +982,9 @@ impl SettingsChanges {
 /// `old` から `new` への変化。
 pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
     SettingsChanges {
-        hotkeys: old.hotkeys != new.hotkeys || region_hotkeys(old) != region_hotkeys(new),
+        hotkeys: old.hotkeys != new.hotkeys
+            || region_hotkeys(old) != region_hotkeys(new)
+            || recipe_hotkeys(old) != recipe_hotkeys(new),
         shortcuts: old.shortcuts != new.shortcuts || old.recipes != new.recipes,
         mouse: old.mouse != new.mouse,
         save: old.general.save_dir != new.general.save_dir
@@ -971,6 +996,16 @@ pub fn diff(old: &Settings, new: &Settings) -> SettingsChanges {
         log_level: old.log_level != new.log_level,
         language: old.general.language != new.general.language,
     }
+}
+
+/// 登録するレシピのホットキー（問題のないキャプチャで始まるレシピの位置とホットキー）。`HotkeyAction::Recipe`
+/// は位置で持つので、位置とホットキーの対応が変わったら登録し直す。
+fn recipe_hotkeys(settings: &Settings) -> Vec<(usize, Chord)> {
+    recipe::plan(&settings.recipes, OPERATIONS)
+        .plans
+        .iter()
+        .filter_map(|plan| Some((plan.index, plan.hotkey?)))
+        .collect()
 }
 
 /// 定型領域のホットキーを位置の順に並べたもの。`HotkeyAction::Region` は位置で持つので、位置とホットキーの
@@ -1190,7 +1225,7 @@ fn read_regions_at(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(us
     regions
 }
 
-/// `[[recipes]]` を読む。名前か操作の並びが読めないレシピは捨てる。ショートカットが読めなければ割り当てなしにする。
+/// `[[recipes]]` を読む。名前か操作の並びが読めないレシピは捨てる。ショートカットかホットキーが読めなければ割り当てなしにする。
 /// 項目名は `recipes[N].key`（N は 1 から）。空の名前・空の並び・入れられない操作などの中身の問題は、ここでは
 /// 見ない（`recipe::plan` が見る。設定 GUI で直せるように、書いたまま残す）。
 fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
@@ -1209,6 +1244,9 @@ fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
         let shortcut = r
             .value(Some(table), &path, "shortcut", optional_chord)
             .flatten();
+        let hotkey = r
+            .value(Some(table), &path, "hotkey", optional_chord)
+            .flatten();
         let (Some(name), Some(steps)) = (name, steps) else {
             continue;
         };
@@ -1216,6 +1254,7 @@ fn recipes(root: &dyn TableLike, r: &mut Reader) -> Vec<Recipe> {
             name,
             steps,
             shortcut,
+            hotkey,
         });
     }
     recipes
@@ -2527,6 +2566,109 @@ width = 0
         assert!(!diff(&old, &renamed).hotkeys);
     }
 
+    fn capture_recipe_src(name: &str, hotkey: &str) -> String {
+        format!(
+            "[[recipes]]\nname = \"{name}\"\nsteps = [\"select_capture\", \"copy\"]\nhotkey = \"{hotkey}\"\n"
+        )
+    }
+
+    #[test]
+    fn a_recipe_hotkey_is_read_and_assigned_with_the_other_hotkeys() {
+        let src = format!(
+            "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Alt+S\"\n{}{}{}{}",
+            region_src("a", "hotkey = \"Ctrl+Alt+1\""),
+            capture_recipe_src("撮ってコピー", "Ctrl+Alt+C"),
+            capture_recipe_src("領域と同じ", "Ctrl+Alt+1"),
+            capture_recipe_src("範囲選択と同じ", "Ctrl+Alt+S"),
+        );
+        let (settings, issues) = load(&src);
+        assert_eq!(issues, vec![]);
+        assert_eq!(settings.recipes[0].hotkey, Some(chord("Ctrl+Alt+C")));
+        assert_eq!(settings.recipes[0].shortcut, None);
+        let keymap = keymap(&settings, OPERATIONS);
+        assert_eq!(
+            keymap.hotkeys.bound,
+            BTreeMap::from([(chord("Ctrl+Alt+C"), HotkeyAction::Recipe(0))])
+        );
+        assert_eq!(
+            keymap.issues,
+            vec![
+                SettingsIssue::Conflict {
+                    chord: chord("Ctrl+Alt+1"),
+                    items: vec![SettingsItem::RegionHotkey(0), SettingsItem::RecipeHotkey(1)],
+                },
+                SettingsIssue::Conflict {
+                    chord: chord("Ctrl+Alt+S"),
+                    items: vec![
+                        SettingsItem::SelectCaptureHotkey,
+                        SettingsItem::RecipeHotkey(2)
+                    ],
+                },
+            ]
+        );
+        // スクラップのショートカットとの重なりは、ほかのホットキーと同じく警告だけ
+        let overlap = format!("version = 1\n{}", capture_recipe_src("r", "Ctrl+C"));
+        let keymap = keymap_of(&overlap);
+        assert_eq!(
+            keymap.hotkeys.bound,
+            BTreeMap::from([(chord("Ctrl+C"), HotkeyAction::Recipe(0))])
+        );
+        assert_eq!(
+            keymap.issues,
+            vec![SettingsIssue::Overlap {
+                chord: chord("Ctrl+C"),
+                hotkey: SettingsItem::RecipeHotkey(0),
+                shortcut: SettingsItem::Shortcut("copy".to_owned()),
+            }]
+        );
+        assert_eq!(
+            SettingsItem::RecipeHotkey(0).to_string(),
+            "recipes[1].hotkey"
+        );
+    }
+
+    #[test]
+    fn a_recipe_hotkey_that_does_not_fit_its_steps_is_a_problem_on_the_shown_key() {
+        let src = "version = 1\n[hotkeys]\nselect_capture = \"Ctrl+Alt+S\"\n\
+            [[recipes]]\nname = \"a\"\nsteps = [\"select_capture\"]\nshortcut = \"Ctrl+Q\"\nhotkey = \"Ctrl+Alt+A\"\n\
+            [[recipes]]\nname = \"b\"\nsteps = [\"select_capture\"]\n\
+            [[recipes]]\nname = \"c\"\nsteps = [\"copy\"]\nhotkey = \"Ctrl+Alt+C\"\n\
+            [[recipes]]\nname = \"d\"\nsteps = [\"copy\", \"select_capture\"]\n";
+        let (settings, _) = load(src);
+        let keymap = keymap(&settings, OPERATIONS);
+        assert_eq!(
+            keymap.hotkeys.bound.values().collect::<Vec<_>>(),
+            [&HotkeyAction::SelectCapture]
+        );
+        let issue = |item, problem| ValidationIssue { item, problem };
+        assert_eq!(
+            validate(&settings),
+            vec![
+                issue(SettingsItem::RecipeHotkey(0), Problem::ShortcutOnCapture),
+                issue(SettingsItem::RecipeHotkey(1), Problem::Unset),
+                issue(
+                    SettingsItem::RecipeShortcut(2),
+                    Problem::HotkeyWithoutCapture
+                ),
+                issue(SettingsItem::RecipeSteps(3), Problem::FirstOnlyNotFirst),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_tells_that_hotkeys_changed_when_a_recipe_hotkey_changed() {
+        let (old, _) = load(&format!(
+            "version = 1\n{}",
+            capture_recipe_src("a", "Ctrl+Alt+C")
+        ));
+        let mut new = old.clone();
+        new.recipes[0].hotkey = Some(chord("Ctrl+Alt+D"));
+        assert!(diff(&old, &new).hotkeys);
+        let mut renamed = old.clone();
+        renamed.recipes[0].name = "b".to_owned();
+        assert!(!diff(&old, &renamed).hotkeys);
+    }
+
     fn keymap_of(src: &str) -> Keymap {
         let (settings, issues) = load(src);
         assert_eq!(issues, vec![], "{src}");
@@ -2762,20 +2904,25 @@ width = 0
         assert_eq!(names(&settings), vec!["ダッシュボード"]);
         assert_eq!(settings.regions[0].rect, Rect::new(0, 0, 800, 600));
         assert_eq!(
-            settings.recipes,
+            settings.recipes[..2],
             vec![
                 Recipe {
                     name: "コピーして閉じる".to_owned(),
                     steps: vec!["copy".into(), "close".into()],
                     shortcut: Some("Ctrl+Q".parse().unwrap()),
+                    hotkey: None,
                 },
                 Recipe {
                     name: "戻して書き込む".to_owned(),
                     steps: vec!["zoom_actual".into(), "annotate".into()],
                     shortcut: Some("Ctrl+E".parse().unwrap()),
+                    hotkey: None,
                 },
             ]
         );
+        let capture = &settings.recipes[2];
+        assert_eq!(capture.steps[0], "select_capture".into());
+        assert_eq!(capture.hotkey, Some("Ctrl+Shift+F1".parse().unwrap()));
         assert_eq!(recipe::plan(&settings.recipes, OPERATIONS).problems, vec![]);
     }
 
