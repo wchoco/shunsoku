@@ -365,10 +365,10 @@ struct Scrap {
     /// drop でウィンドウを壊す。
     window: scrap_window::ScrapWindow,
     model: ScrapModel,
-    /// 元の画像（トリム前）。
-    image: Image,
-    /// トリムしていれば、`image` から切り出した表示する画像（`ScrapModel::shown_image`）。
-    shown: Option<Image>,
+    /// 元の画像（トリム前）。描き手のビットマップの作り置きと一緒に持ち、差し替えると作り置きも作り直す。
+    image: render::CachedImage,
+    /// トリムしていれば、`image` から切り出した表示する画像（`ScrapModel::shown_image`）。作り置きは `image` と同じ。
+    shown: Option<render::CachedImage>,
     /// 左ドラッグ。
     drag: Drag,
     /// ホイールの回転（1 ノッチに満たない量をためる）。
@@ -475,6 +475,11 @@ impl Scrap {
 
     /// 表示する画像（保存・コピーの対象）。トリムしていればトリム後。
     fn shown(&self) -> &Image {
+        self.shown_cached().image()
+    }
+
+    /// 表示する画像と、そのビットマップの作り置き。
+    fn shown_cached(&self) -> &render::CachedImage {
         self.shown.as_ref().unwrap_or(&self.image)
     }
 
@@ -483,10 +488,10 @@ impl Scrap {
     fn sync_shown(&mut self, before: &ScrapModel) {
         let repainted = self.model.background() != before.background();
         if repainted && let Some(image) = self.model.blank_image() {
-            self.image = image;
+            self.image = render::CachedImage::new(image);
         }
         if repainted || self.model.trim_rect() != before.trim_rect() {
-            self.shown = shown_image(&self.model, &self.image);
+            self.shown = shown_image(&self.model, self.image.image());
         }
     }
 
@@ -544,7 +549,7 @@ impl Scrap {
         let caret = paint_scrap(
             renderer,
             &self.window,
-            self.shown(),
+            self.shown_cached(),
             &self.model,
             appearance,
             label,
@@ -567,7 +572,7 @@ impl Scrap {
 fn paint_scrap(
     renderer: &mut Option<render::Renderer>,
     window: &scrap_window::ScrapWindow,
-    image: &Image,
+    image: &render::CachedImage,
     model: &ScrapModel,
     appearance: &Appearance,
     label: Option<render::ZoomLabel>,
@@ -582,8 +587,9 @@ fn paint_scrap(
     };
     let view;
     let image = match model.compact_view() {
+        // 正方形に映す部分は小さいので、作り置きにせず描くたびに切り出す
         Some(rect) => {
-            view = image.crop(rect);
+            view = render::CachedImage::new(image.image().crop(rect));
             &view
         }
         None => image,
@@ -2545,7 +2551,7 @@ fn perform(
                 Effect::ShowScrapFileSaveDialog => {
                     deferred.push(Deferred::SaveScrapFile(Box::new(ScrapFile::of(
                         &scrap.model,
-                        &scrap.image,
+                        scrap.image.image(),
                     ))));
                 }
             }
@@ -3015,7 +3021,8 @@ fn remove_scrap(hwnd: HWND, removal: Removal) {
         } = scrap;
         // 一時ファイルは裏のスレッドで書くので、借りたままでよい
         if let Some(thumbnail) = thumbnail {
-            app.trash.push(model, image, thumbnail, save::now());
+            app.trash
+                .push(model, image.into_image(), thumbnail, save::now());
         }
         Some((toolbar, window, to_trash))
     })
@@ -3369,8 +3376,10 @@ fn finish_selection() {
 }
 
 /// トリムしていれば、元の画像から切り出した表示する画像（`Scrap::shown`）。
-fn shown_image(model: &ScrapModel, image: &Image) -> Option<Image> {
-    model.is_trimmed().then(|| model.shown_image(image))
+fn shown_image(model: &ScrapModel, image: &Image) -> Option<render::CachedImage> {
+    model
+        .is_trimmed()
+        .then(|| render::CachedImage::new(model.shown_image(image)))
 }
 
 /// 画像を `model` のとおりに浮かべるスクラップを作る。
@@ -3391,7 +3400,8 @@ fn open_scrap(
     model.set_dpi(window.dpi(), scaling, ZoomAnchor::Center);
     // 描いて出すときに届くメッセージ（WM_WINDOWPOSCHANGED など）では App を借りないので、借りたまま描いてよい。
     // 借りられなければ（起こらないはず）、その場かぎりの描き手で描く
-    let shown = shown_image(&model, &image);
+    let image = render::CachedImage::new(image);
+    let shown = shown_image(&model, image.image());
     let visible = shown.as_ref().unwrap_or(&image);
     let painted = with_app(|app| {
         paint_scrap(
