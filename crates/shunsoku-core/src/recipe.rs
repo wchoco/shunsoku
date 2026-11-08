@@ -17,6 +17,14 @@ pub struct Recipe {
     pub hotkey: Option<Chord>,
 }
 
+impl Recipe {
+    /// 最初の操作がキャプチャ系か（キャプチャで始まるレシピか。ADR-0010）。キャプチャで始まるレシピはホットキーで、
+    /// ほかのレシピはショートカットで呼ぶ。
+    pub fn starts_with_capture(&self) -> bool {
+        self.steps.first().is_some_and(|s| is_first_only(s.op_id()))
+    }
+}
+
 /// キャプチャ系の操作（ADR-0010）。レシピの最初にだけ置け、スクラップを作る。スクラップに対する操作ではないので、
 /// スクラップ操作の表（`scrap::ops::OPERATIONS`）には入れない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +78,22 @@ impl Capture {
 pub fn is_first_only(id: &str) -> bool {
     Capture::from_id(id).is_some()
 }
+
+/// 検査を通ったキャプチャ系の操作。パラメータを添えるもの（定型領域キャプチャ）は、その値も持つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedCapture {
+    /// 範囲選択キャプチャ（`Capture::Select`）。
+    Select,
+    /// ウィンドウキャプチャ（`Capture::ActiveWindow`）。
+    ActiveWindow,
+    /// 白紙スクラップを作る（`Capture::Blank`）。
+    Blank,
+    /// 定型領域キャプチャ（`Capture::Region`）と、撮る定型領域の名前（`Region::name`）。
+    Region(String),
+}
+
+/// 書き込みの編集モードに入る操作の id（スクラップ操作 `annotate`）。レシピの最後では、入るだけで抜けない。
+pub const ANNOTATE: &str = "annotate";
 
 /// 見た目を指定する操作の id（設定ファイルの `op = "appearance"`）。ADR-0008。
 pub const APPEARANCE: &str = "appearance";
@@ -385,8 +409,8 @@ pub enum Rejection {
     BadValue,
     /// 知らないキー。
     UnknownKey,
-    /// `op` が `appearance` でも `background` でもない（書いていないときも）。
-    NotAppearance,
+    /// `op` が表で書ける操作（`appearance`、`background`、`capture_region`）でない（書いていないときも）。
+    UnknownTableOp,
 }
 
 /// 検査を通った操作 1 つ。
@@ -404,9 +428,7 @@ pub struct Plan {
     pub index: usize,
     pub name: String,
     /// 最初に置いたキャプチャ系の操作。キャプチャで始まらないレシピは None。
-    pub capture: Option<Capture>,
-    /// 定型領域キャプチャで撮る定型領域の名前（`Region::name`）。ほかのレシピは None。
-    pub region: Option<String>,
+    pub capture: Option<PlannedCapture>,
     /// スクラップ操作の並び（キャプチャ系の操作を除く）。
     pub steps: Vec<PlannedStep>,
     pub shortcut: Option<Chord>,
@@ -441,8 +463,9 @@ pub enum Problem {
     BadValue(String),
     /// パラメータを添えた操作の知らないキー。
     UnknownKey(String),
-    /// パラメータを添えた操作の `op` が `appearance` でも `background` でもない（書いていないときも）。
-    NotAppearance,
+    /// パラメータを添えた操作の `op` が表で書ける操作（`appearance`、`background`、`capture_region`）でない（書いて
+    /// いないときも）。
+    UnknownTableOp,
     /// パラメータを添えた操作に、項目を 1 つも書いていない。
     NoValues,
     /// パラメータを添えた操作に、`border = false` と枠の色か太さを一緒に書いた。
@@ -517,16 +540,18 @@ pub fn plan(
         }
         let mut steps = Vec::with_capacity(recipe.steps.len());
         let mut capture = None;
-        let mut region = None;
         for (position, step) in recipe.steps.iter().enumerate() {
             if let Some(c) = Capture::from_id(step.op_id())
                 && matches!(step, Step::Op(_) | Step::CaptureRegion(_))
             {
                 if position == 0 {
-                    capture = Some(c);
-                    if c == Capture::Region {
-                        region = check_capture_region(step, regions, &mut problems);
-                    }
+                    capture = match c {
+                        Capture::Select => Some(PlannedCapture::Select),
+                        Capture::ActiveWindow => Some(PlannedCapture::ActiveWindow),
+                        Capture::Blank => Some(PlannedCapture::Blank),
+                        Capture::Region => check_capture_region(step, regions, &mut problems)
+                            .map(PlannedCapture::Region),
+                    };
                 } else if !problems.contains(&Problem::FirstOnlyNotFirst) {
                     problems.push(Problem::FirstOnlyNotFirst);
                 }
@@ -561,11 +586,7 @@ pub fn plan(
             problems.push(Problem::LastOnlyNotLast);
         }
         // キャプチャで始まるレシピはホットキーで、ほかのレシピはショートカットで呼ぶ
-        let starts_with_capture = recipe
-            .steps
-            .first()
-            .is_some_and(|s| is_first_only(s.op_id()));
-        if starts_with_capture {
+        if recipe.starts_with_capture() {
             if recipe.shortcut.is_some() {
                 problems.push(Problem::ShortcutOnCapture);
             }
@@ -580,7 +601,6 @@ pub fn plan(
                 index,
                 name: recipe.name.clone(),
                 capture,
-                region,
                 steps,
                 shortcut: recipe.shortcut,
                 hotkey: recipe.hotkey,
@@ -594,6 +614,40 @@ pub fn plan(
     checked
 }
 
+/// キャプチャで始まるレシピを実行できなかったわけ（`launch`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CannotLaunch {
+    /// その位置に、キャプチャで始まるレシピがもうない。
+    Gone,
+    /// レシピに問題がある（定型領域を消したあとなど）。
+    Problems(Vec<Problem>),
+}
+
+/// ホットキーを受けた時点の設定（`recipes`、`regions`）で検査した、`index` 番目の（`Settings::recipes` の中の位置）
+/// キャプチャで始まるレシピの実行（ADR-0010）。設定を変えたあとで実行できなければ、そのわけを返す。
+pub fn launch(
+    recipes: &[Recipe],
+    ops: &'static [OperationDescriptor],
+    regions: &[Region],
+    index: usize,
+) -> Result<Launch, CannotLaunch> {
+    let checked = plan(recipes, ops, regions);
+    if let Some(plan) = checked.plans.iter().find(|plan| plan.index == index) {
+        return Launch::of(plan).ok_or(CannotLaunch::Gone);
+    }
+    let problems: Vec<Problem> = checked
+        .problems
+        .into_iter()
+        .filter(|(i, _)| *i == index)
+        .map(|(_, problem)| problem)
+        .collect();
+    if problems.is_empty() {
+        Err(CannotLaunch::Gone)
+    } else {
+        Err(CannotLaunch::Problems(problems))
+    }
+}
+
 /// 読めなかった項目を問題にして `problems` に足す。
 fn check_rejected(rejected: &[Rejected], problems: &mut Vec<Problem>) {
     for r in rejected {
@@ -601,7 +655,7 @@ fn check_rejected(rejected: &[Rejected], problems: &mut Vec<Problem>) {
             Rejection::OutOfRange => Problem::OutOfRange(r.key.as_str().to_owned()),
             Rejection::BadValue => Problem::BadValue(r.key.as_str().to_owned()),
             Rejection::UnknownKey => Problem::UnknownKey(r.key.as_str().to_owned()),
-            Rejection::NotAppearance => Problem::NotAppearance,
+            Rejection::UnknownTableOp => Problem::UnknownTableOp,
         });
     }
 }
@@ -771,6 +825,14 @@ impl Run {
         }
         self.next += 1;
         self.state = State::Waiting;
+        // レシピの「編集モードに入る」は入るだけ。もう編集モードなら何もしない（右クリックメニューやショートカットの
+        // ように抜けはしない）
+        if op.id == ANNOTATE && model.is_editing() {
+            return Advance::Step {
+                op,
+                effects: Vec::new(),
+            };
+        }
         let context = OpContext {
             values,
             ..context.clone()
@@ -820,9 +882,7 @@ impl Run {
 /// 当ててから最初に出し、返った `Run` を、ショートカットから呼んだレシピと同じく 1 つずつ進める（ADR-0007）。
 #[derive(Debug, Clone)]
 pub struct Launch {
-    capture: Capture,
-    /// 定型領域キャプチャで撮る定型領域の名前。
-    region: Option<String>,
+    capture: PlannedCapture,
     /// キャプチャの直後に続く、見た目（`APPEARANCE`）と背景色（`BACKGROUND`）の操作。
     before_show: Vec<PlannedStep>,
     /// 残りの操作（出す前に当てる操作のあと、最初のほかの操作から先）。
@@ -834,15 +894,16 @@ pub struct Launch {
 pub struct Shown {
     /// 出したあとに進める残りの操作。出す前に当てる操作が今は実行できなければ、止まっている。
     pub run: Run,
-    /// 出す前に当てた操作の `Effect` のうち、出したあとに実行するもの。描き直し（`Effect::Redraw`）は、出すとき
-    /// に描くので除く。
-    pub effects: Vec<Effect>,
+    /// 出す前に当てた操作の `Effect` のうち、出したあとに実行するもの（当てた操作の id と、その `Effect`。当てた
+    /// 順）。描き直し（`Effect::Redraw`）は、出すときに描くので除く。出したあとに実行する `Effect` のない操作は
+    /// 入れない。
+    pub effects: Vec<(OperationId, Vec<Effect>)>,
 }
 
 impl Launch {
     /// キャプチャで始まるレシピ `plan` の実行。キャプチャで始まらなければ None。
     pub fn of(plan: &Plan) -> Option<Launch> {
-        let capture = plan.capture?;
+        let capture = plan.capture.clone()?;
         let shown_with = |s: &PlannedStep| s.op.id == APPEARANCE || s.op.id == BACKGROUND;
         let split = plan
             .steps
@@ -852,20 +913,14 @@ impl Launch {
         let (before_show, rest) = plan.steps.split_at(split);
         Some(Launch {
             capture,
-            region: plan.region.clone(),
             before_show: before_show.to_vec(),
             rest: rest.to_vec(),
         })
     }
 
     /// 最初に行うキャプチャ。
-    pub fn capture(&self) -> Capture {
-        self.capture
-    }
-
-    /// 定型領域キャプチャで撮る定型領域の名前（`Region::name`）。ほかのキャプチャは None。
-    pub fn region(&self) -> Option<&str> {
-        self.region.as_deref()
+    pub fn capture(&self) -> &PlannedCapture {
+        &self.capture
     }
 
     /// キャプチャでできた、まだ出していない `model` に、出す前に当てる操作を並べた順に当てる。今は実行できない操作
@@ -887,11 +942,13 @@ impl Launch {
                 values,
                 ..context.clone()
             };
-            effects.extend(
-                (op.run)(model, &context)
-                    .into_iter()
-                    .filter(|e| *e != Effect::Redraw),
-            );
+            let after_show: Vec<Effect> = (op.run)(model, &context)
+                .into_iter()
+                .filter(|e| *e != Effect::Redraw)
+                .collect();
+            if !after_show.is_empty() {
+                effects.push((op.id, after_show));
+            }
         }
         Shown {
             run: Run::new(self.rest),
@@ -1119,10 +1176,10 @@ mod tests {
             checked.plans.iter().map(|p| p.index).collect::<Vec<_>>(),
             [0, 1]
         );
-        assert_eq!(checked.plans[0].capture, Some(Capture::Select));
+        assert_eq!(checked.plans[0].capture, Some(PlannedCapture::Select));
         assert_eq!(ids(&checked.plans[0]), ["copy"]);
         assert_eq!(checked.plans[0].hotkey, Some(chord("Ctrl+Alt+C")));
-        assert_eq!(checked.plans[1].capture, Some(Capture::Select));
+        assert_eq!(checked.plans[1].capture, Some(PlannedCapture::Select));
         assert_eq!(ids(&checked.plans[1]), Vec::<&str>::new());
     }
 
@@ -1388,6 +1445,20 @@ mod tests {
             step(&mut run, &mut model),
             ("annotate", vec![Effect::EnterEditMode])
         );
+        assert!(model.is_editing());
+        run.settle(Outcome::Succeeded);
+        assert!(matches!(
+            run.advance(&mut model, &OpContext::default()),
+            Advance::Finished
+        ));
+    }
+
+    #[test]
+    fn annotate_at_the_end_only_enters_and_does_nothing_when_already_editing() {
+        let mut run = run_of(&["annotate"]);
+        let mut model = model();
+        model.start_editing(crate::annotate::Style::default());
+        assert_eq!(step(&mut run, &mut model), ("annotate", vec![]));
         assert!(model.is_editing());
         run.settle(Outcome::Succeeded);
         assert!(matches!(
@@ -1779,9 +1850,9 @@ mod tests {
             ),
             (
                 r#"[{ op = "copy", shadow = true }]"#,
-                vec![Problem::NotAppearance],
+                vec![Problem::UnknownTableOp],
             ),
-            (r#"[{ shadow = true }]"#, vec![Problem::NotAppearance]),
+            (r#"[{ shadow = true }]"#, vec![Problem::UnknownTableOp]),
             (r#"[{ op = "appearance" }]"#, vec![Problem::NoValues]),
             (
                 r##"[{ op = "appearance", border = false, border_color = "#FF0000" }]"##,
@@ -1874,7 +1945,7 @@ mod tests {
         assert!(Launch::of(&checked.plans[0]).is_none());
         assert_eq!(
             launch_of(r#"["select_capture"]"#).capture(),
-            Capture::Select
+            &PlannedCapture::Select
         );
     }
 
@@ -2142,9 +2213,9 @@ shortcut = "Ctrl+Nope"
             checked.problems,
             vec![(2, Problem::FirstOnlyNotFirst), (3, Problem::NoHotkey)]
         );
-        assert_eq!(checked.plans[0].capture, Some(Capture::ActiveWindow));
+        assert_eq!(checked.plans[0].capture, Some(PlannedCapture::ActiveWindow));
         assert_eq!(ids(&checked.plans[0]), ["copy"]);
-        assert_eq!(checked.plans[1].capture, Some(Capture::Blank));
+        assert_eq!(checked.plans[1].capture, Some(PlannedCapture::Blank));
         assert_eq!(
             Capture::ALL.map(Capture::label_key),
             [
@@ -2177,7 +2248,7 @@ shortcut = "Ctrl+Nope"
         let launch = launch_of(
             r#"["blank_scrap", { op = "background", color = "transparent" }, "copy", "zoom_in"]"#,
         );
-        assert_eq!(launch.capture(), Capture::Blank);
+        assert_eq!(launch.capture(), &PlannedCapture::Blank);
         let context = no_border_context();
         let mut scrap = white_blank();
         let Shown { mut run, effects } = launch.captured(&mut scrap, &context);
@@ -2263,17 +2334,35 @@ shortcut = "Ctrl+Nope"
     }
 
     #[test]
+    fn a_capture_recipe_whose_region_is_gone_by_the_hotkey_cannot_be_launched() {
+        let settings = with_a_region(r#"[{ op = "capture_region", region = "左上" }, "copy"]"#);
+        let launched = launch(&settings.recipes, OPERATIONS, &settings.regions, 0);
+        assert_eq!(
+            launched.map(|l| l.capture().clone()),
+            Ok(PlannedCapture::Region("左上".to_owned()))
+        );
+        // 設定を変えて定型領域を消したあと
+        assert_eq!(
+            launch(&settings.recipes, OPERATIONS, &[], 0).err(),
+            Some(CannotLaunch::Problems(vec![Problem::NoSuchRegion(
+                "左上".to_owned()
+            )]))
+        );
+        // レシピを消したあと
+        assert_eq!(
+            launch(&settings.recipes, OPERATIONS, &settings.regions, 1).err(),
+            Some(CannotLaunch::Gone)
+        );
+    }
+
+    #[test]
     fn a_fixed_region_capture_names_the_region_it_captures() {
         let checked =
             checked_with_a_region(r#"[{ op = "capture_region", region = "左上" }, "copy"]"#);
         assert_eq!(checked.problems, vec![]);
         let launch = Launch::of(&checked.plans[0]).expect("starts with a capture");
-        assert_eq!(launch.capture(), Capture::Region);
-        assert_eq!(launch.region(), Some("左上"));
+        assert_eq!(launch.capture(), &PlannedCapture::Region("左上".to_owned()));
         assert_eq!(ids(&checked.plans[0]), ["copy"]);
-        // ほかのキャプチャは定型領域を選ばない
-        let select = checked_with_a_region(r#"["select_capture"]"#);
-        assert_eq!(Launch::of(&select.plans[0]).unwrap().region(), None);
     }
 
     #[test]

@@ -244,6 +244,11 @@ no_values = "パラメータを 1 つも書いていない操作があります"
 border_off_with_color_or_width = "border = false と枠の色・太さは一緒に書けません"
 no_such_region = "撮る定型領域が見つかりません（名前を変えたか消した定型領域は、選び直してください）"
 
+# レシピ
+[recipe]
+# キャプチャで始まるレシピのホットキーを押した時点で、設定を変えたあとなどで実行できないとき（この後ろにレシピの名前）
+cannot_launch = "レシピを実行できませんでした。設定のレシピを確かめてください: "
+
 # レシピの最初に置けるキャプチャ系の操作（recipe::Capture::label_key）
 [recipe.capture]
 select_capture = "範囲選択キャプチャ"
@@ -408,3 +413,5 @@ seq3 = "{seq:3}  3 桁の連番（001, 002, …）"
 
 [blank_scrap]
 failed = "白紙スクラップを作れませんでした。"
+# 白紙の背景色（[annotation] background）を読めなかったとき（failed の次の行）
+no_background = "背景色を設定から読めませんでした。詳しくはログを見てください。"

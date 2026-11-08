@@ -706,8 +706,8 @@ pub enum Problem {
     BadValue,
     /// レシピのパラメータを添えた操作の知らないキー。
     UnknownKey,
-    /// レシピのパラメータを添えた操作の `op` が `appearance` でない。
-    NotAppearance,
+    /// レシピのパラメータを添えた操作の `op` が表で書ける操作（`appearance`、`background`、`capture_region`）でない。
+    UnknownTableOp,
     /// レシピのパラメータを添えた操作に項目がない。
     NoValues,
     /// レシピのパラメータを添えた操作に `border = false` と枠の色か太さを一緒に書いた。
@@ -815,7 +815,7 @@ pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
                     recipe::Problem::OutOfRange(_) => Problem::OutOfRange,
                     recipe::Problem::BadValue(_) => Problem::BadValue,
                     recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
-                    recipe::Problem::NotAppearance => Problem::NotAppearance,
+                    recipe::Problem::UnknownTableOp => Problem::UnknownTableOp,
                     recipe::Problem::NoValues => Problem::NoValues,
                     recipe::Problem::BorderOffWithColorOrWidth => {
                         Problem::BorderOffWithColorOrWidth
@@ -1298,7 +1298,7 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
         let (key, reason) = if key == "op" {
             wrote_op = true;
             let other = value.as_str() != Some(recipe::APPEARANCE);
-            (StepKey::Op, other.then_some(Rejection::NotAppearance))
+            (StepKey::Op, other.then_some(Rejection::UnknownTableOp))
         } else {
             match AppearanceItem::from_key(key) {
                 Some(item) => (
@@ -1325,7 +1325,7 @@ fn appearance_step(table: &toml_edit::InlineTable) -> AppearanceStep {
         step.rejected.push(Rejected {
             key: StepKey::Op,
             value: None,
-            reason: Rejection::NotAppearance,
+            reason: Rejection::UnknownTableOp,
         });
     }
     step
