@@ -7,11 +7,12 @@
 //! 並びは次のとおり（数はリトルエンディアン）。
 //!
 //! ```text
-//! MAGIC（13 バイト） | 版（u32） | 記録の長さ（u32） | 記録（UTF-8 の TOML） | 元の画像の PNG（残り全部）
+//! MAGIC（13 バイト） | 版（u32） | 記録の長さ（u32） | 記録（UTF-8 の TOML） | 元の画像の PNG（残り全部。白紙スクラップはなし）
 //! ```
 //!
-//! 記録の `[source]` の `kind` が中身の種類で、いまは画像（`"image"`、大きさを持ち、後ろに PNG が続く）だけ。
-//! 種類を足すとき（白紙スクラップなど、PNG を持たないもの）は、`Content` に行を足し、`kind` の名前を足す。
+//! 記録の `[source]` の `kind` が中身の種類で、画像（`"image"`、大きさを持ち、後ろに PNG が続く）と白紙
+//! スクラップ（`"blank"`、大きさと `background`（`#RRGGBB` か `transparent`）を持ち、後ろに何も続かない）。
+//! 種類と後ろの PNG の有無が食い違うファイルは形式の誤りとして拒む。
 //!
 //! ファイルは外から来るデータで、読み込みは管理者として動く常駐本体の中で走る。大きな確保をしないよう、
 //! ファイル・記録・画像の大きさと書き込みの数に上限を置き、PNG は画素を読む前に大きさを記録と突き合わせる。
@@ -25,7 +26,7 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
 use crate::annotate::{Annotation, Annotations, Font, Shape, Style};
 use crate::geometry::{Point, Rect, Size};
 use crate::image::Image;
-use crate::scrap::ScrapModel;
+use crate::scrap::{Background, ScrapModel};
 use crate::settings::{ANNOTATION_FONT_SIZE_RANGE, ANNOTATION_WIDTH_RANGE, Rgb};
 
 /// スクラップファイルの拡張子。
@@ -72,6 +73,8 @@ pub struct ScrapFile {
 pub enum Content {
     /// 元の画像（トリム前）。
     Image(Image),
+    /// 白紙スクラップの下地（大きさと背景色。画素は持たず、開くときに背景色で塗る）。
+    Blank { size: Size, background: Background },
 }
 
 impl Content {
@@ -79,22 +82,32 @@ impl Content {
     pub fn size(&self) -> Size {
         match self {
             Content::Image(image) => image.size(),
+            Content::Blank { size, .. } => *size,
         }
     }
 }
 
 impl ScrapFile {
-    /// スクラップ `model` と元の画像 `image` から作る（保存するとき）。
+    /// スクラップ `model` と元の画像 `image` から作る（保存するとき）。白紙スクラップなら、塗った下地の
+    /// `image` ではなく背景色と大きさを持つ（開くときに塗り直す）。
     pub fn of(model: &ScrapModel, image: &Image) -> ScrapFile {
+        let content = match model.background() {
+            Some(background) => Content::Blank {
+                size: model.image_size,
+                background,
+            },
+            None => Content::Image(image.clone()),
+        };
         ScrapFile {
-            content: Content::Image(image.clone()),
+            content,
             trim: model.trim_rect(),
             annotations: model.annotations().items().to_vec(),
         }
     }
 
     /// 開いたスクラップの状態。表示する画像（トリムしていればその範囲）の中心を `monitor`（スクリーン座標）の
-    /// 中心に置き、倍率は 100%、見た目の個別値はなく、履歴は空。
+    /// 中心に置き、倍率は 100%、見た目の個別値はなく、履歴は空。白紙スクラップは背景色を持つ（下地は
+    /// `ScrapModel::blank_image` で塗る）。
     pub fn into_scrap(self, monitor: Rect) -> (ScrapModel, Content) {
         let size = self.content.size();
         let shown = self.trim.map_or(size, |r| r.size());
@@ -106,9 +119,14 @@ impl ScrapFile {
             center(monitor.left, monitor.width(), shown.width),
             center(monitor.top, monitor.height(), shown.height),
         );
+        let background = match self.content {
+            Content::Image(_) => None,
+            Content::Blank { background, .. } => Some(background),
+        };
         let model = ScrapModel::restored(
             position,
             size,
+            background,
             self.trim,
             Annotations::from_items(self.annotations),
         );
@@ -223,9 +241,15 @@ pub fn encode(file: &ScrapFile) -> Result<Vec<u8>, EncodeError> {
         Content::Image(_) => {
             source.insert("kind", toml_edit::value("image"));
         }
+        Content::Blank { .. } => {
+            source.insert("kind", toml_edit::value("blank"));
+        }
     }
     source.insert("width", toml_edit::value(i64::from(size.width)));
     source.insert("height", toml_edit::value(i64::from(size.height)));
+    if let Content::Blank { background, .. } = &file.content {
+        source.insert("background", toml_edit::value(background.to_string()));
+    }
     doc.insert("source", Item::Table(source));
     if let Some(trim) = file.trim {
         let mut table = Table::new();
@@ -252,6 +276,7 @@ pub fn encode(file: &ScrapFile) -> Result<Vec<u8>, EncodeError> {
     out.extend_from_slice(record.as_bytes());
     match &file.content {
         Content::Image(image) => image.write_png(&mut out).map_err(EncodeError::Png)?,
+        Content::Blank { .. } => {}
     }
     Ok(out)
 }
@@ -363,19 +388,33 @@ pub fn decode(bytes: &[u8]) -> Result<ScrapFile, LoadError> {
         .get("source")
         .and_then(Item::as_table)
         .ok_or_else(|| bad("no [source]"))?;
-    only_keys(source, "source", &["kind", "width", "height"])?;
     let kind = source
         .get("kind")
         .and_then(Item::as_str)
         .ok_or_else(|| bad("no source.kind"))?;
-    let size = Size::new(
-        side(source, "source", "width")?,
-        side(source, "source", "height")?,
-    );
     let content = match kind {
-        "image" => Content::Image(decode_png(payload, size)?),
+        "image" => {
+            only_keys(source, "source", &["kind", "width", "height"])?;
+            Content::Image(decode_png(payload, source_size(source)?)?)
+        }
+        "blank" => {
+            only_keys(source, "source", &["kind", "width", "height", "background"])?;
+            let size = source_size(source)?;
+            // 開くときに背景色で塗るので、画像と同じ画素の数の上限を置く
+            if u64::from(size.width) * u64::from(size.height) > MAX_PIXELS {
+                return Err(LoadError::TooLarge);
+            }
+            let background = string(source, "source", "background")?
+                .parse()
+                .map_err(|_| bad("source.background is not #RRGGBB or transparent"))?;
+            if !payload.is_empty() {
+                return Err(bad("a blank scrap has an image after the record"));
+            }
+            Content::Blank { size, background }
+        }
         other => return Err(bad(format!("unknown source.kind {other:?}"))),
     };
+    let size = content.size();
 
     let trim = match root.get("trim") {
         None => None,
@@ -428,6 +467,14 @@ fn integer(table: &Table, path: &str, key: &str) -> Result<i64, LoadError> {
         .get(key)
         .and_then(Item::as_integer)
         .ok_or_else(|| bad(format!("{path}.{key} is missing or not an integer")))
+}
+
+/// `[source]` の大きさ。
+fn source_size(source: &Table) -> Result<Size, LoadError> {
+    Ok(Size::new(
+        side(source, "source", "width")?,
+        side(source, "source", "height")?,
+    ))
 }
 
 /// 画像の一辺。0 は記録の誤り、上限を超えたら `TooLarge`。
@@ -731,6 +778,139 @@ mod tests {
         assert_eq!(decode(&bytes).unwrap(), file);
     }
 
+    fn blank(background: Background) -> ScrapFile {
+        ScrapFile {
+            content: Content::Blank {
+                size: Size::new(4, 3),
+                background,
+            },
+            ..sample()
+        }
+    }
+
+    #[test]
+    fn a_blank_scrap_of_a_color_or_transparent_comes_back_as_it_was_without_a_png() {
+        for background in [
+            Background::Color(Rgb(0x12, 0x34, 0x56)),
+            Background::Transparent,
+        ] {
+            let file = blank(background);
+            let bytes = encode(&file).unwrap();
+            assert_eq!(decode(&bytes).unwrap(), file);
+            // 記録で終わり、後ろに PNG を持たない
+            let record_length = u32::from_le_bytes(bytes[17..21].try_into().unwrap()) as usize;
+            assert_eq!(bytes.len(), MAGIC.len() + HEADER_NUMBERS + record_length);
+        }
+    }
+
+    #[test]
+    fn a_file_whose_blankness_disagrees_with_having_an_image_is_malformed() {
+        let blank_record =
+            "[source]\nkind = \"blank\"\nwidth = 4\nheight = 3\nbackground = \"#FFFFFF\"\n";
+        let cases = [
+            // 白紙なのに PNG が続く
+            assemble(VERSION, blank_record, &png()),
+            // 白紙なのに後ろに何か残る
+            assemble(VERSION, blank_record, b"x"),
+            // 画像なのに背景色を持つ
+            assemble(
+                VERSION,
+                &format!("{}background = \"#FFFFFF\"\n", image_record(4, 3)),
+                &png(),
+            ),
+            // 画像なのに PNG がない
+            assemble(VERSION, &image_record(4, 3), &[]),
+        ];
+        for (i, bytes) in cases.iter().enumerate() {
+            let error = decode(bytes).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                LoadErrorKind::Malformed,
+                "case {i}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_record_needs_a_background_that_is_a_color_or_transparent_and_a_size_in_the_limits() {
+        let record = |background: &str, width: u32, height: u32| {
+            format!("[source]\nkind = \"blank\"\nwidth = {width}\nheight = {height}\n{background}")
+        };
+        for (i, text) in [
+            record("", 4, 3),
+            record("background = \"Transparent\"\n", 4, 3),
+            record("background = \"#FFF\"\n", 4, 3),
+            record("background = 0\n", 4, 3),
+            record("background = \"#FFFFFF\"\n", 0, 3),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let error = decode(&assemble(VERSION, text, &[])).unwrap_err();
+            assert!(
+                matches!(error, LoadError::BadRecord(_)),
+                "case {i}: {error:?}"
+            );
+        }
+        let huge = record("background = \"#FFFFFF\"\n", MAX_SIDE, MAX_SIDE);
+        assert!(matches!(
+            decode(&assemble(VERSION, &huge, &[])),
+            Err(LoadError::TooLarge)
+        ));
+        let outside = format!(
+            "{}[trim]\nx = 3\ny = 0\nwidth = 2\nheight = 1\n",
+            record("background = \"#FFFFFF\"\n", 4, 3)
+        );
+        assert!(matches!(
+            decode(&assemble(VERSION, &outside, &[])),
+            Err(LoadError::OutOfRange(_))
+        ));
+    }
+
+    #[test]
+    fn saving_a_blank_scrap_takes_its_background_and_size_instead_of_the_painted_image() {
+        for background in [Background::WHITE, Background::Transparent] {
+            let model = ScrapModel::restored(
+                Point::new(5, 6),
+                Size::new(4, 3),
+                Some(background),
+                Some(Rect::new(1, 1, 3, 3)),
+                Annotations::from_items(every_shape()),
+            );
+            let painted = model.blank_image().unwrap();
+            assert_eq!(ScrapFile::of(&model, &painted), blank(background));
+        }
+    }
+
+    #[test]
+    fn an_opened_blank_scrap_keeps_its_background_and_can_change_it() {
+        let monitor = Rect::new(0, 0, 100, 100);
+        let (mut model, content) = blank(Background::Transparent).into_scrap(monitor);
+        assert_eq!(
+            content,
+            Content::Blank {
+                size: Size::new(4, 3),
+                background: Background::Transparent
+            }
+        );
+        assert_eq!(model.background(), Some(Background::Transparent));
+        assert_eq!(model.image_rect(), Rect::new(49, 49, 51, 51));
+        assert_eq!(model.annotations().items(), every_shape().as_slice());
+        assert!(!model.is_empty_transparent_blank());
+        // 開いた白紙スクラップでも背景色を変えられ、下地はその色で塗られる
+        assert!(model.set_background(Background::WHITE));
+        assert_eq!(
+            model.blank_image(),
+            Image::from_bgra(Size::new(4, 3), [0xFF; 4].repeat(12))
+        );
+        // 何も書かれていない透明な白紙は、開いても捨てる決まりの対象
+        let empty = ScrapFile {
+            annotations: vec![],
+            ..blank(Background::Transparent)
+        };
+        assert!(empty.into_scrap(monitor).0.is_empty_transparent_blank());
+    }
+
     #[test]
     fn a_scrap_without_trim_or_annotations_comes_back_as_it_was() {
         let file = ScrapFile {
@@ -746,6 +926,7 @@ mod tests {
         let model = ScrapModel::restored(
             Point::new(500, 600),
             Size::new(4, 3),
+            None,
             Some(Rect::new(1, 1, 3, 3)),
             Annotations::from_items(every_shape()),
         );
