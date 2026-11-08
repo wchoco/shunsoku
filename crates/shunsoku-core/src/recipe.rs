@@ -23,16 +23,22 @@ pub struct Recipe {
 pub enum Capture {
     /// 範囲選択キャプチャ。範囲選択の画面で選んだ範囲か、クリックしたウィンドウを撮る。
     Select,
+    /// ウィンドウキャプチャ。いまアクティブなウィンドウを撮る。
+    ActiveWindow,
+    /// 白紙スクラップを作る。範囲選択の画面で位置と大きさを選ぶ（画面は取り込まない）。
+    Blank,
 }
 
 impl Capture {
     /// キャプチャ系の操作のすべて（「追加」の一覧の順）。
-    pub const ALL: [Capture; 1] = [Capture::Select];
+    pub const ALL: [Capture; 3] = [Capture::Select, Capture::ActiveWindow, Capture::Blank];
 
     /// レシピの `steps` に書く id。
     pub fn id(self) -> &'static str {
         match self {
             Capture::Select => "select_capture",
+            Capture::ActiveWindow => "active_window_capture",
+            Capture::Blank => "blank_scrap",
         }
     }
 
@@ -45,6 +51,8 @@ impl Capture {
     pub fn label_key(self) -> &'static str {
         match self {
             Capture::Select => "recipe.capture.select_capture",
+            Capture::ActiveWindow => "recipe.capture.active_window_capture",
+            Capture::Blank => "recipe.capture.blank_scrap",
         }
     }
 }
@@ -712,6 +720,19 @@ impl Run {
     /// 結果を待っている操作の id。
     pub fn waiting_for(&self) -> Option<OperationId> {
         (self.state == State::Waiting).then(|| self.steps[self.next - 1].op.id)
+    }
+
+    /// 終えたか止まったあとに、`model` で書き込みの編集モードに入るか。レシピの途中では、白紙スクラップを作っても
+    /// 編集モードに入らない（続きの操作を止めないため）。終えたとき（`Advance::Finished`）か止まったとき
+    /// （`Advance::Stopped`）に、何も書かれていない透明な白紙（`ScrapModel::starts_in_edit_mode`）が残っていて、まだ
+    /// 編集モードでなければ入る（見えずにつかめるだけの物を残さないため）。
+    pub fn enters_edit_mode(&self, model: &ScrapModel) -> bool {
+        let ended = match self.state {
+            State::Stopped(_) => true,
+            State::Ready => self.next >= self.steps.len(),
+            State::Waiting => false,
+        };
+        ended && model.starts_in_edit_mode() && !model.is_editing()
     }
 
     /// 実行した操作の結果を受ける。成功なら次の操作へ進めるようにし、失敗か取り消しなら止める。結果を待って
@@ -2019,5 +2040,124 @@ shortcut = "Ctrl+Nope"
                 hotkey: None,
             }]
         );
+    }
+
+    #[test]
+    fn window_captures_and_blank_scraps_go_only_first_and_take_a_hotkey() {
+        let checked = plan(
+            &[
+                capture_recipe("窓", &["active_window_capture", "copy"], "Ctrl+Alt+W"),
+                capture_recipe("白紙", &["blank_scrap"], "Ctrl+Alt+N"),
+                recipe("a", &["copy", "blank_scrap"]),
+                recipe("b", &["active_window_capture"]),
+            ],
+            OPERATIONS,
+        );
+        assert_eq!(
+            checked.problems,
+            vec![(2, Problem::FirstOnlyNotFirst), (3, Problem::NoHotkey)]
+        );
+        assert_eq!(checked.plans[0].capture, Some(Capture::ActiveWindow));
+        assert_eq!(ids(&checked.plans[0]), ["copy"]);
+        assert_eq!(checked.plans[1].capture, Some(Capture::Blank));
+        assert_eq!(
+            Capture::ALL.map(Capture::label_key),
+            [
+                "recipe.capture.select_capture",
+                "recipe.capture.active_window_capture",
+                "recipe.capture.blank_scrap",
+            ]
+        );
+    }
+
+    fn transparent_blank() -> ScrapModel {
+        ScrapModel::blank(Point::new(0, 0), Size::new(20, 10), Background::Transparent)
+    }
+
+    /// `model` に 1 本の線を書く（編集モードに入って書き、抜ける）。
+    fn write_a_line(model: &mut ScrapModel) {
+        model.start_editing(crate::annotate::Style::default());
+        model.edit_input(crate::annotate::EditInput::Press(Point::new(1, 1)));
+        model.edit_input(crate::annotate::EditInput::Move {
+            at: Point::new(8, 8),
+            shift: false,
+        });
+        model.edit_input(crate::annotate::EditInput::Leave);
+        assert!(!model.is_editing());
+    }
+
+    #[test]
+    fn a_blank_scrap_recipe_paints_the_background_before_showing_and_edits_only_at_the_end() {
+        let launch = launch_of(
+            r#"["blank_scrap", { op = "background", color = "transparent" }, "copy", "zoom_in"]"#,
+        );
+        assert_eq!(launch.capture(), Capture::Blank);
+        let context = no_border_context();
+        let mut scrap = white_blank();
+        let Shown { mut run, effects } = launch.captured(&mut scrap, &context);
+        assert_eq!(effects, vec![]);
+        assert_eq!(scrap.background(), Some(Background::Transparent));
+        // 途中では、透明な白紙でも編集モードに入らない
+        assert!(!run.enters_edit_mode(&scrap));
+        assert_eq!(step_in(&mut run, &mut scrap, &context).0, "copy");
+        assert!(!scrap.is_editing());
+        assert!(!run.enters_edit_mode(&scrap));
+        run.settle(Outcome::Succeeded);
+        assert!(!run.enters_edit_mode(&scrap));
+        assert_eq!(step_in(&mut run, &mut scrap, &context).0, "zoom_in");
+        run.settle(Outcome::Succeeded);
+        assert_eq!(run.advance(&mut scrap, &context), Advance::Finished);
+        assert!(!scrap.is_editing());
+        assert!(run.enters_edit_mode(&scrap));
+    }
+
+    #[test]
+    fn a_recipe_that_stops_on_an_empty_transparent_blank_enters_the_edit_mode() {
+        for outcome in [Outcome::Failed, Outcome::Cancelled] {
+            let mut run = run_of(&["copy", "zoom_in"]);
+            let mut scrap = transparent_blank();
+            step(&mut run, &mut scrap);
+            run.settle(outcome);
+            assert!(matches!(
+                run.advance(&mut scrap, &OpContext::default()),
+                Advance::Stopped(_)
+            ));
+            assert!(run.enters_edit_mode(&scrap), "{outcome:?}");
+        }
+        // 出す前に当てる操作が今は実行できずに止まったときも
+        let launch = launch_of(
+            r#"["select_capture", { op = "background", color = "transparent" }, "copy"]"#,
+        );
+        let mut scrap = model();
+        let Shown { run, .. } = launch.captured(&mut scrap, &OpContext::default());
+        assert!(!run.enters_edit_mode(&scrap));
+    }
+
+    #[test]
+    fn the_edit_mode_at_the_end_is_only_for_an_empty_transparent_blank_not_yet_editing() {
+        let finished = |model: &mut ScrapModel, steps: &[&str]| {
+            let mut run = run_of(steps);
+            loop {
+                match run.advance(model, &OpContext::default()) {
+                    Advance::Step { .. } => run.settle(Outcome::Succeeded),
+                    Advance::Finished => return run,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        let mut transparent = transparent_blank();
+        assert!(finished(&mut transparent, &["copy"]).enters_edit_mode(&transparent));
+        let mut white = white_blank();
+        assert!(!finished(&mut white, &["copy"]).enters_edit_mode(&white));
+        let mut image = model();
+        assert!(!finished(&mut image, &["copy"]).enters_edit_mode(&image));
+        let mut written = transparent_blank();
+        write_a_line(&mut written);
+        assert!(!finished(&mut written, &["copy"]).enters_edit_mode(&written));
+        // 最後の「編集モードに入る」でもう入っている
+        let mut editing = transparent_blank();
+        let run = finished(&mut editing, &["copy", "annotate"]);
+        assert!(editing.is_editing());
+        assert!(!run.enters_edit_mode(&editing));
     }
 }

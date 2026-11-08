@@ -2075,7 +2075,7 @@ mod tests {
     fn captures_are_always_offered_first_and_named_in_the_step_list() {
         for ids in [&[][..], &["copy"], &["copy", "close"], &["select_capture"]] {
             let editor = with_steps(ids);
-            assert_eq!(captures(&editor, 0), [Capture::Select], "{ids:?}");
+            assert_eq!(captures(&editor, 0), Capture::ALL, "{ids:?}");
             assert_eq!(
                 editor.step_choices(0)[0],
                 StepChoice::Capture(Capture::Select),
@@ -2088,6 +2088,11 @@ mod tests {
         );
         let editor = with_steps(&["select_capture", "copy"]);
         assert_eq!(labels(&editor), ["範囲選択キャプチャ", "コピー"]);
+        let editor = with_steps(&["active_window_capture", "blank_scrap"]);
+        assert_eq!(
+            labels(&editor),
+            ["ウィンドウキャプチャ", "白紙スクラップを作る"]
+        );
     }
 
     #[test]

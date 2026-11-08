@@ -167,6 +167,8 @@ impl CaptureRequest {
     pub fn recipe(index: usize, capture: crate::recipe::Capture) -> CaptureRequest {
         let method = match capture {
             crate::recipe::Capture::Select => CaptureMethod::Select,
+            crate::recipe::Capture::ActiveWindow => CaptureMethod::ActiveWindow,
+            crate::recipe::Capture::Blank => CaptureMethod::BlankScrap,
         };
         CaptureRequest {
             recipe: Some(index),
@@ -362,6 +364,26 @@ mod tests {
                 ..select_capture()
             }
         );
+    }
+
+    #[test]
+    fn window_and_blank_scrap_recipe_hotkeys_take_like_their_own_hotkeys_and_name_the_recipe() {
+        for (capture, source) in [
+            (
+                crate::recipe::Capture::ActiveWindow,
+                Source::ActiveWindowHotkey,
+            ),
+            (crate::recipe::Capture::Blank, Source::BlankScrap),
+        ] {
+            assert_eq!(
+                CaptureRequest::recipe(1, capture),
+                CaptureRequest {
+                    recipe: Some(1),
+                    ..CaptureRequest::from_source(source)
+                },
+                "{capture:?}"
+            );
+        }
     }
 
     #[test]

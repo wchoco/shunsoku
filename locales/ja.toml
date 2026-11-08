@@ -240,6 +240,8 @@ border_off_with_color_or_width = "border = false と枠の色・太さは一緒�
 # レシピの最初に置けるキャプチャ系の操作（recipe::Capture::label_key）
 [recipe.capture]
 select_capture = "範囲選択キャプチャ"
+active_window_capture = "ウィンドウキャプチャ"
+blank_scrap = "白紙スクラップを作る"
 
 [hotkey]
 failed = "次のホットキーを登録できませんでした（他のアプリが使っている可能性があります）: "

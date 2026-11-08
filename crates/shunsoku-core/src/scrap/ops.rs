@@ -683,11 +683,12 @@ fn background_choices(model: &ScrapModel, _: &Appearance) -> Vec<Choice> {
 /// 背景色を、レシピの操作に添えたパラメータか、一覧から選んだ色にする。「その他の色…」なら色の選択ダイアログを出す。
 /// 背景色が変わったときだけ描き直す（変わらなければ、操作は成功として次へ進む）。
 fn background_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
-    let background = match (context.values, context.choice) {
-        (Some(StepValues::Background(background)), _) => background,
+    // パラメータで来るのはレシピの操作だけ
+    let (background, in_recipe) = match (context.values, context.choice) {
+        (Some(StepValues::Background(background)), _) => (background, true),
         (_, Some(choice)) => match BackgroundChoice::from_value(choice) {
-            Some(BackgroundChoice::Color(colour)) => Background::Color(colour),
-            Some(BackgroundChoice::Transparent) => Background::Transparent,
+            Some(BackgroundChoice::Color(colour)) => (Background::Color(colour), false),
+            Some(BackgroundChoice::Transparent) => (Background::Transparent, false),
             Some(BackgroundChoice::Other) => return vec![Effect::ShowBackgroundDialog],
             None => return Vec::new(),
         },
@@ -697,8 +698,9 @@ fn background_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
         return Vec::new();
     }
     // 何も書かれていない白紙を透明にしたら、見えずにつかめるだけの物にしないよう、書き込みに入る（何も書かずに
-    // 抜けると捨てる）
-    if model.is_empty_transparent_blank()
+    // 抜けると捨てる）。レシピの途中では入らず、レシピを終えたか止まったときに入る（`recipe::Run::enters_edit_mode`）
+    if !in_recipe
+        && model.is_empty_transparent_blank()
         && model.start_editing_with(
             context
                 .carryover
