@@ -30,14 +30,20 @@ pub enum Mark {
     OverlayFlushed,
     /// スクラップを 1 枚出し終えた時点。常駐時のメモリの参考値（スクラップ 1 枚表示中）を読む合図。
     ScrapShown,
+    /// 書き込みの編集モード中のスクラップの描き直しを始めた時点。
+    AnnotatePaintStart,
+    /// 書き込みの編集モード中のスクラップの描き直しを、ウィンドウに出し終えた時点。描けなかったときは書かない。
+    AnnotatePaintEnd,
 }
 
-const MARKS: [Mark; 5] = [
+const MARKS: [Mark; 7] = [
     Mark::ProcessStart,
     Mark::TrayRegistered,
     Mark::HotkeyReceived,
     Mark::OverlayFlushed,
     Mark::ScrapShown,
+    Mark::AnnotatePaintStart,
+    Mark::AnnotatePaintEnd,
 ];
 
 impl Mark {
@@ -49,6 +55,8 @@ impl Mark {
             Mark::HotkeyReceived => "hotkey_received",
             Mark::OverlayFlushed => "overlay_flushed",
             Mark::ScrapShown => "scrap_shown",
+            Mark::AnnotatePaintStart => "annotate_paint_start",
+            Mark::AnnotatePaintEnd => "annotate_paint_end",
         }
     }
 
@@ -122,6 +130,23 @@ impl PerfLog {
             .filter(|(m, _)| *m == mark)
             .nth(n)
             .map(|&(_, ticks)| ticks)
+    }
+
+    /// 区切り `start` と、そのあと次の `start` までに書かれた `end` の組の時刻（QPC のカウント）を、書かれた順に返す。
+    /// 終わりが書かれなかった（描けなかった、まだ書いている途中の）始まりは入れない。
+    pub fn spans(&self, start: Mark, end: Mark) -> Vec<(i64, i64)> {
+        let mut spans = Vec::new();
+        let mut open = None;
+        for &(mark, ticks) in &self.marks {
+            if mark == start {
+                open = Some(ticks);
+            } else if mark == end
+                && let Some(from) = open.take()
+            {
+                spans.push((from, ticks));
+            }
+        }
+        spans
     }
 
     /// `from` から `to` までのカウントを ms にする。周波数が書かれていなければ None。
@@ -230,6 +255,59 @@ mod tests {
         // "tray_registered 2500100\n" の途中まで書かれたところを読んだ
         let log = PerfLog::parse("frequency 10000000\nprocess_start 100\ntray_registered 25");
         assert_eq!(log.marks, vec![(Mark::ProcessStart, 100)]);
+    }
+
+    #[test]
+    fn annotate_paint_marks_are_read_back() {
+        let mut out = Vec::new();
+        let mut rec = Recorder::new(&mut out, 10_000_000).unwrap();
+        rec.mark(Mark::AnnotatePaintStart, 100).unwrap();
+        rec.mark(Mark::AnnotatePaintEnd, 200).unwrap();
+        let log = PerfLog::parse(std::str::from_utf8(&out).unwrap());
+        assert_eq!(
+            log.marks,
+            vec![
+                (Mark::AnnotatePaintStart, 100),
+                (Mark::AnnotatePaintEnd, 200)
+            ]
+        );
+        assert!(out.starts_with(
+            b"frequency 10000000\nannotate_paint_start 100\nannotate_paint_end 200\n"
+        ));
+    }
+
+    #[test]
+    fn spans_pair_each_start_with_the_end_that_follows_it() {
+        let log = PerfLog::parse(
+            "frequency 10000000\n\
+             annotate_paint_start 100\n\
+             annotate_paint_end 150\n\
+             hotkey_received 160\n\
+             annotate_paint_start 200\n\
+             annotate_paint_end 260\n",
+        );
+        assert_eq!(
+            log.spans(Mark::AnnotatePaintStart, Mark::AnnotatePaintEnd),
+            vec![(100, 150), (200, 260)]
+        );
+    }
+
+    #[test]
+    fn a_start_without_its_end_is_dropped_from_the_spans() {
+        // 2 回目は描けずに終わりが書かれなかった。3 回目はまだ書いている途中
+        let log = PerfLog::parse(
+            "frequency 10000000\n\
+             annotate_paint_start 100\n\
+             annotate_paint_end 150\n\
+             annotate_paint_start 200\n\
+             annotate_paint_start 300\n\
+             annotate_paint_end 340\n\
+             annotate_paint_start 400\n",
+        );
+        assert_eq!(
+            log.spans(Mark::AnnotatePaintStart, Mark::AnnotatePaintEnd),
+            vec![(100, 150), (300, 340)]
+        );
     }
 
     #[test]
