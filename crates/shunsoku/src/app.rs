@@ -4379,11 +4379,23 @@ fn open_scrap_path(path: &Path) -> std::result::Result<(), OpenFailure> {
         OpenFailure::Load(e)
     })?;
     let (model, content) = file.into_scrap(cursor_monitor());
-    let scrap_file::Content::Image(image) = content;
-    float_model(model, image, true).map_err(|reason| {
+    let failed = |reason: String| {
         log::error!("could not float {}: {reason}", path.display());
         OpenFailure::Float(reason)
-    })?;
+    };
+    let image = match content {
+        scrap_file::Content::Image(image) => image,
+        // 白紙スクラップは背景色で塗り直す（作ったときと同じ下地）
+        scrap_file::Content::Blank { size, .. } => model
+            .blank_image()
+            .ok_or_else(|| failed(format!("could not paint the blank scrap of {size:?}")))?,
+    };
+    // 何も書かれていない透明な白紙は、作ったときと同じく書き込みの編集モードで浮かべる（何も書かずに抜けると捨てる）
+    let edit = model.is_empty_transparent_blank();
+    let hwnd = float_model(model, image, true).map_err(failed)?;
+    if edit && let Some(op) = ops::find("annotate") {
+        run_scrap_operation(hwnd, op, OpContext::default());
+    }
     log::info!("opened {}", path.display());
     Ok(())
 }
