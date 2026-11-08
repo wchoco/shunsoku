@@ -413,8 +413,7 @@ impl Editor {
         self.draft
             .recipes
             .get(index)
-            .and_then(|r| r.steps.first())
-            .is_some_and(|s| recipe::is_first_only(s.op_id()))
+            .is_some_and(Recipe::starts_with_capture)
     }
 
     /// 操作の並びを変えたあと、最初の操作がキャプチャ系かどうか（変える前は `before`）が変わったら、

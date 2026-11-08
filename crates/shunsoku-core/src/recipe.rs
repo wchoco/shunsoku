@@ -17,6 +17,14 @@ pub struct Recipe {
     pub hotkey: Option<Chord>,
 }
 
+impl Recipe {
+    /// 最初の操作がキャプチャ系か（キャプチャで始まるレシピか。ADR-0010）。キャプチャで始まるレシピはホットキーで、
+    /// ほかのレシピはショートカットで呼ぶ。
+    pub fn starts_with_capture(&self) -> bool {
+        self.steps.first().is_some_and(|s| is_first_only(s.op_id()))
+    }
+}
+
 /// キャプチャ系の操作（ADR-0010）。レシピの最初にだけ置け、スクラップを作る。スクラップに対する操作ではないので、
 /// スクラップ操作の表（`scrap::ops::OPERATIONS`）には入れない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -577,11 +585,7 @@ pub fn plan(
             problems.push(Problem::LastOnlyNotLast);
         }
         // キャプチャで始まるレシピはホットキーで、ほかのレシピはショートカットで呼ぶ
-        let starts_with_capture = recipe
-            .steps
-            .first()
-            .is_some_and(|s| is_first_only(s.op_id()));
-        if starts_with_capture {
+        if recipe.starts_with_capture() {
             if recipe.shortcut.is_some() {
                 problems.push(Problem::ShortcutOnCapture);
             }
