@@ -3438,11 +3438,29 @@ fn request_capture(source: Source) {
 
 /// キャプチャで始まるレシピ（`index` は `Settings::recipes` の添字）を始める（ADR-0010）。キャプチャを依頼し、
 /// 撮れたら `output` がスクラップを出してから残りの操作を進める。定型領域キャプチャは `capture_region` が撮り、
-/// 白紙スクラップにする定型領域なら、そこで白紙スクラップを出して残りの操作を進める。
+/// 白紙スクラップにする定型領域なら、そこで白紙スクラップを出して残りの操作を進める。いまの設定で実行できなければ
+/// （定型領域を消したあとなど）、通知して何もしない。
 fn request_capture_recipe(index: usize) {
-    let Some(launch) = capture_recipe_launch(index) else {
-        log::warn!("recipe {index} does not start with a capture");
+    let Some((launched, name)) = with_app(|app| {
+        let name = app.settings.recipes.get(index).map(|r| r.name.clone());
+        (try_capture_recipe_launch(index, &app.settings), name)
+    }) else {
         return;
+    };
+    let launch = match launched {
+        Ok(launch) => launch,
+        Err(reason) => {
+            log::warn!("capture recipe {index} cannot run: {reason:?}");
+            notify_user(
+                notify::Level::Error,
+                &format!(
+                    "{}{}",
+                    text("recipe.cannot_launch"),
+                    name.unwrap_or_default()
+                ),
+            );
+            return;
+        }
     };
     log::info!("capture recipe {index} requested from hotkey");
     let Some(request) =
@@ -3453,20 +3471,17 @@ fn request_capture_recipe(index: usize) {
     submit(request);
 }
 
+/// `settings` での、`index` 番目のキャプチャで始まるレシピの実行（core の `recipe::launch`）。
+fn try_capture_recipe_launch(
+    index: usize,
+    settings: &settings::Settings,
+) -> std::result::Result<Launch, recipe::CannotLaunch> {
+    recipe::launch(&settings.recipes, ops::OPERATIONS, &settings.regions, index)
+}
+
 /// いまの設定での、`index` 番目のレシピの実行。キャプチャで始まる、問題のないレシピでなければ None。
 fn capture_recipe_launch(index: usize) -> Option<Launch> {
-    with_app(|app| {
-        recipe::plan(
-            &app.settings.recipes,
-            ops::OPERATIONS,
-            &app.settings.regions,
-        )
-        .plans
-        .iter()
-        .find(|plan| plan.index == index)
-        .and_then(Launch::of)
-    })
-    .flatten()
+    with_app(|app| try_capture_recipe_launch(index, &app.settings).ok()).flatten()
 }
 
 /// キャプチャの依頼を受ける。ほかの依頼を進めている間（範囲選択の画面を開いている間など）は、ホットキー・

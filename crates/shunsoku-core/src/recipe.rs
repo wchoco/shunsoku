@@ -597,6 +597,40 @@ pub fn plan(
     checked
 }
 
+/// キャプチャで始まるレシピを実行できなかったわけ（`launch`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CannotLaunch {
+    /// その位置に、キャプチャで始まるレシピがもうない。
+    Gone,
+    /// レシピに問題がある（定型領域を消したあとなど）。
+    Problems(Vec<Problem>),
+}
+
+/// ホットキーを受けた時点の設定（`recipes`、`regions`）で検査した、`index` 番目の（`Settings::recipes` の中の位置）
+/// キャプチャで始まるレシピの実行（ADR-0010）。設定を変えたあとで実行できなければ、そのわけを返す。
+pub fn launch(
+    recipes: &[Recipe],
+    ops: &'static [OperationDescriptor],
+    regions: &[Region],
+    index: usize,
+) -> Result<Launch, CannotLaunch> {
+    let checked = plan(recipes, ops, regions);
+    if let Some(plan) = checked.plans.iter().find(|plan| plan.index == index) {
+        return Launch::of(plan).ok_or(CannotLaunch::Gone);
+    }
+    let problems: Vec<Problem> = checked
+        .problems
+        .into_iter()
+        .filter(|(i, _)| *i == index)
+        .map(|(_, problem)| problem)
+        .collect();
+    if problems.is_empty() {
+        Err(CannotLaunch::Gone)
+    } else {
+        Err(CannotLaunch::Problems(problems))
+    }
+}
+
 /// 読めなかった項目を問題にして `problems` に足す。
 fn check_rejected(rejected: &[Rejected], problems: &mut Vec<Problem>) {
     for r in rejected {
@@ -2285,6 +2319,28 @@ shortcut = "Ctrl+Nope"
     fn checked_with_a_region(steps: &str) -> Checked {
         let settings = with_a_region(steps);
         plan(&settings.recipes, OPERATIONS, &settings.regions)
+    }
+
+    #[test]
+    fn a_capture_recipe_whose_region_is_gone_by_the_hotkey_cannot_be_launched() {
+        let settings = with_a_region(r#"[{ op = "capture_region", region = "左上" }, "copy"]"#);
+        let launched = launch(&settings.recipes, OPERATIONS, &settings.regions, 0);
+        assert_eq!(
+            launched.map(|l| l.region().map(str::to_owned)),
+            Ok(Some("左上".to_owned()))
+        );
+        // 設定を変えて定型領域を消したあと
+        assert_eq!(
+            launch(&settings.recipes, OPERATIONS, &[], 0).err(),
+            Some(CannotLaunch::Problems(vec![Problem::NoSuchRegion(
+                "左上".to_owned()
+            )]))
+        );
+        // レシピを消したあと
+        assert_eq!(
+            launch(&settings.recipes, OPERATIONS, &settings.regions, 1).err(),
+            Some(CannotLaunch::Gone)
+        );
     }
 
     #[test]

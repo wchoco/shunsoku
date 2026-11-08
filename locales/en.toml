@@ -229,6 +229,11 @@ no_values = "A step written as a table has no parameters"
 border_off_with_color_or_width = "border = false cannot go with a border color or width"
 no_such_region = "The saved region to capture is not found (choose it again if it was renamed or deleted)"
 
+# Recipes
+[recipe]
+# A recipe starting with a capture could not run when its hotkey was pressed, e.g. after a settings change (the recipe name follows)
+cannot_launch = "Could not run the recipe. Check the recipe in the settings: "
+
 # Capture steps that can start a recipe (recipe::Capture::label_key)
 [recipe.capture]
 select_capture = "Region capture"
