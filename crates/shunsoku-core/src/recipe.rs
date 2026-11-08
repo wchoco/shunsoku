@@ -409,8 +409,8 @@ pub enum Rejection {
     BadValue,
     /// 知らないキー。
     UnknownKey,
-    /// `op` が `appearance` でも `background` でもない（書いていないときも）。
-    NotAppearance,
+    /// `op` が表で書ける操作（`appearance`、`background`、`capture_region`）でない（書いていないときも）。
+    UnknownTableOp,
 }
 
 /// 検査を通った操作 1 つ。
@@ -463,8 +463,9 @@ pub enum Problem {
     BadValue(String),
     /// パラメータを添えた操作の知らないキー。
     UnknownKey(String),
-    /// パラメータを添えた操作の `op` が `appearance` でも `background` でもない（書いていないときも）。
-    NotAppearance,
+    /// パラメータを添えた操作の `op` が表で書ける操作（`appearance`、`background`、`capture_region`）でない（書いて
+    /// いないときも）。
+    UnknownTableOp,
     /// パラメータを添えた操作に、項目を 1 つも書いていない。
     NoValues,
     /// パラメータを添えた操作に、`border = false` と枠の色か太さを一緒に書いた。
@@ -654,7 +655,7 @@ fn check_rejected(rejected: &[Rejected], problems: &mut Vec<Problem>) {
             Rejection::OutOfRange => Problem::OutOfRange(r.key.as_str().to_owned()),
             Rejection::BadValue => Problem::BadValue(r.key.as_str().to_owned()),
             Rejection::UnknownKey => Problem::UnknownKey(r.key.as_str().to_owned()),
-            Rejection::NotAppearance => Problem::NotAppearance,
+            Rejection::UnknownTableOp => Problem::UnknownTableOp,
         });
     }
 }
@@ -1846,9 +1847,9 @@ mod tests {
             ),
             (
                 r#"[{ op = "copy", shadow = true }]"#,
-                vec![Problem::NotAppearance],
+                vec![Problem::UnknownTableOp],
             ),
-            (r#"[{ shadow = true }]"#, vec![Problem::NotAppearance]),
+            (r#"[{ shadow = true }]"#, vec![Problem::UnknownTableOp]),
             (r#"[{ op = "appearance" }]"#, vec![Problem::NoValues]),
             (
                 r##"[{ op = "appearance", border = false, border_color = "#FF0000" }]"##,

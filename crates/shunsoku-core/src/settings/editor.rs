@@ -82,7 +82,7 @@ impl Mark {
             Mark::Problem(Problem::OutOfRange) => "settings_gui.mark.out_of_range",
             Mark::Problem(Problem::BadValue) => "settings_gui.mark.bad_value",
             Mark::Problem(Problem::UnknownKey) => "settings_gui.mark.unknown_key",
-            Mark::Problem(Problem::NotAppearance) => "settings_gui.mark.not_appearance",
+            Mark::Problem(Problem::UnknownTableOp) => "settings_gui.mark.not_appearance",
             Mark::Problem(Problem::NoValues) => "settings_gui.mark.no_values",
             Mark::Problem(Problem::BorderOffWithColorOrWidth) => {
                 "settings_gui.mark.border_off_with_color_or_width"
@@ -1117,7 +1117,7 @@ mod tests {
             Mark::Problem(Problem::OutOfRange),
             Mark::Problem(Problem::BadValue),
             Mark::Problem(Problem::UnknownKey),
-            Mark::Problem(Problem::NotAppearance),
+            Mark::Problem(Problem::UnknownTableOp),
             Mark::Problem(Problem::NoValues),
             Mark::Problem(Problem::BorderOffWithColorOrWidth),
             Mark::Problem(Problem::NoSuchRegion),
@@ -1653,7 +1653,7 @@ mod tests {
             (r#"[{ op = "appearance", width = 3 }]"#, Problem::UnknownKey),
             (
                 r#"[{ op = "copy", shadow = true }]"#,
-                Problem::NotAppearance,
+                Problem::UnknownTableOp,
             ),
             (r#"[{ op = "appearance" }]"#, Problem::NoValues),
             (
