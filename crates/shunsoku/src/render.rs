@@ -25,8 +25,10 @@
 //! - コピーと保存の画像は、`render_image` で画像と書き込みを画像の大きさに描いてから作る（表示と同じ描き方に
 //!   するため。ADR-0006）。
 
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::ffi::c_void;
+use std::ops::Deref;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use shunsoku_core::annotate::toolbar::{Button, Layout, ToolSlot};
@@ -224,14 +226,22 @@ impl Canvas {
     /// 使い回す描き先 `slot` を大きさ `size` で返す。同じ大きさのものがあればそのまま（中身は描くときに
     /// `Renderer` が消す）、なければ前のものを返してから作り直す。作れなければ `slot` は空になる。
     ///
+    /// `slot` がほかの描き直しに借りられていれば（出している間に届いたメッセージで描き直したとき）、使い捨ての
+    /// 描き先を作って返す（`slot` には触れない）。
+    ///
     /// `UpdateLayeredWindow` は中身を写し取るので、出し終えた描き先は次の描き直しで使ってよい。
-    pub fn reuse(slot: &mut Option<Canvas>, size: Size) -> Result<&Canvas> {
-        if slot.as_ref().is_some_and(|canvas| canvas.size == size) {
-            return Ok(slot.as_ref().expect("checked above"));
+    pub fn reuse(slot: &RefCell<Option<Canvas>>, size: Size) -> Result<CanvasLease<'_>> {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return Ok(CanvasLease::Once(Canvas::new(size)?));
+        };
+        if slot.as_ref().is_none_or(|canvas| canvas.size != size) {
+            // 大きな DIB を 2 枚同時に持たないよう、先に返す
+            *slot = None;
+            *slot = Some(Canvas::new(size)?);
         }
-        // 大きな DIB を 2 枚同時に持たないよう、先に返す
-        *slot = None;
-        Ok(slot.insert(Canvas::new(size)?))
+        Ok(CanvasLease::Reused(RefMut::map(slot, |slot| {
+            slot.as_mut().expect("filled above")
+        })))
     }
 
     /// DIB を選んだメモリ DC（`UpdateLayeredWindow` の描き元）。
@@ -270,23 +280,80 @@ impl Drop for Canvas {
     }
 }
 
+/// `Canvas::reuse` が返す描き先。使い回すもの（借りている間はほかの描き直しに使わせない）か、使い捨てのもの。
+pub enum CanvasLease<'a> {
+    Reused(RefMut<'a, Canvas>),
+    Once(Canvas),
+}
+
+impl Deref for CanvasLease<'_> {
+    type Target = Canvas;
+
+    fn deref(&self) -> &Canvas {
+        match self {
+            CanvasLease::Reused(canvas) => canvas,
+            CanvasLease::Once(canvas) => canvas,
+        }
+    }
+}
+
 /// スクラップに表示する画像と、描き手（`Renderer`）がその画像から作った Direct2D のビットマップの作り置き。
 ///
 /// 描き直しのたびに画像全体を premultiplied にしてビットマップを作り直さないよう、初めて描いたときに作って
 /// 持っておく。画像はあとから差し替えられない（変わったら新しく作る）ので、作り置きが別の画像のものになることは
 /// ない。ビットマップは作ったレンダー ターゲットでしか使えないので、作った描き手の番号（`Renderer::id`）も持ち、
 /// 描き手が作り直されていたら（`D2DERR_RECREATE_TARGET` などで捨てたあと）古いものを捨てて作り直す。
-/// 作り置きはこの値と一緒に捨てる（スクラップを閉じたら返る）。
+/// 作り置きはこの値と一緒に捨てる（スクラップを閉じたら返る）。描き手を捨てたときも、その描き手で作った作り置きは
+/// 次に描くのを待たずに捨てる（`Kept`）。
 pub struct CachedImage {
     image: Image,
-    bitmap: RefCell<Option<(u64, ID2D1Bitmap)>>,
+    bitmap: Rc<BitmapSlot>,
+}
+
+/// 作り置きのビットマップと、それを作った描き手の番号（`Kept::id`）。
+type BitmapSlot = RefCell<Option<(u64, ID2D1Bitmap)>>;
+
+/// 描き手が作り置きにさせたビットマップの控え。描き手を捨てるとき（`Renderer` の drop）、ここから辿って捨てる。
+struct Kept {
+    /// 描き手ごとに違う番号。作り置きのビットマップを作った描き手を見分ける。
+    id: u64,
+    /// 作り置きにさせた `CachedImage` の置き場。閉じたスクラップのものは、次に作り置きを足すときに除く。
+    slots: RefCell<Vec<Weak<BitmapSlot>>>,
+}
+
+impl Kept {
+    fn new() -> Kept {
+        Kept {
+            id: RENDERER_IDS.fetch_add(1, Ordering::Relaxed),
+            slots: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn remember(&self, slot: &Rc<BitmapSlot>) {
+        let mut slots = self.slots.borrow_mut();
+        slots.retain(|slot| slot.strong_count() > 0);
+        slots.push(Rc::downgrade(slot));
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        for slot in self.slots.get_mut().iter().filter_map(Weak::upgrade) {
+            // ほかの描き手が作り直したものは残す
+            if let Ok(mut slot) = slot.try_borrow_mut()
+                && slot.as_ref().is_some_and(|(id, _)| *id == self.id)
+            {
+                *slot = None;
+            }
+        }
+    }
 }
 
 impl CachedImage {
     pub fn new(image: Image) -> CachedImage {
         CachedImage {
             image,
-            bitmap: RefCell::new(None),
+            bitmap: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -299,29 +366,53 @@ impl CachedImage {
         self.image
     }
 
-    /// `renderer` の描き手で使えるビットマップ。なければ（初めて描くとき、描き手が作り直されたとき）作る。
-    fn bitmap(&self, target: &ID2D1RenderTarget, renderer: u64) -> Result<ID2D1Bitmap> {
+    /// ビットマップを作り置きにしているか。
+    #[cfg(test)]
+    fn keeps_bitmap(&self) -> bool {
+        self.bitmap.borrow().is_some()
+    }
+
+    /// 画像を `dest` に伸び縮みさせて描く。縮めるときだけ線形補間にする。空の画像は描かない。
+    /// `kept` があればその描き手の作り置きを使い（なければ作って控えさせる）、なければその場で作って捨てる
+    /// （コピーと保存の使い捨ての描き手で、スクラップの描き手の作り置きを追い出さないため）。
+    fn draw(&self, target: &ID2D1RenderTarget, dest: Rect, kept: Option<&Kept>) -> Result<()> {
+        let size = self.image.size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+        let bitmap = match kept {
+            Some(kept) => self.bitmap(target, kept)?,
+            None => create_bitmap(target, &self.image)?,
+        };
+        draw_bitmap(target, &bitmap, size, dest);
+        Ok(())
+    }
+
+    /// `kept` の描き手で使えるビットマップ。なければ（初めて描くとき、描き手が作り直されたとき）作る。
+    fn bitmap(&self, target: &ID2D1RenderTarget, kept: &Kept) -> Result<ID2D1Bitmap> {
         let mut cached = self.bitmap.borrow_mut();
         if let Some((id, bitmap)) = cached.as_ref()
-            && *id == renderer
+            && *id == kept.id
         {
             return Ok(bitmap.clone());
         }
         // 別の描き手のものは、作る前に捨てる（2 枚ぶん持たない）
         *cached = None;
         let bitmap = create_bitmap(target, &self.image)?;
-        *cached = Some((renderer, bitmap.clone()));
+        *cached = Some((kept.id, bitmap.clone()));
+        kept.remember(&self.bitmap);
         Ok(bitmap)
     }
 }
 
-/// 描き手の番号の払い出し（`Renderer::id`）。
+/// 描き手の番号の払い出し（`Kept::id`）。
 static RENDERER_IDS: AtomicU64 = AtomicU64::new(0);
 
 /// Canvas に描く Direct2D の DC レンダー ターゲット。
 pub struct Renderer {
-    /// 描き手ごとに違う番号。作り置きのビットマップ（`CachedImage`）を作った描き手を見分ける。
-    id: u64,
+    /// この描き手で作ったビットマップの作り置き（`CachedImage`）の控え。描き手と一緒に捨て、作り置きも捨てさせる。
+    /// レンダー ターゲットより先に捨てる（フィールドは書いた順に drop される）。
+    kept: Kept,
     factory: ID2D1Factory,
     target: ID2D1DCRenderTarget,
     /// 倍率の表示を書く DirectWrite。初めて表示するときに作る。
@@ -348,7 +439,7 @@ impl Renderer {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let target = factory.CreateDCRenderTarget(&props)?;
             Ok(Renderer {
-                id: RENDERER_IDS.fetch_add(1, Ordering::Relaxed),
+                kept: Kept::new(),
                 factory,
                 target,
                 dwrite: None,
@@ -385,7 +476,7 @@ impl Renderer {
             None
         };
         let window = Rect::from_origin_size(Point::default(), canvas.size());
-        let renderer = self.id;
+        let kept = &self.kept;
         let mut caret = None;
         self.paint(canvas, |target| {
             // SAFETY: BeginDraw と EndDraw の間で呼ぶ
@@ -425,11 +516,7 @@ impl Renderer {
                     target.FillRectangle(&to_rect_f(image_rect), &brush);
                 }
             }
-            let size = image.image.size();
-            if size.width > 0 && size.height > 0 {
-                let bitmap = image.bitmap(target, renderer)?;
-                draw_bitmap(target, &bitmap, size, image_rect);
-            }
+            image.draw(target, image_rect, Some(kept))?;
             caret = draw_annotations(target, annotations, image_rect)?;
             if let Some(trim) = trim {
                 draw_trim_overlay(target, image_rect, trim)?;
@@ -439,7 +526,7 @@ impl Renderer {
             }
             match (magnified, &dwrite) {
                 (Some((m, scale)), Some(dwrite)) => {
-                    draw_trim_magnifier(target, dwrite, &image.image, window, m, scale)
+                    draw_trim_magnifier(target, dwrite, image.image(), window, m, scale)
                 }
                 _ => Ok(()),
             }
@@ -474,15 +561,16 @@ impl Renderer {
     }
 
     /// 画像と書き込みを画像の大きさの `canvas` に描く（コピーや保存で、表示と同じ描き方を使うため）。
+    /// 画像のビットマップは作り置きにしない（使い捨ての描き手で描くので）。
     pub fn paint_image(
         &self,
         canvas: &Canvas,
-        image: &Image,
+        image: &CachedImage,
         annotations: AnnotationLayer,
     ) -> Result<()> {
-        let rect = Rect::from_origin_size(Point::default(), image.size());
+        let rect = Rect::from_origin_size(Point::default(), image.image().size());
         self.paint(canvas, |target| {
-            draw_image(target, image, rect)?;
+            image.draw(target, rect, None)?;
             draw_annotations(target, annotations, rect).map(|_| ())
         })
     }
@@ -515,26 +603,17 @@ impl Renderer {
 }
 
 /// コピーと保存の画像を作る: 画像と書き込みを画像の画素の大きさに、表示と同じ描き方で描く。
-pub fn render_image(image: &Image, annotations: AnnotationLayer) -> Result<Image> {
-    if image.width() == 0 || image.height() == 0 {
-        return Ok(image.clone());
+pub fn render_image(image: &CachedImage, annotations: AnnotationLayer) -> Result<Image> {
+    let size = image.image().size();
+    // 大きさ 0 の描き先は作れない
+    if size.width == 0 || size.height == 0 {
+        return Ok(image.image().clone());
     }
-    let canvas = Canvas::new(image.size())?;
+    let canvas = Canvas::new(size)?;
     Renderer::new()?.paint_image(&canvas, image, annotations)?;
     canvas
         .to_image()
         .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED))
-}
-
-/// 画像を `dest` に伸び縮みさせて描く。縮めるときだけ線形補間にする。
-fn draw_image(target: &ID2D1RenderTarget, image: &Image, dest: Rect) -> Result<()> {
-    let size = image.size();
-    if size.width == 0 || size.height == 0 {
-        return Ok(());
-    }
-    let bitmap = create_bitmap(target, image)?;
-    draw_bitmap(target, &bitmap, size, dest);
-    Ok(())
 }
 
 /// 大きさ `size` の画像のビットマップを `dest` に伸び縮みさせて描く。縮めるときだけ線形補間にする。

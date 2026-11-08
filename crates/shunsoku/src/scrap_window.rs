@@ -12,7 +12,7 @@
 //! - drop でウィンドウを壊す。描き先も一緒に返す。
 //! - 書き込みの編集モードで消しゴムを選んでいる間のカーソル（`set_eraser_cursor`）もここで作る。
 
-use std::cell::{RefCell, RefMut};
+use std::cell::RefCell;
 
 use shunsoku_core::geometry::Rect;
 use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND};
@@ -179,8 +179,8 @@ impl ScrapWindow {
 
     /// 描き直しで使い回す描き先（`Canvas::reuse` に渡す）。`UpdateLayeredWindow` は中身を写し取るので、出し終えた
     /// 描き先は次の描き直しで使ってよい。
-    pub fn canvas(&self) -> RefMut<'_, Option<Canvas>> {
-        self.canvas.borrow_mut()
+    pub fn canvas(&self) -> &RefCell<Option<Canvas>> {
+        &self.canvas
     }
 
     pub fn hwnd(&self) -> HWND {

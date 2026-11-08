@@ -84,12 +84,12 @@ fn paint(
     display: Size,
     hit_alpha: Option<u8>,
 ) -> Image {
-    paint_on(&mut None, renderer, image, display, hit_alpha)
+    paint_on(&RefCell::new(None), renderer, image, display, hit_alpha)
 }
 
 /// `paint` と同じものを、描き先 `canvas` を使い回して（大きさが違えば作り直して）描いた画素。
 fn paint_on(
-    canvas: &mut Option<Canvas>,
+    canvas: &RefCell<Option<Canvas>>,
     renderer: &mut Renderer,
     image: &CachedImage,
     display: Size,
@@ -99,6 +99,7 @@ fn paint_on(
     let margin = appearance.margin() as u32;
     let window = Size::new(display.width + margin * 2, display.height + margin * 2);
     let canvas = Canvas::reuse(canvas, window).unwrap();
+    let canvas = &*canvas;
     let annotations = annotations();
     let size = image.image().size();
     let overlays = Overlays {
@@ -196,9 +197,9 @@ fn reused_canvas_paints_the_same_pixels_as_a_new_one() {
     ];
 
     let mut renderer = Renderer::new().unwrap();
-    let mut canvas = None;
+    let canvas = RefCell::new(None);
     for (i, (image, display, alpha)) in steps.iter().enumerate() {
-        let got = paint_on(&mut canvas, &mut renderer, image, *display, *alpha);
+        let got = paint_on(&canvas, &mut renderer, image, *display, *alpha);
         let want = paint(&mut renderer, image, *display, *alpha);
         assert!(got == want, "step {i}: the reused canvas drew other pixels");
         let margin = framed().margin() as u32;
@@ -217,4 +218,45 @@ fn reused_canvas_paints_the_same_pixels_as_a_new_one() {
         };
         assert_eq!(corner, expected, "step {i}");
     }
+}
+
+#[test]
+fn a_canvas_borrowed_by_an_outer_paint_does_not_stop_a_nested_one() {
+    // 出している間（`UpdateLayeredWindow` の中）に届いたメッセージで描き直すと、描き先はまだ借りられている
+    let size = Size::new(48, 40);
+    let image = CachedImage::new(solid(size, [0x10, 0x80, 0xF0, 0xFF]));
+    let mut renderer = Renderer::new().unwrap();
+    let canvas = RefCell::new(None);
+    let want = paint_on(&canvas, &mut renderer, &image, size, None);
+
+    let outer = Canvas::reuse(&canvas, want.size()).unwrap();
+    let got = paint_on(&canvas, &mut renderer, &image, size, None);
+    drop(outer);
+    assert!(got == want, "the nested paint drew other pixels");
+    // 外の描き直しが借りていた描き先は、そのあとも使い回せる
+    let again = paint_on(&canvas, &mut renderer, &image, size, None);
+    assert!(again == want, "the reused canvas drew other pixels");
+}
+
+#[test]
+fn dropping_the_renderer_returns_the_bitmaps_kept_for_it() {
+    // 描き手を作り直したとき（`D2DERR_RECREATE_TARGET` で捨てたときなど）、描き直していないスクラップにも古い
+    // 描き手のビットマップを残さない
+    let size = Size::new(48, 40);
+    let drawn = CachedImage::new(solid(size, [0x10, 0x80, 0xF0, 0xFF]));
+    let other = CachedImage::new(solid(size, [0xF0, 0x20, 0x40, 0xFF]));
+    let mut renderer = Renderer::new().unwrap();
+    paint(&mut renderer, &drawn, size, None);
+    paint(&mut renderer, &other, size, None);
+    assert!(drawn.keeps_bitmap() && other.keeps_bitmap());
+
+    drop(renderer);
+    assert!(
+        !drawn.keeps_bitmap(),
+        "the dropped renderer's bitmap is kept"
+    );
+    assert!(
+        !other.keeps_bitmap(),
+        "the dropped renderer's bitmap is kept"
+    );
 }
