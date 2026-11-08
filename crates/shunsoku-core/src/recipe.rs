@@ -894,9 +894,10 @@ pub struct Launch {
 pub struct Shown {
     /// 出したあとに進める残りの操作。出す前に当てる操作が今は実行できなければ、止まっている。
     pub run: Run,
-    /// 出す前に当てた操作の `Effect` のうち、出したあとに実行するもの。描き直し（`Effect::Redraw`）は、出すとき
-    /// に描くので除く。
-    pub effects: Vec<Effect>,
+    /// 出す前に当てた操作の `Effect` のうち、出したあとに実行するもの（当てた操作の id と、その `Effect`。当てた
+    /// 順）。描き直し（`Effect::Redraw`）は、出すときに描くので除く。出したあとに実行する `Effect` のない操作は
+    /// 入れない。
+    pub effects: Vec<(OperationId, Vec<Effect>)>,
 }
 
 impl Launch {
@@ -941,11 +942,13 @@ impl Launch {
                 values,
                 ..context.clone()
             };
-            effects.extend(
-                (op.run)(model, &context)
-                    .into_iter()
-                    .filter(|e| *e != Effect::Redraw),
-            );
+            let after_show: Vec<Effect> = (op.run)(model, &context)
+                .into_iter()
+                .filter(|e| *e != Effect::Redraw)
+                .collect();
+            if !after_show.is_empty() {
+                effects.push((op.id, after_show));
+            }
         }
         Shown {
             run: Run::new(self.rest),

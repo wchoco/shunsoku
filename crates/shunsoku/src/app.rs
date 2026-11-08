@@ -4410,10 +4410,8 @@ fn float_recipe_scrap(
         log::info!("the recipe waiting for a save was discarded");
     }
     log::info!("capture recipe started");
-    if !effects.is_empty() {
-        perform(hwnd, OpContext::default(), |_, _| {
-            Some((recipe::APPEARANCE, effects))
-        });
+    for (op_id, effects) in effects {
+        perform(hwnd, OpContext::default(), |_, _| Some((op_id, effects)));
     }
     drive_recipe(hwnd, run);
     Ok(())
