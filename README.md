@@ -72,12 +72,14 @@ shunsoku-cli capture region <名前> [出力のオプション]
 shunsoku-cli capture select [出力のオプション]
 shunsoku-cli capture active [--delay <秒>] [出力のオプション]
 shunsoku-cli monitors
+shunsoku-cli open <path>
 shunsoku-cli --help | --version
 ```
 
 - 既定では、設定の保存先に保存し、保存した絶対パスを出します。
 - 出力のオプション: `--scrap`（スクラップを出す）、`--copy`（クリップボードにコピー）、`--no-save`（保存しない。`--scrap` か `--copy` と合わせて使う）、`--out <path>`（このファイルに保存。`.png` だけ）、`--quiet`（トレイ通知を出さない）。
-- 終了コード: 0 成功 / 1 キャプチャの失敗 / 2 引数の誤り / 3 常駐本体に依頼できない・バージョンが合わない / 4 ユーザーが取り消した。
+- `open <path>` は、スクラップファイル（`.shunsoku`）をトレイの「開く…」と同じように新しいスクラップとして開きます。
+- 終了コード: 0 成功 / 1 キャプチャの失敗 / 2 引数の誤り / 3 常駐本体に依頼できない・バージョンが合わない / 4 ユーザーが取り消した / 5 開くファイルを読めない / 6 スクラップファイルとして正しくない / 7 新しい版の shunsoku で作られたファイル。
 
 詳しくは `shunsoku-cli --help` を見てください。
 

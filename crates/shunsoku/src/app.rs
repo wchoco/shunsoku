@@ -4353,28 +4353,39 @@ fn open_scrap_file() {
             return;
         }
     };
-    let file = match scrap_file::read(&path) {
-        Ok(file) => file,
-        Err(e) => {
-            log::error!("could not open {}: {e}", path.display());
-            notify_user(
-                notify::Level::Error,
-                &format!("{}\n{}", text(e.message_key()), path.display()),
-            );
-            return;
+    let message = match open_scrap_path(&path) {
+        Ok(()) => return,
+        Err(OpenFailure::Load(e)) => format!("{}\n{}", text(e.message_key()), path.display()),
+        Err(OpenFailure::Float(reason)) => {
+            format!("{}\n{reason}", text("scrap_file.unreadable"))
         }
     };
+    notify_user(notify::Level::Error, &message);
+}
+
+/// スクラップファイルを開けなかったわけ。
+enum OpenFailure {
+    /// ファイルを読めない・正しくない・新しい版。
+    Load(scrap_file::LoadError),
+    /// 読めたが、スクラップを浮かべられなかった（ウィンドウを作れない など）。
+    Float(String),
+}
+
+/// `path` のスクラップファイルを読み、新しいスクラップとしてカーソルのあるモニタの中央に浮かべてフォーカスを移す
+/// （トレイの「開く…」と CLI の `open`）。通知は出さない（呼び出し元が出す・返す）。
+fn open_scrap_path(path: &Path) -> std::result::Result<(), OpenFailure> {
+    let file = scrap_file::read(path).map_err(|e| {
+        log::error!("could not open {}: {e}", path.display());
+        OpenFailure::Load(e)
+    })?;
     let (model, content) = file.into_scrap(cursor_monitor());
     let scrap_file::Content::Image(image) = content;
-    match float_model(model, image, true) {
-        Ok(_) => log::info!("opened {}", path.display()),
-        Err(reason) => {
-            notify_user(
-                notify::Level::Error,
-                &format!("{}\n{reason}", text("scrap_file.unreadable")),
-            );
-        }
-    }
+    float_model(model, image, true).map_err(|reason| {
+        log::error!("could not float {}: {reason}", path.display());
+        OpenFailure::Float(reason)
+    })?;
+    log::info!("opened {}", path.display());
+    Ok(())
 }
 
 /// カーソルのあるモニタの矩形（スクリーン座標）。わからなければメインモニタ。

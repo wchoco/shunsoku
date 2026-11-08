@@ -9,6 +9,8 @@ pub enum Command {
     Capture(Capture),
     /// `monitors`: モニタの番号・名前・解像度・拡大率を出す。
     Monitors,
+    /// `open <path>`: 常駐本体にスクラップファイルを開かせる。
+    Open(Open),
     /// `--help`（`-h`）。どこにあっても、ほかの引数より優先する。
     Help,
     /// `--version`（`-V`）。どこにあっても、ほかの引数より優先する。
@@ -30,6 +32,9 @@ pub const USAGE: &str = "\
       アクティブウィンドウを撮ります。--delay（0〜60 秒）で、撮る前に待ちます。
   shunsoku-cli monitors
       モニタの番号・名前・解像度・拡大率を出します。
+  shunsoku-cli open <path>
+      スクラップファイル（拡張子は .shunsoku だけ）を、新しいスクラップとして開きます。
+      カーソルのあるモニタの中央に、倍率 100%、見た目は全体の既定値で浮かびます。
   shunsoku-cli --help | --version
 
 capture の出力のオプション（既定は保存だけ）:
@@ -44,6 +49,8 @@ capture の出力のオプション（既定は保存だけ）:
 終了コード:
   0 成功 / 1 キャプチャの失敗 / 2 引数の誤り / 3 常駐本体に依頼できない・バージョンが合わない
   4 ユーザーが取り消した
+  open の失敗: 5 ファイルを読めない / 6 スクラップファイルとして正しくない（壊れている・スクラップファイルでない）
+  7 新しい版の shunsoku で作られたファイル
 ";
 
 /// `capture` の依頼。
@@ -95,6 +102,13 @@ pub enum Target {
     Active { delay: u32 },
 }
 
+/// `open` の依頼。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Open {
+    /// 開くスクラップファイル。CLI は引数のまま持ち、常駐本体に送る前に絶対パスにする。
+    pub path: String,
+}
+
 /// `--delay` の上限（秒）。
 pub const MAX_DELAY: u32 = 60;
 
@@ -133,6 +147,15 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Command, ArgError> {
         )),
         ["monitors"] => Ok(Command::Monitors),
         ["monitors", extra, ..] => Err(error(&format!("余分な引数があります: {extra}"))),
+        ["open", path] if !path.starts_with("--") => {
+            check_scrap_file(path)?;
+            Ok(Command::Open(Open {
+                path: (*path).to_owned(),
+            }))
+        }
+        ["open", arg] => Err(unexpected(arg)),
+        ["open"] => Err(error("開くスクラップファイルを指定してください")),
+        ["open", _, extra, ..] => Err(error(&format!("余分な引数があります: {extra}"))),
         [command, ..] => Err(error(&format!("不明なコマンドです: {command}"))),
         [] => Err(error("コマンドを指定してください")),
     }
@@ -288,18 +311,59 @@ fn parse_out(value: Option<&str>) -> Result<String, ArgError> {
     Ok(path.to_owned())
 }
 
-/// `--out` の拡張子が `.png`（大文字・小文字は問わない）か。区切りは `\` と `/` のどちらでも、ホストによらず同じに判定する。
+/// `--out` の拡張子が `.png`（大文字・小文字は問わない）か。
 fn check_png(path: &str) -> Result<(), ArgError> {
-    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    let is_png = name
-        .rsplit_once('.')
-        .is_some_and(|(stem, ext)| !stem.is_empty() && ext.eq_ignore_ascii_case("png"));
-    if !is_png {
+    if !has_extension(path, "png") {
         return Err(error(&format!(
             "--out の拡張子は .png にしてください: {path}"
         )));
     }
     Ok(())
+}
+
+/// `open` のパスの拡張子が `.shunsoku`（大文字・小文字は問わない）か。
+fn check_scrap_file(path: &str) -> Result<(), ArgError> {
+    if !has_extension(path, crate::scrap_file::EXTENSION) {
+        return Err(error(&format!(
+            "開けるのはスクラップファイル（拡張子 .{}）だけです: {path}",
+            crate::scrap_file::EXTENSION
+        )));
+    }
+    Ok(())
+}
+
+/// ファイル名の拡張子が `extension` か（大文字・小文字は問わない）。区切りは `\` と `/` のどちらでも、
+/// ホストによらず同じに判定する。拡張子だけの名前（`.png`）は拡張子を持たないとみなす。
+fn has_extension(path: &str, extension: &str) -> bool {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    name.rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && ext.eq_ignore_ascii_case(extension))
+}
+
+/// 常駐本体に届いた `open` の依頼を確かめ直す（パイプの相手を信じきらない）。常駐本体は管理者として
+/// 動くことがあるので、読みに行く先を絞る: CLI が絶対パスにしてから送るので絶対パスであること、
+/// デバイスの名前空間（`\\.\`・`\\?\`・`\??\`）と、UNC の名前付きパイプ・メールスロット
+/// （`\\<サーバー>\pipe\`・`\\<サーバー>\mailslot\`）でないこと、拡張子が `.shunsoku` であること。
+pub fn check_open(open: &Open) -> Result<(), ArgError> {
+    let path = open.path.as_str();
+    if !is_absolute_file_path(path) || is_ipc_share(path) {
+        return Err(error(&format!(
+            "開くファイルは絶対パス（ドライブ名か \\\\<サーバー>\\<共有> から）にしてください: {path}"
+        )));
+    }
+    check_scrap_file(path)
+}
+
+/// UNC の `\\<サーバー>\pipe\...`・`\\<サーバー>\mailslot\...`（ファイルではなく、プロセス間の通信の口）か。
+fn is_ipc_share(path: &str) -> bool {
+    let separator = |c: char| c == '\\' || c == '/';
+    let mut parts = path.split(separator);
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(""), Some(""), Some(_server), Some(share)) => {
+            share.eq_ignore_ascii_case("pipe") || share.eq_ignore_ascii_case("mailslot")
+        }
+        _ => false,
+    }
 }
 
 /// 常駐本体に届いた `capture` の依頼を、CLI の引数と同じ規則で確かめ直す（パイプの相手を信じきらない）。
@@ -735,5 +799,69 @@ mod tests {
     #[test]
     fn a_rect_reaching_past_i32_is_an_argument_error() {
         assert!(parse(&["capture", "rect", "2147483000,0,1000,1"]).is_err());
+    }
+
+    fn open_of(path: &str) -> Result<Command, ArgError> {
+        Ok(Command::Open(Open {
+            path: path.to_owned(),
+        }))
+    }
+
+    #[test]
+    fn open_takes_the_path_of_a_scrap_file() {
+        assert_eq!(
+            parse(&["open", r"shots\a.shunsoku"]),
+            open_of(r"shots\a.shunsoku")
+        );
+        assert_eq!(
+            parse(&["open", "C:/a b/メモ.SHUNSOKU"]),
+            open_of("C:/a b/メモ.SHUNSOKU")
+        );
+    }
+
+    #[test]
+    fn open_needs_exactly_one_scrap_file() {
+        let bad: [&[&str]; 6] = [
+            &["open"],
+            &["open", "a.shunsoku", "b.shunsoku"],
+            &["open", "--scrap", "a.shunsoku"],
+            &["open", "a.png"],
+            &["open", ".shunsoku"],
+            &["open", r"C:\a.shunsoku\"],
+        ];
+        for args in bad {
+            assert!(parse(args).is_err(), "{args:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn the_resident_accepts_only_an_absolute_scrap_file_path() {
+        let check = |path: &str| {
+            check_open(&Open {
+                path: path.to_owned(),
+            })
+        };
+        for path in [
+            r"C:\shots\a.shunsoku",
+            "d:/A.Shunsoku",
+            r"\\server\share\a.shunsoku",
+        ] {
+            assert!(check(path).is_ok(), "{path} should be accepted");
+        }
+        for path in [
+            "a.shunsoku",
+            r"C:a.shunsoku",
+            r"\a.shunsoku",
+            r"\\.\C:\a.shunsoku",
+            r"\\?\C:\a.shunsoku",
+            r"\??\C:\a.shunsoku",
+            r"\\.\pipe\a.shunsoku",
+            r"\\localhost\pipe\a.shunsoku",
+            r"\\localhost\PIPE\a.shunsoku",
+            r"\\localhost\mailslot\a.shunsoku",
+            r"C:\Windows\a.dll",
+        ] {
+            assert!(check(path).is_err(), "{path} should be refused");
+        }
     }
 }
