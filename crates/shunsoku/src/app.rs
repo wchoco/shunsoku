@@ -4322,19 +4322,22 @@ fn create_blank_scrap(rect: Rect) {
         rect.left,
         rect.top
     );
-    match float_model(model, image, true) {
-        Ok(hwnd) => {
-            if let Some(op) = ops::find("annotate") {
-                run_scrap_operation(hwnd, op, OpContext::default());
-            }
-        }
-        Err(reason) => {
-            notify_user(
-                notify::Level::Error,
-                &format!("{}\n{reason}", text("blank_scrap.failed")),
-            );
-        }
+    if let Err(reason) = float_model_to_edit(model, image) {
+        notify_user(
+            notify::Level::Error,
+            &format!("{}\n{reason}", text("blank_scrap.failed")),
+        );
     }
+}
+
+/// `model` のスクラップを浮かべてフォーカスを移し、すぐに書き込みの編集モードに入る（白紙スクラップを作った
+/// ときと、何も書かれていない透明な白紙スクラップを開いたとき）。出せなければ理由を返す。
+fn float_model_to_edit(model: ScrapModel, image: Image) -> std::result::Result<HWND, String> {
+    let hwnd = float_model(model, image, true)?;
+    if let Some(op) = ops::find("annotate") {
+        run_scrap_operation(hwnd, op, OpContext::default());
+    }
+    Ok(hwnd)
 }
 
 /// トレイの「開く…」: スクラップファイルを選ばせ、新しいスクラップとしてカーソルのあるモニタの中央に浮かべる。
@@ -4401,11 +4404,12 @@ fn open_scrap_path(path: &Path) -> std::result::Result<(), OpenFailure> {
             .ok_or_else(|| failed(format!("could not paint the blank scrap of {size:?}")))?,
     };
     // 何も書かれていない透明な白紙は、作ったときと同じく書き込みの編集モードで浮かべる（何も書かずに抜けると捨てる）
-    let edit = model.is_empty_transparent_blank();
-    let hwnd = float_model(model, image, true).map_err(failed)?;
-    if edit && let Some(op) = ops::find("annotate") {
-        run_scrap_operation(hwnd, op, OpContext::default());
+    if model.is_empty_transparent_blank() {
+        float_model_to_edit(model, image)
+    } else {
+        float_model(model, image, true)
     }
+    .map_err(failed)?;
     log::info!("opened {}", path.display());
     Ok(())
 }
