@@ -23,7 +23,56 @@ use crate::annotate::{
 };
 use crate::geometry::{Point, Rect, Size};
 use crate::image::Image;
-use crate::settings::{DpiScaling, ScrapAppearance};
+use crate::settings::{DpiScaling, Rgb, ScrapAppearance};
+
+/// 白紙スクラップの背景色。背景色は見た目ではなく中身なので、「見た目を既定に戻す」では戻らない。
+/// 設定ファイルでは `#RRGGBB` で書く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Background {
+    /// 不透明な一色。
+    Color(Rgb),
+}
+
+impl Background {
+    /// 白（設定の既定値）。
+    pub const WHITE: Background = Background::Color(Rgb(0xFF, 0xFF, 0xFF));
+
+    /// 下地の 1 画素の BGRA（premultiply しない）。
+    fn bgra(self) -> [u8; 4] {
+        match self {
+            Background::Color(Rgb(r, g, b)) => [b, g, r, 0xFF],
+        }
+    }
+}
+
+impl Default for Background {
+    fn default() -> Background {
+        Background::WHITE
+    }
+}
+
+/// `#RRGGBB`（大文字）。
+impl std::fmt::Display for Background {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Background::Color(c) => c.fmt(f),
+        }
+    }
+}
+
+/// `#RRGGBB`（大文字と小文字を問わない）でない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotBackground;
+
+impl std::str::FromStr for Background {
+    type Err = NotBackground;
+
+    fn from_str(s: &str) -> Result<Background, NotBackground> {
+        s.parse::<Rgb>()
+            .map(Background::Color)
+            .map_err(|_| NotBackground)
+    }
+}
 
 /// 書き込みの当たり判定の、線の外の広さ（96 DPI での画面の画素。モニタの DPI で換算する）。
 const HIT_SLOP: u32 = 4;
@@ -188,6 +237,8 @@ pub struct ScrapModel {
     trimmed: Option<Rect>,
     /// 書き込み。元の画像（トリム前）の画素の座標で持つ。
     annotations: Annotations,
+    /// 白紙スクラップなら背景色。画像を持つスクラップは None。
+    background: Option<Background>,
 }
 
 impl ScrapModel {
@@ -203,7 +254,29 @@ impl ScrapModel {
             compact: None,
             trimmed: None,
             annotations: Annotations::default(),
+            background: None,
         }
+    }
+
+    /// 白紙スクラップ。`position` に `size` の大きさで、`background` の一色を下地にする。
+    pub fn blank(position: Point, size: Size, background: Background) -> ScrapModel {
+        ScrapModel {
+            background: Some(background),
+            ..ScrapModel::new(position, size)
+        }
+    }
+
+    /// 白紙スクラップの背景色。画像を持つスクラップなら None。
+    pub fn background(&self) -> Option<Background> {
+        self.background
+    }
+
+    /// 白紙スクラップの元の画像に当たる下地（大きさが `image_size` の、背景色の一色）。画素は持たずに背景色から
+    /// 作るので、ごみ箱は白紙スクラップの画素を退避しない。画像を持つスクラップなら None。
+    pub fn blank_image(&self) -> Option<Image> {
+        let bgra = self.background?.bgra();
+        let count = self.image_size.width as usize * self.image_size.height as usize;
+        Image::from_bgra(self.image_size, bgra.repeat(count))
     }
 
     /// コンパクト表示に畳んでいるか。
@@ -219,6 +292,7 @@ impl ScrapModel {
     /// `before` と描く中身が同じか（位置のほかは変わっていない）。同じならウィンドウを動かすだけでよい。
     pub fn same_content(&self, before: &ScrapModel) -> bool {
         self.image_size == before.image_size
+            && self.background == before.background
             && self.image_rect().size() == before.image_rect().size()
             && self.display_size() == before.display_size()
             && self.mode == before.mode
@@ -1095,6 +1169,35 @@ mod tests {
         let scrap = ScrapModel::new(Point::new(-100, 50), Size::new(300, 200));
         assert_eq!(scrap.mode, Mode::Normal);
         assert_eq!(scrap.image_rect(), Rect::new(-100, 50, 200, 250));
+    }
+
+    #[test]
+    fn a_blank_scrap_has_the_chosen_size_and_is_painted_with_its_background() {
+        let white = Background::Color(Rgb(0xFF, 0xFF, 0xFF));
+        let scrap = ScrapModel::blank(Point::new(10, 20), Size::new(3, 2), white);
+        assert_eq!(scrap.image_rect(), Rect::new(10, 20, 13, 22));
+        assert_eq!(scrap.background(), Some(white));
+        let image = scrap.blank_image().unwrap();
+        assert_eq!(image.size(), Size::new(3, 2));
+        assert_eq!(image.pixel(0, 0), [0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(image.pixel(2, 1), [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn a_blank_scrap_paints_its_background_in_bgra() {
+        let colour = Background::Color(Rgb(0x10, 0x20, 0x30));
+        let scrap = ScrapModel::blank(Point::default(), Size::new(1, 1), colour);
+        assert_eq!(
+            scrap.blank_image().unwrap().pixel(0, 0),
+            [0x30, 0x20, 0x10, 0xFF]
+        );
+    }
+
+    #[test]
+    fn a_captured_scrap_has_no_background_of_its_own() {
+        let scrap = ScrapModel::new(Point::default(), Size::new(3, 2));
+        assert_eq!(scrap.background(), None);
+        assert_eq!(scrap.blank_image(), None);
     }
 
     #[test]

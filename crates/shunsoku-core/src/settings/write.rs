@@ -17,7 +17,7 @@ use super::{
     ANNOTATION_FONT_SIZE_RANGE, ANNOTATION_WIDTH_RANGE, AnnotationDefaults, BORDER_WIDTH_RANGE,
     DEFAULT_REGION_FILE_NAME_TEMPLATE, DpiScaling, General, HotkeyAction, Hotkeys, LogLevel,
     OPACITY_RANGE, Reader, Region, ScrapAppearance, SelectionScreen, Settings, TRASH_LIMIT_RANGE,
-    VERSION, dpi_scaling, in_range, language, log_level, non_empty_str, optional_chord,
+    VERSION, background, dpi_scaling, in_range, language, log_level, non_empty_str, optional_chord,
     optional_gesture, read_regions_at, recipe_steps, region_number, rgb, save_dir, selection_mode,
 };
 use crate::i18n::Language;
@@ -276,6 +276,14 @@ fn write_annotation(t: &mut dyn TableLike, a: &AnnotationDefaults) {
     put(t, "font", non_empty_str, Some(d.font), &a.font, |s| {
         Some(s.as_str().into())
     });
+    put(
+        t,
+        "background",
+        background,
+        Some(d.background),
+        &a.background,
+        |b| Some(b.to_string().into()),
+    );
 }
 
 fn write_selection(t: &mut dyn TableLike, s: &SelectionScreen) {
@@ -650,6 +658,7 @@ mod tests {
     use super::*;
     use crate::geometry::Rect;
     use crate::keys::Chord;
+    use crate::scrap::Background;
     use crate::scrap::ops::MouseGesture;
     use crate::settings::{Rgb, load};
 
@@ -1144,6 +1153,25 @@ font = "Meiryo"     # 書体
         let read = load(&out).0.annotation;
         assert_eq!(read.color, Rgb(0, 0, 0));
         assert_eq!(read.font, "Meiryo");
+    }
+
+    #[test]
+    fn the_blank_scrap_background_and_hotkey_are_written_and_read_back() {
+        let out = written("version = 1\n", |s| {
+            s.annotation.background = Background::Color(Rgb(0x12, 0x34, 0x56));
+            s.hotkeys.blank_scrap = Some("Ctrl+Alt+N".parse().unwrap());
+        });
+        let (read, issues) = load(&out);
+        assert_eq!(issues, vec![]);
+        assert_eq!(
+            read.annotation.background,
+            Background::Color(Rgb(0x12, 0x34, 0x56))
+        );
+        assert_eq!(
+            read.hotkeys.blank_scrap,
+            Some("Ctrl+Alt+N".parse().unwrap())
+        );
+        assert!(out.contains("background = \"#123456\""), "{out}");
     }
 
     #[test]

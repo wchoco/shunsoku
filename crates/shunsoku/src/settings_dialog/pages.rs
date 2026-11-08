@@ -2,6 +2,7 @@
 
 use super::fields::{Field, TemplateOf};
 use super::{FIELD_X, LABEL_WIDTH, PAGE_WIDTH, PageBuilder};
+use shunsoku_core::settings::SettingsItem;
 
 /// 行の間隔（欄 1 行）。
 const ROW: i16 = 20;
@@ -88,4 +89,23 @@ pub(super) fn annotation(b: &mut PageBuilder) {
     b.choice(Field::AnnotationFont, FIELD_X, y, FIELD_WIDTH, 120);
     y += ROW + 4;
     b.label("settings_gui.annotation.hint", 0, y, PAGE_WIDTH, 20);
+    // 白紙スクラップは書き込むための台紙なので、作るホットキーと背景色もこのタブに置く
+    y += 20 + 8;
+    b.label(
+        "settings_gui.annotation.blank_scrap",
+        0,
+        y + 2,
+        LABEL_WIDTH,
+        10,
+    );
+    b.chord_field(SettingsItem::BlankScrapHotkey, FIELD_X, y, 110);
+    y += 34;
+    b.label(
+        "settings_gui.annotation.blank_background",
+        0,
+        y + 2,
+        LABEL_WIDTH,
+        10,
+    );
+    b.color_field(Field::BlankBackground, FIELD_X, y);
 }
