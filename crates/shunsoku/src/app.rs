@@ -4304,8 +4304,8 @@ fn float_model(model: ScrapModel, image: Image, focus: bool) -> std::result::Res
     }
 }
 
-/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移し、すぐに書き込みの
-/// 編集モードに入る。出せなければ通知する。
+/// `rect`（スクリーン座標）に、設定の既定の背景色の白紙スクラップを浮かべてフォーカスを移す。背景が透明なときだけ
+/// すぐに書き込みの編集モードに入る（core の `ScrapModel::starts_in_edit_mode`）。出せなければ通知する。
 fn create_blank_scrap(rect: Rect) {
     let Some(background) = with_app(|app| app.settings.annotation.background) else {
         return;
@@ -4322,7 +4322,7 @@ fn create_blank_scrap(rect: Rect) {
         rect.left,
         rect.top
     );
-    if let Err(reason) = float_model_to_edit(model, image) {
+    if let Err(reason) = float_new_model(model, image) {
         notify_user(
             notify::Level::Error,
             &format!("{}\n{reason}", text("blank_scrap.failed")),
@@ -4330,11 +4330,12 @@ fn create_blank_scrap(rect: Rect) {
     }
 }
 
-/// `model` のスクラップを浮かべてフォーカスを移し、すぐに書き込みの編集モードに入る（白紙スクラップを作った
-/// ときと、何も書かれていない透明な白紙スクラップを開いたとき）。出せなければ理由を返す。
-fn float_model_to_edit(model: ScrapModel, image: Image) -> std::result::Result<HWND, String> {
+/// 作った・開いた `model` のスクラップを浮かべてフォーカスを移す。core の `ScrapModel::starts_in_edit_mode` なら
+/// （何も書かれていない透明な白紙）すぐに書き込みの編集モードに入る。出せなければ理由を返す。
+fn float_new_model(model: ScrapModel, image: Image) -> std::result::Result<HWND, String> {
+    let edit = model.starts_in_edit_mode();
     let hwnd = float_model(model, image, true)?;
-    if let Some(op) = ops::find("annotate") {
+    if edit && let Some(op) = ops::find("annotate") {
         run_scrap_operation(hwnd, op, OpContext::default());
     }
     Ok(hwnd)
@@ -4404,12 +4405,7 @@ fn open_scrap_path(path: &Path) -> std::result::Result<(), OpenFailure> {
             .ok_or_else(|| failed(format!("could not paint the blank scrap of {size:?}")))?,
     };
     // 何も書かれていない透明な白紙は、作ったときと同じく書き込みの編集モードで浮かべる（何も書かずに抜けると捨てる）
-    if model.is_empty_transparent_blank() {
-        float_model_to_edit(model, image)
-    } else {
-        float_model(model, image, true)
-    }
-    .map_err(failed)?;
+    float_new_model(model, image).map_err(failed)?;
     log::info!("opened {}", path.display());
     Ok(())
 }

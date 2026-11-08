@@ -329,6 +329,13 @@ impl ScrapModel {
         self.is_transparent_blank() && self.annotations.is_empty()
     }
 
+    /// 浮かべたらすぐ書き込みの編集モードに入るか。白紙スクラップを作ったとき（ホットキー・トレイ・レシピの
+    /// どの作り方でも）と、スクラップファイルを開いたときに、この規則で決める。入るのは何も書かれていない透明な
+    /// 白紙だけ（見えずにつかめるだけの物にしないため。何も書かずに抜けると捨てる）。不透明な白紙はそのまま浮かぶ。
+    pub fn starts_in_edit_mode(&self) -> bool {
+        self.is_empty_transparent_blank()
+    }
+
     /// 白紙スクラップの元の画像に当たる下地（大きさが `image_size` の、背景色の一色）。画素は持たずに背景色から
     /// 作るので、ごみ箱は白紙スクラップの画素を退避しない。画像を持つスクラップなら None。
     pub fn blank_image(&self) -> Option<Image> {
@@ -1323,6 +1330,28 @@ mod tests {
         written.edit_input(EditInput::Leave);
         assert_eq!(written.annotations().items().len(), 1);
         assert!(!written.is_empty_transparent_blank());
+    }
+
+    #[test]
+    fn only_a_transparent_blank_scrap_with_nothing_written_starts_in_edit_mode() {
+        let size = Size::new(4, 4);
+        let transparent = ScrapModel::blank(Point::default(), size, Background::Transparent);
+        assert!(transparent.starts_in_edit_mode());
+        assert!(
+            !ScrapModel::blank(Point::default(), size, Background::WHITE).starts_in_edit_mode()
+        );
+        let dark = Background::Color(Rgb(0x21, 0x21, 0x21));
+        assert!(!ScrapModel::blank(Point::default(), size, dark).starts_in_edit_mode());
+        assert!(!ScrapModel::new(Point::default(), size).starts_in_edit_mode());
+        let mut written = transparent.clone();
+        written.start_editing(Style::default());
+        written.edit_input(EditInput::Press(Point::new(0, 0)));
+        written.edit_input(EditInput::Move {
+            at: Point::new(3, 3),
+            shift: false,
+        });
+        written.edit_input(EditInput::Leave);
+        assert!(!written.starts_in_edit_mode());
     }
 
     #[test]

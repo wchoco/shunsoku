@@ -53,7 +53,8 @@
 //! width = 3                                    # 1〜64（画像の画素）
 //! font_size = 16                               # 文字の大きさ。1〜256（画像の画素）
 //! font = "Yu Gothic UI"                        # 文字の書体。入っていなければ代わりの書体で描く
-//! background = "#FFFFFF"                       # 新しく作る白紙スクラップの背景色（"transparent" で透明）
+//! background = "#FFFFFF"                       # 新しく作る白紙スクラップの背景色（"transparent" で透明）。
+//!                                              #   透明なときだけ、作るとすぐ書き込みの編集モードに入る
 //!
 //! [selection]                                  # 範囲選択の画面
 //! mode = "normal"                              # 開いたときのモード: normal / precise
@@ -407,7 +408,8 @@ pub struct AnnotationDefaults {
     pub font_size: u32,
     /// 文字の書体の名前。入っていない書体でも誤りにはせず、描くときに DirectWrite が代わりの書体で描く。
     pub font: String,
-    /// 新しく作る白紙スクラップの背景色。作ったあとの白紙スクラップは、作ったときの色を持つ。
+    /// 新しく作る白紙スクラップの背景色。作ったあとの白紙スクラップは、作ったときの色を持つ。透明なときだけ、
+    /// 作るとすぐ書き込みの編集モードに入る（`ScrapModel::starts_in_edit_mode`）。
     pub background: Background,
 }
 
