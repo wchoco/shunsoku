@@ -66,7 +66,7 @@ impl Mark {
             Mark::Problem(Problem::DuplicateName) => "settings_gui.mark.duplicate_name",
             Mark::Problem(Problem::NoSteps) => "settings_gui.mark.no_steps",
             Mark::Problem(Problem::NotAStep) => "settings_gui.mark.not_a_step",
-            Mark::Problem(Problem::CloseNotLast) => "settings_gui.mark.close_not_last",
+            Mark::Problem(Problem::LastOnlyNotLast) => "settings_gui.mark.last_only_not_last",
             Mark::Problem(Problem::OutOfRange) => "settings_gui.mark.out_of_range",
             Mark::Problem(Problem::BadValue) => "settings_gui.mark.bad_value",
             Mark::Problem(Problem::UnknownKey) => "settings_gui.mark.unknown_key",
@@ -319,8 +319,9 @@ impl Editor {
     }
 
     /// レシピ `index` の「操作を足す」で選べるもの。値のない操作（表の順）と、最後に見た目を指定する手。値のない
-    /// 操作は、レシピに入れられる操作（`recipe::can_be_step`）のうち、`close` で終わるレシピには `close` を出さない
-    /// （`add_step` は `close` の前に足すので、2 つ目の `close` は最後に置けない）。`index` のレシピがなければ空。
+    /// 操作は、レシピに入れられる操作（`recipe::can_be_step`）。最後にだけ置ける操作（`close`、`annotate`）で終わる
+    /// レシピには最後にだけ置ける操作を出さない（`add_step` はその前に足すので、2 つ目は最後に置けない）。`index` の
+    /// レシピがなければ空。
     pub fn step_choices(&self, index: usize) -> Vec<StepChoice> {
         let Some(r) = self.draft.recipes.get(index) else {
             return Vec::new();
@@ -339,7 +340,7 @@ impl Editor {
     }
 
     /// レシピ `index` に `choice` を足す。見た目を指定する手は、全部の項目が「変えない」（そのままでは
-    /// `NoValues`）。レシピが `close` で終わっていれば、その前に入れる（`close` は最後にだけ置けるため）。入れた
+    /// `NoValues`）。レシピが最後にだけ置ける操作（`close`、`annotate`）で終わっていれば、その前に入れる。入れた
     /// 位置を返す。`index` のレシピがなければ何もせず None。
     pub fn add_step(&mut self, index: usize, choice: impl Into<StepChoice>) -> Option<usize> {
         let steps = &mut self.draft.recipes.get_mut(index)?.steps;
@@ -921,7 +922,7 @@ mod tests {
             Mark::Problem(Problem::DuplicateName),
             Mark::Problem(Problem::NoSteps),
             Mark::Problem(Problem::NotAStep),
-            Mark::Problem(Problem::CloseNotLast),
+            Mark::Problem(Problem::LastOnlyNotLast),
             Mark::Problem(Problem::OutOfRange),
             Mark::Problem(Problem::BadValue),
             Mark::Problem(Problem::UnknownKey),
@@ -1334,11 +1335,11 @@ mod tests {
         let mut editor = Editor::new(Settings::default());
         editor.add_recipe("R");
         let ids = choice_ids(&editor, 0);
-        for id in ["copy", "zoom_in", "toggle_compact", "close"] {
+        for id in ["copy", "zoom_in", "toggle_compact", "close", "annotate"] {
             assert!(ids.contains(&id), "{id} in {ids:?}");
         }
-        // モードを切り替える操作、引数を取る操作、ドラッグ専用の操作は出さない
-        for id in ["trim", "annotate", "zoom", "opacity", "move"] {
+        // トリム、引数を取る操作、ドラッグ専用の操作は出さない
+        for id in ["trim", "zoom", "opacity", "move"] {
             assert!(!ids.contains(&id), "{id} in {ids:?}");
         }
     }
@@ -1354,6 +1355,19 @@ mod tests {
         assert_eq!(steps(&editor, 0), ["copy", "copy", "close"]);
         assert_eq!(editor.mark(&SettingsItem::RecipeSteps(0)), None);
         assert_eq!(editor.add_step(1, "copy"), None);
+    }
+
+    #[test]
+    fn a_recipe_ending_with_one_last_only_step_is_not_offered_the_other() {
+        // 最後にだけ置ける操作は 1 つまで。足すとその前に入るので、「閉じる」と「書き込み」は一緒に出さない
+        for (last, other) in [("close", "annotate"), ("annotate", "close")] {
+            let mut editor = Editor::new(Settings::default());
+            editor.add_recipe("R");
+            editor.add_step(0, last);
+            let ids = choice_ids(&editor, 0);
+            assert!(!ids.contains(&last) && !ids.contains(&other), "{ids:?}");
+            assert!(ids.contains(&"copy"), "{ids:?}");
+        }
     }
 
     /// 操作の並びが `ids` のレシピ 1 つを持つ写し（ほかに適用を止める問題はない）。
@@ -1715,7 +1729,7 @@ mod tests {
         assert_eq!(steps(&editor, 0), ["zoom_in", "close", "copy"]);
         assert_eq!(
             editor.mark(&SettingsItem::RecipeSteps(0)),
-            Some(Mark::Problem(Problem::CloseNotLast))
+            Some(Mark::Problem(Problem::LastOnlyNotLast))
         );
         assert_eq!(editor.move_step(1, 0, Move::Down), 0);
     }

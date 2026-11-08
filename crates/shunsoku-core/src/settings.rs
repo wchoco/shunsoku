@@ -674,8 +674,8 @@ pub enum Problem {
     NoSteps,
     /// レシピに入れられない操作がある。
     NotAStep,
-    /// レシピの `close` が最後以外にある。
-    CloseNotLast,
+    /// レシピの最後にだけ置ける操作（`close`、`annotate`）が最後以外にある。
+    LastOnlyNotLast,
     /// レシピの値のある手の値が範囲外。
     OutOfRange,
     /// レシピの値のある手の値の型か書式の誤り。
@@ -780,7 +780,7 @@ pub fn validate(settings: &Settings) -> Vec<ValidationIssue> {
                 recipe::Problem::DuplicateName => Problem::DuplicateName,
                 recipe::Problem::NoSteps => Problem::NoSteps,
                 recipe::Problem::NotAStep(_) => Problem::NotAStep,
-                recipe::Problem::CloseNotLast => Problem::CloseNotLast,
+                recipe::Problem::LastOnlyNotLast => Problem::LastOnlyNotLast,
                 recipe::Problem::OutOfRange(_) => Problem::OutOfRange,
                 recipe::Problem::BadValue(_) => Problem::BadValue,
                 recipe::Problem::UnknownKey(_) => Problem::UnknownKey,
@@ -2717,12 +2717,20 @@ width = 0
         assert_eq!(settings.regions[0].rect, Rect::new(0, 0, 800, 600));
         assert_eq!(
             settings.recipes,
-            vec![Recipe {
-                name: "コピーして閉じる".to_owned(),
-                steps: vec!["copy".into(), "close".into()],
-                shortcut: Some("Ctrl+Q".parse().unwrap()),
-            }]
+            vec![
+                Recipe {
+                    name: "コピーして閉じる".to_owned(),
+                    steps: vec!["copy".into(), "close".into()],
+                    shortcut: Some("Ctrl+Q".parse().unwrap()),
+                },
+                Recipe {
+                    name: "戻して書き込む".to_owned(),
+                    steps: vec!["zoom_actual".into(), "annotate".into()],
+                    shortcut: Some("Ctrl+E".parse().unwrap()),
+                },
+            ]
         );
+        assert_eq!(recipe::plan(&settings.recipes, OPERATIONS).problems, vec![]);
     }
 
     fn named(names: &[&str]) -> Settings {

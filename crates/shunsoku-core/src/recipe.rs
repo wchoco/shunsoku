@@ -344,8 +344,9 @@ pub enum Problem {
     NoSteps,
     /// レシピに入れられない操作（表にない、`InRecipe::Never`、別のレシピ）。書いた id。
     NotAStep(String),
-    /// 最後にだけ置ける操作（`InRecipe::Last`。`close`）が最後以外にある。
-    CloseNotLast,
+    /// 最後にだけ置ける操作（`InRecipe::Last`。`close`、`annotate`）が最後以外にある。2 つ置いたときも、前の
+    /// ほうが最後以外になるのでこれ。
+    LastOnlyNotLast,
     /// 値のある手の値が範囲外。書いたキー。
     OutOfRange(String),
     /// 値のある手の値の型か書式の誤り。書いたキー。
@@ -431,7 +432,7 @@ pub fn plan(recipes: &[Recipe], ops: &'static [OperationDescriptor]) -> Checked 
         if let Some((_, before_last)) = recipe.steps.split_last()
             && before_last.iter().any(|s| is_last_only(s.op_id(), ops))
         {
-            problems.push(Problem::CloseNotLast);
+            problems.push(Problem::LastOnlyNotLast);
         }
         if problems.is_empty() {
             checked.plans.push(Plan {
@@ -732,16 +733,9 @@ mod tests {
 
     #[test]
     fn steps_that_cannot_go_in_a_recipe_make_it_an_error() {
-        // trim と annotate はモードを変える。zoom は選択肢を持ち、move はドラッグ専用。fly は表にない（別の
+        // trim はモードを変える。zoom は選択肢を持ち、move はドラッグ専用。fly は表にない（別の
         // レシピの名前も同じ）
-        for step in [
-            "trim",
-            "annotate",
-            "zoom",
-            "move",
-            "fly",
-            "コピーして閉じる",
-        ] {
+        for step in ["trim", "zoom", "move", "fly", "コピーして閉じる"] {
             let checked = plan(
                 &[
                     recipe("コピーして閉じる", &["copy", "close"]),
@@ -788,11 +782,38 @@ mod tests {
         );
         assert_eq!(
             checked.problems,
-            vec![(0, Problem::CloseNotLast), (1, Problem::CloseNotLast)]
+            vec![(0, Problem::LastOnlyNotLast), (1, Problem::LastOnlyNotLast)]
         );
         assert_eq!(
             checked.plans.iter().map(|p| p.index).collect::<Vec<_>>(),
             [2]
+        );
+    }
+
+    #[test]
+    fn annotate_goes_only_at_the_end_and_not_with_close() {
+        let checked = plan(
+            &[
+                recipe("a", &["annotate", "copy"]),
+                recipe("b", &["copy", "close", "annotate"]),
+                recipe("c", &["annotate", "close"]),
+                recipe("d", &["annotate", "annotate"]),
+                recipe("e", &["copy", "annotate"]),
+            ],
+            OPERATIONS,
+        );
+        assert_eq!(
+            checked.problems,
+            vec![
+                (0, Problem::LastOnlyNotLast),
+                (1, Problem::LastOnlyNotLast),
+                (2, Problem::LastOnlyNotLast),
+                (3, Problem::LastOnlyNotLast),
+            ]
+        );
+        assert_eq!(
+            checked.plans.iter().map(|p| p.index).collect::<Vec<_>>(),
+            [4]
         );
     }
 
@@ -954,7 +975,7 @@ mod tests {
                 ),
                 issue(
                     SettingsItem::RecipeSteps(1),
-                    settings::Problem::CloseNotLast
+                    settings::Problem::LastOnlyNotLast
                 ),
                 issue(
                     SettingsItem::RecipeName(2),
@@ -1014,6 +1035,24 @@ mod tests {
             step(&mut run, &mut model),
             ("close", vec![Effect::MoveToTrash])
         );
+        run.settle(Outcome::Succeeded);
+        assert!(matches!(
+            run.advance(&mut model, &OpContext::default()),
+            Advance::Finished
+        ));
+    }
+
+    #[test]
+    fn annotate_at_the_end_enters_the_edit_mode_after_the_steps_before_it() {
+        let mut run = run_of(&["zoom_in", "annotate"]);
+        let mut model = model();
+        assert_eq!(step(&mut run, &mut model).0, "zoom_in");
+        run.settle(Outcome::Succeeded);
+        assert_eq!(
+            step(&mut run, &mut model),
+            ("annotate", vec![Effect::EnterEditMode])
+        );
+        assert!(model.is_editing());
         run.settle(Outcome::Succeeded);
         assert!(matches!(
             run.advance(&mut model, &OpContext::default()),
