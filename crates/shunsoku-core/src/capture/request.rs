@@ -581,6 +581,7 @@ mod tests {
             file_name_template: "{name}_{seq}".to_owned(),
             save,
             scrap,
+            blank_scrap: false,
             loaded_name: None,
         }
     }

@@ -65,8 +65,12 @@ const MONITOR: i32 = 13;
 const RESELECT: i32 = 20;
 const TEST_CAPTURE: i32 = 27;
 const WARNING: i32 = 28;
-const SAVE_DIR: i32 = 30;
-const DETAIL_END: i32 = 39;
+const BLANK_SCRAP: i32 = 29;
+/// 撮ったものの出し方の最初（保存先の見出し）。ここから `DETAIL_END` の手前までを、白紙スクラップにする領域では
+/// 使えなくする（`Editor::region_uses_capture_outputs`）。
+const OUTPUTS_FIRST: i32 = 30;
+const SAVE_DIR: i32 = 31;
+const DETAIL_END: i32 = 40;
 
 /// 一覧の幅と高さ、その下のボタン（ページの中のダイアログ単位）。
 const LIST_WIDTH: i16 = 112;
@@ -207,52 +211,61 @@ pub(super) fn build(b: &mut PageBuilder) {
         DETAIL_WIDTH,
         10,
     );
+    // 白紙スクラップにする（入れると、下の撮ったものの出し方の欄が使えない）
+    let blank_scrap = b.next_id;
+    b.check(
+        Field::Region(0, RegionKey::BlankScrap),
+        "settings_gui.regions.blank_scrap",
+        DETAIL_X,
+        120,
+        DETAIL_WIDTH,
+    );
     // 保存先と、その下の「参照…」「フォルダを開く」
     b.label(
         "settings_gui.regions.save_dir_label",
         DETAIL_X,
-        120,
+        136,
         LABEL_WIDTH,
         10,
     );
     let save_dir = Field::Region(0, RegionKey::SaveDir);
-    let save_dir_id = b.text(save_dir, FIELD_X, 118, FIELD_WIDTH);
+    let save_dir_id = b.text(save_dir, FIELD_X, 134, FIELD_WIDTH);
     b.button(
         Action::BrowseFolder(save_dir),
         "settings_gui.browse",
         FIELD_X,
-        134,
+        150,
         50,
     );
     b.button(
         Action::OpenFolder(save_dir),
         "settings_gui.regions.open_folder",
         FIELD_X + 54,
-        134,
+        150,
         64,
     );
     // ファイル名テンプレート（プレビューを含めて高さ 28）
     b.label(
         "settings_gui.regions.template_label",
         DETAIL_X,
-        152,
+        168,
         LABEL_WIDTH,
         10,
     );
-    b.template_field(TemplateOf::Region(0), FIELD_X, 150, FIELD_WIDTH);
+    b.template_field(TemplateOf::Region(0), FIELD_X, 166, FIELD_WIDTH);
     // 撮影後の動作
     b.check(
         Field::Region(0, RegionKey::Save),
         "settings_gui.regions.save",
         DETAIL_X,
-        180,
+        196,
         60,
     );
     b.check(
         Field::Region(0, RegionKey::Scrap),
         "settings_gui.regions.scrap",
         DETAIL_X + 64,
-        180,
+        196,
         DETAIL_WIDTH - 64,
     );
     let offsets = |ids: &[i32]| ids.iter().map(|id| id - first).collect::<Vec<_>>();
@@ -263,8 +276,24 @@ pub(super) fn build(b: &mut PageBuilder) {
     );
     debug_assert_eq!(offsets(&list_buttons), [ADD, DUPLICATE, REMOVE, UP, DOWN]);
     debug_assert_eq!(
-        offsets(&[name, name_mark, hotkey, monitor, warning, save_dir_id]),
-        [NAME, NAME_MARK, HOTKEY, MONITOR, WARNING, SAVE_DIR]
+        offsets(&[
+            name,
+            name_mark,
+            hotkey,
+            monitor,
+            warning,
+            blank_scrap,
+            save_dir_id
+        ]),
+        [
+            NAME,
+            NAME_MARK,
+            HOTKEY,
+            MONITOR,
+            WARNING,
+            BLANK_SCRAP,
+            SAVE_DIR
+        ]
     );
     debug_assert_eq!(offsets(&range_buttons), [RESELECT, TEST_CAPTURE]);
     debug_assert_eq!(b.next_id - first, DETAIL_END);
@@ -444,6 +473,11 @@ pub(super) fn fill(hwnd: HWND, editor: &Editor, text: Text, env: &Env) {
     let selected = selected(hwnd).filter(|&i| i < len);
     for offset in DETAIL_FIRST..DETAIL_END {
         enable(hwnd, id(offset), selected.is_some());
+    }
+    // 白紙スクラップにする領域は撮らず何も保存しないので、出し方の欄を使えなくする
+    let outputs = selected.is_some_and(|i| editor.region_uses_capture_outputs(i));
+    for offset in OUTPUTS_FIRST..DETAIL_END {
+        enable(hwnd, id(offset), outputs);
     }
     enable(hwnd, id(DUPLICATE), selected.is_some());
     enable(hwnd, id(REMOVE), selected.is_some());

@@ -113,6 +113,9 @@ pub enum RegionKey {
     Save,
     /// 撮ったらスクラップとして表示する。
     Scrap,
+    /// 撮らずに、範囲の位置と大きさで白紙スクラップを作る。入れると保存先・ファイル名テンプレート・保存する・
+    /// スクラップとして表示するの欄が使えなくなる（`Editor::region_uses_capture_outputs`）。
+    BlankScrap,
 }
 
 impl Field {
@@ -253,7 +256,9 @@ fn kind(field: Field) -> Kind {
         | Field::Crosshair
         | Field::Border
         | Field::Shadow
-        | Field::Region(_, RegionKey::Save | RegionKey::Scrap) => Kind::Check,
+        | Field::Region(_, RegionKey::Save | RegionKey::Scrap | RegionKey::BlankScrap) => {
+            Kind::Check
+        }
         Field::SaveDir
         | Field::Template(_)
         | Field::BorderColor
@@ -400,7 +405,7 @@ fn shown(field: Field, editor: &Editor, fonts: &[String], text: Text) -> Shown {
 fn region_shown(region: Option<&Region>, key: RegionKey) -> Shown {
     let Some(r) = region else {
         return match key {
-            RegionKey::Save | RegionKey::Scrap => Shown::Check(false),
+            RegionKey::Save | RegionKey::Scrap | RegionKey::BlankScrap => Shown::Check(false),
             _ => Shown::Text(String::new()),
         };
     };
@@ -418,6 +423,7 @@ fn region_shown(region: Option<&Region>, key: RegionKey) -> Shown {
         ),
         RegionKey::Save => Shown::Check(r.save),
         RegionKey::Scrap => Shown::Check(r.scrap),
+        RegionKey::BlankScrap => Shown::Check(r.blank_scrap),
     }
 }
 
@@ -539,6 +545,7 @@ fn set_region(region: &mut Region, key: RegionKey, input: Input) {
         }
         (RegionKey::Save, Input::Check(v)) if v || region.scrap => region.save = v,
         (RegionKey::Scrap, Input::Check(v)) if v || region.save => region.scrap = v,
+        (RegionKey::BlankScrap, Input::Check(v)) => region.blank_scrap = v,
         _ => {}
     }
 }

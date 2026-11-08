@@ -140,6 +140,7 @@ open_folder = "フォルダを開く"
 template_label = "ファイル名:"
 save = "保存する"
 scrap = "スクラップとして表示する"
+blank_scrap = "撮らずに白紙スクラップにする"
 
 [settings_gui.scrap]
 opacity = "透明度（%）:"

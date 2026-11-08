@@ -72,6 +72,9 @@
 //! file_name_template = "{name}_{date}-{time}"
 //! save = true                                  # save と scrap の両方 false は save を true に戻す
 //! scrap = false
+//! blank_scrap = false                          # true なら画面を撮らず、範囲の位置と大きさで白紙スクラップを
+//!                                              #   作る（背景色は [annotation] background）。何も保存せず、
+//!                                              #   save_dir / file_name_template / save / scrap は無視する
 //! ```
 
 use std::collections::BTreeMap;
@@ -181,6 +184,9 @@ pub struct Region {
     pub save: bool,
     /// 撮ったらスクラップとして表示する。`save` と両方 false にはならない（読み込みで `save` を true に戻す）。
     pub scrap: bool,
+    /// 画面を撮らずに、範囲の位置と大きさで白紙スクラップを作る（背景色は `[annotation] background`）。
+    /// 真なら保存先・ファイル名テンプレート・`save`・`scrap` は使わない（何も保存しない）。
+    pub blank_scrap: bool,
     /// ファイルで付いている名前（読み込んだ・書いたときの `name`）。ファイルにまだない定型領域は None。
     /// 書き戻し（`write`）と 3-way マージは、これで定型領域とファイルの `[[regions]]` の要素を結び付ける
     /// （名前を変えても、手で書いたコメントは元の要素ごと残る）。
@@ -198,6 +204,7 @@ impl PartialEq for Region {
             file_name_template,
             save,
             scrap,
+            blank_scrap,
             loaded_name: _,
         } = self;
         *name == other.name
@@ -208,6 +215,7 @@ impl PartialEq for Region {
             && *file_name_template == other.file_name_template
             && *save == other.save
             && *scrap == other.scrap
+            && *blank_scrap == other.blank_scrap
     }
 }
 
@@ -229,6 +237,7 @@ pub fn new_region(settings: &Settings, base: &str, monitor: &str, rect: Rect) ->
         file_name_template: settings.general.file_name_template.clone(),
         save: true,
         scrap: false,
+        blank_scrap: false,
         loaded_name: None,
     }
 }
@@ -1144,8 +1153,14 @@ fn read_regions_at(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(us
             .unwrap_or_else(|| DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned());
         let mut save = r.value(t, &path, "save", Item::as_bool).unwrap_or(true);
         let scrap = r.value(t, &path, "scrap", Item::as_bool).unwrap_or(false);
+        let blank_scrap = r
+            .value(t, &path, "blank_scrap", Item::as_bool)
+            .unwrap_or(false);
         if !save && !scrap {
-            r.invalid(format!("{path}.save"));
+            // 白紙スクラップにする定型領域は保存もスクラップも使わないので、問題にせずに戻すだけ
+            if !blank_scrap {
+                r.invalid(format!("{path}.save"));
+            }
             save = true;
         }
         let (Some(name), Some(monitor), Some(rect)) = (name, monitor, rect) else {
@@ -1167,6 +1182,7 @@ fn read_regions_at(tables: &toml_edit::ArrayOfTables, r: &mut Reader) -> Vec<(us
                 file_name_template,
                 save,
                 scrap,
+                blank_scrap,
             },
         ));
     }
@@ -2314,6 +2330,7 @@ height = 1
                     file_name_template: "dash_{seq:3}".to_owned(),
                     save: false,
                     scrap: true,
+                    blank_scrap: false,
                     loaded_name: None,
                 },
                 Region {
@@ -2325,6 +2342,7 @@ height = 1
                     file_name_template: "{name}_{date}-{time}".to_owned(),
                     save: true,
                     scrap: false,
+                    blank_scrap: false,
                     loaded_name: None,
                 },
             ]
@@ -2363,6 +2381,31 @@ height = 1
         assert_eq!(issues, vec![invalid("regions[1].save")]);
         assert!(settings.regions[0].save);
         assert!(!settings.regions[0].scrap);
+    }
+
+    #[test]
+    fn a_region_becomes_a_blank_scrap_only_when_it_says_so() {
+        let src = format!(
+            "version = 1\n{}{}{}",
+            region_src("a", ""),
+            region_src("b", "blank_scrap = true"),
+            region_src("c", "blank_scrap = 1")
+        );
+        let (settings, issues) = load(&src);
+        assert_eq!(issues, vec![invalid("regions[3].blank_scrap")]);
+        let blank: Vec<bool> = settings.regions.iter().map(|r| r.blank_scrap).collect();
+        assert_eq!(blank, [false, true, false]);
+    }
+
+    #[test]
+    fn a_blank_scrap_region_ignores_that_it_neither_saves_nor_shows_a_scrap() {
+        let src = format!(
+            "version = 1\n{}",
+            region_src("a", "blank_scrap = true\nsave = false\nscrap = false")
+        );
+        let (settings, issues) = load(&src);
+        assert_eq!(issues, vec![]);
+        assert!(settings.regions[0].blank_scrap);
     }
 
     #[test]
@@ -2745,6 +2788,7 @@ width = 0
             file_name_template: DEFAULT_REGION_FILE_NAME_TEMPLATE.to_owned(),
             save: true,
             scrap: false,
+            blank_scrap: false,
             loaded_name: None,
         };
         Settings {
@@ -2788,6 +2832,7 @@ width = 0
                 file_name_template: "cap_{seq:3}".to_owned(),
                 save: true,
                 scrap: false,
+                blank_scrap: false,
                 loaded_name: None,
             }
         );
