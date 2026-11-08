@@ -11,6 +11,7 @@ blank_scrap = "白紙スクラップ"
 regions = "定型領域"
 regions_empty = "（なし）"
 add_region = "定型領域を追加…"
+open = "開く…"
 trash = "ごみ箱"
 trash_empty = "（空）"
 close_all = "すべてのスクラップを閉じる"
@@ -233,6 +234,7 @@ unset = "範囲選択キャプチャのホットキーが未設定です。ト�
 copy = "コピー"
 save_default = "既定の保存先へ保存"
 save_as = "保存先を確認して保存"
+save_scrap_file = "スクラップファイルとして保存…"
 trim = "トリム"
 untrim = "トリムを解除"
 annotate = "書き込み"
@@ -353,6 +355,18 @@ saved = "保存しました（クリックでフォルダを開きます）:"
 failed = "保存できませんでした。スクラップは残っています。"
 # 「名前を付けて保存」のファイルの種類
 png_filter = "PNG 画像"
+
+# スクラップファイル（.shunsoku）。開けなかったわけは scrap_file::LoadError::message_key
+[scrap_file]
+filter = "shunsoku スクラップファイル"
+unreadable = "スクラップファイルを開けませんでした。ファイルを読めません。"
+not_scrap_file = "スクラップファイルを開けませんでした。スクラップファイルではありません。"
+newer_version = "スクラップファイルを開けませんでした。新しい版の shunsoku で作られたファイルです。shunsoku を更新してください。"
+bad_record = "スクラップファイルを開けませんでした。ファイルが壊れています（書き込みやトリムの記録）。"
+bad_image = "スクラップファイルを開けませんでした。ファイルが壊れています（画像）。"
+size_mismatch = "スクラップファイルを開けませんでした。ファイルが壊れています（画像の大きさが記録と合いません）。"
+too_large = "スクラップファイルを開けませんでした。大きすぎます。"
+out_of_range = "スクラップファイルを開けませんでした。ファイルが壊れています（範囲の外の値）。"
 
 # ファイル名テンプレートの「変数を挿入」のメニュー。キーは template::VARIABLES の label_key
 [template.var]

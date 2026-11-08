@@ -51,6 +51,8 @@ pub enum MenuItem {
     Regions,
     /// 定型領域を追加…。
     AddRegion,
+    /// 開く…（スクラップファイルを選んで開く）。
+    Open,
     /// ごみ箱のサブメニュー。
     Trash,
     /// すべてのスクラップを閉じる。
@@ -74,6 +76,7 @@ pub fn menu(any_hidden: bool) -> Vec<MenuItem> {
         MenuItem::BlankScrap,
         MenuItem::Regions,
         MenuItem::AddRegion,
+        MenuItem::Open,
         MenuItem::Trash,
         MenuItem::CloseAll,
         if any_hidden {
@@ -102,6 +105,16 @@ mod tests {
             .position(|&i| i == MenuItem::SelectCapture)
             .unwrap();
         assert_eq!(items.get(at + 1), Some(&MenuItem::BlankScrap));
+    }
+
+    #[test]
+    fn the_menu_offers_to_open_a_scrap_file_after_the_saved_regions() {
+        let items = menu(false);
+        let at = items
+            .iter()
+            .position(|&i| i == MenuItem::AddRegion)
+            .unwrap();
+        assert_eq!(items.get(at + 1), Some(&MenuItem::Open));
     }
 
     #[test]
