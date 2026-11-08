@@ -1,10 +1,10 @@
 //! 配布物の性能を測るハーネス（開発専用。zip には入れない）。測り方と指標の定義は `docs/perf.md`。
 //!
 //! ```text
-//! perf-harness <shunsoku.exe> [--runs N] [--hotkey <組み合わせ>] [memory] [hotkey] [cold-start]
+//! perf-harness <shunsoku.exe> [--runs N] [--hotkey <組み合わせ>] [memory] [hotkey] [cold-start] [annotate]
 //! ```
 //!
-//! 指標を書かなければ 3 つとも測る。本体は `SHUNSOKU_PERF_LOG` で区切りの時刻を書き、ハーネスはそれを読む。
+//! 指標を書かなければ memory・hotkey・cold-start の 3 つを測る。`annotate`（書き込みの更新）は書いたときだけ測る。本体は `SHUNSOKU_PERF_LOG` で区切りの時刻を書き、ハーネスはそれを読む。
 
 #[cfg(windows)]
 mod measure;
@@ -20,7 +20,7 @@ const DEFAULT_RUNS: usize = 20;
 /// ハーネスが本体に設定するホットキーの既定値。ほかのアプリと重なりにくい組み合わせ。
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+Shift+F9";
 
-const USAGE: &str = "usage: perf-harness <shunsoku.exe> [--runs N] [--hotkey <組み合わせ>] [memory] [hotkey] [cold-start]";
+const USAGE: &str = "usage: perf-harness <shunsoku.exe> [--runs N] [--hotkey <組み合わせ>] [memory] [hotkey] [cold-start] [annotate]";
 
 /// 測る指標。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +31,8 @@ pub enum Metric {
     Hotkey,
     /// コールドスタート。
     ColdStart,
+    /// 書き込みの更新（書き込みの編集モードでの 1 回の描き直し）。指標を書かなかったときは測らない。
+    Annotate,
 }
 
 /// コマンドラインの指定。
@@ -64,6 +66,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
             "memory" => metrics.push(Metric::Memory),
             "hotkey" => metrics.push(Metric::Hotkey),
             "cold-start" => metrics.push(Metric::ColdStart),
+            "annotate" => metrics.push(Metric::Annotate),
             "-h" | "--help" => return Err(USAGE.to_owned()),
             _ if arg.starts_with('-') => return Err(format!("知らないオプション: {arg}\n{USAGE}")),
             _ if exe.is_none() => exe = Some(PathBuf::from(arg)),
@@ -99,5 +102,36 @@ fn main() {
         let _ = options;
         eprintln!("perf-harness は Windows でだけ動きます");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(args: &[&str]) -> Vec<Metric> {
+        parse_args(args.iter().map(|a| a.to_string()))
+            .unwrap()
+            .metrics
+    }
+
+    #[test]
+    fn without_metrics_the_three_existing_ones_are_measured() {
+        assert_eq!(
+            metrics(&["shunsoku.exe"]),
+            vec![Metric::Memory, Metric::Hotkey, Metric::ColdStart]
+        );
+    }
+
+    #[test]
+    fn annotate_is_measured_only_when_named() {
+        assert_eq!(
+            metrics(&["shunsoku.exe", "annotate"]),
+            vec![Metric::Annotate]
+        );
+        assert_eq!(
+            metrics(&["shunsoku.exe", "hotkey", "annotate"]),
+            vec![Metric::Hotkey, Metric::Annotate]
+        );
     }
 }

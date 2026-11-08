@@ -1976,8 +1976,10 @@ fn edit_input(hwnd: HWND, input: EditInput) -> Option<Vec<EditOutput>> {
         }
         if !outputs.is_empty() {
             // 描くだけで App を借りるメッセージは届かないので、借りたまま描く
-            if let Err(e) = scrap.paint(&appearance, renderer) {
-                log::warn!("could not draw the annotations: {e}");
+            perf::mark(Mark::AnnotatePaintStart);
+            match scrap.paint(&appearance, renderer) {
+                Ok(()) => perf::mark(Mark::AnnotatePaintEnd),
+                Err(e) => log::warn!("could not draw the annotations: {e}"),
             }
         }
         app.carryover.record(&outputs);
