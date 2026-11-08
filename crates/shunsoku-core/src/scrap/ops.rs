@@ -292,7 +292,8 @@ pub enum Effect {
     EnterEditMode,
     /// 書き込みの編集モードを抜けた。
     LeaveEditMode,
-    /// 背景色の「その他の色…」: 色の選択ダイアログを出し、選ばれた色を `background` の選択肢として実行する。
+    /// 背景色の「その他の色…」: 色の選択ダイアログを出し、選ばれた色を `background` の値
+    /// （`StepValues::Background`）として実行する。
     ShowBackgroundDialog,
     /// スクラップを閉じて、ごみ箱に入れずに捨てる（何も書かれていない透明な白紙スクラップが編集モードを
     /// 抜けたとき。`ScrapModel::is_empty_transparent_blank`）。
@@ -609,15 +610,48 @@ const BACKGROUND_LABELS: [&str; 8] = [
     "scrap.background.white",
 ];
 
-/// 背景色の一覧の「その他の色…」の値。色の値（`0xRRGGBB`）は 0 以上なので重ならない。
-pub const OTHER_BACKGROUND: i32 = -1;
+/// 背景色の一覧の選択肢。メニューの値（`Choice::value` と `OpContext::choice` の i32）との行き来は
+/// `value` と `from_value` だけで行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundChoice {
+    /// その色（`0xRRGGBB` を値にする。0 以上なので、ほかの値と重ならない）。
+    Color(Rgb),
+    /// 透明。
+    Transparent,
+    /// 「その他の色…」（色の選択ダイアログを出す）。
+    Other,
+}
 
-/// 背景色の一覧の「透明」の値。
-pub const TRANSPARENT_BACKGROUND: i32 = -2;
+impl BackgroundChoice {
+    const TRANSPARENT: i32 = -2;
+    const OTHER: i32 = -1;
+
+    /// メニューの値。
+    fn value(self) -> i32 {
+        match self {
+            // 24 ビットに収まるので i32 で正のまま
+            BackgroundChoice::Color(colour) => colour.to_rrggbb() as i32,
+            BackgroundChoice::Transparent => Self::TRANSPARENT,
+            BackgroundChoice::Other => Self::OTHER,
+        }
+    }
+
+    /// メニューの値から。どれでもない値なら None。
+    fn from_value(value: i32) -> Option<BackgroundChoice> {
+        match value {
+            Self::TRANSPARENT => Some(BackgroundChoice::Transparent),
+            Self::OTHER => Some(BackgroundChoice::Other),
+            _ => u32::try_from(value)
+                .ok()
+                .filter(|&rrggbb| rrggbb <= 0xFF_FF_FF)
+                .map(|rrggbb| BackgroundChoice::Color(Rgb::from_rrggbb(rrggbb))),
+        }
+    }
+}
 
 /// 白紙スクラップで、畳んでいなければ実行できる。
 fn blank_and_not_compact(model: &ScrapModel) -> bool {
-    not_compact(model) && model.background().is_some()
+    not_compact(model) && model.is_blank()
 }
 
 /// 背景色の一覧: ツールバーと同じ 8 色（`PALETTE`）、「透明」と「その他の色…」。並びにない色なら
@@ -629,17 +663,17 @@ fn background_choices(model: &ScrapModel, _: &Appearance) -> Vec<Choice> {
         .zip(BACKGROUND_LABELS)
         .map(|(&colour, key)| Choice {
             label: ChoiceLabel::Key(key),
-            value: colour.to_rrggbb() as i32,
+            value: BackgroundChoice::Color(colour).value(),
             checked: now == Some(Background::Color(colour)),
         });
     let transparent = Choice {
         label: ChoiceLabel::Key("scrap.background.transparent"),
-        value: TRANSPARENT_BACKGROUND,
+        value: BackgroundChoice::Transparent.value(),
         checked: now == Some(Background::Transparent),
     };
     let other = Choice {
         label: ChoiceLabel::Key("scrap.background.other"),
-        value: OTHER_BACKGROUND,
+        value: BackgroundChoice::Other.value(),
         checked: matches!(now, Some(Background::Color(c)) if !PALETTE.contains(&c)),
     };
     colours.chain([transparent, other]).collect()
@@ -650,11 +684,11 @@ fn background_choices(model: &ScrapModel, _: &Appearance) -> Vec<Choice> {
 fn background_to(model: &mut ScrapModel, context: &OpContext) -> Vec<Effect> {
     let background = match (context.values, context.choice) {
         (Some(StepValues::Background(background)), _) => background,
-        (_, Some(OTHER_BACKGROUND)) => return vec![Effect::ShowBackgroundDialog],
-        (_, Some(TRANSPARENT_BACKGROUND)) => Background::Transparent,
-        (_, Some(choice)) => match u32::try_from(choice) {
-            Ok(rrggbb) => Background::Color(Rgb::from_rrggbb(rrggbb)),
-            Err(_) => return Vec::new(),
+        (_, Some(choice)) => match BackgroundChoice::from_value(choice) {
+            Some(BackgroundChoice::Color(colour)) => Background::Color(colour),
+            Some(BackgroundChoice::Transparent) => Background::Transparent,
+            Some(BackgroundChoice::Other) => return vec![Effect::ShowBackgroundDialog],
+            None => return Vec::new(),
         },
         _ => return Vec::new(),
     };
@@ -1539,7 +1573,7 @@ pub fn menu(
     let mut listed: Vec<&OperationDescriptor> = ops
         .iter()
         .filter(|op| op.in_menu && !op.drag_only)
-        .filter(|op| model.background().is_some() || !BLANK_ONLY.contains(&op.id))
+        .filter(|op| model.is_blank() || !BLANK_ONLY.contains(&op.id))
         .collect();
     listed.sort_by_key(|op| (op.group, op.order));
     let mut entries = Vec::new();
@@ -3175,6 +3209,11 @@ reset_appearance = "Ctrl+Shift+D"
     }
 
     /// メニューの「背景色」の子メニュー。出ていなければ None。
+    /// 背景色の一覧で `0xRRGGBB` の色を選んだときの値。
+    fn colour(rrggbb: u32) -> i32 {
+        BackgroundChoice::Color(Rgb::from_rrggbb(rrggbb)).value()
+    }
+
     fn background_menu(model: &ScrapModel) -> Option<Submenu> {
         let shortcuts = Shortcuts::new(OPERATIONS, &ShortcutOverrides::new());
         menu(OPERATIONS, model, &shortcuts, &Appearance::default())
@@ -3183,6 +3222,21 @@ reset_appearance = "Ctrl+Shift+D"
                 MenuEntry::Submenu(submenu) if submenu.id == "background" => Some(submenu),
                 _ => None,
             })
+    }
+
+    #[test]
+    fn a_background_choice_comes_back_from_its_menu_value() {
+        for choice in [
+            BackgroundChoice::Color(Rgb(0, 0, 0)),
+            BackgroundChoice::Color(Rgb(0xFF, 0xFF, 0xFF)),
+            BackgroundChoice::Color(Rgb(0x1E, 0x88, 0xE5)),
+            BackgroundChoice::Transparent,
+            BackgroundChoice::Other,
+        ] {
+            assert_eq!(BackgroundChoice::from_value(choice.value()), Some(choice));
+        }
+        assert_eq!(BackgroundChoice::from_value(-3), None);
+        assert_eq!(BackgroundChoice::from_value(0x0100_0000), None);
     }
 
     #[test]
@@ -3200,8 +3254,16 @@ reset_appearance = "Ctrl+Shift+D"
         assert_eq!(
             values,
             [
-                0xE5_39_35, 0xFB_8C_00, 0xFD_D8_35, 0x43_A0_47, 0x1E_88_E5, 0x8E_24_AA, 0x21_21_21,
-                0xFF_FF_FF, -2, -1
+                0xE5_39_35,
+                0xFB_8C_00,
+                0xFD_D8_35,
+                0x43_A0_47,
+                0x1E_88_E5,
+                0x8E_24_AA,
+                0x21_21_21,
+                0xFF_FF_FF,
+                BackgroundChoice::Transparent.value(),
+                BackgroundChoice::Other.value()
             ]
         );
         let checked: Vec<i32> = submenu
@@ -3223,14 +3285,14 @@ reset_appearance = "Ctrl+Shift+D"
             .filter(|c| c.checked)
             .map(|c| c.value)
             .collect();
-        assert_eq!(checked, [-1]);
+        assert_eq!(checked, [BackgroundChoice::Other.value()]);
     }
 
     #[test]
     fn choosing_a_background_colour_repaints_the_blank_scrap_with_it() {
         let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
         assert_eq!(
-            execute(op("background"), &mut model, &choose(0x1E_88_E5)),
+            execute(op("background"), &mut model, &choose(colour(0x1E_88_E5))),
             vec![Effect::Redraw]
         );
         assert_eq!(
@@ -3243,7 +3305,7 @@ reset_appearance = "Ctrl+Shift+D"
         );
         // 同じ色なら何もしない
         assert_eq!(
-            execute(op("background"), &mut model, &choose(0x1E_88_E5)),
+            execute(op("background"), &mut model, &choose(colour(0x1E_88_E5))),
             vec![]
         );
     }
@@ -3252,13 +3314,21 @@ reset_appearance = "Ctrl+Shift+D"
     fn choosing_transparent_makes_the_blank_scrap_see_through_and_checks_it() {
         let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
         let submenu = background_menu(&model).unwrap();
-        let transparent = submenu.choices.iter().find(|c| c.value == -2).unwrap();
+        let transparent = submenu
+            .choices
+            .iter()
+            .find(|c| c.value == BackgroundChoice::Transparent.value())
+            .unwrap();
         assert_eq!(
             transparent.label,
             ChoiceLabel::Key("scrap.background.transparent")
         );
         assert!(!transparent.checked);
-        execute(op("background"), &mut model, &choose(-2));
+        execute(
+            op("background"),
+            &mut model,
+            &choose(BackgroundChoice::Transparent.value()),
+        );
         assert_eq!(model.background(), Some(Background::Transparent));
         assert_eq!(model.blank_image().unwrap().pixel(0, 0), [0, 0, 0, 0]);
         let checked: Vec<i32> = background_menu(&model)
@@ -3268,7 +3338,7 @@ reset_appearance = "Ctrl+Shift+D"
             .filter(|c| c.checked)
             .map(|c| c.value)
             .collect();
-        assert_eq!(checked, [-2]);
+        assert_eq!(checked, [BackgroundChoice::Transparent.value()]);
     }
 
     /// 編集モードに入って四角を 1 つ描いて抜ける。
@@ -3306,7 +3376,11 @@ reset_appearance = "Ctrl+Shift+D"
         let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
         draw_a_rect(&mut model);
         assert_eq!(
-            execute(op("background"), &mut model, &choose(-2)),
+            execute(
+                op("background"),
+                &mut model,
+                &choose(BackgroundChoice::Transparent.value())
+            ),
             vec![Effect::Redraw]
         );
         assert!(!model.is_editing());
@@ -3316,7 +3390,7 @@ reset_appearance = "Ctrl+Shift+D"
     fn making_an_empty_blank_scrap_a_colour_stays_out_of_the_edit_mode() {
         let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
         assert_eq!(
-            execute(op("background"), &mut model, &choose(0x21_21_21)),
+            execute(op("background"), &mut model, &choose(colour(0x21_21_21))),
             vec![Effect::Redraw]
         );
         assert!(!model.is_editing());
@@ -3325,7 +3399,11 @@ reset_appearance = "Ctrl+Shift+D"
     #[test]
     fn leaving_the_edit_mode_discards_an_empty_transparent_blank_scrap() {
         let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
-        execute(op("background"), &mut model, &choose(-2));
+        execute(
+            op("background"),
+            &mut model,
+            &choose(BackgroundChoice::Transparent.value()),
+        );
         assert!(model.is_editing());
         assert_eq!(
             execute(op("annotate"), &mut model, &editing_context()),
@@ -3377,7 +3455,11 @@ reset_appearance = "Ctrl+Shift+D"
         let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
         let before = model.clone();
         assert_eq!(
-            execute(op("background"), &mut model, &choose(-1)),
+            execute(
+                op("background"),
+                &mut model,
+                &choose(BackgroundChoice::Other.value())
+            ),
             vec![Effect::ShowBackgroundDialog]
         );
         assert_eq!(model, before);
@@ -3389,7 +3471,7 @@ reset_appearance = "Ctrl+Shift+D"
         let before = model.clone();
         assert!(!(op("background").can_execute)(&model));
         assert_eq!(
-            execute(op("background"), &mut model, &choose(0xFF_00_00)),
+            execute(op("background"), &mut model, &choose(colour(0xFF_00_00))),
             vec![]
         );
         assert_eq!(model, before);
@@ -3409,7 +3491,7 @@ reset_appearance = "Ctrl+Shift+D"
     fn resetting_the_appearance_keeps_the_background() {
         let defaults = Appearance::default();
         let mut model = blank(Rgb(0xFF, 0xFF, 0xFF));
-        execute(op("background"), &mut model, &choose(0x21_21_21));
+        execute(op("background"), &mut model, &choose(colour(0x21_21_21)));
         execute(op("shadow"), &mut model, &choose(0));
         execute(op("reset_appearance"), &mut model, &with_defaults(defaults));
         assert_eq!(model.appearance(&defaults), defaults);

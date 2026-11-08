@@ -91,7 +91,7 @@ use std::time::Instant;
 
 use shunsoku_core::APP_NAME;
 use shunsoku_core::annotate::toolbar::{self, Button as ToolbarButton, Layout as ToolbarLayout};
-use shunsoku_core::annotate::{Carryover, EditInput, EditOutput, Style};
+use shunsoku_core::annotate::{Carryover, EditInput, EditOutput, Style, Tool};
 use shunsoku_core::app_window;
 use shunsoku_core::capture::request::{
     self, CaptureMethod, CaptureRequest, OnSaveFailure, ReplyTo, SaveTarget, Source,
@@ -104,7 +104,7 @@ use shunsoku_core::monitors::{self, LocateError};
 use shunsoku_core::notice::Notices;
 use shunsoku_core::perf::Mark;
 use shunsoku_core::protocol::{ErrorKind, Response};
-use shunsoku_core::recipe::{Advance, Outcome, Parked, PlannedStep, Run};
+use shunsoku_core::recipe::{Advance, Outcome, Parked, PlannedStep, Run, StepValues};
 use shunsoku_core::scrap::ops::{
     self, ChoiceLabel, Effect, MenuEntry, MouseBindings, MouseGesture, OpContext,
     OperationDescriptor, OperationId, Shortcuts,
@@ -119,7 +119,7 @@ use shunsoku_core::settings::{
     self, LogLevel, Rgb, Settings, SettingsChanges, SettingsIssue, unset,
 };
 use shunsoku_core::trash::TrashId;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::Com::{
@@ -136,14 +136,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EndMenu, EnumThreadWindows,
-    GetClassNameW, GetMessagePos, GetMessageW, HWND_MESSAGE, IDI_APPLICATION, IsWindowVisible,
-    KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SPI_GETSELECTIONFADE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    SetCursorPos, SetTimer, SystemParametersInfoW, TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE,
-    WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetClassNameW, GetCursorPos, GetMessagePos, GetMessageW, HWND_MESSAGE, IDC_ARROW,
+    IDI_APPLICATION, IsWindowVisible, KillTimer, LoadIconW, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SPI_GETSELECTIONFADE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursorPos, SetTimer, SystemParametersInfoW,
+    TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION,
+    WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_TIMER,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WindowFromPoint,
 };
 use windows::core::{PCWSTR, Result, w};
 // 精密モード（#66）で足したもの
@@ -162,10 +163,6 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, IDC_SIZEALL, LoadCursorW, MA_NOACTIVATE, SetCursor, WM_MOUSEACTIVATE,
 };
-// 消しゴム（#145）で足したもの
-use shunsoku_core::annotate::Tool;
-use windows::Win32::Foundation::POINT;
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, IDC_ARROW, WindowFromPoint};
 
 mod cli;
 mod settings_gui;
@@ -635,7 +632,7 @@ fn paint_scrap(
         trim: trim.as_ref(),
     };
     // 透明な白紙スクラップは、透明な部分も当たり判定に入るよう、見えないほど小さいアルファを敷く
-    let see_through = model.background() == Some(Background::Transparent);
+    let see_through = model.is_transparent_blank();
     let hit_alpha = see_through.then(|| appearance.hit_alpha());
     let caret = painter.paint_scrap(&canvas, image, display, appearance, hit_alpha, overlays)?;
     *renderer = Some(painter);
@@ -2500,7 +2497,7 @@ fn perform(
                 Effect::Discard => deferred.push(Deferred::Discard),
                 // 描くだけでメッセージは届かないので、借りたまま描く
                 Effect::CopyToClipboard => {
-                    let job = if scrap.model.background() == Some(Background::Transparent) {
+                    let job = if scrap.model.is_transparent_blank() {
                         Deferred::CopyWithAlpha
                     } else {
                         Deferred::Copy
@@ -2576,7 +2573,7 @@ fn perform(
     })
 }
 
-/// `Effect::ShowBackgroundDialog`: 色の選択ダイアログを出し、選ばれた色を `background` の選択肢として
+/// `Effect::ShowBackgroundDialog`: 色の選択ダイアログを出し、選ばれた色を `background` の値として
 /// 実行する。モーダルなので App を借りずに呼ぶ。取り消したら何もしない。
 fn pick_background(hwnd: HWND, current: Rgb) -> Outcome {
     let Some(color) = crate::settings_dialog::fields::pick_color(hwnd, current) else {
@@ -2587,7 +2584,7 @@ fn pick_background(hwnd: HWND, current: Rgb) -> Outcome {
         return Outcome::Failed;
     };
     let context = OpContext {
-        choice: Some(color.to_rrggbb() as i32),
+        values: Some(StepValues::Background(Background::Color(color))),
         ..OpContext::default()
     };
     perform(hwnd, context, |model, context| {
@@ -2942,7 +2939,7 @@ fn save_failed(path: Option<&Path>, reason: &str) {
 /// スクラップを閉じて、閉じる直前の状態のままごみ箱に移す（上限が 0 なら破棄する）。何も書かれていない透明な
 /// 白紙スクラップ（編集モードの途中で閉じたものも）は、ごみ箱に入れずに捨てる。
 fn close_scrap(hwnd: HWND) {
-    remove_scrap(hwnd, true);
+    remove_scrap(hwnd, Removal::Close);
 }
 
 /// 何も書かれていない透明な白紙スクラップを、ごみ箱に入れずに捨てる（`Effect::Discard` と、編集モードを
@@ -2955,12 +2952,22 @@ fn discard_scrap(hwnd: HWND) {
     })
     .unwrap_or(false);
     if discardable {
-        remove_scrap(hwnd, false);
+        remove_scrap(hwnd, Removal::Discard);
     }
 }
 
-/// スクラップを閉じる。`to_trash` で、何も書かれていない透明な白紙スクラップでなければ、ごみ箱に移す。
-fn remove_scrap(hwnd: HWND, to_trash: bool) {
+/// スクラップの片付け方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// 閉じる: ごみ箱に移す。ただし、片付けた（`ScrapModel::settle`）あとで何も書かれていない透明な白紙
+    /// スクラップなら、ごみ箱に入れずに捨てる（描きかけは片付けで書き込みになるので、片付けてから決める）。
+    Close,
+    /// ごみ箱に入れずに捨てる。
+    Discard,
+}
+
+/// スクラップを `removal` のとおりに片付ける。
+fn remove_scrap(hwnd: HWND, removal: Removal) {
     let removed = with_app(|app| {
         // 保存を待っているレシピは、スクラップと一緒に捨てる
         if app.recipe.discard_for(&(hwnd.0 as isize)).is_some() {
@@ -2970,7 +2977,10 @@ fn remove_scrap(hwnd: HWND, to_trash: bool) {
         let mut scrap = app.scraps.remove(index);
         // トリムの範囲を選んでいる途中で閉じたら選ぶ前の状態で、書き込みの編集モードなら抜けてから入れる
         scrap.model.settle();
-        let to_trash = to_trash && !scrap.model.is_empty_transparent_blank();
+        let to_trash = match removal {
+            Removal::Close => !scrap.model.is_empty_transparent_blank(),
+            Removal::Discard => false,
+        };
         let thumbnail = to_trash.then(|| trash_thumbnail(&scrap));
         let Scrap {
             toolbar,
@@ -4312,19 +4322,22 @@ fn create_blank_scrap(rect: Rect) {
         rect.left,
         rect.top
     );
-    match float_model(model, image, true) {
-        Ok(hwnd) => {
-            if let Some(op) = ops::find("annotate") {
-                run_scrap_operation(hwnd, op, OpContext::default());
-            }
-        }
-        Err(reason) => {
-            notify_user(
-                notify::Level::Error,
-                &format!("{}\n{reason}", text("blank_scrap.failed")),
-            );
-        }
+    if let Err(reason) = float_model_to_edit(model, image) {
+        notify_user(
+            notify::Level::Error,
+            &format!("{}\n{reason}", text("blank_scrap.failed")),
+        );
     }
+}
+
+/// `model` のスクラップを浮かべてフォーカスを移し、すぐに書き込みの編集モードに入る（白紙スクラップを作った
+/// ときと、何も書かれていない透明な白紙スクラップを開いたとき）。出せなければ理由を返す。
+fn float_model_to_edit(model: ScrapModel, image: Image) -> std::result::Result<HWND, String> {
+    let hwnd = float_model(model, image, true)?;
+    if let Some(op) = ops::find("annotate") {
+        run_scrap_operation(hwnd, op, OpContext::default());
+    }
+    Ok(hwnd)
 }
 
 /// トレイの「開く…」: スクラップファイルを選ばせ、新しいスクラップとしてカーソルのあるモニタの中央に浮かべる。
@@ -4391,11 +4404,12 @@ fn open_scrap_path(path: &Path) -> std::result::Result<(), OpenFailure> {
             .ok_or_else(|| failed(format!("could not paint the blank scrap of {size:?}")))?,
     };
     // 何も書かれていない透明な白紙は、作ったときと同じく書き込みの編集モードで浮かべる（何も書かずに抜けると捨てる）
-    let edit = model.is_empty_transparent_blank();
-    let hwnd = float_model(model, image, true).map_err(failed)?;
-    if edit && let Some(op) = ops::find("annotate") {
-        run_scrap_operation(hwnd, op, OpContext::default());
+    if model.is_empty_transparent_blank() {
+        float_model_to_edit(model, image)
+    } else {
+        float_model(model, image, true)
     }
+    .map_err(failed)?;
     log::info!("opened {}", path.display());
     Ok(())
 }

@@ -184,7 +184,7 @@ impl TrashStore {
         closed_at: LocalTime,
     ) {
         // 白紙スクラップの画素は背景色から作り直せるので、預からない
-        let image = model.background().is_none().then(|| Stash::new(image));
+        let image = (!model.is_blank()).then(|| Stash::new(image));
         let entry = Entry {
             model,
             closed_at,

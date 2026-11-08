@@ -180,8 +180,8 @@ pub enum Response {
 /// 失敗の種類。終了コードを決める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// 撮れなかった・開いたものを浮かべられなかった（範囲選択の画面を開いている、モニタがない、保存できない、
-    /// 裏のスレッドのパニック など）。終了コード 1。
+    /// 撮れなかった（範囲選択の画面を開いている、モニタがない、保存できない、裏のスレッドのパニック など）。
+    /// 終了コード 1。
     CaptureFailed,
     /// 引数の誤り。終了コード 2。
     InvalidArguments,
@@ -195,6 +195,8 @@ pub enum ErrorKind {
     FileMalformed,
     /// 開くスクラップファイルが新しい版の shunsoku で作られた。終了コード 7。
     FileNewerVersion,
+    /// スクラップファイルは読めたが、スクラップを出せなかった（ウィンドウを作れない など）。終了コード 8。
+    ShowFailed,
 }
 
 impl From<LoadErrorKind> for ErrorKind {
@@ -208,48 +210,48 @@ impl From<LoadErrorKind> for ErrorKind {
 }
 
 impl ErrorKind {
-    pub fn exit_code(self) -> i32 {
+    /// すべての種類（応答の名前から引くときに使う）。
+    const ALL: [ErrorKind; 8] = [
+        ErrorKind::CaptureFailed,
+        ErrorKind::InvalidArguments,
+        ErrorKind::Unavailable,
+        ErrorKind::Cancelled,
+        ErrorKind::FileUnreadable,
+        ErrorKind::FileMalformed,
+        ErrorKind::FileNewerVersion,
+        ErrorKind::ShowFailed,
+    ];
+
+    /// 応答に書く名前と、CLI の終了コード。種類ごとの決まりはここにだけ書く。
+    fn entry(self) -> (&'static str, i32) {
         match self {
-            ErrorKind::CaptureFailed => 1,
-            ErrorKind::InvalidArguments => 2,
-            ErrorKind::Unavailable => 3,
-            ErrorKind::Cancelled => 4,
-            ErrorKind::FileUnreadable => 5,
-            ErrorKind::FileMalformed => 6,
-            ErrorKind::FileNewerVersion => 7,
+            ErrorKind::CaptureFailed => ("capture-failed", 1),
+            ErrorKind::InvalidArguments => ("invalid-arguments", 2),
+            ErrorKind::Unavailable => ("unavailable", 3),
+            ErrorKind::Cancelled => ("cancelled", 4),
+            ErrorKind::FileUnreadable => ("file-unreadable", 5),
+            ErrorKind::FileMalformed => ("file-malformed", 6),
+            ErrorKind::FileNewerVersion => ("file-newer-version", 7),
+            ErrorKind::ShowFailed => ("show-failed", 8),
         }
+    }
+
+    pub fn exit_code(self) -> i32 {
+        self.entry().1
     }
 
     fn name(self) -> &'static str {
-        match self {
-            ErrorKind::CaptureFailed => "capture-failed",
-            ErrorKind::InvalidArguments => "invalid-arguments",
-            ErrorKind::Unavailable => "unavailable",
-            ErrorKind::Cancelled => "cancelled",
-            ErrorKind::FileUnreadable => "file-unreadable",
-            ErrorKind::FileMalformed => "file-malformed",
-            ErrorKind::FileNewerVersion => "file-newer-version",
-        }
+        self.entry().0
     }
 
     fn from_name(name: &str) -> Option<ErrorKind> {
-        [
-            ErrorKind::CaptureFailed,
-            ErrorKind::InvalidArguments,
-            ErrorKind::Unavailable,
-            ErrorKind::Cancelled,
-            ErrorKind::FileUnreadable,
-            ErrorKind::FileMalformed,
-            ErrorKind::FileNewerVersion,
-        ]
-        .into_iter()
-        .find(|kind| kind.name() == name)
+        ErrorKind::ALL.into_iter().find(|kind| kind.name() == name)
     }
 }
 
 impl Response {
     /// CLI の終了コード（0 成功 / 1 キャプチャの失敗 / 2 引数の誤り / 3 依頼できない・バージョン違い / 4 取り消し
-    /// / 5〜7 スクラップファイルを開けない。`ErrorKind::exit_code`）。
+    /// / 5〜7 スクラップファイルを開けない / 8 開いたスクラップを出せない。`ErrorKind::exit_code`）。
     pub fn exit_code(&self) -> i32 {
         match self {
             Response::Captured { .. } | Response::Monitors(_) | Response::Opened => 0,
@@ -812,6 +814,7 @@ mod tests {
             failed(ErrorKind::FileUnreadable),
             failed(ErrorKind::FileMalformed),
             failed(ErrorKind::FileNewerVersion),
+            failed(ErrorKind::ShowFailed),
         ] {
             let wire = encode_response(&response);
             assert_eq!(decode_response(&wire), Ok(response));
@@ -825,6 +828,21 @@ mod tests {
         assert_eq!(code(LoadErrorKind::Unreadable), 5);
         assert_eq!(code(LoadErrorKind::Malformed), 6);
         assert_eq!(code(LoadErrorKind::NewerVersion), 7);
+        assert_eq!(ErrorKind::ShowFailed.exit_code(), 8);
+    }
+
+    #[test]
+    fn every_error_kind_has_its_own_name_and_exit_code() {
+        let names: std::collections::HashSet<_> =
+            ErrorKind::ALL.iter().map(|kind| kind.name()).collect();
+        let codes: std::collections::HashSet<_> =
+            ErrorKind::ALL.iter().map(|kind| kind.exit_code()).collect();
+        assert_eq!(names.len(), ErrorKind::ALL.len());
+        assert_eq!(codes.len(), ErrorKind::ALL.len());
+        assert!(!codes.contains(&0));
+        for kind in ErrorKind::ALL {
+            assert_eq!(ErrorKind::from_name(kind.name()), Some(kind));
+        }
     }
 
     #[test]

@@ -72,7 +72,7 @@ pub(super) fn on_pipe_requests(message_window: HWND) {
 }
 
 /// `open`: スクラップファイルを開いて浮かべ、結果を CLI に返す。読めない・正しくない・新しい版は、それぞれの
-/// 終了コード（`ErrorKind::from(LoadErrorKind)`）で返す。
+/// 終了コード（`ErrorKind::from(LoadErrorKind)`）で、読めたが出せなければ `ErrorKind::ShowFailed` で返す。
 fn open_for_cli(path: &Path, to: ReplyTo) {
     log::info!("open requested from the CLI: {}", path.display());
     let response = match open_scrap_path(path) {
@@ -82,7 +82,7 @@ fn open_for_cli(path: &Path, to: ReplyTo) {
             message: format!("{} {}", text(e.message_key()), path.display()),
         },
         Err(OpenFailure::Float(reason)) => Response::Failed {
-            kind: ErrorKind::CaptureFailed,
+            kind: ErrorKind::ShowFailed,
             message: format!("{} {reason}", text("cli.float_failed")),
         },
     };
