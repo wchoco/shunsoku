@@ -260,3 +260,279 @@ fn dropping_the_renderer_returns_the_bitmaps_kept_for_it() {
         "the dropped renderer's bitmap is kept"
     );
 }
+
+/// `annotations` を書き込みに重ねて（選んでいるものの印は `selected`。キャレット・範囲選択の枠・トリム・倍率は
+/// なし）、枠と影を付けて描き先 `canvas` に描き、返った値と描き先の画素を返す。画像の 1 画素は表示で `zoom` 倍。
+fn paint_drawing(
+    canvas: &RefCell<Option<Canvas>>,
+    renderer: &mut Renderer,
+    image: &CachedImage,
+    zoom: u32,
+    hit_alpha: Option<u8>,
+    annotations: &[Annotation],
+    selected: &[Rect],
+) -> (Painted, Image) {
+    let appearance = framed();
+    let size = image.image().size();
+    let display = Size::new(size.width * zoom, size.height * zoom);
+    let margin = appearance.margin() as u32;
+    let window = Size::new(display.width + margin * 2, display.height + margin * 2);
+    let canvas = Canvas::reuse(canvas, window).unwrap();
+    let canvas = &*canvas;
+    let overlays = Overlays {
+        annotations: AnnotationLayer {
+            annotations,
+            view: View {
+                left: 0.0,
+                top: 0.0,
+                scale_x: f64::from(zoom),
+                scale_y: f64::from(zoom),
+            },
+            selected,
+            selection_range: None,
+            typing: None,
+            scale: 1.0,
+        },
+        label: None,
+        trim: None,
+    };
+    let painted = renderer
+        .paint_scrap(canvas, image, display, &appearance, hit_alpha, overlays)
+        .unwrap();
+    (painted, canvas.to_image().unwrap())
+}
+
+/// `paint_drawing` と同じものを、新しい描き先にウィンドウ全体で描いた画素。
+fn paint_whole(
+    renderer: &mut Renderer,
+    image: &CachedImage,
+    zoom: u32,
+    hit_alpha: Option<u8>,
+    annotations: &[Annotation],
+    selected: &[Rect],
+) -> Image {
+    let fresh = RefCell::new(None);
+    let (painted, image) = paint_drawing(
+        &fresh,
+        renderer,
+        image,
+        zoom,
+        hit_alpha,
+        annotations,
+        selected,
+    );
+    assert_eq!(painted.dirty, Some(whole_window(&image)), "a new canvas");
+    image
+}
+
+/// ウィンドウ全体の矩形。
+fn whole_window(image: &Image) -> Rect {
+    Rect::from_origin_size(Point::default(), image.size())
+}
+
+fn stroke(shape: Shape, color: Rgb, width: u32) -> Annotation {
+    Annotation {
+        shape,
+        style: Style { color, width },
+    }
+}
+
+fn freehand(points: &[(i32, i32)], width: u32) -> Annotation {
+    let points = points.iter().map(|&(x, y)| Point::new(x, y)).collect();
+    stroke(Shape::Freehand { points }, Rgb(0xE0, 0x20, 0x20), width)
+}
+
+fn arrow(from: (i32, i32), to: (i32, i32), width: u32) -> Annotation {
+    let (from, to) = (Point::new(from.0, from.1), Point::new(to.0, to.1));
+    stroke(Shape::Arrow { from, to }, Rgb(0x10, 0x60, 0xE0), width)
+}
+
+/// 書き込みを足していく並び（ドラッグ中のフリーハンド・矢印・線・矩形・楕円と、元に戻す、変わらない描き直し）。
+/// 太い線、矢印の頭、丸めた端が、前の書き込みと画像の端の近くに来るようにしてある（画像は 120×80）。
+fn drawing_steps() -> Vec<Vec<Annotation>> {
+    let mut steps: Vec<Vec<Annotation>> = vec![vec![]];
+    // 太いフリーハンドを 1 点ずつ伸ばす（前の線と交わり、画像の左上の端で丸めた端が切れる）
+    let trail = [
+        (1, 1),
+        (20, 6),
+        (34, 30),
+        (12, 40),
+        (8, 18),
+        (40, 12),
+        (60, 50),
+    ];
+    // （描いているフリーハンドはいつも 2 点から。core の `EditState`）
+    for n in 2..=trail.len() {
+        steps.push(vec![freehand(&trail[..n], 11)]);
+    }
+    let done = freehand(&trail, 11);
+    // 太い矢印の先を動かす（頭が前の線に重なり、画像の右の端にかかる）
+    for to in [(70, 20), (90, 35), (118, 10), (50, 25)] {
+        steps.push(vec![done.clone(), arrow((80, 70), to, 9)]);
+    }
+    let pointed = arrow((80, 70), (50, 25), 9);
+    // 太い線を伸ばす（丸めた端が画像の左下の外に出る）
+    for to in [(30, 60), (5, 79), (-10, 90)] {
+        let line = Shape::Line {
+            from: Point::new(100, 40),
+            to: Point::new(to.0, to.1),
+        };
+        steps.push(vec![
+            done.clone(),
+            pointed.clone(),
+            stroke(line, Rgb(0x20, 0xA0, 0x40), 13),
+        ]);
+    }
+    // 矩形と楕円を広げる（画像の右下の端にかかる）
+    for (corner, end) in [((70, 60), (20, 20)), ((119, 79), (60, 70))] {
+        let rect = Shape::Rect {
+            from: Point::new(40, 45),
+            to: Point::new(corner.0, corner.1),
+        };
+        let ellipse = Shape::Ellipse {
+            from: Point::new(25, 15),
+            to: Point::new(end.0, end.1),
+        };
+        steps.push(vec![
+            done.clone(),
+            pointed.clone(),
+            stroke(rect, Rgb(0x20, 0xA0, 0x40), 7),
+            stroke(ellipse, Rgb(0xA0, 0x20, 0xA0), 6),
+        ]);
+    }
+    // 元に戻す（最後の 2 つを消す）
+    steps.push(vec![done.clone(), pointed.clone()]);
+    // 変わったものがない
+    steps.push(vec![done, pointed]);
+    steps
+}
+
+#[test]
+fn a_dirty_rect_paints_the_same_pixels_as_the_whole_window() {
+    let size = Size::new(120, 80);
+    let hit_alpha = Appearance::default().hit_alpha();
+    let opaque = CachedImage::new(solid(size, [0x10, 0x80, 0xF0, 0xFF]));
+    let see_through = CachedImage::new(half_transparent(size, [0x00, 0x00, 0xFF, 0x80]));
+    // 等倍・拡大・透明な白紙スクラップの下敷き
+    let cases = [
+        (&opaque, 1, None),
+        (&opaque, 3, None),
+        (&see_through, 2, Some(hit_alpha)),
+    ];
+    let steps = drawing_steps();
+    for (c, (image, zoom, alpha)) in cases.into_iter().enumerate() {
+        let mut renderer = Renderer::new().unwrap();
+        let canvas = RefCell::new(None);
+        let mut partial = 0;
+        for (i, annotations) in steps.iter().enumerate() {
+            let (painted, got) =
+                paint_drawing(&canvas, &mut renderer, image, zoom, alpha, annotations, &[]);
+            let want = paint_whole(&mut renderer, image, zoom, alpha, annotations, &[]);
+            assert!(
+                got == want,
+                "case {c} step {i}: the dirty rect drew other pixels"
+            );
+            let window = whole_window(&want);
+            match (i, painted.dirty) {
+                (0, dirty) => assert_eq!(dirty, Some(window), "case {c}: the first paint"),
+                (i, dirty) if i == steps.len() - 1 => {
+                    assert_eq!(dirty, None, "case {c}: nothing changed")
+                }
+                (_, Some(dirty)) if dirty != window => {
+                    assert!(
+                        window.intersect(&dirty) == Some(dirty),
+                        "case {c} step {i}: {dirty:?} is out of the window"
+                    );
+                    partial += 1;
+                }
+                _ => {}
+            }
+        }
+        // ドラッグ中は、ウィンドウの一部だけを描き直して渡す
+        assert!(
+            partial >= steps.len() - 3,
+            "case {c}: only {partial} paints were partial"
+        );
+    }
+}
+
+#[test]
+fn marks_text_and_other_looks_paint_the_whole_window() {
+    let size = Size::new(48, 40);
+    let image = CachedImage::new(solid(size, [0x10, 0x80, 0xF0, 0xFF]));
+    let other = CachedImage::new(solid(size, [0xF0, 0x20, 0x40, 0xFF]));
+    let line = freehand(&[(4, 4), (30, 20)], 5);
+    let longer = freehand(&[(4, 4), (30, 20), (40, 30)], 5);
+    let text = stroke(
+        Shape::Text {
+            at: Point::new(6, 24),
+            text: "Ab".to_owned(),
+            font: Font::default(),
+        },
+        Rgb(0x20, 0x20, 0x20),
+        3,
+    );
+    let marked = [line.bounds()];
+    let no_marks: &[Rect] = &[];
+    // 並び: 選択の印 → 印を外す → 文字を足す → 別の画像 → 別の倍率 → 別の当たり判定の下敷き。どれも前と比べて
+    // 範囲を正しく出せないので、ウィンドウ全体を描き直す
+    /// 画像・倍率・当たり判定の下敷き・書き込み・選択の印。
+    type Step<'a> = (
+        &'a CachedImage,
+        u32,
+        Option<u8>,
+        Vec<Annotation>,
+        &'a [Rect],
+    );
+    let steps: [Step; 7] = [
+        (&image, 1, None, vec![line.clone()], no_marks),
+        (&image, 1, None, vec![line.clone()], &marked),
+        (&image, 1, None, vec![longer.clone()], no_marks),
+        (
+            &image,
+            1,
+            None,
+            vec![longer.clone(), text.clone()],
+            no_marks,
+        ),
+        (
+            &other,
+            1,
+            None,
+            vec![longer.clone(), text.clone()],
+            no_marks,
+        ),
+        (&other, 2, None, vec![longer.clone()], no_marks),
+        (&other, 2, Some(1), vec![longer.clone()], no_marks),
+    ];
+    let mut renderer = Renderer::new().unwrap();
+    let canvas = RefCell::new(None);
+    for (i, (image, zoom, alpha, annotations, selected)) in steps.iter().enumerate() {
+        let (painted, got) = paint_drawing(
+            &canvas,
+            &mut renderer,
+            image,
+            *zoom,
+            *alpha,
+            annotations,
+            selected,
+        );
+        let want = paint_whole(&mut renderer, image, *zoom, *alpha, annotations, selected);
+        assert!(got == want, "step {i}: drew other pixels");
+        assert_eq!(painted.dirty, Some(whole_window(&got)), "step {i}");
+    }
+
+    // 出せなかったとき（`Canvas::forget`）は、次はウィンドウ全体を描き直す
+    let (_, got) = paint_drawing(&canvas, &mut renderer, &other, 2, Some(1), &[], no_marks);
+    Canvas::reuse(&canvas, got.size()).unwrap().forget();
+    let (painted, got) = paint_drawing(
+        &canvas,
+        &mut renderer,
+        &other,
+        2,
+        Some(1),
+        &[line],
+        no_marks,
+    );
+    assert_eq!(painted.dirty, Some(whole_window(&got)), "after forget");
+}

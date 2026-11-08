@@ -12,7 +12,7 @@
 //! - drop でウィンドウを壊す。描き先も一緒に返す。
 //! - 書き込みの編集モードで消しゴムを選んでいる間のカーソル（`set_eraser_cursor`）もここで作る。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use shunsoku_core::geometry::Rect;
 use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND};
@@ -136,6 +136,8 @@ pub struct ScrapWindow {
     hwnd: HWND,
     /// 描き先。まだ描いていなければ None。
     canvas: RefCell<Option<Canvas>>,
+    /// 出した回数（`present`）。
+    presents: Cell<u64>,
 }
 
 impl ScrapWindow {
@@ -168,13 +170,27 @@ impl ScrapWindow {
         Ok(ScrapWindow {
             hwnd,
             canvas: RefCell::new(None),
+            presents: Cell::new(0),
         })
     }
 
     /// `source`（premultiplied BGRA の DIB を選んだ DC、大きさは `rect` と同じ）の中身を `rect` に出す。
+    /// `dirty`（`source` の中の座標）があればその範囲だけを写す（前に出したときと大きさが同じときだけ渡す）。
     /// `constant_alpha` は全体のアルファ（`Appearance::constant_alpha`）。
-    pub fn present(&self, source: HDC, rect: Rect, constant_alpha: u8) -> Result<()> {
-        layered::present(self.hwnd, source, rect, constant_alpha)
+    pub fn present(
+        &self,
+        source: HDC,
+        rect: Rect,
+        dirty: Option<Rect>,
+        constant_alpha: u8,
+    ) -> Result<()> {
+        self.presents.set(self.presents.get().wrapping_add(1));
+        layered::present(self.hwnd, source, rect, dirty, constant_alpha)
+    }
+
+    /// 出した回数（`present` を呼んだ回数）。出している間にほかの描き直しが出したかを見分ける。
+    pub fn presents(&self) -> u64 {
+        self.presents.get()
     }
 
     /// 描き直しで使い回す描き先（`Canvas::reuse` に渡す）。`UpdateLayeredWindow` は中身を写し取るので、出し終えた
