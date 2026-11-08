@@ -28,6 +28,7 @@
 use std::cell::{RefCell, RefMut};
 use std::ffi::c_void;
 use std::ops::Deref;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use shunsoku_core::annotate::toolbar::{Button, Layout, ToolSlot};
@@ -302,17 +303,57 @@ impl Deref for CanvasLease<'_> {
 /// 持っておく。画像はあとから差し替えられない（変わったら新しく作る）ので、作り置きが別の画像のものになることは
 /// ない。ビットマップは作ったレンダー ターゲットでしか使えないので、作った描き手の番号（`Renderer::id`）も持ち、
 /// 描き手が作り直されていたら（`D2DERR_RECREATE_TARGET` などで捨てたあと）古いものを捨てて作り直す。
-/// 作り置きはこの値と一緒に捨てる（スクラップを閉じたら返る）。
+/// 作り置きはこの値と一緒に捨てる（スクラップを閉じたら返る）。描き手を捨てたときも、その描き手で作った作り置きは
+/// 次に描くのを待たずに捨てる（`Kept`）。
 pub struct CachedImage {
     image: Image,
-    bitmap: RefCell<Option<(u64, ID2D1Bitmap)>>,
+    bitmap: Rc<BitmapSlot>,
+}
+
+/// 作り置きのビットマップと、それを作った描き手の番号（`Kept::id`）。
+type BitmapSlot = RefCell<Option<(u64, ID2D1Bitmap)>>;
+
+/// 描き手が作り置きにさせたビットマップの控え。描き手を捨てるとき（`Renderer` の drop）、ここから辿って捨てる。
+struct Kept {
+    /// 描き手ごとに違う番号。作り置きのビットマップを作った描き手を見分ける。
+    id: u64,
+    /// 作り置きにさせた `CachedImage` の置き場。閉じたスクラップのものは、次に作り置きを足すときに除く。
+    slots: RefCell<Vec<Weak<BitmapSlot>>>,
+}
+
+impl Kept {
+    fn new() -> Kept {
+        Kept {
+            id: RENDERER_IDS.fetch_add(1, Ordering::Relaxed),
+            slots: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn remember(&self, slot: &Rc<BitmapSlot>) {
+        let mut slots = self.slots.borrow_mut();
+        slots.retain(|slot| slot.strong_count() > 0);
+        slots.push(Rc::downgrade(slot));
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        for slot in self.slots.get_mut().iter().filter_map(Weak::upgrade) {
+            // ほかの描き手が作り直したものは残す
+            if let Ok(mut slot) = slot.try_borrow_mut()
+                && slot.as_ref().is_some_and(|(id, _)| *id == self.id)
+            {
+                *slot = None;
+            }
+        }
+    }
 }
 
 impl CachedImage {
     pub fn new(image: Image) -> CachedImage {
         CachedImage {
             image,
-            bitmap: RefCell::new(None),
+            bitmap: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -325,29 +366,53 @@ impl CachedImage {
         self.image
     }
 
-    /// `renderer` の描き手で使えるビットマップ。なければ（初めて描くとき、描き手が作り直されたとき）作る。
-    fn bitmap(&self, target: &ID2D1RenderTarget, renderer: u64) -> Result<ID2D1Bitmap> {
+    /// ビットマップを作り置きにしているか。
+    #[cfg(test)]
+    fn keeps_bitmap(&self) -> bool {
+        self.bitmap.borrow().is_some()
+    }
+
+    /// 画像を `dest` に伸び縮みさせて描く。縮めるときだけ線形補間にする。空の画像は描かない。
+    /// `kept` があればその描き手の作り置きを使い（なければ作って控えさせる）、なければその場で作って捨てる
+    /// （コピーと保存の使い捨ての描き手で、スクラップの描き手の作り置きを追い出さないため）。
+    fn draw(&self, target: &ID2D1RenderTarget, dest: Rect, kept: Option<&Kept>) -> Result<()> {
+        let size = self.image.size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+        let bitmap = match kept {
+            Some(kept) => self.bitmap(target, kept)?,
+            None => create_bitmap(target, &self.image)?,
+        };
+        draw_bitmap(target, &bitmap, size, dest);
+        Ok(())
+    }
+
+    /// `kept` の描き手で使えるビットマップ。なければ（初めて描くとき、描き手が作り直されたとき）作る。
+    fn bitmap(&self, target: &ID2D1RenderTarget, kept: &Kept) -> Result<ID2D1Bitmap> {
         let mut cached = self.bitmap.borrow_mut();
         if let Some((id, bitmap)) = cached.as_ref()
-            && *id == renderer
+            && *id == kept.id
         {
             return Ok(bitmap.clone());
         }
         // 別の描き手のものは、作る前に捨てる（2 枚ぶん持たない）
         *cached = None;
         let bitmap = create_bitmap(target, &self.image)?;
-        *cached = Some((renderer, bitmap.clone()));
+        *cached = Some((kept.id, bitmap.clone()));
+        kept.remember(&self.bitmap);
         Ok(bitmap)
     }
 }
 
-/// 描き手の番号の払い出し（`Renderer::id`）。
+/// 描き手の番号の払い出し（`Kept::id`）。
 static RENDERER_IDS: AtomicU64 = AtomicU64::new(0);
 
 /// Canvas に描く Direct2D の DC レンダー ターゲット。
 pub struct Renderer {
-    /// 描き手ごとに違う番号。作り置きのビットマップ（`CachedImage`）を作った描き手を見分ける。
-    id: u64,
+    /// この描き手で作ったビットマップの作り置き（`CachedImage`）の控え。描き手と一緒に捨て、作り置きも捨てさせる。
+    /// レンダー ターゲットより先に捨てる（フィールドは書いた順に drop される）。
+    kept: Kept,
     factory: ID2D1Factory,
     target: ID2D1DCRenderTarget,
     /// 倍率の表示を書く DirectWrite。初めて表示するときに作る。
@@ -374,7 +439,7 @@ impl Renderer {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let target = factory.CreateDCRenderTarget(&props)?;
             Ok(Renderer {
-                id: RENDERER_IDS.fetch_add(1, Ordering::Relaxed),
+                kept: Kept::new(),
                 factory,
                 target,
                 dwrite: None,
@@ -411,7 +476,7 @@ impl Renderer {
             None
         };
         let window = Rect::from_origin_size(Point::default(), canvas.size());
-        let renderer = self.id;
+        let kept = &self.kept;
         let mut caret = None;
         self.paint(canvas, |target| {
             // SAFETY: BeginDraw と EndDraw の間で呼ぶ
@@ -451,11 +516,7 @@ impl Renderer {
                     target.FillRectangle(&to_rect_f(image_rect), &brush);
                 }
             }
-            let size = image.image.size();
-            if size.width > 0 && size.height > 0 {
-                let bitmap = image.bitmap(target, renderer)?;
-                draw_bitmap(target, &bitmap, size, image_rect);
-            }
+            image.draw(target, image_rect, Some(kept))?;
             caret = draw_annotations(target, annotations, image_rect)?;
             if let Some(trim) = trim {
                 draw_trim_overlay(target, image_rect, trim)?;

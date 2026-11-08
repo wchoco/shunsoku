@@ -237,3 +237,26 @@ fn a_canvas_borrowed_by_an_outer_paint_does_not_stop_a_nested_one() {
     let again = paint_on(&canvas, &mut renderer, &image, size, None);
     assert!(again == want, "the reused canvas drew other pixels");
 }
+
+#[test]
+fn dropping_the_renderer_returns_the_bitmaps_kept_for_it() {
+    // 描き手を作り直したとき（`D2DERR_RECREATE_TARGET` で捨てたときなど）、描き直していないスクラップにも古い
+    // 描き手のビットマップを残さない
+    let size = Size::new(48, 40);
+    let drawn = CachedImage::new(solid(size, [0x10, 0x80, 0xF0, 0xFF]));
+    let other = CachedImage::new(solid(size, [0xF0, 0x20, 0x40, 0xFF]));
+    let mut renderer = Renderer::new().unwrap();
+    paint(&mut renderer, &drawn, size, None);
+    paint(&mut renderer, &other, size, None);
+    assert!(drawn.keeps_bitmap() && other.keeps_bitmap());
+
+    drop(renderer);
+    assert!(
+        !drawn.keeps_bitmap(),
+        "the dropped renderer's bitmap is kept"
+    );
+    assert!(
+        !other.keeps_bitmap(),
+        "the dropped renderer's bitmap is kept"
+    );
+}
