@@ -50,6 +50,7 @@ apply = "Apply"
 write_failed = "Could not write the settings file. The changes in Settings are not applied yet."
 browse = "Browse…"
 pick_color = "Pick…"
+transparent = "Transparent"
 chord_none = "None"
 insert_variable = "Insert variable"
 
@@ -99,6 +100,9 @@ mode_precise = "Precise (adjust, then capture)"
 crosshair = "Show a crosshair when selecting"
 crosshair_color = "Crosshair color:"
 hint = "Select a field and press keys to assign them. Tab moves to the next field."
+blank_scrap = "Blank scrap"
+blank_scrap_hotkey = "Hotkey to create:"
+blank_background = "Background:"
 
 [settings_gui.regions]
 name = "Name"
@@ -145,8 +149,6 @@ width = "Width:"
 font_size = "Text size:"
 font = "Font:"
 hint = "Defaults for new drawings. Existing drawings do not change."
-blank_scrap = "Blank scrap:"
-blank_background = "Blank background:"
 
 [settings_gui.scrap_ops]
 operation = "Action"

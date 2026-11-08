@@ -54,6 +54,7 @@ write_failed = "設定ファイルに書けませんでした。設定 GUI の�
 # 欄の横のボタン
 browse = "参照…"
 pick_color = "選ぶ…"
+transparent = "透明"
 # キーの組み合わせの欄が空のときに出す文字（標準のコントロールに任せると OS の表示言語で出る）
 chord_none = "なし"
 insert_variable = "変数を挿入"
@@ -109,6 +110,9 @@ mode_precise = "精密（調整してから確定）"
 crosshair = "範囲選択の画面に十字線を出す"
 crosshair_color = "十字線の色:"
 hint = "欄を選んでキーを押すと割り当てます。Tab で次の欄へ移ります。"
+blank_scrap = "白紙スクラップ"
+blank_scrap_hotkey = "作るホットキー:"
+blank_background = "背景色:"
 
 [settings_gui.regions]
 # 一覧の列
@@ -159,8 +163,6 @@ width = "太さ:"
 font_size = "文字サイズ:"
 font = "書体:"
 hint = "これから書き込むときの既定値です。書き込み済みのものは変わりません。"
-blank_scrap = "白紙スクラップ:"
-blank_background = "白紙の背景色:"
 
 [settings_gui.scrap_ops]
 operation = "操作"

@@ -38,6 +38,7 @@ use std::path::Path;
 use shunsoku_core::geometry::Rect;
 use shunsoku_core::i18n::{self, Language};
 use shunsoku_core::monitors;
+use shunsoku_core::scrap::Background;
 use shunsoku_core::settings::editor::{AppearanceInput, AppearanceItem, Editor, Move};
 use shunsoku_core::settings::form::{ClickPlace, FieldEntry, PauseChange};
 use shunsoku_core::settings::merge::{Field, merge};
@@ -720,6 +721,9 @@ fn on_button(hwnd: HWND, fields: &Fields, action: Action) {
             if let Some(color) = fields::pick_color(hwnd, current) {
                 set_field(field, Input::Text(color.to_string()));
             }
+        }
+        Action::Transparent(field) => {
+            set_field(field, Input::Text(Background::Transparent.to_string()))
         }
         Action::InsertVariable(of) => insert_variable(hwnd, fields, of),
         Action::OpenFolder(field) => {

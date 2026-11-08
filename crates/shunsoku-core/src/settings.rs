@@ -101,6 +101,7 @@ pub mod form;
 mod location;
 pub mod merge;
 pub mod tab_step;
+pub mod tabs;
 pub mod unset;
 mod write;
 mod write_failure;
