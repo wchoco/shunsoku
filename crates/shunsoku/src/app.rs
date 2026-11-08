@@ -112,6 +112,7 @@ use shunsoku_core::scrap::ops::{
 use shunsoku_core::scrap::{
     Appearance, Drag, Mode, Pointer, ScrapModel, TrimInput, Wheel, ZoomAnchor,
 };
+use shunsoku_core::scrap_file::{self, ScrapFile};
 use shunsoku_core::selection::{Button, CursorShape, Direction, Input, Selection, State};
 use shunsoku_core::settings::form::HotkeyPause;
 use shunsoku_core::settings::{
@@ -215,6 +216,7 @@ const CMD_SHOW_ALL: u32 = 5;
 const CMD_ADD_REGION: u32 = 6;
 const CMD_SETTINGS: u32 = 7;
 const CMD_BLANK_SCRAP: u32 = 8;
+const CMD_OPEN: u32 = 9;
 /// ごみ箱の一覧の項目の番号は、これに一覧の添字を足したもの。
 const CMD_TRASH_FIRST: u32 = 100;
 /// 「定型領域」の項目の番号は、これに `Settings::regions` の添字を足したもの。
@@ -1246,6 +1248,7 @@ fn on_tray(owner: HWND, event: tray::Event) {
                     MenuItem::AddRegion => {
                         menu::Entry::item(CMD_ADD_REGION, text("tray.menu.add_region"), true)
                     }
+                    MenuItem::Open => menu::Entry::item(CMD_OPEN, text("tray.menu.open"), true),
                     MenuItem::Trash => menu::Entry::Submenu {
                         label: text("tray.menu.trash").into(),
                         enabled: true,
@@ -1315,6 +1318,7 @@ fn on_command(command: u32) {
         CMD_HIDE_ALL => set_scraps_visible(false),
         CMD_SHOW_ALL => set_scraps_visible(true),
         CMD_SETTINGS => settings_gui::open(None),
+        CMD_OPEN => open_scrap_file(),
         CMD_EXIT => {
             log::info!("exit requested from the tray menu");
             // SAFETY: UI スレッドで呼ぶ
@@ -2343,6 +2347,7 @@ enum Deferred {
     Copy(Image),
     Save(Image),
     SaveAs(Image),
+    SaveScrapFile(Box<ScrapFile>),
     /// コピーや保存の画像を作れなかった。`failed_key` はその仕事の失敗の文言のキー。
     RenderFailed {
         failed_key: &'static str,
@@ -2473,6 +2478,13 @@ fn perform(
                 Effect::ShowSaveDialog => {
                     deferred.push(render_for(scrap, Deferred::SaveAs, "save.failed"));
                 }
+                // 描いた画像ではなく、元の画像と書き込みをそのまま書く
+                Effect::ShowScrapFileSaveDialog => {
+                    deferred.push(Deferred::SaveScrapFile(Box::new(ScrapFile::of(
+                        &scrap.model,
+                        &scrap.image,
+                    ))));
+                }
             }
         }
         Some(deferred)
@@ -2495,6 +2507,7 @@ fn perform(
             Deferred::Copy(image) => copy_to_clipboard(&image),
             Deferred::Save(image) => save(save_default(image)),
             Deferred::SaveAs(image) => save(save_as(hwnd, image)),
+            Deferred::SaveScrapFile(file) => save(save_scrap_file(hwnd, file)),
             Deferred::RenderFailed { failed_key, reason } => {
                 log::error!("could not render the scrap image ({failed_key}): {reason}");
                 notify_user(
@@ -2552,7 +2565,13 @@ fn copy_image(image: &Image) -> std::result::Result<(), String> {
 /// 失敗してもスクラップはそのまま残る。
 fn save_default(image: Image) -> Saving {
     match default_destination() {
-        Some(path) => start_save(path, image, save::Overwrite::Deny, None, None, true),
+        Some(path) => start_save(
+            path,
+            Payload::Png(image, save::Overwrite::Deny),
+            None,
+            None,
+            true,
+        ),
         None => Saving::Ended(Outcome::Failed),
     }
 }
@@ -2572,10 +2591,43 @@ fn save_as(owner: HWND, image: Image) -> Saving {
         return Saving::Ended(Outcome::Failed);
     };
     // モーダルなので App を借りずに呼ぶ
-    match save::ask_path(owner, &proposed, text("save.png_filter")) {
-        Ok(Some(path)) => start_save(path, image, save::Overwrite::Allow, None, None, true),
+    match save::ask_path(
+        owner,
+        &proposed,
+        save::FileType::png(text("save.png_filter")),
+    ) {
+        Ok(Some(path)) => start_save(
+            path,
+            Payload::Png(image, save::Overwrite::Allow),
+            None,
+            None,
+            true,
+        ),
         Ok(None) => {
             log::info!("save as cancelled");
+            Saving::Ended(Outcome::Cancelled)
+        }
+        Err(e) => {
+            log::error!("could not show the save dialog: {e}");
+            save_failed(None, &e.to_string());
+            Saving::Ended(Outcome::Failed)
+        }
+    }
+}
+
+/// `Effect::ShowScrapFileSaveDialog`: スクラップファイルの保存先のダイアログを出し、選ばれた場所に書く。初期フォルダと
+/// ファイル名は既定の保存と同じ（拡張子だけ替える）。キャンセルしたら何もしない。失敗は既定の保存と同じく通知する。
+fn save_scrap_file(owner: HWND, file: Box<ScrapFile>) -> Saving {
+    let Some(proposed) = default_destination() else {
+        return Saving::Ended(Outcome::Failed);
+    };
+    let proposed = proposed.with_extension(scrap_file::EXTENSION);
+    let file_type = save::FileType::scrap_file(text("scrap_file.filter"));
+    // モーダルなので App を借りずに呼ぶ
+    match save::ask_path(owner, &proposed, file_type) {
+        Ok(Some(path)) => start_save(path, Payload::ScrapFile(file), None, None, true),
+        Ok(None) => {
+            log::info!("save as scrap file cancelled");
             Saving::Ended(Outcome::Cancelled)
         }
         Err(e) => {
@@ -2647,12 +2699,28 @@ fn resolve_destination(
     }
 }
 
-/// `path` に PNG を書く仕事を裏のスレッドで始める。結果は `WM_APP_SAVED` で受ける。失敗したら `fallback` を
+/// 裏のスレッドで書くもの。
+enum Payload {
+    /// 画像の PNG。
+    Png(Image, save::Overwrite),
+    /// スクラップファイル（ダイアログで上書きを確かめてあるので上書きする）。
+    ScrapFile(Box<ScrapFile>),
+}
+
+impl Payload {
+    fn write(&self, path: &Path) -> std::io::Result<()> {
+        match self {
+            Payload::Png(image, overwrite) => save::write_png(path, image, *overwrite),
+            Payload::ScrapFile(file) => save::write_scrap_file(path, file),
+        }
+    }
+}
+
+/// `path` に `payload` を書く仕事を裏のスレッドで始める。結果は `WM_APP_SAVED` で受ける。失敗したら `fallback` を
 /// スクラップとして浮かべる。`reply` があれば、結果を CLI にも返す。`notify` が false なら結果を通知しない。
 fn start_save(
     path: PathBuf,
-    image: Image,
-    overwrite: save::Overwrite,
+    payload: Payload,
     fallback: Option<Fallback>,
     reply: Option<ReplyTo>,
     notify: bool,
@@ -2678,11 +2746,9 @@ fn start_save(
     let spawned = std::thread::Builder::new()
         .name("save".into())
         .spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                save::write_png(&job_path, &image, overwrite)
-            }))
-            .map_err(|_| text("job.panicked").to_owned())
-            .and_then(|written| written.map_err(|e| e.to_string()));
+            let result = catch_unwind(AssertUnwindSafe(|| payload.write(&job_path)))
+                .map_err(|_| text("job.panicked").to_owned())
+                .and_then(|written| written.map_err(|e| e.to_string()));
             let _ = sender.send(Saved {
                 path: job_path,
                 result,
@@ -3403,7 +3469,13 @@ fn output(request: CaptureRequest, area: Rect, image: Image) {
     });
     match resolve_save_target(target) {
         Ok(path) => {
-            start_save(path, image, overwrite, fallback, reply_to, notify);
+            start_save(
+                path,
+                Payload::Png(image, overwrite),
+                fallback,
+                reply_to,
+                notify,
+            );
         }
         Err((dir, reason)) if strict => {
             let mut reason = reason;
@@ -4151,6 +4223,70 @@ fn create_blank_scrap(rect: Rect) {
             );
         }
     }
+}
+
+/// トレイの「開く…」: スクラップファイルを選ばせ、新しいスクラップとしてカーソルのあるモニタの中央に浮かべる。
+/// 倍率 100%、見た目は全体の既定値、履歴は空。読めなければ何も開かず、わけを通知する。
+fn open_scrap_file() {
+    let Some((owner, initial)) =
+        with_app(|app| (app.windows.message, app.settings.general.save_dir.clone()))
+    else {
+        return;
+    };
+    let initial = initial.or_else(|| save::default_dir().ok());
+    let file_type = save::FileType::scrap_file(text("scrap_file.filter"));
+    // モーダルなので App を借りずに呼ぶ
+    let path = match save::ask_open_path(owner, initial.as_deref(), file_type) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            log::info!("open cancelled");
+            return;
+        }
+        Err(e) => {
+            log::error!("could not show the open dialog: {e}");
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{e}", text("scrap_file.unreadable")),
+            );
+            return;
+        }
+    };
+    let file = match scrap_file::read(&path) {
+        Ok(file) => file,
+        Err(e) => {
+            log::error!("could not open {}: {e}", path.display());
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{}", text(e.message_key()), path.display()),
+            );
+            return;
+        }
+    };
+    let (model, content) = file.into_scrap(cursor_monitor());
+    let scrap_file::Content::Image(image) = content;
+    match float_model(model, image, true) {
+        Ok(_) => log::info!("opened {}", path.display()),
+        Err(reason) => {
+            notify_user(
+                notify::Level::Error,
+                &format!("{}\n{reason}", text("scrap_file.unreadable")),
+            );
+        }
+    }
+}
+
+/// カーソルのあるモニタの矩形（スクリーン座標）。わからなければメインモニタ。
+fn cursor_monitor() -> Rect {
+    let monitors = monitor_list::list();
+    let mut cursor = POINT::default();
+    // SAFETY: cursor はこの関数の中で生きている
+    let at = unsafe { GetCursorPos(&mut cursor) }
+        .ok()
+        .map(|()| Point::new(cursor.x, cursor.y));
+    at.and_then(|at| monitors.iter().find(|m| m.rect.contains(at)))
+        .or_else(|| monitors.iter().find(|m| m.primary))
+        .or_else(|| monitors.first())
+        .map_or(Rect::new(0, 0, 0, 0), |m| m.rect)
 }
 
 /// 設定ファイルを読む。ファイルがなければ既定値で、問題にしない。読めなければ既定値で、TOML として読めない

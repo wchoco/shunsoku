@@ -984,6 +984,7 @@ mod tests {
         for (save, effect) in [
             ("save_default", Effect::SaveDefault),
             ("save_as", Effect::ShowSaveDialog),
+            ("save_scrap_file", Effect::ShowScrapFileSaveDialog),
         ] {
             let mut run = run_of(&[save, "close"]);
             let mut model = model();
@@ -1011,6 +1012,11 @@ mod tests {
             ),
             ("save_as", Outcome::Failed, Stop::Failed("save_as")),
             ("save_as", Outcome::Cancelled, Stop::Cancelled("save_as")),
+            (
+                "save_scrap_file",
+                Outcome::Cancelled,
+                Stop::Cancelled("save_scrap_file"),
+            ),
         ] {
             let mut run = run_of(&[save, "close"]);
             let mut model = model();

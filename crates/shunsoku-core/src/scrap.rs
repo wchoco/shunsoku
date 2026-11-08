@@ -258,6 +258,22 @@ impl ScrapModel {
         }
     }
 
+    /// 中身（トリムの範囲 `trimmed` と書き込み `annotations`）を戻したスクラップ（スクラップファイルから
+    /// 開いたとき）。`position` は表示する画像の左上。倍率は 100%、見た目の個別値はなし。`trimmed` は
+    /// `image_size` の中の空でない範囲であること（`scrap_file` が確かめる）。
+    pub fn restored(
+        position: Point,
+        image_size: Size,
+        trimmed: Option<Rect>,
+        annotations: Annotations,
+    ) -> ScrapModel {
+        ScrapModel {
+            trimmed,
+            annotations,
+            ..ScrapModel::new(position, image_size)
+        }
+    }
+
     /// 白紙スクラップ。`position` に `size` の大きさで、`background` の一色を下地にする。
     pub fn blank(position: Point, size: Size, background: Background) -> ScrapModel {
         ScrapModel {
