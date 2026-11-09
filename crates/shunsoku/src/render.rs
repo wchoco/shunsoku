@@ -14,6 +14,9 @@
 //! - 文字の書き込み（`Shape::Text`）は DirectWrite で、左上を書き込みの点の画素の左上に合わせ、行の高さを core の
 //!   見積もり（`annotate::LINE_HEIGHT`）に揃えて描く。打っている文字（`TypingLayer`）は、IME で変換中の文字に
 //!   下線を引いてつなげ、キャレットを描く（その矩形を IME の窓の位置に使う）。
+//! - スクラップの画像のビットマップは、画像と一緒に作り置きにする（`CachedImage`）。画像が変わらない描き直しでは、
+//!   画像全体の premultiplied への変換とビットマップの作り直しをしない。
+//! - レンダー ターゲットはソフトウェア（`D2D1_RENDER_TARGET_TYPE_SOFTWARE`）。CPU で DIB に直接描く。
 //! - 透明度はここでは掛けない（レイヤード ウィンドウの `SourceConstantAlpha` で掛ける）。
 //! - 透明な白紙スクラップは、画像の下に当たり判定のための見えないほど小さいアルファ（`Appearance::hit_alpha`）を
 //!   敷く。コピーと保存の画像（`render_image`）には敷かないので、透明な部分はアルファ 0 のまま。
@@ -22,7 +25,11 @@
 //! - コピーと保存の画像は、`render_image` で画像と書き込みを画像の大きさに描いてから作る（表示と同じ描き方に
 //!   するため。ADR-0006）。
 
+use std::cell::{RefCell, RefMut};
 use std::ffi::c_void;
+use std::ops::Deref;
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use shunsoku_core::annotate::toolbar::{Button, Layout, ToolSlot};
 use shunsoku_core::annotate::{
@@ -43,10 +50,10 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
     D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_LINE_JOIN_ROUND,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE,
     D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
-    ID2D1Brush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush,
-    ID2D1StrokeStyle,
+    ID2D1Bitmap, ID2D1Brush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget,
+    ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -61,7 +68,10 @@ use windows::Win32::Graphics::Gdi::{
     DeleteDC, DeleteObject, GdiFlush, HBITMAP, HDC, HGDIOBJ, SelectObject,
 };
 use windows::core::{Result, w};
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
+
+#[cfg(test)]
+mod tests;
 
 /// 影の濃さ（いちばん内側の不透明度）。外側ほど薄くする。
 const SHADOW_ALPHA: f32 = 0.22;
@@ -162,6 +172,37 @@ pub struct ZoomLabel {
     pub scale: f32,
 }
 
+/// `Renderer::paint_scrap` で描いた結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Painted {
+    /// 文字を打っていれば、キャレットの矩形（ウィンドウの中の座標）。
+    pub caret: Option<Rect>,
+    /// 描き直したウィンドウの中の範囲（ウィンドウに出し直す範囲）。描き先の前の中身と比べて変わらなければ None
+    /// （出し直さなくてよい）。
+    pub dirty: Option<Rect>,
+}
+
+/// 描き先の中身を描いた入力（`Canvas::drawn`）。
+struct Drawn {
+    look: Look,
+    /// 描いた書き込み（`AnnotationLayer::annotations`）。
+    annotations: Vec<Annotation>,
+}
+
+/// 描き先の中身を描いた入力のうち、書き込みのほかのもの。これが前と違えば、ウィンドウ全体を描き直す。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Look {
+    /// 画像（`CachedImage::id`）。
+    image: u64,
+    display: Size,
+    appearance: Appearance,
+    hit_alpha: Option<u8>,
+    view: View,
+    /// 書き込みのほかに重ねたもの（選択の印・キャレット・範囲選択の枠・トリム・倍率）があったか。どれも範囲を
+    /// 書き込みから出せないので、あった描き直しとその次の描き直しはウィンドウ全体を描く。
+    marked: bool,
+}
+
 /// 描き先の DIB（上の行から並ぶ 32bit BGRA）と、それを選んだメモリ DC。
 pub struct Canvas {
     dc: HDC,
@@ -170,6 +211,9 @@ pub struct Canvas {
     /// DIB の画素（`bitmap` が生きている間だけ有効）。
     bits: *const u8,
     size: Size,
+    /// いまの中身を描いた入力（`Renderer::paint_scrap`）。次の描き直しで、変わった部分だけを描き直すのに使う。
+    /// 中身が何か分からないとき（作ったばかり、描けなかった、出せなかった）は None。
+    drawn: RefCell<Option<Drawn>>,
 }
 
 impl Canvas {
@@ -209,8 +253,36 @@ impl Canvas {
                 old,
                 bits: bits.cast_const().cast(),
                 size,
+                drawn: RefCell::new(None),
             })
         }
+    }
+
+    /// 使い回す描き先 `slot` を大きさ `size` で返す。同じ大きさのものがあればそのまま（中身は描くときに
+    /// `Renderer` が消す）、なければ前のものを返してから作り直す。作れなければ `slot` は空になる。
+    ///
+    /// `slot` がほかの描き直しに借りられていれば（出している間に届いたメッセージで描き直したとき）、使い捨ての
+    /// 描き先を作って返す（`slot` には触れない）。
+    ///
+    /// `UpdateLayeredWindow` は中身を写し取るので、出し終えた描き先は次の描き直しで使ってよい。
+    pub fn reuse(slot: &RefCell<Option<Canvas>>, size: Size) -> Result<CanvasLease<'_>> {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return Ok(CanvasLease::Once(Canvas::new(size)?));
+        };
+        if slot.as_ref().is_none_or(|canvas| canvas.size != size) {
+            // 大きな DIB を 2 枚同時に持たないよう、先に返す
+            *slot = None;
+            *slot = Some(Canvas::new(size)?);
+        }
+        Ok(CanvasLease::Reused(RefMut::map(slot, |slot| {
+            slot.as_mut().expect("filled above")
+        })))
+    }
+
+    /// いまの中身を忘れさせる。次の描き直しはウィンドウ全体を描く。ウィンドウに出せなかったとき、ほかの描き先の
+    /// 中身を出したかもしれないときに呼ぶ（ウィンドウに見えているものが、この描き先の中身と違うかもしれないので）。
+    pub fn forget(&self) {
+        *self.drawn.borrow_mut() = None;
     }
 
     /// DIB を選んだメモリ DC（`UpdateLayeredWindow` の描き元）。
@@ -249,8 +321,146 @@ impl Drop for Canvas {
     }
 }
 
+/// `Canvas::reuse` が返す描き先。使い回すもの（借りている間はほかの描き直しに使わせない）か、使い捨てのもの。
+pub enum CanvasLease<'a> {
+    Reused(RefMut<'a, Canvas>),
+    Once(Canvas),
+}
+
+impl Deref for CanvasLease<'_> {
+    type Target = Canvas;
+
+    fn deref(&self) -> &Canvas {
+        match self {
+            CanvasLease::Reused(canvas) => canvas,
+            CanvasLease::Once(canvas) => canvas,
+        }
+    }
+}
+
+/// スクラップに表示する画像と、描き手（`Renderer`）がその画像から作った Direct2D のビットマップの作り置き。
+///
+/// 描き直しのたびに画像全体を premultiplied にしてビットマップを作り直さないよう、初めて描いたときに作って
+/// 持っておく。画像はあとから差し替えられない（変わったら新しく作る）ので、作り置きが別の画像のものになることは
+/// ない。ビットマップは作ったレンダー ターゲットでしか使えないので、作った描き手の番号（`Renderer::id`）も持ち、
+/// 描き手が作り直されていたら（`D2DERR_RECREATE_TARGET` などで捨てたあと）古いものを捨てて作り直す。
+/// 作り置きはこの値と一緒に捨てる（スクラップを閉じたら返る）。描き手を捨てたときも、その描き手で作った作り置きは
+/// 次に描くのを待たずに捨てる（`Kept`）。
+pub struct CachedImage {
+    /// 値ごとに違う番号。描き先の中身がどの画像を描いたものかを見分ける（`Drawn`）。アドレスは使い回されるので
+    /// 使わない。
+    id: u64,
+    image: Image,
+    bitmap: Rc<BitmapSlot>,
+}
+
+/// `CachedImage::id` の払い出し。
+static IMAGE_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// 作り置きのビットマップと、それを作った描き手の番号（`Kept::id`）。
+type BitmapSlot = RefCell<Option<(u64, ID2D1Bitmap)>>;
+
+/// 描き手が作り置きにさせたビットマップの控え。描き手を捨てるとき（`Renderer` の drop）、ここから辿って捨てる。
+struct Kept {
+    /// 描き手ごとに違う番号。作り置きのビットマップを作った描き手を見分ける。
+    id: u64,
+    /// 作り置きにさせた `CachedImage` の置き場。閉じたスクラップのものは、次に作り置きを足すときに除く。
+    slots: RefCell<Vec<Weak<BitmapSlot>>>,
+}
+
+impl Kept {
+    fn new() -> Kept {
+        Kept {
+            id: RENDERER_IDS.fetch_add(1, Ordering::Relaxed),
+            slots: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn remember(&self, slot: &Rc<BitmapSlot>) {
+        let mut slots = self.slots.borrow_mut();
+        slots.retain(|slot| slot.strong_count() > 0);
+        slots.push(Rc::downgrade(slot));
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        for slot in self.slots.get_mut().iter().filter_map(Weak::upgrade) {
+            // ほかの描き手が作り直したものは残す
+            if let Ok(mut slot) = slot.try_borrow_mut()
+                && slot.as_ref().is_some_and(|(id, _)| *id == self.id)
+            {
+                *slot = None;
+            }
+        }
+    }
+}
+
+impl CachedImage {
+    pub fn new(image: Image) -> CachedImage {
+        CachedImage {
+            id: IMAGE_IDS.fetch_add(1, Ordering::Relaxed),
+            image,
+            bitmap: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    pub fn image(&self) -> &Image {
+        &self.image
+    }
+
+    /// 作り置きを捨てて画像だけを返す。
+    pub fn into_image(self) -> Image {
+        self.image
+    }
+
+    /// ビットマップを作り置きにしているか。
+    #[cfg(test)]
+    fn keeps_bitmap(&self) -> bool {
+        self.bitmap.borrow().is_some()
+    }
+
+    /// 画像を `dest` に伸び縮みさせて描く。縮めるときだけ線形補間にする。空の画像は描かない。
+    /// `kept` があればその描き手の作り置きを使い（なければ作って控えさせる）、なければその場で作って捨てる
+    /// （コピーと保存の使い捨ての描き手で、スクラップの描き手の作り置きを追い出さないため）。
+    fn draw(&self, target: &ID2D1RenderTarget, dest: Rect, kept: Option<&Kept>) -> Result<()> {
+        let size = self.image.size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+        let bitmap = match kept {
+            Some(kept) => self.bitmap(target, kept)?,
+            None => create_bitmap(target, &self.image)?,
+        };
+        draw_bitmap(target, &bitmap, size, dest);
+        Ok(())
+    }
+
+    /// `kept` の描き手で使えるビットマップ。なければ（初めて描くとき、描き手が作り直されたとき）作る。
+    fn bitmap(&self, target: &ID2D1RenderTarget, kept: &Kept) -> Result<ID2D1Bitmap> {
+        let mut cached = self.bitmap.borrow_mut();
+        if let Some((id, bitmap)) = cached.as_ref()
+            && *id == kept.id
+        {
+            return Ok(bitmap.clone());
+        }
+        // 別の描き手のものは、作る前に捨てる（2 枚ぶん持たない）
+        *cached = None;
+        let bitmap = create_bitmap(target, &self.image)?;
+        *cached = Some((kept.id, bitmap.clone()));
+        kept.remember(&self.bitmap);
+        Ok(bitmap)
+    }
+}
+
+/// 描き手の番号の払い出し（`Kept::id`）。
+static RENDERER_IDS: AtomicU64 = AtomicU64::new(0);
+
 /// Canvas に描く Direct2D の DC レンダー ターゲット。
 pub struct Renderer {
+    /// この描き手で作ったビットマップの作り置き（`CachedImage`）の控え。描き手と一緒に捨て、作り置きも捨てさせる。
+    /// レンダー ターゲットより先に捨てる（フィールドは書いた順に drop される）。
+    kept: Kept,
     factory: ID2D1Factory,
     target: ID2D1DCRenderTarget,
     /// 倍率の表示を書く DirectWrite。初めて表示するときに作る。
@@ -260,7 +470,9 @@ pub struct Renderer {
 impl Renderer {
     pub fn new() -> Result<Renderer> {
         let props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            // GPU で描いて DIB に読み戻すより、CPU で DIB に直接描く方が速い（#168、docs/perf.md の書き込みの
+            // 更新の表）。GPU のないマシンでも同じ種類で描ける。
+            r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
@@ -275,6 +487,7 @@ impl Renderer {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let target = factory.CreateDCRenderTarget(&props)?;
             Ok(Renderer {
+                kept: Kept::new(),
                 factory,
                 target,
                 dwrite: None,
@@ -284,18 +497,24 @@ impl Renderer {
 
     /// スクラップのウィンドウの中身を描く。`canvas` はウィンドウの大きさ（`ScrapModel::window_rect`）で、
     /// 画像は余白（`Appearance::margin`）の内側に `display`（`ScrapModel::display_size`）の大きさで置く。
+    /// 画像のビットマップは `image` の作り置きを使う（なければ作る）。
     /// 画像の上に `overlays` を重ねる。文字を打っていれば、キャレットの矩形（ウィンドウの中の座標）を返す。
+    ///
+    /// `canvas` に前に描いた中身と比べて、変わったのが書き込みだけなら（ドラッグ中の図形、元に戻すなど）、変わった
+    /// 書き込みの前と今の範囲を足し合わせた範囲（`Painted::dirty`）だけを描き直す。範囲を書き込みから正しく
+    /// 出せないとき（選択の印・キャレット・範囲選択の枠・トリム・倍率があるとき、文字の書き込みが変わったとき、
+    /// 画像・大きさ・見た目が変わったとき、`canvas` の中身が分からないとき）はウィンドウ全体を描き直す。
     /// `hit_alpha` があれば（透明な白紙スクラップ）、画像の下にそのアルファの黒を敷き、透明な部分のクリックが
     /// 下のウィンドウに抜けないようにする（`Appearance::hit_alpha`）。
     pub fn paint_scrap(
         &mut self,
         canvas: &Canvas,
-        image: &Image,
+        image: &CachedImage,
         display: Size,
         appearance: &Appearance,
         hit_alpha: Option<u8>,
         overlays: Overlays,
-    ) -> Result<Option<Rect>> {
+    ) -> Result<Painted> {
         let Overlays {
             annotations,
             label,
@@ -303,15 +522,54 @@ impl Renderer {
         } = overlays;
         let margin = appearance.margin();
         let image_rect = Rect::from_origin_size(Point::new(margin, margin), display);
+        let window = Rect::from_origin_size(Point::default(), canvas.size());
+        let drawn = Drawn {
+            look: Look {
+                image: image.id,
+                display,
+                appearance: *appearance,
+                hit_alpha,
+                view: annotations.view,
+                marked: label.is_some()
+                    || trim.is_some()
+                    || !annotations.selected.is_empty()
+                    || annotations.selection_range.is_some()
+                    || annotations.typing.is_some(),
+            },
+            annotations: annotations.annotations.to_vec(),
+        };
+        // 描けなかったら中身は分からないので、描き終えるまで空にしておく
+        let before = canvas.drawn.borrow_mut().take();
+        let area = match before {
+            Some(before) if !before.look.marked && before.look == drawn.look => {
+                match changed_area(
+                    &before.annotations,
+                    &drawn.annotations,
+                    drawn.look.view,
+                    image_rect,
+                ) {
+                    Some(area) => area.and_then(|area| area.intersect(&image_rect)),
+                    None => Some(window),
+                }
+            }
+            _ => Some(window),
+        };
+        let Some(area) = area else {
+            *canvas.drawn.borrow_mut() = Some(drawn);
+            return Ok(Painted {
+                caret: None,
+                dirty: None,
+            });
+        };
         let magnified = trim.and_then(|t| t.magnifier.as_ref().map(|m| (m, t.scale)));
         let dwrite = if label.is_some() || magnified.is_some() {
             Some(self.dwrite()?)
         } else {
             None
         };
-        let window = Rect::from_origin_size(Point::default(), canvas.size());
+        let kept = &self.kept;
         let mut caret = None;
-        self.paint(canvas, |target| {
+        self.paint(canvas, area, |target| {
             // SAFETY: BeginDraw と EndDraw の間で呼ぶ
             unsafe {
                 let mut edge = image_rect;
@@ -349,7 +607,7 @@ impl Renderer {
                     target.FillRectangle(&to_rect_f(image_rect), &brush);
                 }
             }
-            draw_image(target, image, image_rect)?;
+            image.draw(target, image_rect, Some(kept))?;
             caret = draw_annotations(target, annotations, image_rect)?;
             if let Some(trim) = trim {
                 draw_trim_overlay(target, image_rect, trim)?;
@@ -359,12 +617,16 @@ impl Renderer {
             }
             match (magnified, &dwrite) {
                 (Some((m, scale)), Some(dwrite)) => {
-                    draw_trim_magnifier(target, dwrite, image, window, m, scale)
+                    draw_trim_magnifier(target, dwrite, image.image(), window, m, scale)
                 }
                 _ => Ok(()),
             }
         })?;
-        Ok(caret)
+        *canvas.drawn.borrow_mut() = Some(drawn);
+        Ok(Painted {
+            caret,
+            dirty: Some(area),
+        })
     }
 
     /// 書き込みのツールバーを描く。`canvas` は `layout` の大きさ。`state` の道具・色・太さのボタンを選んだ
@@ -378,7 +640,8 @@ impl Renderer {
         scale: f32,
     ) -> Result<()> {
         let factory = &self.factory;
-        self.paint(canvas, |target| {
+        let whole = Rect::from_origin_size(Point::default(), canvas.size());
+        self.paint(canvas, whole, |target| {
             draw_toolbar(target, factory, layout, state, annotations, scale)
         })
     }
@@ -394,37 +657,41 @@ impl Renderer {
     }
 
     /// 画像と書き込みを画像の大きさの `canvas` に描く（コピーや保存で、表示と同じ描き方を使うため）。
+    /// 画像のビットマップは作り置きにしない（使い捨ての描き手で描くので）。
     pub fn paint_image(
         &self,
         canvas: &Canvas,
-        image: &Image,
+        image: &CachedImage,
         annotations: AnnotationLayer,
     ) -> Result<()> {
-        let rect = Rect::from_origin_size(Point::default(), image.size());
-        self.paint(canvas, |target| {
-            draw_image(target, image, rect)?;
+        let rect = Rect::from_origin_size(Point::default(), image.image().size());
+        self.paint(canvas, rect, |target| {
+            image.draw(target, rect, None)?;
             draw_annotations(target, annotations, rect).map(|_| ())
         })
     }
 
-    /// `canvas` を透明で塗ってから `draw` で描く。
+    /// `canvas` の `area` の中（`canvas` の中の座標）を透明で塗ってから `draw` で描く。`draw` は `canvas` 全体の
+    /// 座標で描き、`area` の外は描かれない（`canvas` の前の中身のまま）。
     fn paint(
         &self,
         canvas: &Canvas,
+        area: Rect,
         draw: impl FnOnce(&ID2D1RenderTarget) -> Result<()>,
     ) -> Result<()> {
-        let size = canvas.size();
         let rect = RECT {
-            left: 0,
-            top: 0,
-            right: size.width as i32,
-            bottom: size.height as i32,
+            left: area.left,
+            top: area.top,
+            right: area.right,
+            bottom: area.bottom,
         };
         let target: &ID2D1RenderTarget = &self.target;
         // SAFETY: canvas の DC は描き終わるまで生きている
         unsafe {
+            // 描き先を DC の `area` の中に結び、`canvas` 全体の座標で描けるようにずらす
             self.target.BindDC(canvas.dc(), &rect)?;
             target.BeginDraw();
+            target.SetTransform(&Matrix3x2::translation(-area.left as f32, -area.top as f32));
             target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
             target.Clear(Some(&rgb(0, 0.0)));
             let drawn = draw(target);
@@ -435,29 +702,119 @@ impl Renderer {
 }
 
 /// コピーと保存の画像を作る: 画像と書き込みを画像の画素の大きさに、表示と同じ描き方で描く。
-pub fn render_image(image: &Image, annotations: AnnotationLayer) -> Result<Image> {
-    if image.width() == 0 || image.height() == 0 {
-        return Ok(image.clone());
+pub fn render_image(image: &CachedImage, annotations: AnnotationLayer) -> Result<Image> {
+    let size = image.image().size();
+    // 大きさ 0 の描き先は作れない
+    if size.width == 0 || size.height == 0 {
+        return Ok(image.image().clone());
     }
-    let canvas = Canvas::new(image.size())?;
+    let canvas = Canvas::new(size)?;
     Renderer::new()?.paint_image(&canvas, image, annotations)?;
     canvas
         .to_image()
         .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED))
 }
 
-/// 画像を `dest` に伸び縮みさせて描く。縮めるときだけ線形補間にする。
-fn draw_image(target: &ID2D1RenderTarget, image: &Image, dest: Rect) -> Result<()> {
-    let size = image.size();
-    if size.width == 0 || size.height == 0 {
-        return Ok(());
+/// 書き込みが `before` から `after` に変わって、描いた画素が変わりうる範囲（画像の矩形 `image_rect` の左上を
+/// 原点に `view` で置いたときの座標）。変わったものがなければ `Some(None)`。文字の書き込みが変わったときは、
+/// 描いた字形の範囲を出せないので None。
+///
+/// 前と今で、頭からと後ろから同じ書き込みを除いた残りを、変わった書き込みとする（描いている図形は後ろに足され、
+/// 元に戻すと後ろから消える）。
+fn changed_area(
+    before: &[Annotation],
+    after: &[Annotation],
+    view: View,
+    image_rect: Rect,
+) -> Option<Option<Rect>> {
+    let head = before.iter().zip(after).take_while(|(a, b)| a == b).count();
+    let (before, after) = (&before[head..], &after[head..]);
+    let tail = before
+        .iter()
+        .rev()
+        .zip(after.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let changed = before[..before.len() - tail]
+        .iter()
+        .chain(&after[..after.len() - tail]);
+    let origin = (f64::from(image_rect.left), f64::from(image_rect.top));
+    let mut area: Option<Rect> = None;
+    for annotation in changed {
+        let reach = reach(annotation, view, origin)?;
+        area = match (area, reach) {
+            (Some(a), Some(b)) => Some(Rect::new(
+                a.left.min(b.left),
+                a.top.min(b.top),
+                a.right.max(b.right),
+                a.bottom.max(b.bottom),
+            )),
+            (a, b) => a.or(b),
+        };
     }
+    Some(area)
+}
+
+/// 書き込み `annotation` を描いたときに画素が変わりうる範囲（`Pen::draw` と同じく、`view` で置いて `origin` だけ
+/// ずらした座標）。描くものがなければ `Some(None)`。文字は字形の範囲を出せないので None。
+///
+/// 線の太さの半分（丸めた端・折れ目、矩形の角）と、アンチエイリアスでにじむ分だけ、図形の点から広げる。
+fn reach(annotation: &Annotation, view: View, origin: (f64, f64)) -> Option<Option<Rect>> {
+    /// アンチエイリアスでにじむ分（描く先の画素）。
+    const BLUR: f64 = 2.0;
+    let at = |p: Point| {
+        let (x, y) = view.point(p);
+        (x + origin.0, y + origin.1)
+    };
+    let width = view.width(annotation.style.width);
+    let points: Vec<(f64, f64)> = match &annotation.shape {
+        Shape::Rect { from, to } | Shape::Ellipse { from, to } | Shape::Line { from, to } => {
+            vec![at(*from), at(*to)]
+        }
+        Shape::Arrow { from, to } => {
+            let (from, to) = (at(*from), at(*to));
+            match arrow_head(from, to, width) {
+                Some(head) => vec![from, to, head.left, head.right],
+                // 長さ 0 の矢印は描かない
+                None => vec![],
+            }
+        }
+        Shape::Freehand { points } => points.iter().map(|p| at(*p)).collect(),
+        Shape::Text { .. } => return None,
+    };
+    let pad = width / 2.0 + BLUR;
+    let mut points = points.into_iter();
+    let Some((x, y)) = points.next() else {
+        return Some(None);
+    };
+    let (mut x0, mut y0, mut x1, mut y1) = (x, y, x, y);
+    for (x, y) in points {
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    Some(Some(Rect::new(
+        (x0 - pad).floor() as i32,
+        (y0 - pad).floor() as i32,
+        (x1 + pad).ceil() as i32,
+        (y1 + pad).ceil() as i32,
+    )))
+}
+
+/// 大きさ `size` の画像のビットマップを `dest` に伸び縮みさせて描く。縮めるときだけ線形補間にする。
+fn draw_bitmap(target: &ID2D1RenderTarget, bitmap: &ID2D1Bitmap, size: Size, dest: Rect) {
     let interpolation: D2D1_BITMAP_INTERPOLATION_MODE =
         if dest.width() < size.width || dest.height() < size.height {
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
         } else {
             D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
         };
+    let dest = to_rect_f(dest);
+    // SAFETY: BeginDraw と EndDraw の間で呼ぶ
+    unsafe { target.DrawBitmap(bitmap, Some(&dest), 1.0, interpolation, None) };
+}
+
+/// 画像全体を premultiplied にして、`target` で使えるビットマップを作る。画像は空でないこと。
+fn create_bitmap(target: &ID2D1RenderTarget, image: &Image) -> Result<ID2D1Bitmap> {
+    let size = image.size();
     let pixels = image.to_premultiplied();
     let props = D2D1_BITMAP_PROPERTIES {
         pixelFormat: D2D1_PIXEL_FORMAT {
@@ -467,10 +824,9 @@ fn draw_image(target: &ID2D1RenderTarget, image: &Image, dest: Rect) -> Result<(
         dpiX: 96.0,
         dpiY: 96.0,
     };
-    let dest = to_rect_f(dest);
     // SAFETY: pixels は CreateBitmap が写し終えるまで生きている
     unsafe {
-        let bitmap = target.CreateBitmap(
+        target.CreateBitmap(
             D2D_SIZE_U {
                 width: size.width,
                 height: size.height,
@@ -478,10 +834,8 @@ fn draw_image(target: &ID2D1RenderTarget, image: &Image, dest: Rect) -> Result<(
             Some(pixels.as_ptr().cast()),
             size.width * 4,
             &props,
-        )?;
-        target.DrawBitmap(&bitmap, Some(&dest), 1.0, interpolation, None);
+        )
     }
-    Ok(())
 }
 
 /// 書き込みを、`image_rect` の左上を原点に `layer.view` で置いて描く。画像の矩形の外（トリムで隠した部分など）は

@@ -1,10 +1,11 @@
 //! 配布物の性能を測るハーネス（開発専用。zip には入れない）。測り方と指標の定義は `docs/perf.md`。
 //!
 //! ```text
-//! perf-harness <shunsoku.exe> [--runs N] [--hotkey <組み合わせ>] [memory] [hotkey] [cold-start]
+//! perf-harness <shunsoku.exe> [--runs N] [--hotkey <組み合わせ>] [--monitor <DISPLAYn>] [memory] [hotkey] [cold-start] [annotate]
 //! ```
 //!
-//! 指標を書かなければ 3 つとも測る。本体は `SHUNSOKU_PERF_LOG` で区切りの時刻を書き、ハーネスはそれを読む。
+//! 指標を書かなければ memory・hotkey・cold-start の 3 つを測る。`annotate`（書き込みの更新）は書いたときだけ測り、
+//! `--monitor`（`DISPLAY2` など、GDI のデバイス名）で白紙スクラップを出すモニタを選ぶ（既定は主モニタ）。本体は `SHUNSOKU_PERF_LOG` で区切りの時刻を書き、ハーネスはそれを読む。
 
 #[cfg(windows)]
 mod measure;
@@ -20,7 +21,7 @@ const DEFAULT_RUNS: usize = 20;
 /// ハーネスが本体に設定するホットキーの既定値。ほかのアプリと重なりにくい組み合わせ。
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+Shift+F9";
 
-const USAGE: &str = "usage: perf-harness <shunsoku.exe> [--runs N] [--hotkey <組み合わせ>] [memory] [hotkey] [cold-start]";
+const USAGE: &str = "usage: perf-harness <shunsoku.exe> [--runs N] [--hotkey <組み合わせ>] [--monitor <DISPLAYn>] [memory] [hotkey] [cold-start] [annotate]";
 
 /// 測る指標。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,8 @@ pub enum Metric {
     Hotkey,
     /// コールドスタート。
     ColdStart,
+    /// 書き込みの更新（書き込みの編集モードでの 1 回の描き直し）。指標を書かなかったときは測らない。
+    Annotate,
 }
 
 /// コマンドラインの指定。
@@ -40,6 +43,8 @@ pub struct Options {
     pub runs: usize,
     pub hotkey: Chord,
     pub metrics: Vec<Metric>,
+    /// 書き込みの更新で白紙スクラップを出すモニタの GDI のデバイス名（`DISPLAY2` など）。None なら主モニタ。
+    pub monitor: Option<String>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
@@ -47,6 +52,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
     let mut runs = DEFAULT_RUNS;
     let mut hotkey = Chord::from_str(DEFAULT_HOTKEY).map_err(|e| e.to_string())?;
     let mut metrics = Vec::new();
+    let mut monitor = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--runs" => {
@@ -61,9 +67,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
                 let value = args.next().ok_or("--hotkey の値がない")?;
                 hotkey = Chord::from_str(&value).map_err(|e| e.to_string())?;
             }
+            "--monitor" => monitor = Some(args.next().ok_or("--monitor の値がない")?),
             "memory" => metrics.push(Metric::Memory),
             "hotkey" => metrics.push(Metric::Hotkey),
             "cold-start" => metrics.push(Metric::ColdStart),
+            "annotate" => metrics.push(Metric::Annotate),
             "-h" | "--help" => return Err(USAGE.to_owned()),
             _ if arg.starts_with('-') => return Err(format!("知らないオプション: {arg}\n{USAGE}")),
             _ if exe.is_none() => exe = Some(PathBuf::from(arg)),
@@ -78,6 +86,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
         runs,
         hotkey,
         metrics,
+        monitor,
     })
 }
 
@@ -99,5 +108,47 @@ fn main() {
         let _ = options;
         eprintln!("perf-harness は Windows でだけ動きます");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(args: &[&str]) -> Vec<Metric> {
+        parse_args(args.iter().map(|a| a.to_string()))
+            .unwrap()
+            .metrics
+    }
+
+    #[test]
+    fn without_metrics_the_three_existing_ones_are_measured() {
+        assert_eq!(
+            metrics(&["shunsoku.exe"]),
+            vec![Metric::Memory, Metric::Hotkey, Metric::ColdStart]
+        );
+    }
+
+    #[test]
+    fn the_annotate_monitor_is_the_primary_one_unless_named() {
+        let parse = |args: &[&str]| parse_args(args.iter().map(|a| a.to_string())).unwrap();
+        assert_eq!(parse(&["shunsoku.exe", "annotate"]).monitor, None);
+        assert_eq!(
+            parse(&["shunsoku.exe", "annotate", "--monitor", "DISPLAY2"]).monitor,
+            Some("DISPLAY2".to_owned())
+        );
+        assert!(parse_args(["shunsoku.exe", "--monitor"].iter().map(|a| a.to_string())).is_err());
+    }
+
+    #[test]
+    fn annotate_is_measured_only_when_named() {
+        assert_eq!(
+            metrics(&["shunsoku.exe", "annotate"]),
+            vec![Metric::Annotate]
+        );
+        assert_eq!(
+            metrics(&["shunsoku.exe", "hotkey", "annotate"]),
+            vec![Metric::Hotkey, Metric::Annotate]
+        );
     }
 }

@@ -80,7 +80,7 @@ impl ToolbarWindow {
 
     /// `source` の中身を `rect`（スクリーン座標）に出す。いつも不透明。
     pub fn present(&self, source: HDC, rect: Rect) -> Result<()> {
-        layered::present(self.hwnd, source, rect, 0xFF)
+        layered::present(self.hwnd, source, rect, None, 0xFF)
     }
 
     /// 大きさを変えずに、左上を `rect` の左上に動かす（中身は描き直さない）。
