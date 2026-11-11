@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "perf-harness"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "shunsoku-core",
  "windows",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "release-tools"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "serde_core"
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "shunsoku"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "log",
  "shunsoku-core",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "shunsoku-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "shunsoku-core",
  "shunsoku-pipe-identity",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "shunsoku-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "png",
  "toml_edit",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "shunsoku-pipe-identity"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "windows",
 ]
@@ -274,7 +274,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "win-driver"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "shunsoku-core",
  "windows",
